@@ -423,8 +423,9 @@ secure_active_paths() {
 
 secure_active_config() (
 	local directory snapshot metadata mode links owner group size remainder
-	local workdir_fd old_fd stage_fd stage="" old_hash stage_hash snapshot_fd=""
+	local workdir_fd old_fd stage_fd stage="" capture verify old_hash snapshot_fd=""
 	secure_active_paths || exit 1
+	umask 077
 	directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || exit 1
 	trap '[ -z "$stage" ] || rm -f "$stage"; rm -rf "$directory"' EXIT
 	snapshot="${directory}/AdGuardHome.yaml"
@@ -469,18 +470,24 @@ secure_active_config() (
 					esac
 					case "$size" in ""|*[!0-9]*) exit 1 ;; esac
 					[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
-					old_hash="$(open_fd_hash "$old_fd")" || exit 1
-					umask 077
+					# Two bounded captures must agree before the active pathname can be
+					# replaced.  Hash only those private captures, never the mutable old
+					# inode directly, so an old writer cannot create an unbounded read.
+					capture="${directory}/service-owned.yaml"
+					verify="${directory}/service-owned-verify.yaml"
+					snapshot_config_file "$config_file" "$capture" "" 8 || exit 1
+					old_hash="$SNAPSHOT_CONFIG_HASH"
+					snapshot_config_file "$config_file" "$verify" "$old_hash" 8 || exit 1
 					stage="$(mktemp "${work_dir}/.AdGuardHome-secure.XXXXXX")" || exit 1
 					exec 9<>"$stage" || exit 1
 					stage_fd=/proc/self/fd/9
 					[ -f "$stage_fd" ] && [ "$stage_fd" -ef "$stage" ] || exit 1
-					/usr/bin/timeout -k 1s 3s /bin/dd if="$old_fd" bs=4096 count=129 \
+					/usr/bin/timeout -k 1s 3s /bin/dd if="$capture" bs=4096 count=129 \
 						of="$stage_fd" 2>/dev/null || exit 1
 					secure_config_inode "$stage_fd" || exit 1
-					stage_hash="$(open_fd_hash "$stage_fd")" || exit 1
-					[ "$stage_hash" = "$old_hash" ] || exit 1
-					[ "$(open_fd_hash "$old_fd")" = "$old_hash" ] || exit 1
+					# This is the final size/hash gate before rename.  A truncate or
+					# growth beyond MAX_YAML_SIZE therefore leaves the old path intact.
+					snapshot_config_file "$stage" "$snapshot" "$old_hash" 9 || exit 1
 					[ -f "$old_fd" ] && [ ! -L "$config_file" ] &&
 						[ "$old_fd" -ef "$config_file" ] || exit 1
 					[ -d "$workdir_fd" ] && [ "$workdir_fd" -ef "$work_dir" ] || exit 1
@@ -501,7 +508,6 @@ secure_active_config() (
 					$metadata
 					EOF
 					[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || exit 1
-					[ "$(open_fd_hash "$stage_fd")" = "$old_hash" ] || exit 1
 					snapshot_fd=9
 					;;
 				*) exit 1 ;;
@@ -511,7 +517,7 @@ secure_active_config() (
 		*) exit 1 ;;
 	esac
 
-	snapshot_config_file "$config_file" "$snapshot" "" "$snapshot_fd" || exit 1
+	snapshot_config_file "$config_file" "$snapshot" "$old_hash" "$snapshot_fd" || exit 1
 )
 
 secure_config_inode() {
