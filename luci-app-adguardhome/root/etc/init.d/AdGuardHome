@@ -1092,7 +1092,9 @@ valid_tls_path_syntax() {
 
 # Require every ancestor of a root-read file to be root-owned.  Writable
 # ancestors are rejected except for the target's top-level /etc (exposed as
-# mode 0777 by this rootfs) and the root-owned sticky /tmp used by mktemp; every
+# mode 0777 by this rootfs) and the root-owned sticky /tmp used by mktemp.
+# ImmortalWrt's fixed /var -> /tmp link is treated exactly like /tmp only when
+# its target and dereferenced permissions match that system layout.  Every
 # deeper ancestor must be non-writable, and the held-FD identity checks below
 # reject replacement before bytes are accepted.
 trusted_root_file_source() {
@@ -1104,8 +1106,17 @@ trusted_root_file_source() {
 	while [ -n "$remaining" ]; do
 		component="${remaining%%/*}"
 		current="${current}/${component}"
-		[ -d "$current" ] && [ ! -L "$current" ] || return 1
-		metadata="$(LC_ALL=C ls -ldn "$current" 2>/dev/null)" || return 1
+		if [ -L "$current" ]; then
+			[ "$current" = /var ] || return 1
+			case "$(readlink "$current" 2>/dev/null)" in
+				tmp|/tmp) ;;
+				*) return 1 ;;
+			esac
+			metadata="$(LC_ALL=C ls -ldnL "$current" 2>/dev/null)" || return 1
+		else
+			[ -d "$current" ] || return 1
+			metadata="$(LC_ALL=C ls -ldn "$current" 2>/dev/null)" || return 1
+		fi
 		read -r mode links owner group remainder <<-EOF
 		$metadata
 		EOF
@@ -1115,11 +1126,12 @@ trusted_root_file_source() {
 				case "$current:$mode" in
 					/etc:*) ;;
 					/tmp:drwxrwxrwt) ;;
+					/var:drwxrwxrwt) ;;
 					*) return 1 ;;
 				esac
 				;;
 		esac
-		case "$current" in /etc|/tmp) ;; *) protected_ancestor=1 ;; esac
+		case "$current" in /etc|/tmp|/var) ;; *) protected_ancestor=1 ;; esac
 		[ "$remaining" = "$component" ] && break
 		remaining="${remaining#*/}"
 	done
