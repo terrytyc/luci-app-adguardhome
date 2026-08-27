@@ -590,6 +590,30 @@ trap - 0 HUP INT TERM
 exit 0
 endef
 
+# base-files deliberately continues past a failed uci-defaults script and
+# leaves that script in place for a later retry.  For this coordinator, a
+# partially applied migration is not an acceptable successful installation:
+# turn the retained package-owned script into a hard package-manager failure.
+define Package/$(PKG_NAME)/postinst
+#!/bin/sh
+[ -z "$${IPKG_INSTROOT}" ] || exit 0
+
+if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
+   [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
+	echo "AdGuard Home configuration migration failed; package installation aborted." >&2
+	exit 1
+fi
+
+rm -f /tmp/luci-indexcache.* || exit 1
+if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
+	rm -f /tmp/luci-modulecache || exit 1
+elif [ -d /tmp/luci-modulecache ]; then
+	rm -rf /tmp/luci-modulecache/ || exit 1
+fi
+[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+exit 0
+endef
+
 # default_prerm intentionally ignores init-script failures.  Retry and verify
 # DNS cleanup directly so package removal cannot leave a resolver takeover or
 # a running lower service after this coordinator has disappeared.

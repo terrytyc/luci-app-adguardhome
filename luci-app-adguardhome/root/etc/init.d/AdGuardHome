@@ -2551,6 +2551,11 @@ isrunning() {
 
 start_service() {
 	local prepare_rc=0
+	if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
+	   [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
+		log_error "Configuration migration is incomplete; refusing to start the coordinator"
+		return 1
+	fi
 	START_PREPARED=0
 	START_DISABLED=0
 	run_locked prepare_wrapper_locked || prepare_rc=$?
