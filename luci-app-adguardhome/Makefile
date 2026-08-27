@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=1.1.1
-PKG_MAINTAINER:=<https://github.com/sirpdboy/luci-app-adguardhome>
+PKG_MAINTAINER:=<https://github.com/terrytyc/luci-app-adguardhome>
 
 LUCI_TITLE:=LuCI app for AdGuardHome
 LUCI_PKGARCH:=all
@@ -15,7 +15,7 @@ LUCI_DESCRIPTION:=LuCI support for AdGuardHome
 
 define Package/$(PKG_NAME)/conffiles
 /etc/config/AdGuardHome
-/etc/AdGuardHome.yaml
+/etc/AdGuardHome/AdGuardHome.yaml
 endef
 
 define Package/$(PKG_NAME)/preinst
@@ -60,7 +60,7 @@ endef
 
 define Package/$(PKG_NAME)/postrm
 #!/bin/sh
-rm -rf /etc/AdGuardHome/
+#rm -rf /etc/AdGuardHome/
 exit 0
 endef
 include $(TOPDIR)/feeds/luci/luci.mk
