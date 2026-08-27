@@ -18,12 +18,17 @@ DEFAULT_CONFIG_FILE="${DEFAULT_WORK_DIR}/AdGuardHome.yaml"
 CORE_BINARY="/usr/bin/AdGuardHome"
 ADGUARD_UID=853
 ADGUARD_GID=853
+ADGUARD_USER="adguardhome"
+ADGUARD_GROUP="adguardhome"
+NORMALIZER_GROUP="root"
 MAX_YAML_SIZE=524288
 MAX_TLS_FILE_SIZE=1048576
 MANAGED_JAIL_OPTION="managed_jail_mount"
 MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
 
 INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
+NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
+NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
 MONITOR_INTERVAL=2
 # First boot can download and compile the packaged default filters before the
 # DNS sockets appear, especially on slower routers.  Keep takeover disabled
@@ -44,12 +49,13 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config yaml_update tls_refresh"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update tls_refresh"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
 \tweb_listening <port>\tVerify an official-core TCP listener
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
+\tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
 \ttls_refresh\t\tRecheck ACME material after renewal"
 
@@ -898,6 +904,239 @@ valid_config_candidate_path() {
 	! path_contains_symlink "$value"
 }
 
+normalizer_lock_directory_is_private() {
+	local directory="${NORMALIZER_LOCK%/*}" metadata mode links owner group remainder
+	[ -d "$directory" ] && [ ! -L "$directory" ] || return 1
+	path_contains_symlink "$directory" && return 1
+	metadata="$(LC_ALL=C ls -ldn "$directory" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = "0:0:drwx------" ]
+}
+
+normalizer_lock_is_private() {
+	local metadata mode links owner group remainder
+	[ -d "$NORMALIZER_LOCK" ] && [ ! -L "$NORMALIZER_LOCK" ] || return 1
+	path_contains_symlink "$NORMALIZER_LOCK" && return 1
+	metadata="$(LC_ALL=C ls -ldn "$NORMALIZER_LOCK" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = "0:0:drwx------" ]
+}
+
+# The writable normalizer child may start only while uid 853 is otherwise
+# completely quiescent.  Read each thread status once and fail closed if a
+# non-vanished record is malformed.
+adguard_uid_process_exists() {
+	local status uids
+	for status in /proc/[0-9]*/task/[0-9]*/status; do
+		if [ ! -r "$status" ]; then
+			[ ! -e "$status" ] && continue
+			return 0
+		fi
+		uids="$(awk '$1 == "Uid:" {
+			if (NF != 5) exit 2
+			for (i=2; i<=5; i++) if ($i !~ /^[0-9]+$/) exit 2
+			print $2, $3, $4, $5; found=1; exit }
+			END { if (!found) exit 1 }' \
+			"$status" 2>/dev/null)" || {
+			[ ! -e "$status" ] && continue
+			return 0
+		}
+		case " $uids " in *" ${ADGUARD_UID} "*) return 0 ;; esac
+	done
+	return 1
+}
+
+# Installer migrations are the only place where an old schema must be written
+# by the official core before it becomes active.  Keep the disposable tree
+# behind a root-only parent and expose only its root-group-writable config/work
+# children inside a dedicated ujail mount namespace.  The lowered child has
+# uid 853 and primary gid 0 solely so it can write the root-group staging
+# children.  No other uid-853 process may coexist, so none can reach the
+# root-only outer directory through the child's procfs views.  Runtime and RPC
+# validation continue to use the read-only sandbox above.
+normalize_installer_config() (
+	local candidate="$1" source_fd original_hash
+	local validation_dir validation_config_dir validation_work validation
+	local normalized normalized_verify source_verify config_dir_fd output_fd
+	local original_certificate_path original_private_key_path tls_paths_rewritten=0
+	local normalized_hash replacement="" replacement_fd metadata mode links
+	local owner group size remainder rc=0 pattern_rc=0 lock_held=0
+	local account_groups
+
+	cleanup_installer_normalizer() {
+		case "$replacement" in
+			"${candidate}.normalized."??????) rm -f "$replacement" ;;
+		esac
+		case "$validation_dir" in
+			/tmp/AdGuardHome-normalize.??????) rm -rf "$validation_dir" ;;
+		esac
+		if [ "$lock_held" = 1 ]; then
+			rmdir "$NORMALIZER_LOCK" >/dev/null 2>&1 || true
+		fi
+	}
+
+	root_private_config_source "$candidate" || exit 1
+	[ -x /sbin/ujail ] || exit 1
+	[ "$(id -u "$ADGUARD_USER" 2>/dev/null)" = "$ADGUARD_UID" ] || exit 1
+	[ "$(id -g "$ADGUARD_USER" 2>/dev/null)" = "$ADGUARD_GID" ] || exit 1
+	[ "$(id -gn "$ADGUARD_USER" 2>/dev/null)" = "$ADGUARD_GROUP" ] || exit 1
+	[ "$(id -g "$NORMALIZER_GROUP" 2>/dev/null)" = 0 ] || exit 1
+	[ "$(id -gn "$NORMALIZER_GROUP" 2>/dev/null)" = "$NORMALIZER_GROUP" ] || exit 1
+	account_groups="$(id -G "$ADGUARD_USER" 2>/dev/null)" || exit 1
+	case " $account_groups " in *" 0 "*) exit 1 ;; esac
+	normalizer_lock_directory_is_private || exit 1
+	trap cleanup_installer_normalizer EXIT
+	# mkdir is the lock acquisition: it is atomic, nonblocking, and only the
+	# successful creator removes this exact directory on exit.  Unlike unlinking
+	# a flock file, this cannot split contenders across two locked inodes.
+	mkdir -m 0700 "$NORMALIZER_LOCK" || exit 1
+	lock_held=1
+	chown 0:0 "$NORMALIZER_LOCK" && chmod 0700 "$NORMALIZER_LOCK" || exit 1
+	normalizer_lock_is_private || exit 1
+	if adguard_uid_process_exists; then
+		log_error "Refusing installer normalization while uid ${ADGUARD_UID} is not quiescent"
+		exit 1
+	fi
+	exec 8<"$candidate" || exit 1
+	source_fd=/proc/self/fd/8
+	[ -f "$source_fd" ] && [ "$source_fd" -ef "$candidate" ] || exit 1
+
+	validation_dir="$(mktemp -d /tmp/AdGuardHome-normalize.XXXXXX)" || exit 1
+	validation_config_dir="${validation_dir}/config"
+	validation_work="${validation_dir}/work"
+	validation="${validation_config_dir}/AdGuardHome.yaml"
+	normalized="${validation_dir}/normalized.yaml"
+	normalized_verify="${validation_dir}/normalized-verify.yaml"
+	source_verify="${validation_dir}/source-verify.yaml"
+	mkdir "$validation_config_dir" "$validation_work" || exit 1
+	snapshot_config_file "$candidate" "$validation" "" 8 || exit 1
+	original_hash="$SNAPSHOT_CONFIG_HASH"
+	original_certificate_path="$(yaml_get_section_value tls certificate_path "$validation")"
+	original_private_key_path="$(yaml_get_section_value tls private_key_path "$validation")"
+	prepare_tls_validation_files "$validation" "$validation_dir" || exit 1
+	[ -z "$TLS_CERT_REAL" ] || tls_paths_rewritten=1
+	if [ "$tls_paths_rewritten" = 1 ]; then
+		chown 0:0 "${validation_dir}/tls-certificate" \
+			"${validation_dir}/tls-private-key" || exit 1
+		chmod 0640 "${validation_dir}/tls-certificate" \
+			"${validation_dir}/tls-private-key" || exit 1
+	fi
+
+	# Hold the exact config directory before it becomes writable.  Its root-only
+	# parent remains mode 0700 on the host; ujail bind-mounts the child at the
+	# same pathname inside a private mount namespace for the lowered core.
+	exec 7<"$validation_config_dir" || exit 1
+	config_dir_fd=/proc/self/fd/7
+	[ -d "$config_dir_fd" ] && [ "$config_dir_fd" -ef "$validation_config_dir" ] || exit 1
+	chown 0:0 "$config_dir_fd" "$validation_work" || exit 1
+	chown "${ADGUARD_UID}:0" "$validation" || exit 1
+	chmod 0770 "$config_dir_fd" "$validation_work" || exit 1
+	chmod 0600 "$validation" || exit 1
+	[ "$config_dir_fd" -ef "$validation_config_dir" ] || exit 1
+
+	# Let ujail reap a TERM-resistant child before the outer timeout may kill its
+	# supervisor.  The four-second outer grace exceeds ujail's one-second grace.
+	set -- /sbin/ujail -n AGHNormalize -t 1 -E -c -o \
+		-U "$ADGUARD_USER" -G "$NORMALIZER_GROUP" \
+		-w "$validation_config_dir" -w "$validation_work"
+	if [ "$tls_paths_rewritten" = 1 ]; then
+		set -- "$@" -r "${validation_dir}/tls-certificate" \
+			-r "${validation_dir}/tls-private-key"
+	fi
+	set -- "$@" -- "$CORE_BINARY" --check-config \
+		--config "$validation" --work-dir "$validation_work"
+	/usr/bin/timeout -k 4s 20s "$@" >/dev/null 2>&1 || rc=$?
+	[ "$rc" = 0 ] || exit 1
+
+	# Revoke the bind source through its held descriptor before opening output.
+	# Then prove that the core produced one bounded regular inode and capture it
+	# twice through a held FD.  Hash only the root-owned bounded snapshots.
+	[ -d "$config_dir_fd" ] && [ "$config_dir_fd" -ef "$validation_config_dir" ] || exit 1
+	chown 0:0 "$config_dir_fd" && chmod 0700 "$config_dir_fd" || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$config_dir_fd" 2>/dev/null)" || exit 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = "0:0:drwx------" ] || exit 1
+	[ -f "$validation" ] && [ ! -L "$validation" ] || exit 1
+	exec 9<"$validation" || exit 1
+	output_fd=/proc/self/fd/9
+	[ -f "$output_fd" ] && [ "$output_fd" -ef "$validation" ] || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$output_fd" 2>/dev/null)" || exit 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode:$links" = \
+		"${ADGUARD_UID}:0:-rw-------:1" ] || exit 1
+	case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
+	chown 0:0 "$output_fd" && chmod 0600 "$output_fd" || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$output_fd" 2>/dev/null)" || exit 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || exit 1
+	case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
+	snapshot_config_file "$validation" "$normalized" "" 9 || exit 1
+	normalized_hash="$SNAPSHOT_CONFIG_HASH"
+	snapshot_config_file "$validation" "$normalized_verify" \
+		"$normalized_hash" 9 || exit 1
+	chown 0:0 "$normalized" && chmod 0600 "$normalized" || exit 1
+	if [ "$tls_paths_rewritten" = 1 ]; then
+		yaml_replace_tls_scalar tls certificate_path \
+			"$original_certificate_path" "$normalized" || exit 1
+		yaml_replace_tls_scalar tls private_key_path \
+			"$original_private_key_path" "$normalized" || exit 1
+	fi
+	yaml_replace_section_list_item filtering safe_fs_patterns \
+		"${validation_work}/data/userfilters/*" \
+		"${work_dir}/data/userfilters/*" "$normalized" || pattern_rc=$?
+	case "$pattern_rc" in 0|3) ;; *) exit 1 ;; esac
+	# No jail-private path may escape into the installed YAML.  This also catches
+	# any future official migrator field that embeds its disposable workdir.
+	rc=0
+	grep -F "$validation_dir" "$normalized" >/dev/null 2>&1 || rc=$?
+	case "$rc" in 0) exit 1 ;; 1) ;; *) exit 1 ;; esac
+	normalized_hash="$(yaml_file_hash "$normalized")" || exit 1
+	check_core_config_file "$normalized" "$normalized_hash" "" "" || exit 1
+
+	snapshot_config_file "$candidate" "$source_verify" "$original_hash" 8 || exit 1
+	[ -f "$candidate" ] && [ ! -L "$candidate" ] && \
+		[ "$source_fd" -ef "$candidate" ] || exit 1
+	root_private_config_source "$candidate" || exit 1
+	replacement="$(mktemp "${candidate}.normalized.XXXXXX")" || exit 1
+	exec 6<>"$replacement" || exit 1
+	replacement_fd=/proc/self/fd/6
+	[ -f "$replacement_fd" ] && [ "$replacement_fd" -ef "$replacement" ] || exit 1
+	/usr/bin/timeout -k 1s 3s /bin/dd if="$normalized" \
+		bs=4096 count=129 of="$replacement_fd" 2>/dev/null || exit 1
+	chown 0:0 "$replacement_fd" && chmod 0600 "$replacement_fd" || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$replacement_fd" 2>/dev/null)" || exit 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || exit 1
+	case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
+	[ "$(open_fd_hash "$replacement_fd")" = "$normalized_hash" ] || exit 1
+	snapshot_config_file "$candidate" "$source_verify" "$original_hash" 8 || exit 1
+	[ -f "$candidate" ] && [ ! -L "$candidate" ] && \
+		[ "$source_fd" -ef "$candidate" ] || exit 1
+	mv "$replacement" "$candidate" || exit 1
+	replacement=""
+	[ "$replacement_fd" -ef "$candidate" ] || exit 1
+	[ "$(open_fd_hash "$replacement_fd")" = "$normalized_hash" ] || exit 1
+	exec 6>&-
+	exec 9>&-
+	exec 7>&-
+	exec 8>&-
+)
+
 # Restricted validator for the clean-install/migration script.  It accepts no
 # UCI state and performs no writes outside a root-owned disposable directory.
 # snapshot_config_file() either uses a root-private source or reads as uid 853,
@@ -912,6 +1151,22 @@ check_config() {
 	validate_managed_work_dir_namespace "$requested_work_dir" || return 1
 	work_dir="${requested_work_dir%/}"
 	check_core_config_file "$candidate"
+}
+
+normalize_config() {
+	local candidate="$1" requested_work_dir="$2"
+	valid_config_candidate_path "$candidate" || return 1
+	case "$candidate" in
+		"${NORMALIZER_RUNTIME_DIR}/yaml-migration."??????|\
+		"${NORMALIZER_RUNTIME_DIR}/yaml-workdir-result."??????|\
+		"${NORMALIZER_RUNTIME_DIR}/yaml-dns-result."??????) ;;
+		*) return 1 ;;
+	esac
+	# Package migrations may normalize only root-private candidates after the
+	# requested destination has passed the same namespace checks as runtime.
+	validate_managed_work_dir_namespace "$requested_work_dir" || return 1
+	work_dir="${requested_work_dir%/}"
+	normalize_installer_config "$candidate"
 }
 
 restore_yaml_backup() {
@@ -1417,7 +1672,10 @@ yaml_replace_tls_scalar() {
 				if (value ~ ("^" key ":[[:space:]]*")) { matches++; found=i }
 			}
 			if (matches != 1) exit 1
-			line[found]=pad(depth) key ": " replacement
+			# TLS paths have already passed the restricted path grammar, which
+			# excludes quotes and backslashes.  Quote the scalar so a permitted
+			# trailing colon cannot change YAML syntax during normalization.
+			line[found]=pad(depth) key ": \"" replacement "\""
 			for (i=1; i<=n; i++) print line[i]
 		}' "$file" >"$tmp"
 	rc=$?

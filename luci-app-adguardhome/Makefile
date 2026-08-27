@@ -10,7 +10,7 @@ PKG_LICENSE:=Apache-2.0
 
 LUCI_TITLE:=LuCI support for AdGuard Home
 LUCI_PKGARCH:=all
-LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +coreutils-timeout +adguardhome
+LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +coreutils-timeout +procd-ujail +adguardhome
 LUCI_EXTRA_DEPENDS:=adguardhome (>=0.107.76-r1)
 LUCI_DESCRIPTION:=LuCI integration for the packaged AdGuard Home service
 LUCI_MAINTAINER:=terrytyc

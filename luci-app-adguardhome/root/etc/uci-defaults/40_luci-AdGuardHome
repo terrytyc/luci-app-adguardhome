@@ -746,8 +746,10 @@ validate_yaml_candidate() {
 		echo "The packaged AdGuard Home validation helper is unavailable." >&2
 		return 1
 	fi
-	/usr/bin/timeout -k 2s 25s /etc/init.d/AdGuardHome \
-		check_config "$candidate" "$requested_work_dir"
+	# Cover both bounded TLS snapshots, the writable schema-normalization jail,
+	# the read-only official-core recheck, and descriptor-based captures.
+	/usr/bin/timeout -k 5s 120s /etc/init.d/AdGuardHome \
+		normalize_config "$candidate" "$requested_work_dir"
 }
 
 secure_work_dir_inode() (
@@ -761,7 +763,11 @@ secure_work_dir_inode() (
 	$metadata
 	EOF
 	case "${owner}:${group}:${mode}" in
-		0:0:drwx------|0:"$ADGUARD_GID":drwx------|0:"$ADGUARD_GID":drwx--x---|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		# The 1.x APK shipped its fixed workdir as root:root 0775.  Accept
+		# that exact legacy state (and its non-writable 0755 variant) only
+		# long enough to tighten the held inode below; world-writable and
+		# non-root-owned directories remain rejected.
+		0:0:drwxrwxr-x|0:0:drwxr-xr-x|0:0:drwx------|0:"$ADGUARD_GID":drwx------|0:"$ADGUARD_GID":drwx--x---|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
 		*) exit 1 ;;
 	esac
 	chown 0:0 "$fd_path" && chmod 0700 "$fd_path" || exit 1
@@ -855,6 +861,16 @@ migrate_yaml() {
 		echo "Unsafe AdGuard Home config source: '$source'." >&2
 		return 1
 	}
+	# Secure the old fixed workdir before selecting a capture path only when the
+	# source is the root-owned target itself.  Service-owned workdirs must remain
+	# traversable until their YAML has been captured as uid 853; they are secured
+	# later by install_yaml_candidate().
+	if [ "$source" = "$target" ] && root_owned_regular_file "$source"; then
+		secure_target_work_dir "${target%/*}" || {
+			echo "Unable to secure the managed AdGuard Home workdir '${target%/*}'." >&2
+			return 1
+		}
+	fi
 	new_private_temp yaml-migration || return 1
 	candidate="$NEW_PRIVATE_TEMP"
 	copy_yaml_bounded "$source" "$candidate" || {
@@ -867,7 +883,9 @@ migrate_yaml() {
 	}
 	if [ -e "$target" ] || [ -L "$target" ]; then
 		[ -f "$target" ] && [ ! -L "$target" ] || return 1
-		[ "$source" = "$target" ] || preserve_existing=1
+		if [ "$source" != "$target" ] || ! cmp -s "$candidate" "$target"; then
+			preserve_existing=1
+		fi
 	fi
 	install_yaml_candidate "$candidate" "$target" "$preserve_existing" || {
 		echo "Unable to install the validated AdGuard Home configuration." >&2
@@ -1243,19 +1261,23 @@ select_migration_source() {
 }
 
 resume_paused_official() {
+	local running_rc=0
 	[ "$OFFICIAL_PAUSED" = 1 ] || return 0
-	OFFICIAL_PAUSED=0
 	/usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome restart \
-		>/dev/null 2>&1 || true
+		>/dev/null 2>&1 || return 1
+	/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+		>/dev/null 2>&1 || running_rc=$?
+	[ "$running_rc" = 0 ] || return 1
+	OFFICIAL_PAUSED=0
 }
 
-pause_official_for_import() {
+pause_official_for_normalization() {
 	local running_rc=0
-	[ "$IMPORT_OFFICIAL" = 1 ] && [ "$OFFICIAL_WAS_RUNNING" = 1 ] || return 0
+	[ "$OFFICIAL_WAS_RUNNING" = 1 ] || return 0
 	OFFICIAL_PAUSED=1
 	if ! /usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome stop \
 		>/dev/null 2>&1; then
-		echo "Unable to stop the running official AdGuard Home service before migration." >&2
+		echo "Unable to stop the running official AdGuard Home service before normalization." >&2
 		return 1
 	fi
 	/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
@@ -1504,7 +1526,7 @@ ensure_upper_section || exit 1
 read_official_state || exit 1
 select_migration_source || exit 1
 TARGET_CONFIG_FILE="${TARGET_WORK_DIR}/AdGuardHome.yaml"
-pause_official_for_import || exit 1
+pause_official_for_normalization || exit 1
 migrate_yaml "$SOURCE_CONFIG_FILE" "$TARGET_CONFIG_FILE" || exit 1
 migrate_runtime_data "$DATA_SOURCE_WORK_DIR" "$TARGET_WORK_DIR" || exit 1
 rewrite_migrated_workdir_pattern "$DATA_SOURCE_WORK_DIR" "$TARGET_WORK_DIR" \
@@ -1531,7 +1553,7 @@ if [ -z "$IPKG_INSTROOT" ] && [ "$DHCP_CHANGED" = 1 ]; then
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 fi
 
-resume_paused_official
+resume_paused_official || exit 1
 
 if [ "$IS_UPGRADE" = 1 ]; then
 	remove_resolved_upgrade_candidate /etc/config/AdGuardHome.apk-new || exit 1
