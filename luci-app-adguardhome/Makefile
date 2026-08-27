@@ -660,6 +660,18 @@ bounded_private_file() {
 	[ "$$size" -gt 0 ] && [ "$$size" -le 524288 ]
 }
 
+discard_official_pending_delta() {
+	local delta_dir=/tmp/.uci delta_file=/tmp/.uci/adguardhome
+	if [ ! -e "$$delta_dir" ] && [ ! -L "$$delta_dir" ]; then
+		return 0
+	fi
+	root_private_directory "$$delta_dir" || return 1
+	if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
+		rm -f "$$delta_file" || return 1
+	fi
+	[ ! -e "$$delta_file" ] && [ ! -L "$$delta_file" ]
+}
+
 # Restore through a descriptor held across the same-directory rename.  This
 # keeps the operation functional on the target's root-owned mode-0777
 # /etc/config while detecting any pathname replacement before or after mv.
@@ -940,7 +952,11 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 		fi
 	done
 	rm -f /tmp/luci-indexcache.*
-	rm -rf /tmp/luci-modulecache/
+	if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
+		rm -f /tmp/luci-modulecache
+	elif [ -d /tmp/luci-modulecache ]; then
+		rm -rf /tmp/luci-modulecache/
+	fi
 	[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1 || true
 fi
 exit 0
