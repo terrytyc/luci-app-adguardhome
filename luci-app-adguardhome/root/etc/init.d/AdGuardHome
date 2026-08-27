@@ -2146,7 +2146,7 @@ validate_yaml_stage() {
 	path_contains_symlink "$work_dir" && return 1
 	case "$inherited_fd" in ""|*[!0-9]*) return 1 ;; esac
 	[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
-	fd_path="/proc/$$/fd/${inherited_fd}"
+	fd_path="/proc/self/fd/${inherited_fd}"
 	[ -f "$fd_path" ] && [ "$fd_path" -ef "$stage" ]
 }
 
@@ -2265,7 +2265,8 @@ resume_paused_yaml_runtime() {
 # the final optimistic-lock comparison before the atomic rename.
 yaml_update_locked() (
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
-	local before_hash final_hash held_hash fd_path
+	local before_hash final_hash verify_hash held_hash fd_path
+	local committed_port committed_mode committed_work_dir committed_tls_mounts
 	local was_running=0 backup="" backup_directory=""
 	load_legacy_settings || return 1
 	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
@@ -2337,7 +2338,7 @@ yaml_update_locked() (
 		return 1
 	fi
 	YAML_STAGE_CLEANUP=""
-	fd_path="/proc/$$/fd/${inherited_fd}"
+	fd_path="/proc/self/fd/${inherited_fd}"
 	if [ ! -f "$fd_path" ] || [ ! "$fd_path" -ef "$config_file" ] ||
 	   ! secure_config_inode "$fd_path"; then
 		log_error "The installed LuCI YAML no longer matches its held descriptor"
@@ -2355,10 +2356,14 @@ yaml_update_locked() (
 			log_error "Failed to restore the previous YAML runtime"
 		return 1
 	fi
+	committed_port="$dns_port"
+	committed_mode="$redirect_mode"
+	committed_work_dir="$work_dir"
+	committed_tls_mounts="$TLS_DESIRED_MOUNTS"
 	if [ "$legacy_enabled" = 1 ]; then
 		if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1 ||
-		   ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" ||
-		   ! apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; then
+		   ! wait_for_core_ready "$committed_port" "$committed_mode" "$committed_work_dir" ||
+		   ! apply_integration_locked "$committed_port" "$committed_mode" "$committed_work_dir"; then
 			log_error "The edited YAML failed at runtime; restoring the previous file"
 			attempt_yaml_rollback "$backup" "$was_running" ||
 				log_error "Failed to restore the previous YAML runtime"
@@ -2372,20 +2377,56 @@ yaml_update_locked() (
 			log_error "Failed to restore the previous YAML runtime"
 		return 1
 	}
+	if [ "$held_hash" != "$candidate_hash" ]; then
+		log_error "The submitted YAML changed while its transaction was running"
+		attempt_yaml_rollback "$backup" "$was_running" ||
+			log_error "Failed to restore the previous YAML runtime"
+		return 1
+	fi
 	final_hash="$(active_config_hash)" || {
 		attempt_yaml_rollback "$backup" "$was_running" ||
 			log_error "Failed to restore the previous YAML runtime"
 		return 1
 	}
-	if [ "$held_hash" != "$candidate_hash" ] ||
-	   [ "$final_hash" != "$candidate_hash" ] ||
-	   { [ "$legacy_enabled" != 1 ] && [ ! "$fd_path" -ef "$config_file" ]; }; then
-		log_error "The running core changed the submitted YAML; restoring the previous file"
+	if [ "$legacy_enabled" = 1 ]; then
+		# The official core owns the work directory as uid 853 and serializes a
+		# canonical YAML through an atomic rename when it starts.  That legitimate
+		# rewrite can change comments, formatting, the inode, and therefore the
+		# byte hash.  Accept only a bounded, policy-checked, stable snapshot while
+		# its external TLS mount requirements and the expected supervised listener
+		# and resolver integration remain unchanged and live.
+		if ! secure_active_paths ||
+		   ! check_core_config_file "$config_file" "$final_hash" "" 1 ||
+		   [ "$TLS_DESIRED_MOUNTS" != "$committed_tls_mounts" ] ||
+		   ! runtime_settings_match "$committed_port" "$committed_mode" \
+			"$committed_work_dir" ||
+		   ! official_running || ! dns_port_listening; then
+			log_error "The running core produced an unsafe YAML result; restoring the previous file"
+			attempt_yaml_rollback "$backup" "$was_running" ||
+				log_error "Failed to restore the previous YAML runtime"
+			return 1
+		fi
+		verify_hash="$(active_config_hash)" || {
+			attempt_yaml_rollback "$backup" "$was_running" ||
+				log_error "Failed to restore the previous YAML runtime"
+			return 1
+		}
+		if [ "$verify_hash" != "$final_hash" ] ||
+		   ! runtime_settings_match "$committed_port" "$committed_mode" \
+			"$committed_work_dir" ||
+		   ! official_running || ! dns_port_listening; then
+			log_error "The running core YAML did not reach a stable valid state; restoring the previous file"
+			attempt_yaml_rollback "$backup" "$was_running" ||
+				log_error "Failed to restore the previous YAML runtime"
+			return 1
+		fi
+	elif [ "$final_hash" != "$candidate_hash" ] ||
+	     [ ! "$fd_path" -ef "$config_file" ]; then
+		log_error "The stopped-service YAML changed after installation; restoring the previous file"
 		attempt_yaml_rollback "$backup" "$was_running" ||
 			log_error "Failed to restore the previous YAML runtime"
 		return 1
-	fi
-	if [ "$fd_path" -ef "$config_file" ]; then
+	else
 		secure_config_inode "$fd_path" || {
 			attempt_yaml_rollback "$backup" "$was_running" ||
 				log_error "Failed to restore the previous YAML runtime"

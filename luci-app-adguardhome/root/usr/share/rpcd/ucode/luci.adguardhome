@@ -391,8 +391,10 @@ function update_yaml(content, expected_hash) {
 	let result = read_yaml();
 	if (!result || type(result.sha256) != 'string')
 		return { error: 'YAML update transaction did not complete' };
-	if (result.sha256 != candidate_hash)
-		return { error: 'YAML changed after the committed update' };
+	// A running official core may atomically serialize the accepted candidate
+	// into its canonical form.  The privileged transaction validates a stable
+	// canonical runtime before returning; expose the coherent current revision
+	// so the editor can immediately reload the latest authorized content.
 
 	return {
 		ok: true,
