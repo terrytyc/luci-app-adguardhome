@@ -1,0 +1,13 @@
+* text=auto
+*.js text eol=lf
+*.json text eol=lf
+*.po text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf
+README.md text eol=lf
+.gitattributes text eol=lf
+luci-app-adguardhome/root/etc/config/* text eol=lf
+luci-app-adguardhome/root/etc/init.d/* text eol=lf
+luci-app-adguardhome/root/etc/uci-defaults/* text eol=lf
+luci-app-adguardhome/root/usr/share/rpcd/ucode/* text eol=lf

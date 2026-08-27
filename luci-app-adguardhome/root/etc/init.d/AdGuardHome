@@ -1,601 +1,1335 @@
 #!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: Apache-2.0
+
+# Compatibility and DNS-integration coordinator for the historical mixed-case
+# UCI name.  The packaged lowercase service remains the only process supervisor.
 
 USE_PROCD=1
+START=18
+STOP=90
 
-START=95
-STOP=01
+LEGACY_CONFIG="AdGuardHome"
+LEGACY_SECTION="AdGuardHome"
+OFFICIAL_CONFIG="adguardhome"
+OFFICIAL_SECTION="config"
+OFFICIAL_SERVICE="/etc/init.d/adguardhome"
+DEFAULT_WORK_DIR="/etc/AdGuardHome"
+DEFAULT_CONFIG_FILE="${DEFAULT_WORK_DIR}/AdGuardHome.yaml"
+CORE_BINARY="/usr/bin/AdGuardHome"
 
-CONFIGURATION=AdGuardHome
-CRON_FILE=/etc/crontabs/root
-GFWSET="gfwlist"
-EXTRA_COMMANDS="do_redirect testbackup test_crontab force_reload isrunning"
-EXTRA_HELP="        do_redirect 0 or 1\
-        testbackup backup or restore\
-		test_crontab
-		force_reload
-		isrunning"
+INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
+MONITOR_INTERVAL=2
+# First boot can download and compile the packaged default filters before the
+# DNS sockets appear, especially on slower routers.  Keep takeover disabled
+# while allowing the official core enough time to become genuinely ready.
+READY_TIMEOUT=120
+READY_STABLE_COUNT=3
 
-set_forward_dnsmasq()
-{
-	addr="127.0.0.1#$AdGuardHome_PORT"
-    OLD_SERVER="$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)"
-	echo $OLD_SERVER | grep "^$addr" >/dev/null 2>&1
-	if [ $? -eq 0 ]; then
-		return
-	fi
-	uci delete dhcp.@dnsmasq[0].server 2>/dev/null
-    uci add_list dhcp.@dnsmasq[0].server="$addr"
-	for server in $OLD_SERVER; do
-		if [ "$server" = "$addr" ]; then
-			continue
+SNAPSHOT_MARKER="dnsmasq_snapshot"
+SNAPSHOT_DNSMASQ_SECTION="dnsmasq_snapshot_section"
+SNAPSHOT_ACTIVE_FINGERPRINT="dnsmasq_active_fingerprint"
+SNAPSHOT_SERVER="dnsmasq_snapshot_server"
+SNAPSHOT_NORESOLV_PRESENT="dnsmasq_snapshot_noresolv_present"
+SNAPSHOT_NORESOLV_VALUE="dnsmasq_snapshot_noresolv_value"
+SNAPSHOT_RESOLVFILE_PRESENT="dnsmasq_snapshot_resolvfile_present"
+SNAPSHOT_RESOLVFILE_VALUE="dnsmasq_snapshot_resolvfile_value"
+
+FIREWALL_SECTION="adguardhome_redirect"
+FIREWALL_OWNER_OPTION="name"
+FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
+
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile"
+EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
+\tisrunning\t\tReport the official service status
+\treconcile\t\tReconcile DNS integration with the core state"
+
+log_error() {
+	logger -t AdGuardHome "$*"
+}
+
+run_locked() (
+	mkdir -p "${INTEGRATION_LOCK%/*}" || exit 1
+	lock "$INTEGRATION_LOCK" || exit 1
+	trap 'lock -u "$INTEGRATION_LOCK"' EXIT
+	"$@"
+)
+
+is_valid_port() {
+	case "$1" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+validate_work_dir() {
+	local value="$1"
+	case "$value" in
+		""|/|//*|*//*|*/)
+			log_error "Invalid work directory: '${value}'"
+			return 1
+			;;
+		/*) ;;
+		*)
+			log_error "Work directory must be absolute: '${value}'"
+			return 1
+			;;
+	esac
+	value="${value%/}"
+	case "$value" in
+		/*/*) ;;
+		*)
+			log_error "Work directory must not be a top-level directory: '${value}'"
+			return 1
+			;;
+	esac
+	case "$value" in
+		*[!A-Za-z0-9_./+@%:,=-]*)
+			log_error "Work directory contains unsafe characters: '${value}'"
+			return 1
+			;;
+	esac
+	case "${value}/" in
+		*/./*|*/../*)
+			log_error "Work directory contains a '.' or '..' component: '${value}'"
+			return 1
+			;;
+	esac
+	[ -n "$value" ] && [ "$value" != / ] && ! path_contains_symlink "$value"
+}
+
+validate_managed_work_dir() {
+	validate_work_dir "$1" || return 1
+	case "${1%/}" in
+		/tmp|/tmp/*|/var|/var/*)
+			log_error "Working directories under /tmp or /var are volatile and are not allowed: '$1'"
+			return 1
+			;;
+	esac
+}
+
+path_contains_symlink() {
+	local remaining="${1#/}" component current=""
+	while [ -n "$remaining" ]; do
+		component="${remaining%%/*}"
+		current="${current}/${component}"
+		if [ -L "$current" ]; then
+			# ImmortalWrt's standard rootfs intentionally provides /var -> /tmp;
+			# the official adguardhome package uses /var/lib/adguardhome by
+			# default.  Permit only that verified system link, never an arbitrary
+			# user-controlled symlink.
+			if [ "$current" = /var ]; then
+				case "$(readlink "$current" 2>/dev/null)" in
+					tmp|/tmp)
+						[ "$remaining" = "$component" ] && break
+						remaining="${remaining#*/}"
+						continue
+						;;
+				esac
+			fi
+			log_error "Symlink path components are not allowed: '${current}'"
+			return 0
 		fi
-		uci add_list dhcp.@dnsmasq[0].server=$server
+		[ "$remaining" = "$component" ] && break
+		remaining="${remaining#*/}"
 	done
-	uci delete dhcp.@dnsmasq[0].resolvfile 2>/dev/null
-	uci set dhcp.@dnsmasq[0].noresolv=1
-	uci commit dhcp
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1
-}
-
-stop_forward_dnsmasq()
-{
-	local OLD_PORT="$1"
-	addr="127.0.0.1#$OLD_PORT"
-    OLD_SERVER="$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)"
-	echo $OLD_SERVER | grep "^$addr" >/dev/null 2>&1
-	if [ $? -ne 0 ]; then
-		return
-	fi
-
-    uci del_list dhcp.@dnsmasq[0].server="$addr" 2>/dev/null
-
-    addrlist="$(uci get dhcp.@dnsmasq[0].server 2>/dev/null)"
-    if [ -z "$addrlist" ]; then
-		resolvfile="/tmp/resolv.conf.d/resolv.conf.auto"
-		[ ! -f "$resolvfile" ] && resolvfile="/tmp/resolv.conf.auto"
-		uci set dhcp.@dnsmasq[0].resolvfile="$resolvfile" 2>/dev/null
-		uci delete dhcp.@dnsmasq[0].noresolv 2>/dev/null
-	fi
-	uci commit dhcp
-    /etc/init.d/dnsmasq restart >/dev/null 2>&1
-}
-
-set_firewall()
-{
-	uci set firewall.adguardhome_redirect="redirect"
-	uci set firewall.adguardhome_redirect.target="DNAT"
-	uci set firewall.adguardhome_redirect.name="AdGuard Home"
-	uci set firewall.adguardhome_redirect.src="lan"
-	uci set firewall.adguardhome_redirect.family="any"
-	uci set firewall.adguardhome_redirect.src_dport="53"
-	uci set firewall.adguardhome_redirect.dest_port="$AdGuardHome_PORT"
-	uci commit firewall
-	/etc/init.d/firewall reload
-	echo "firewall rules updated."
-}
-
-clear_firewall()
-{
-	redirects=$(uci show firewall | grep "firewall.adguardhome_redirect")
-	if [ -z "$redirects" ]; then
-		echo "no redirect rules found."
-	else
-		uci delete firewall.adguardhome_redirect
-		uci commit firewall
-		/etc/init.d/firewall reload
-		echo "deleted redirect rule: firewall.adguardhome_redirect"
-	fi
-}
-
-service_triggers() {
-	procd_add_reload_trigger "$CONFIGURATION"
-	[ "$(uci get AdGuardHome.AdGuardHome.redirect)" == "redirect" ] && procd_add_reload_trigger firewall
-}
-
-isrunning(){
-	config_load "${CONFIGURATION}"
-	_isrunning
-	local r=$?
-	([ "$r" == "0" ] && echo "running") || ([ "$r" == "1" ] && echo "not run" ) || echo "no bin"
-	return $r
-}
-
-_isrunning(){
-	config_get binpath $CONFIGURATION binpath "/usr/bin/AdGuardHome"
-	[ ! -f "$binpath" ] && return 2
-	pgrep $binpath 2>&1 >/dev/null && return 0
 	return 1
 }
 
-force_reload(){
-	config_load "${CONFIGURATION}"
-	_isrunning && procd_send_signal "$CONFIGURATION" || start
+load_legacy_settings() {
+	local configured_work_dir
+	config_load "$LEGACY_CONFIG"
+	config_get_bool legacy_enabled "$LEGACY_SECTION" enabled 0
+	config_get configured_work_dir "$LEGACY_SECTION" workdir "$DEFAULT_WORK_DIR"
+	config_get redirect_mode "$LEGACY_SECTION" redirect "dnsmasq-upstream"
+	config_get_bool verbose "$LEGACY_SECTION" verbose 0
+	previous_work_dir="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	[ -n "$previous_work_dir" ] ||
+		previous_work_dir="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+
+	validate_managed_work_dir "$configured_work_dir" || return 1
+	work_dir="${configured_work_dir%/}"
+	config_file="${work_dir}/AdGuardHome.yaml"
+
+	case "$redirect_mode" in
+		none|redirect|dnsmasq-upstream) ;;
+		exchange) redirect_mode="redirect" ;;
+		*)
+			log_error "Invalid redirect mode '${redirect_mode}', using none"
+			redirect_mode="none"
+			;;
+	esac
 }
 
-rm_port53()
-{
-	local AdGuardHome_PORT=$(config_editor "dns.port" "" "$configpath" "1")
-	dnsmasq_port=$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)
-	if [ -z "$dnsmasq_port" ]; then
-	dnsmasq_port="53"
-	fi
-	if [ "$dnsmasq_port" == "$AdGuardHome_PORT" ]; then
-		if [ "$dnsmasq_port" == "53" ]; then
-			dnsmasq_port="1745"
-		fi
-	elif [ "$dnsmasq_port" == "53" ]; then
-		return
-	fi
-	config_editor "dns.port" "$dnsmasq_port" "$configpath"
-	uci set dhcp.@dnsmasq[0].port="53"
-	uci commit dhcp
-	config_get binpath $CONFIGURATION binpath "/usr/bin/AdGuardHome"
-	killall -9 $binpath
-	/etc/init.d/dnsmasq restart
-}
-
-use_port53()
-{
-	local AdGuardHome_PORT=$(config_editor "dns.port" "" "$configpath" "1")
-	dnsmasq_port=$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)
-	if [ -z "$dnsmasq_port" ]; then
-		dnsmasq_port="53"
-	fi
-	if [ "$dnsmasq_port" == "$AdGuardHome_PORT" ]; then
-		if [ "$dnsmasq_port" == "53" ]; then
-			AdGuardHome_PORT="1745"
-		fi
-	elif [ "$AdGuardHome_PORT" == "53" ]; then
-		return
-	fi
-	config_editor "dns.port" "53" "$configpath"
-	uci set dhcp.@dnsmasq[0].port="$AdGuardHome_PORT"
-	uci commit dhcp
-	/etc/init.d/dnsmasq restart
-}
-
-do_redirect()
-{
-	config_load "${CONFIGURATION}"
-	_do_redirect $1
-}
-
-_do_redirect()
-{
-	local section="$CONFIGURATION"
-	enabled=$1
-
-	config_get configpath $CONFIGURATION configpath "/etc/AdGuardHome.yaml"
-	AdGuardHome_PORT=$(config_editor "dns.port" "" "$configpath" "1")
-	if [ ! -s "$configpath" ]; then
-		cp -f /usr/share/AdGuardHome/AdGuardHome_template.yaml $configpath
-	fi
-	if [ -z "$AdGuardHome_PORT" ]; then
-		AdGuardHome_PORT="0"
-	fi
-	config_get "redirect" "$section" "redirect" "none"
-	config_get "old_redirect" "$section" "old_redirect" "none"
-	config_get "old_port" "$section" "old_port" "0"
-	config_get "old_enabled" "$section" "old_enabled" "0"
-	uci get dhcp.@dnsmasq[0].port >/dev/null 2>&1 || uci set dhcp.@dnsmasq[0].port="53" >/dev/null 2>&1
-	uci commit dhcp
-	if [ "$old_enabled" = "1" -a "$old_redirect" == "exchange" ]; then
-		AdGuardHome_PORT=$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)
-	fi
-
-	if [ "$old_redirect" != "$redirect" ] || [ "$old_port" != "$AdGuardHome_PORT" ] || [ "$old_enabled" = "1" -a "$enabled" = "0" ]; then
-		if [ "$old_redirect" != "none" ]; then
-			if [  "$old_redirect" == "redirect" -a "$old_port" != "0" ]; then
-				clear_firewall
-			elif [ "$old_redirect" == "dnsmasq-upstream" ]; then
-				stop_forward_dnsmasq "$old_port"
-			elif [ "$old_redirect" == "exchange" ]; then
-				rm_port53
-			fi
-		fi
-	elif [ "$old_enabled" = "1" -a "$enabled" = "1" ]; then
-		if [  "$old_redirect" == "redirect" -a "$old_port" != "0" ]; then
-			clear_firewall
-		fi
-	fi
-	uci delete AdGuardHome.@AdGuardHome[0].old_redirect 2>/dev/null
-	uci delete AdGuardHome.@AdGuardHome[0].old_port 2>/dev/null
-	uci delete AdGuardHome.@AdGuardHome[0].old_enabled 2>/dev/null
-	uci add_list AdGuardHome.@AdGuardHome[0].old_redirect="$redirect" 2>/dev/null
-	uci add_list AdGuardHome.@AdGuardHome[0].old_port="$AdGuardHome_PORT" 2>/dev/null
-	uci add_list AdGuardHome.@AdGuardHome[0].old_enabled="$enabled" 2>/dev/null
-	uci commit AdGuardHome
-
-	if [ "$enabled" == "0" ] || [ "$AdGuardHome_PORT" == "0" ]; then
-		echo -n "0">/var/run/AdGredir
+# The official YAML is the sole runtime authority for the DNS listener.  The
+# packaged value 53335 is only present in the clean-install template; an
+# existing missing or invalid value must fail closed instead of being replaced.
+load_runtime_dns_port() {
+	local value address web_port
+	if [ ! -f "$config_file" ] || [ -L "$config_file" ]; then
+		log_error "Config file is unavailable while reading the DNS port: ${config_file}"
 		return 1
 	fi
-	redirected=1
-	if [ "$redirect" = "redirect" ]; then
-		set_firewall
-	elif [ "$redirect" = "dnsmasq-upstream" ]; then
-		set_forward_dnsmasq
-	elif [ "$redirect" == "exchange" -a "$(uci get dhcp.@dnsmasq[0].port 2>/dev/null)" == "53" ]; then
-		use_port53
-	else
-		redirected=0
+
+	value="$(yaml_get_section_value dns port "$config_file")"
+	is_valid_port "$value" || {
+		log_error "Invalid or ambiguous dns.port in ${config_file}"
+		return 1
+	}
+	dns_port="$(awk -v value="$value" 'BEGIN { printf "%d\n", value + 0 }')" || return 1
+	if [ "$dns_port" -eq 53 ] 2>/dev/null && [ "$redirect_mode" != none ]; then
+		log_error "DNS port 53 is only supported when DNS integration mode is none"
+		return 1
 	fi
-	echo -n "$redirected">/var/run/AdGredir
+
+	address="$(yaml_get_section_value http address "$config_file")"
+	if [ -n "$address" ]; then
+		case "$address" in
+			*:*) web_port="${address##*:}" ;;
+		esac
+	fi
+	if is_valid_port "$web_port" && [ "$dns_port" -eq "$web_port" ] 2>/dev/null; then
+		log_error "The YAML DNS and HTTP ports must be different: ${dns_port}"
+		return 1
+	fi
 }
 
-get_filesystem()
-{
-# print out path filesystem
-    echo $1 | awk '
-    BEGIN{
-    while (("mount"| getline ret) > 0)
-    {
-    split(ret,d);
-    fs[d[3]]=d[5];
-    m=index(d[1],":")
-    if (m==0)
-    {
-        pt[d[3]]=d[1]
-    }else{
-        pt[d[3]]=substr(d[1],m+1)
-    }}}{
-    split($0,d,"/");
-    if ("/" in fs)
-    {
-    result1=fs["/"];
-    }
-    if ("/" in pt)
-    {
-    result2=pt["/"];
-    }
-    for (i=2;i<=length(d);i++)
-    {
-       p[i]=p[i-1]"/"d[i];
-       if (p[i] in fs)
-        {
-        result1=fs[p[i]];
-        result2=pt[p[i]];
-        }
-    }
-    if (result2 in fs){
-        result=fs[result2]}
-    else{
-        result=result1}
-    print(result);}'
+# Locate a key at the section's actual shallowest indentation.  This accepts
+# both two- and four-space YAML and does not mistake nested keys for children.
+yaml_get_section_value() {
+	local section="$1" key="$2" file="$3"
+	awk -v section="$section" -v key="$key" '
+		function top(s) { return s ~ /^[^[:space:]#][^:]*:/ }
+		function indent(s) { match(s, /^ */); return RLENGTH }
+		{ line[++n] = $0 }
+		END {
+			for (i = 1; i <= n; i++)
+				if (line[i] ~ ("^" section ":[[:space:]]*($|#)")) { sections++; if (!first) first = i }
+			if (sections != 1) exit
+			last = n
+			for (i = first + 1; i <= n; i++)
+				if (top(line[i])) { last = i - 1; break }
+			depth = 0
+			for (i = first + 1; i <= last; i++) {
+				if (line[i] ~ /^[[:space:]]*($|#)/ || line[i] !~ /^ +/) continue
+				d = indent(line[i]); if (!depth || d < depth) depth = d
+			}
+			if (!depth) depth = 2
+			for (i = first + 1; i <= last; i++) {
+				if (indent(line[i]) != depth) continue
+				value = substr(line[i], depth + 1)
+				if (value !~ ("^" key ":[[:space:]]*")) continue
+				matches++
+				sub("^" key ":[[:space:]]*", "", value)
+				sub(/[[:space:]]+#.*$/, "", value)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+				if ((substr(value,1,1)=="\"" && substr(value,length(value),1)=="\"") ||
+				    (substr(value,1,1)=="\047" && substr(value,length(value),1)=="\047"))
+					value = substr(value, 2, length(value) - 2)
+				result = value
+			}
+			if (matches == 1) print result
+		}' "$file"
 }
 
-config_editor()
-{
-	[ -n "$3" -a -f $3 ] || return
-	awk -v yaml="$1" -v value="$2" -v file="$3" -v ro="$4" '
-	BEGIN{split(yaml,part,"\.");s="";i=1;l=length(part);}
-    {
-        if (match($0,s""part[i]":"))
-        {
-            if (i==l)
-            {
-                split($0,t,": ");
-				if (ro==""){
-				system("sed -i '\''"FNR"c \\"t[1]": "value"'\'' "file);
-				}else{
-				print(t[2]);
+install_yaml_temp() {
+	local generated="$1" file="$2" replacement
+	replacement="$(mktemp "${file}.install.XXXXXX")" || return 1
+	# BusyBox in ImmortalWrt 25.12.1 does not provide stat(1).  Seed a
+	# separate inode with cp -p so ownership and mode are retained, then write
+	# the generated content into that inode before the atomic rename.
+	if ! cp -p "$file" "$replacement" || ! cat "$generated" >"$replacement"; then
+		rm -f "$replacement"
+		return 1
+	fi
+	rm -f "$generated" || {
+		rm -f "$replacement"
+		return 1
+	}
+	mv "$replacement" "$file" || {
+		rm -f "$replacement"
+		return 1
+	}
+}
+
+# Replace an existing list item without disturbing user-added entries.  This is
+# used to keep AdGuard Home's default local-filter allowlist aligned when the
+# managed work directory moves.
+yaml_replace_section_list_item() {
+	local section="$1" key="$2" old_value="$3" new_value="$4" file="$5" tmp rc
+	[ -n "$old_value" ] || return 3
+	tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
+	awk -v section="$section" -v key="$key" -v old="$old_value" -v replacement="$new_value" '
+		function top(s) { return s ~ /^[^[:space:]#][^:]*:/ }
+		function indent(s) { match(s, /^ */); return RLENGTH }
+		function pad(count, s, i) { s=""; for(i=0;i<count;i++)s=s " "; return s }
+		{ line[++n]=$0 }
+		END {
+			for(i=1;i<=n;i++)
+				if(line[i] ~ ("^" section ":[[:space:]]*($|#)")){first=i;break}
+			if(!first){for(i=1;i<=n;i++)print line[i]; exit 3}
+			last=n
+			for(i=first+1;i<=n;i++)if(top(line[i])){last=i-1;break}
+			depth=0
+			for(i=first+1;i<=last;i++){
+				if(line[i] ~ /^[[:space:]]*($|#)/ || line[i] !~ /^ +/)continue
+				d=indent(line[i]); if(!depth || d<depth)depth=d
+			}
+			if(!depth)depth=2
+			for(i=first+1;i<=last;i++){
+				if(indent(line[i])!=depth)continue
+				candidate=substr(line[i],depth+1)
+				if(candidate ~ ("^" key ":[[:space:]]*")){key_line=i;break}
+			}
+			if(!key_line){for(i=1;i<=n;i++)print line[i]; exit 3}
+			block_last=last
+			for(i=key_line+1;i<=last;i++){
+				if(line[i] ~ /^[[:space:]]*($|#)/)continue
+				if(indent(line[i])<=depth){block_last=i-1;break}
+			}
+			for(i=key_line+1;i<=block_last;i++){
+				if(indent(line[i])<=depth)continue
+				value=substr(line[i],indent(line[i])+1)
+				if(value !~ /^-[[:space:]]*/)continue
+				sub(/^-[[:space:]]*/, "", value)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+				if((substr(value,1,1)=="\"" && substr(value,length(value),1)=="\"") ||
+				   (substr(value,1,1)=="\047" && substr(value,length(value),1)=="\047"))
+					value=substr(value,2,length(value)-2)
+				if(value==old){
+					line[i]=pad(indent(line[i])) "- " replacement
+					changed=1
 				}
-				exit;
-            }
-            s=s"[- ]{2}";
-            i++;
-        }
-    }' $3
+			}
+			for(i=1;i<=n;i++)print line[i]
+			if(!changed)exit 3
+		}' "$file" >"$tmp"
+	rc=$?
+	case "$rc" in
+		0)
+			if ! install_yaml_temp "$tmp" "$file"; then
+				rm -f "$tmp"
+				return 1
+			fi
+			;;
+		3)
+			rm -f "$tmp"
+			return 3
+			;;
+		*)
+			rm -f "$tmp"
+			return 1
+			;;
+	esac
 }
 
-boot_service() {
-	rm /var/run/AdGserverdis >/dev/null 2>&1
-	config_load "${CONFIGURATION}"
-	config_get waitonboot $CONFIGURATION waitonboot "0"
-	config_get_bool enabled $CONFIGURATION enabled 0
-	config_get binpath $CONFIGURATION binpath "/usr/bin/AdGuardHome"
-	[ -f "$binpath" ] && start_service
-	if [ "$enabled" == "1" ] && [ "$waitonboot" == "1" ]; then
-		procd_open_instance "waitnet"
-		procd_set_param command "/usr/share/AdGuardHome/waitnet.sh"
-		procd_close_instance
-		echo "no net start pinging"
+secure_active_config() {
+	local data_dir="${work_dir}/data"
+	[ -d "$work_dir" ] || return 1
+	[ ! -L "$work_dir" ] || return 1
+	[ -f "$config_file" ] || return 1
+	[ ! -L "$config_file" ] || return 1
+	path_contains_symlink "$work_dir" && return 1
+	chmod 0700 "$work_dir" || return 1
+	chmod 0600 "$config_file" || return 1
+	if [ -e "$data_dir" ] || [ -L "$data_dir" ]; then
+		if [ ! -d "$data_dir" ] || [ -L "$data_dir" ]; then
+			log_error "Unsafe AdGuard Home data path: ${data_dir}"
+			return 1
+		fi
+		chmod 0700 "$data_dir" || return 1
 	fi
 }
 
-testbackup(){
-	config_load "${CONFIGURATION}"
-	if [ "$1" == "backup" ]; then
-		backup
-	elif [ "$1" == "restore" ]; then
-		restore
+ensure_config_file() {
+	local previous_config source tmp
+	if [ -L "$config_file" ]; then
+		log_error "The AdGuard Home configuration file must not be a symlink: ${config_file}"
+		return 1
+	fi
+	if [ -f "$config_file" ]; then
+		secure_active_config
+		return
+	fi
+	mkdir -m 0700 -p "$work_dir" || return 1
+	path_contains_symlink "$work_dir" && return 1
+	previous_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	for source in "$previous_config" "$DEFAULT_CONFIG_FILE"; do
+		[ -n "$source" ] || continue
+		[ "$source" != "$config_file" ] || continue
+		[ -f "$source" ] || continue
+		[ ! -L "$source" ] || continue
+		tmp="$(mktemp "${config_file}.new.XXXXXX")" || return 1
+		if ! cp -p "$source" "$tmp"; then
+			rm -f "$tmp"
+			return 1
+		fi
+		if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+			rm -f "$tmp"
+			log_error "Configuration path appeared while migrating: ${config_file}"
+			return 1
+		fi
+		mv "$tmp" "$config_file" || {
+			rm -f "$tmp"
+			return 1
+		}
+		secure_active_config
+		return
+	done
+	log_error "Config file is missing: ${config_file}"
+	return 1
+}
+
+# Preserve the official core's runtime history and filter data when the managed
+# work directory changes.  Copy into an atomic sibling first, keep the source
+# untouched for rollback, and refuse to merge with an unrelated target tree.
+migrate_work_data() {
+	local old_work source_data target_data marker temporary
+	old_work="${previous_work_dir%/}"
+	[ -n "$old_work" ] || return 0
+	[ "$old_work" != "$work_dir" ] || return 0
+	validate_work_dir "$old_work" || return 1
+	source_data="${old_work}/data"
+	target_data="${work_dir}/data"
+	marker="${target_data}/.luci-app-adguardhome-migrated-from"
+	[ -d "$source_data" ] || return 0
+	if [ -L "$source_data" ] || path_contains_symlink "$old_work"; then
+		log_error "Refusing to migrate data through a symlinked source: ${source_data}"
+		return 1
+	fi
+	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
+		if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$old_work" ]; then
+			chmod 0700 "$target_data" || return 1
+			return 0
+		fi
+		log_error "Target data directory already exists; refusing to overwrite it: ${target_data}"
+		return 1
+	fi
+	temporary="$(mktemp -d "${work_dir}/.data-migration.XXXXXX")" || return 1
+	if ! cp -pR "${source_data}/." "$temporary/"; then
+		rm -rf "$temporary"
+		return 1
+	fi
+	printf '%s\n' "$old_work" >"${temporary}/.luci-app-adguardhome-migrated-from" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	chmod 0600 "${temporary}/.luci-app-adguardhome-migrated-from" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
+		rm -rf "$temporary"
+		log_error "Target data path appeared during migration: ${target_data}"
+		return 1
+	fi
+	mv "$temporary" "$target_data" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	chmod 0700 "$target_data" || return 1
+	log_error "Copied AdGuard Home runtime data from ${source_data} to ${target_data}"
+}
+
+sync_yaml_workdir_pattern() {
+	local old_pattern desired_pattern replace_rc=0
+	[ -n "$previous_work_dir" ] || return 0
+	old_pattern="${previous_work_dir%/}/data/userfilters/*"
+	desired_pattern="${work_dir}/data/userfilters/*"
+	[ "$old_pattern" != "$desired_pattern" ] || return 0
+	yaml_replace_section_list_item filtering safe_fs_patterns \
+		"$old_pattern" "$desired_pattern" "$config_file" || replace_rc=$?
+	case "$replace_rc" in
+		0|3) ;;
+		*) return 1 ;;
+	esac
+}
+
+sync_yaml_managed_fields() {
+	sync_yaml_workdir_pattern
+}
+
+check_core_config() {
+	local validation rc
+	[ -x "$CORE_BINARY" ] || {
+		log_error "AdGuard Home binary is missing: ${CORE_BINARY}"
+		return 1
+	}
+	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
+	validation="$(mktemp "${config_file}.check.XXXXXX")" || return 1
+	if ! cp -p "$config_file" "$validation"; then
+		rm -f "$validation"
+		return 1
+	fi
+	# AdGuard Home may migrate an old schema during --check-config.  Validate a
+	# disposable copy so this helper is genuinely read-only for the active YAML,
+	# including while the official service is running.
+	"$CORE_BINARY" --check-config --config "$validation" \
+		--work-dir "$work_dir" >/dev/null 2>&1
+	rc=$?
+	rm -f "$validation" || return 1
+	return "$rc"
+}
+
+restore_yaml_backup() {
+	local backup="$1"
+	if [ -L "$config_file" ]; then
+		log_error "Refusing to restore over a configuration symlink: ${config_file}"
+		return 1
+	fi
+	mv -f "$backup" "$config_file"
+}
+
+# Keep a complete, metadata-preserving copy until the managed workdir rewrite
+# and AdGuard Home's own parser have accepted the result.
+sync_yaml_managed_fields_checked() {
+	local backup
+	backup="$(mktemp "${config_file}.backup.XXXXXX")" || return 1
+	if ! cp -p "$config_file" "$backup"; then
+		rm -f "$backup"
+		return 1
+	fi
+	if ! sync_yaml_managed_fields; then
+		log_error "Unable to update the managed YAML fields; restoring the original file"
+		restore_yaml_backup "$backup" || return 1
+		return 1
+	fi
+	if ! check_core_config; then
+		log_error "AdGuard Home rejected the updated YAML; restoring the original file"
+		restore_yaml_backup "$backup" || return 1
+		return 1
+	fi
+	rm -f "$backup"
+}
+
+uci_set_if_changed() {
+	local config="$1" section="$2" option="$3" value="$4" current
+	current="$(uci -q get "${config}.${section}.${option}")"
+	[ "$current" = "$value" ] && return 0
+	uci -q set "${config}.${section}.${option}=${value}" || return 1
+	UCI_CHANGED=1
+}
+
+uci_delete_if_present() {
+	local config="$1" section="$2" option="$3"
+	uci -q get "${config}.${section}.${option}" >/dev/null 2>&1 || return 0
+	uci -q delete "${config}.${section}.${option}" || return 1
+	UCI_CHANGED=1
+}
+
+sync_official_uci() {
+	UCI_CHANGED=0
+	if ! uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1; then
+		uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}=adguardhome" || return 1
+		UCI_CHANGED=1
+	fi
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" enabled "$legacy_enabled" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config_file "$config_file" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" work_dir "$work_dir" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" verbose "$verbose" || return 1
+	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config || return 1
+	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" workdir || return 1
+	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG"
+}
+
+disable_official_autostart() {
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = 0 ] && return 0
+	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled=0" || return 1
+	uci -q commit "$OFFICIAL_CONFIG"
+}
+
+reload_service_if_present() {
+	local service="$1" action="$2"
+	[ "${RELOAD_SERVICES:-1}" = 0 ] && return 0
+	[ -x "$service" ] || return 0
+	"$service" "$action" >/dev/null 2>&1
+}
+
+remember_first_dnsmasq() {
+	DNSMASQ_COUNT=$((DNSMASQ_COUNT + 1))
+	[ -n "$DNSMASQ_SECTION" ] || DNSMASQ_SECTION="$1"
+}
+
+load_dnsmasq_section() {
+	DNSMASQ_SECTION=""
+	DNSMASQ_UCI=""
+	DNSMASQ_COUNT=0
+	config_load dhcp || return 1
+	config_foreach remember_first_dnsmasq dnsmasq
+	[ -n "$DNSMASQ_SECTION" ] || return 1
+	if [ "$DNSMASQ_COUNT" -ne 1 ]; then
+		log_error "dnsmasq-upstream mode requires exactly one dnsmasq instance; found ${DNSMASQ_COUNT}"
+		return 1
+	fi
+	DNSMASQ_UCI="dhcp.${DNSMASQ_SECTION}"
+}
+
+load_snapshot_dnsmasq_section() {
+	local recorded
+	recorded="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_DNSMASQ_SECTION}")"
+	if [ -n "$recorded" ] && uci -q get "dhcp.${recorded}" >/dev/null 2>&1; then
+		DNSMASQ_SECTION="$recorded"
+		DNSMASQ_UCI="dhcp.${recorded}"
+		return 0
+	fi
+	load_dnsmasq_section
+}
+
+dnsmasq_managed_fingerprint() {
+	local section_dump managed digest
+	section_dump="$(uci -q show "$DNSMASQ_UCI" 2>/dev/null)" || return 1
+	managed="$(printf '%s\n' "$section_dump" |
+		awk '/\.(server|noresolv|resolvfile)=/')" || return 1
+	digest="$(printf '%s\n' "$managed" | sha256sum 2>/dev/null)" || return 1
+	digest="${digest%% *}"
+	case "$digest" in
+		""|*[!0-9A-Fa-f]*) return 1 ;;
+	esac
+	[ "${#digest}" -eq 64 ] || return 1
+	printf '%s\n' "$digest"
+}
+
+# Entries beginning with /domain/ are conditional.  /#/ is dnsmasq's catch-all
+# syntax, so it is a generic upstream and must not bypass AdGuard Home.
+is_conditional_dnsmasq_server() {
+	case "$1" in
+		/#/*) return 1 ;;
+		/*/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+snapshot_server_value() {
+	uci -q add_list "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_SERVER}=$1" || SNAPSHOT_ERROR=1
+}
+
+snapshot_dnsmasq_state() {
+	local value option
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}")" = 1 ] && return 0
+	load_dnsmasq_section || return 1
+
+	for option in "$SNAPSHOT_MARKER" "$SNAPSHOT_DNSMASQ_SECTION" "$SNAPSHOT_ACTIVE_FINGERPRINT" "$SNAPSHOT_SERVER" \
+		"$SNAPSHOT_NORESOLV_PRESENT" "$SNAPSHOT_NORESOLV_VALUE" \
+		"$SNAPSHOT_RESOLVFILE_PRESENT" "$SNAPSHOT_RESOLVFILE_VALUE"; do
+		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${option}" >/dev/null 2>&1 || true
+	done
+	if value="$(uci -q get "${DNSMASQ_UCI}.noresolv")"; then
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_NORESOLV_PRESENT}=1" || return 1
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_NORESOLV_VALUE}=${value}" || return 1
+	else
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_NORESOLV_PRESENT}=0" || return 1
+	fi
+	if value="$(uci -q get "${DNSMASQ_UCI}.resolvfile")"; then
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_RESOLVFILE_PRESENT}=1" || return 1
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_RESOLVFILE_VALUE}=${value}" || return 1
+	else
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_RESOLVFILE_PRESENT}=0" || return 1
+	fi
+
+	SNAPSHOT_ERROR=0
+	config_list_foreach "$DNSMASQ_SECTION" server snapshot_server_value
+	[ "$SNAPSHOT_ERROR" = 0 ] || return 1
+	uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_DNSMASQ_SECTION}=${DNSMASQ_SECTION}" || return 1
+	# Publish the marker last so an interrupted, incomplete snapshot is never
+	# treated as authoritative during recovery.
+	uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}=1" || return 1
+	uci -q commit "$LEGACY_CONFIG"
+}
+
+add_conditional_snapshot_server() {
+	is_conditional_dnsmasq_server "$1" || return 0
+	uci -q add_list "${DNSMASQ_UCI}.server=$1" || DNSMASQ_LIST_ERROR=1
+}
+
+restore_snapshot_server() {
+	uci -q add_list "${DNSMASQ_UCI}.server=$1" || DNSMASQ_LIST_ERROR=1
+}
+
+clear_dnsmasq_snapshot_metadata() {
+	local option
+	for option in "$SNAPSHOT_DNSMASQ_SECTION" "$SNAPSHOT_ACTIVE_FINGERPRINT" "$SNAPSHOT_SERVER" \
+		"$SNAPSHOT_NORESOLV_PRESENT" "$SNAPSHOT_NORESOLV_VALUE" \
+		"$SNAPSHOT_RESOLVFILE_PRESENT" "$SNAPSHOT_RESOLVFILE_VALUE"; do
+		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${option}" >/dev/null 2>&1 || true
+	done
+	uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}" || return 1
+	uci -q commit "$LEGACY_CONFIG"
+}
+
+restore_dnsmasq_snapshot() {
+	local present value expected_fingerprint current_fingerprint
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}")" = 1 ] || return 0
+	load_snapshot_dnsmasq_section || return 1
+	expected_fingerprint="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_ACTIVE_FINGERPRINT}")"
+	if [ -n "$expected_fingerprint" ]; then
+		current_fingerprint="$(dnsmasq_managed_fingerprint)" || return 1
+		if [ "$current_fingerprint" != "$expected_fingerprint" ]; then
+			log_error "dnsmasq settings changed while AdGuard Home integration was active; refusing to overwrite them"
+			return 1
+		fi
+	fi
+	uci -q delete "${DNSMASQ_UCI}.server" >/dev/null 2>&1 || true
+	config_load "$LEGACY_CONFIG" || return 1
+	DNSMASQ_LIST_ERROR=0
+	config_list_foreach "$LEGACY_SECTION" "$SNAPSHOT_SERVER" restore_snapshot_server
+	[ "$DNSMASQ_LIST_ERROR" = 0 ] || return 1
+
+	present="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_NORESOLV_PRESENT}")"
+	if [ "$present" = 1 ]; then
+		value="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_NORESOLV_VALUE}")"
+		uci -q set "${DNSMASQ_UCI}.noresolv=${value}" || return 1
+	else
+		uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
+	fi
+	present="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_RESOLVFILE_PRESENT}")"
+	if [ "$present" = 1 ]; then
+		value="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_RESOLVFILE_VALUE}")"
+		uci -q set "${DNSMASQ_UCI}.resolvfile=${value}" || return 1
+	else
+		uci -q delete "${DNSMASQ_UCI}.resolvfile" >/dev/null 2>&1 || true
+	fi
+	uci -q commit dhcp || return 1
+	reload_service_if_present /etc/init.d/dnsmasq restart || return 1
+	clear_dnsmasq_snapshot_metadata
+}
+
+mark_generic_server() {
+	is_conditional_dnsmasq_server "$1" && return 0
+	GENERIC_SERVER_FOUND=1
+}
+
+# Best-effort cleanup for state created by releases predating snapshots.
+clear_legacy_dnsmasq_upstream() {
+	local upstream="127.0.0.1#${1}" resolvfile
+	load_dnsmasq_section || return 1
+	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
+	# Refresh the shell-side UCI cache before deciding whether any generic
+	# upstream remains; otherwise the just-deleted legacy entry is still seen.
+	config_load dhcp || return 1
+	GENERIC_SERVER_FOUND=0
+	config_list_foreach "$DNSMASQ_SECTION" server mark_generic_server
+	if [ "$GENERIC_SERVER_FOUND" = 0 ]; then
+		resolvfile="/tmp/resolv.conf.d/resolv.conf.auto"
+		[ -f "$resolvfile" ] || resolvfile="/tmp/resolv.conf.auto"
+		uci -q set "${DNSMASQ_UCI}.resolvfile=${resolvfile}" || return 1
+		uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
+	fi
+	uci -q commit dhcp || return 1
+	reload_service_if_present /etc/init.d/dnsmasq restart
+}
+
+set_dnsmasq_upstream() {
+	local upstream="127.0.0.1#${dns_port}" fingerprint
+	snapshot_dnsmasq_state || return 1
+	uci -q delete "${DNSMASQ_UCI}.server" >/dev/null 2>&1 || true
+	config_load "$LEGACY_CONFIG" || return 1
+	DNSMASQ_LIST_ERROR=0
+	config_list_foreach "$LEGACY_SECTION" "$SNAPSHOT_SERVER" add_conditional_snapshot_server
+	[ "$DNSMASQ_LIST_ERROR" = 0 ] || return 1
+	uci -q add_list "${DNSMASQ_UCI}.server=${upstream}" || return 1
+	uci -q set "${DNSMASQ_UCI}.noresolv=1" || return 1
+	uci -q commit dhcp || return 1
+	fingerprint="$(dnsmasq_managed_fingerprint)" || return 1
+	uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_ACTIVE_FINGERPRINT}=${fingerprint}" || return 1
+	uci -q commit "$LEGACY_CONFIG" || return 1
+	reload_service_if_present /etc/init.d/dnsmasq restart
+}
+
+inspect_active_server() {
+	if is_conditional_dnsmasq_server "$1"; then return 0; fi
+	if [ "$1" = "$EXPECTED_UPSTREAM" ]; then
+		EXPECTED_UPSTREAM_COUNT=$((EXPECTED_UPSTREAM_COUNT + 1))
+	else
+		UNEXPECTED_GENERIC_SERVER=1
 	fi
 }
 
-restore()
-{
-	config_get workdir $CONFIGURATION workdir "/etc/AdGuardHome"
-	config_get backupwdpath $CONFIGURATION backupwdpath "/etc/AdGuardHome"
-	cp -u -r -f $backupwdpath/data $workdir
+dnsmasq_integration_matches() {
+	EXPECTED_UPSTREAM="127.0.0.1#${dns_port}"
+	EXPECTED_UPSTREAM_COUNT=0
+	UNEXPECTED_GENERIC_SERVER=0
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}")" = 1 ] || return 1
+	load_snapshot_dnsmasq_section || return 1
+	[ "$(uci -q get "${DNSMASQ_UCI}.noresolv")" = 1 ] || return 1
+	[ "$(dnsmasq_managed_fingerprint)" = "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_ACTIVE_FINGERPRINT}")" ] || return 1
+	config_load dhcp || return 1
+	config_list_foreach "$DNSMASQ_SECTION" server inspect_active_server
+	[ "$EXPECTED_UPSTREAM_COUNT" = 1 ] && [ "$UNEXPECTED_GENERIC_SERVER" = 0 ]
 }
 
-backup() {
-	config_get backupwdpath $CONFIGURATION backupwdpath "/etc/AdGuardHome"
-	mkdir -p $backupwdpath/data
-	config_get workdir $CONFIGURATION workdir "/etc/AdGuardHome"
-	config_get backupfile $CONFIGURATION backupfile ""
-	for one in $backupfile;
-	do
-		while :
-		do
-			if [ -d "$backupwdpath/data/$one" ]; then
-				cpret=$(cp -u -r -f $workdir/data/$one $backupwdpath/data 2>&1)
-			else
-				cpret=$(cp -u -r -f $workdir/data/$one $backupwdpath/data/$one 2>&1)
+set_firewall_redirect() {
+	local section="firewall.${FIREWALL_SECTION}" owner family=ipv4
+	if uci -q get "$section" >/dev/null 2>&1; then
+		owner="$(uci -q get "${section}.${FIREWALL_OWNER_OPTION}")"
+		if [ "$owner" != "$FIREWALL_OWNER_VALUE" ]; then
+			log_error "Refusing to overwrite the existing firewall.${FIREWALL_SECTION} section"
+			return 1
+		fi
+	fi
+	uci -q set "${section}=redirect" || return 1
+	uci -q set "${section}.${FIREWALL_OWNER_OPTION}=${FIREWALL_OWNER_VALUE}" || return 1
+	uci -q set "${section}.src=lan" || return 1
+	uci -q set "${section}.proto=tcp udp" || return 1
+	uci -q set "${section}.src_dport=53" || return 1
+	uci -q set "${section}.dest_port=${dns_port}" || return 1
+	uci -q set "${section}.target=DNAT" || return 1
+	# Redirect IPv6 only when the supervised core actually owns an IPv6 DNS
+	# socket; otherwise leave IPv6 port 53 with dnsmasq instead of black-holing it.
+	dns_ipv6_listening && family=any
+	uci -q set "${section}.family=${family}" || return 1
+	uci -q set "${section}.reflection=0" || return 1
+	uci -q commit firewall || return 1
+	reload_service_if_present /etc/init.d/firewall reload
+}
+
+clear_firewall_redirect() {
+	local force_reload="$1" existed=0 section="firewall.${FIREWALL_SECTION}" owner
+	if uci -q get "$section" >/dev/null 2>&1; then
+		owner="$(uci -q get "${section}.${FIREWALL_OWNER_OPTION}")"
+		if [ "$owner" != "$FIREWALL_OWNER_VALUE" ]; then
+			if [ "$force_reload" = 1 ]; then
+				log_error "The recorded redirect is not owned by this package; refusing to delete it"
+				return 1
 			fi
-			echo "$cpret"
-			echo "$cpret" | grep "no space left on device"
-			if [ "$?" == "0" ]; then
-				echo "磁盘已满,删除log重试中"
-				del_querylog && continue
-				rm -f -r $backupwdpath/data/filters
-				rm -f -r $workdir/data/filters && continue
-				echo "backup failed"
-			fi
-			break
+			return 0
+		fi
+		existed=1
+		uci -q delete "$section" || return 1
+		uci -q commit firewall || return 1
+	fi
+	[ "$existed" = 1 ] || [ "$force_reload" = 1 ] || return 0
+	reload_service_if_present /etc/init.d/firewall reload
+}
+
+firewall_integration_matches() {
+	local section="firewall.${FIREWALL_SECTION}" expected_family=ipv4
+	dns_ipv6_listening && expected_family=any
+	[ "$(uci -q get "$section")" = redirect ] &&
+		[ "$(uci -q get "${section}.${FIREWALL_OWNER_OPTION}")" = "$FIREWALL_OWNER_VALUE" ] &&
+		[ "$(uci -q get "${section}.src")" = lan ] &&
+		[ "$(uci -q get "${section}.proto")" = "tcp udp" ] &&
+		[ "$(uci -q get "${section}.src_dport")" = 53 ] &&
+		[ "$(uci -q get "${section}.dest_port")" = "$dns_port" ] &&
+		[ "$(uci -q get "${section}.target")" = DNAT ] &&
+		[ "$(uci -q get "${section}.family")" = "$expected_family" ] &&
+		[ "$(uci -q get "${section}.reflection")" = 0 ]
+}
+
+clear_exchange_mode() {
+	local current_port
+	load_dnsmasq_section || return 1
+	current_port="$(uci -q get "${DNSMASQ_UCI}.port")"
+	[ "$current_port" = 53 ] && return 0
+	uci -q set "${DNSMASQ_UCI}.port=53" || return 1
+	uci -q commit dhcp || return 1
+	reload_service_if_present /etc/init.d/dnsmasq restart
+}
+
+record_redirect_state() {
+	local active="$1"
+	UCI_CHANGED=0
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_redirect "$redirect_mode" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_port "$dns_port" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_enabled "$active" || return 1
+	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+	printf '%s' "$active" >/var/run/AdGredir 2>/dev/null || true
+}
+
+record_redirect_inactive() {
+	UCI_CHANGED=0
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_enabled 0 || return 1
+	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+	printf '0' >/var/run/AdGredir 2>/dev/null || true
+}
+
+clear_recorded_integration_locked() {
+	local old_redirect old_port old_enabled force_firewall_reload=0
+	old_redirect="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.old_redirect")"
+	old_port="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.old_port")"
+	old_enabled="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.old_enabled")"
+
+	# Snapshot presence takes precedence over possibly stale old_* fields.  The
+	# marker is deleted only after dnsmasq has accepted the restored state.
+	if [ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}")" = 1 ]; then
+		restore_dnsmasq_snapshot || return 1
+	elif [ "$old_enabled" = 1 ] && [ "$old_redirect" = dnsmasq-upstream ]; then
+		is_valid_port "$old_port" || return 1
+		clear_legacy_dnsmasq_upstream "$old_port" || return 1
+	fi
+
+	[ "$old_enabled" = 1 ] && [ "$old_redirect" = redirect ] && force_firewall_reload=1
+	if [ "$(uci -q get "firewall.${FIREWALL_SECTION}.${FIREWALL_OWNER_OPTION}")" = "$FIREWALL_OWNER_VALUE" ] ||
+	   [ "$force_firewall_reload" = 1 ]; then
+		clear_firewall_redirect "$force_firewall_reload" || return 1
+	fi
+
+	if [ "$old_enabled" = 1 ] && [ "$old_redirect" = exchange ]; then
+		clear_exchange_mode || return 1
+	fi
+	record_redirect_inactive
+}
+
+runtime_settings_match() {
+	local expected_port="$1" expected_mode="$2" expected_work_dir="$3"
+	load_legacy_settings || return 1
+	[ "$legacy_enabled" = 1 ] || return 1
+	load_runtime_dns_port || return 1
+	[ "$dns_port" = "$expected_port" ] &&
+		[ "$redirect_mode" = "$expected_mode" ] &&
+		[ "$work_dir" = "$expected_work_dir" ]
+}
+
+apply_integration_locked() {
+	local expected_port="$1" expected_mode="$2" expected_work_dir="$3" result=0
+	if ! runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir"; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	dns_port="$expected_port"
+	redirect_mode="$expected_mode"
+	work_dir="$expected_work_dir"
+	if ! official_running || ! dns_port_listening; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	# A cleanup failure is terminal.  Never layer a new mode over live old state.
+	clear_recorded_integration_locked || return 1
+	case "$redirect_mode" in
+		redirect) set_firewall_redirect || result=1 ;;
+		dnsmasq-upstream) set_dnsmasq_upstream || result=1 ;;
+		none) ;;
+	esac
+	if [ "$result" != 0 ]; then
+		log_error "Unable to apply ${redirect_mode}; restoring the resolver state"
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	if ! record_redirect_state 1; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	# YAML may be rewritten by the official Web UI while the resolver reloads.
+	# Roll back immediately unless this exact port/mode/workdir is still current.
+	if ! runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir" ||
+	   ! official_running || ! dns_port_listening; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+}
+
+integration_matches_desired() {
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.old_enabled")" = 1 ] || return 1
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.old_redirect")" = "$redirect_mode" ] || return 1
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.old_port")" = "$dns_port" ] || return 1
+	case "$redirect_mode" in
+		dnsmasq-upstream) dnsmasq_integration_matches ;;
+		redirect) firewall_integration_matches ;;
+		none) return 0 ;;
+	esac
+}
+
+official_running() {
+	[ -x "$OFFICIAL_SERVICE" ] && "$OFFICIAL_SERVICE" running >/dev/null 2>&1
+}
+
+official_pid() {
+	ubus -S call service list '{"name":"adguardhome"}' 2>/dev/null |
+		jsonfilter -e '@.adguardhome.instances.*.pid' 2>/dev/null |
+		awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
+}
+
+pid_is_supervised_descendant() {
+	local candidate="$1" supervisor="$2" parent depth=0
+	case "$candidate:$supervisor" in
+		*[!0-9:]*) return 1 ;;
+	esac
+	while [ "$depth" -lt 64 ]; do
+		[ "$candidate" = "$supervisor" ] && return 0
+		[ -r "/proc/${candidate}/status" ] || return 1
+		parent="$(awk '$1 == "PPid:" { print $2; exit }' "/proc/${candidate}/status")"
+		case "$parent" in
+			""|*[!0-9]*) return 1 ;;
+		esac
+		[ "$parent" -gt 1 ] 2>/dev/null || return 1
+		[ "$parent" != "$candidate" ] || return 1
+		candidate="$parent"
+		depth=$((depth + 1))
+	done
+	return 1
+}
+
+# Verify that a socket in the requested kernel table belongs to the PID
+# supervised by the official service.  An unrelated listener on the same port
+# must never trigger DNS takeover.  Address modes additionally restrict a
+# socket to a loopback-reachable or wildcard bind appropriate for the selected
+# integration mode.
+official_owns_socket() {
+	local table="$1" address_mode="$2" expected_state supervisor pid executable port_hex inode fd link
+	[ -r "$table" ] || return 1
+	case "$table" in
+		/proc/net/tcp|/proc/net/tcp6) expected_state=0A ;;
+		/proc/net/udp|/proc/net/udp6) expected_state=07 ;;
+		*) return 1 ;;
+	esac
+	supervisor="$(official_pid)"
+	case "$supervisor" in ""|*[!0-9]*) return 1 ;; esac
+	port_hex="$(printf '%04X' "$dns_port")" || return 1
+	# With procd_add_jail(), ubus reports the outer ujail PID.  Accept only an
+	# AdGuardHome process whose ancestor chain reaches that exact supervisor.
+	for pid in $(pidof AdGuardHome 2>/dev/null); do
+		pid_is_supervised_descendant "$pid" "$supervisor" || continue
+		executable="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || continue
+		case "$executable" in
+			"$CORE_BINARY"|"$CORE_BINARY (deleted)") ;;
+			*) continue ;;
+		esac
+		[ -d "/proc/${pid}/fd" ] || continue
+		for inode in $(awk -v wanted="$port_hex" -v mode="$address_mode" \
+			-v wanted_state="$expected_state" '
+			NR > 1 {
+				split($2,a,":")
+				address=toupper(a[1])
+				if (toupper(a[2]) != wanted) next
+				if (toupper($4) != wanted_state) next
+				if (mode == "ipv4-loopback" &&
+				    address != "00000000" && address != "0100007F") next
+				if (mode == "ipv4-wildcard" && address != "00000000") next
+				if (mode == "ipv6-wildcard" &&
+				    address != "00000000000000000000000000000000") next
+				print $10
+			}' "$table"); do
+			for fd in "/proc/${pid}/fd/"*; do
+				link="$(readlink "$fd" 2>/dev/null)" || continue
+				[ "$link" = "socket:[${inode}]" ] && return 0
+			done
 		done
+	done
+	return 1
+}
+
+# AdGuard Home 0.107.76 uses Go's dual-stack wildcard listeners, so an IPv4
+# unspecified bind may appear only in the IPv6 kernel table.  Accept that exact
+# supervised wildcard fallback, but never an IPv6 loopback or interface-only
+# address.  This is intentionally tied to the package's >=0.107.76 baseline.
+official_owns_ipv4_reachable_socket() {
+	local ipv4_table="$1" ipv6_table="$2" ipv4_mode="$3"
+	official_owns_socket "$ipv4_table" "$ipv4_mode" && return 0
+	official_owns_socket "$ipv6_table" ipv6-wildcard
+}
+
+dns_port_listening() {
+	if [ "$redirect_mode" = dnsmasq-upstream ]; then
+		# dnsmasq is configured with 127.0.0.1#port.  Require both UDP and
+		# TCP on an IPv4-reachable loopback/wildcard listener before
+		# disabling its normal resolvers; a LAN-only listener is unreachable.
+		official_owns_ipv4_reachable_socket \
+			/proc/net/udp /proc/net/udp6 ipv4-loopback &&
+			official_owns_ipv4_reachable_socket \
+			/proc/net/tcp /proc/net/tcp6 ipv4-loopback
+		return
+	fi
+	if [ "$redirect_mode" = redirect ]; then
+		# A firewall DNAT can arrive on any LAN address and captures both
+		# transports.  Only IPv4-reachable wildcard UDP+TCP sockets are safe.
+		official_owns_ipv4_reachable_socket \
+			/proc/net/udp /proc/net/udp6 ipv4-wildcard &&
+			official_owns_ipv4_reachable_socket \
+			/proc/net/tcp /proc/net/tcp6 ipv4-wildcard
+		return
+	fi
+	(official_owns_socket /proc/net/udp any ||
+		official_owns_socket /proc/net/udp6 any) &&
+		(official_owns_socket /proc/net/tcp any ||
+		official_owns_socket /proc/net/tcp6 any)
+}
+
+dns_ipv6_listening() {
+	# family=any redirects both UDP and TCP to every local IPv6 address.
+	official_owns_socket /proc/net/udp6 ipv6-wildcard &&
+		official_owns_socket /proc/net/tcp6 ipv6-wildcard
+}
+
+wait_for_core_ready() {
+	local expected_port="$1" expected_mode="$2" expected_work_dir="$3"
+	local elapsed=0 stable=0
+	dns_port="$expected_port"
+	redirect_mode="$expected_mode"
+	work_dir="$expected_work_dir"
+	while [ "$elapsed" -lt "$READY_TIMEOUT" ]; do
+		if ! runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir"; then
+			log_error "AdGuard Home runtime settings changed while waiting for DNS readiness"
+			return 1
+		fi
+		dns_port="$expected_port"
+		redirect_mode="$expected_mode"
+		work_dir="$expected_work_dir"
+		if official_running && dns_port_listening; then
+			stable=$((stable + 1))
+			if [ "$stable" -ge "$READY_STABLE_COUNT" ]; then
+				runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir" &&
+					dns_port_listening
+				return
+			fi
+		else
+			stable=0
+		fi
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	log_error "Core did not remain ready on DNS port ${dns_port} within ${READY_TIMEOUT}s"
+	return 1
+}
+
+wait_for_core_stopped() {
+	local elapsed=0
+	while [ "$elapsed" -lt 10 ]; do
+		official_running || return 0
+		sleep 1
+		elapsed=$((elapsed + 1))
+	done
+	return 1
+}
+
+fail_safe_locked() {
+	clear_recorded_integration_locked || return 1
+	disable_official_autostart || return 1
+	[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+}
+
+prepare_wrapper_locked() {
+	[ "${WRAPPER_BOOT:-0}" = 1 ] && RELOAD_SERVICES=0
+	if ! load_legacy_settings; then
+		fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	if [ "$legacy_enabled" != 1 ]; then
+		clear_recorded_integration_locked || return 1
+		if official_running; then
+			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+			wait_for_core_stopped || return 1
+		fi
+		ensure_config_file || return 1
+		migrate_work_data || return 1
+		sync_yaml_managed_fields_checked || return 1
+		sync_official_uci || return 1
+		# A distinct success status tells start_service not to create a polling
+		# monitor for a deliberately disabled installation.
+		return 2
+	fi
+	# A work-directory migration copies the lower service's current YAML.  Stop
+	# that writer before taking the copy so the new file cannot be torn.
+	if { [ ! -f "$config_file" ] || [ "${previous_work_dir%/}" != "$work_dir" ]; } &&
+	   official_running; then
+		clear_recorded_integration_locked || return 1
+		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+		wait_for_core_stopped || return 1
+	fi
+	ensure_config_file || {
+		fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	}
+	migrate_work_data || return 1
+	load_runtime_dns_port || {
+		fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	}
+
+	# At boot restore the pre-integration resolver state first.  The monitor will
+	# apply takeover only after the official delayed start has become stable.
+	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
+		clear_recorded_integration_locked || return 1
+	fi
+
+	# Never enter a YAML writer while the core is live.  A running service can
+	# only reach this branch when no workdir rewrite is required.
+	if official_running; then
+		check_core_config || return 1
+	else
+		sync_yaml_managed_fields_checked || return 1
+	fi
+	sync_official_uci || return 1
+}
+
+orchestrate_core_locked() {
+	if ! load_legacy_settings; then
+		fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+
+	# Clean up before stopping the listener.  If cleanup fails, leave the working
+	# core alone rather than creating a DNS black hole.
+	clear_recorded_integration_locked || return 1
+	if official_running; then
+		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+		wait_for_core_stopped || return 1
+	fi
+	ensure_config_file || {
+		fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	}
+	migrate_work_data || return 1
+	load_runtime_dns_port || return 1
+
+	# The core is stopped here, so the managed workdir rewrite cannot race its
+	# own configuration writer.  DNS and Web endpoints remain YAML-owned.
+	sync_yaml_managed_fields_checked || return 1
+	load_runtime_dns_port || return 1
+	sync_official_uci || return 1
+	[ "$legacy_enabled" = 1 ] || return 0
+	[ -x "$OFFICIAL_SERVICE" ] || return 1
+	if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	if ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir"; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	if ! apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+}
+
+reconcile_core_locked() {
+	if ! load_legacy_settings; then
+		fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	if [ "$legacy_enabled" != 1 ]; then
+		clear_recorded_integration_locked || return 1
+		[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || true
+		return 0
+	fi
+	if ! load_runtime_dns_port; then
+		clear_recorded_integration_locked || return 1
+		return 0
+	fi
+	if ! official_running || ! dns_port_listening; then
+		clear_recorded_integration_locked || return 1
+		return 0
+	fi
+	integration_matches_desired && return 0
+	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || {
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		return 1
+	}
+	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
+}
+
+do_redirect_locked() {
+	case "$1" in
+		0) clear_recorded_integration_locked ;;
+		1)
+			load_legacy_settings || return 1
+			load_runtime_dns_port || return 1
+			wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || {
+				clear_recorded_integration_locked >/dev/null 2>&1 || true
+				return 1
+			}
+			apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+do_redirect() {
+	run_locked do_redirect_locked "$1"
+}
+
+reconcile() {
+	run_locked reconcile_core_locked
+}
+
+# This is the only process supervised by the compatibility wrapper.  It never
+# launches or adopts the core; it merely reconciles DNS takeover with the state
+# reported by the official lowercase procd service.
+monitor() {
+	# rc.common serializes init commands with fd 1000.  This long-running
+	# procd command enters through rc.common as well, so release the inherited
+	# control lock before looping; otherwise every later start/stop/reload waits
+	# forever behind the monitor instance.
+	exec 1000>&-
+	trap 'exit 0' TERM INT
+	while :; do
+		run_locked reconcile_core_locked >/dev/null 2>&1 || true
+		sleep "$MONITOR_INTERVAL" &
+		wait $!
 	done
 }
 
-_add_upprotect_file()
-{
-	local file="$1"
-	# Expand variables in the file path
-	local expanded_file=$(eval echo "$file")
-	echo "$expanded_file" >> /lib/upgrade/keep.d/luci-app-adguardhome
+isrunning() {
+	if official_running; then echo "running"; return 0; fi
+	if [ ! -x /usr/bin/AdGuardHome ]; then echo "no bin"; return 2; fi
+	echo "not run"
+	return 1
 }
+
 start_service() {
-	# Reading config
-	rm /var/run/AdGserverdis >/dev/null 2>&1
-	config_load "${CONFIGURATION}"
-	# update password
-	config_get hashpass $CONFIGURATION hashpass ""
-	config_get configpath $CONFIGURATION configpath "/etc/AdGuardHome.yaml"
-	if [ -n "$hashpass" ]; then
-		config_editor "users.password" "$hashpass" "$configpath"
-		uci set $CONFIGURATION.$CONFIGURATION.hashpass=""
-	fi
-	local ipst=0
-	config_get_bool enabled $CONFIGURATION enabled 0
-	# update crontab
-	do_crontab
-	echo "luci enable switch=$enabled"
-	if [ "$enabled" == "0" ]; then
-		_do_redirect 0
-		return
-	fi
-	#what need to do before reload
-	config_get workdir $CONFIGURATION workdir "/etc/AdGuardHome"
-	grep -q "ipset.txt" $configpath 2>/dev/null && ipst=1
-	if [ $ipst -eq 1 ];then
-		ipset list $GFWSET >/dev/null 2>&1 || ipset create $GFWSET hash:ip 2>/dev/null
-	fi
-	config_get backupfile $CONFIGURATION backupfile ""
-	mkdir -p $workdir/data
-	if [ -n "$backupfile" ] && [ ! -d "$workdir/data" ]; then
-		restore
-	fi
-	# for overlay data-stk-oo not suppport
-	local cwdfs=$(get_filesystem $workdir)
-	echo "workdir is a $cwdfs filesystem"
-	if [ "$cwdfs" == "jffs2" ]; then
-		echo "fs error ln db to tmp $workdir $cwdfs"
-		logger "AdGuardHome" "warning db redirect to tmp"
-		touch $workdir/data/stats.db
-		if [ ! -L $workdir/data/stats.db ]; then
-		mv -f $workdir/data/stats.db /tmp/stats.db 2>/dev/null
-		ln -s /tmp/stats.db $workdir/data/stats.db 2>/dev/null
-		fi
-		touch $workdir/data/sessions.db
-		if [ ! -L $workdir/data/sessions.db ]; then
-		mv -f $workdir/data/sessions.db /tmp/sessions.db 2>/dev/null
-		ln -s /tmp/sessions.db $workdir/data/sessions.db 2>/dev/null
-		fi
-	fi
-
-	# hack to save config file when upgrade system
-	config_get upprotect $CONFIGURATION upprotect ""
-	if [ -n "$upprotect" ]; then
-		# Handle both old MultiValue format (space-separated) and new DynamicList format
-		if echo "$upprotect" | grep -q " "; then
-			# Old format: space-separated values
-			eval upprotect=${upprotect// /\\\\n}
-			echo -e "$upprotect">/lib/upgrade/keep.d/luci-app-adguardhome
-		else
-			echo -n > /lib/upgrade/keep.d/luci-app-adguardhome
-			# New format: UCI list, get all values
-			config_list_foreach $CONFIGURATION upprotect _add_upprotect_file
-		fi
-	fi
-
-
-
-	config_get binpath $CONFIGURATION binpath "/usr/bin/AdGuardHome"
-	mkdir -p ${binpath%/*}
-	if [ ! -f "$binpath" ]; then
-		_do_redirect 0
-		/usr/share/AdGuardHome/update_core.sh 2>&1 >/tmp/AdGuardHome_update.log &
-		exit 0
-	fi
-	config_get httpport $CONFIGURATION httpport 3000
-	local ADDITIONAL_ARGS=" -c $configpath -w $workdir -p $httpport --no-check-update"
-	config_get logfile $CONFIGURATION logfile ""
-	if [ -n "$logfile" ]; then
-		ADDITIONAL_ARGS="$ADDITIONAL_ARGS -l $logfile"
-	fi
-	config_get_bool verbose $CONFIGURATION verbose 0
-	if [ "$verbose" -eq 1 ]; then
-		ADDITIONAL_ARGS="$ADDITIONAL_ARGS -v"
-	fi
-
-	procd_open_instance
-	SET_TZ="`uci get system.@system[0].timezone 2>/dev/null`"
-	if [ -n "$SET_TZ" ]; then
-		procd_set_param env TZ="$SET_TZ"
-	fi
-	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
-	procd_set_param limits core="unlimited" nofile="65535 65535"
+	local prepare_rc=0
+	START_PREPARED=0
+	START_DISABLED=0
+	run_locked prepare_wrapper_locked || prepare_rc=$?
+	case "$prepare_rc" in
+		0) START_PREPARED=1 ;;
+		2)
+			START_PREPARED=1
+			START_DISABLED=1
+			return 0
+			;;
+	esac
+	[ "$START_PREPARED" = 1 ] || return 0
+	procd_open_instance monitor
+	procd_set_param command "$initscript" monitor
+	procd_set_param stdout 1
 	procd_set_param stderr 1
-	procd_set_param command $binpath $ADDITIONAL_ARGS
-	procd_set_param file "$configpath" "/etc/hosts" "/etc/config/AdGuardHome"
+	procd_set_param respawn 3600 5 0
+	procd_set_param term_timeout 5
 	procd_close_instance
-	if [ -f "$configpath" ]; then
-        (sleep 5 && _do_redirect 1) &
+	return 0
+}
+
+service_started() {
+	if [ "$START_PREPARED" != 1 ]; then
+		run_locked fail_safe_locked >/dev/null 2>&1 || true
+		return 1
+	fi
+	[ "$START_DISABLED" != 1 ] || return 0
+	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
+		RELOAD_SERVICES=0 run_locked reconcile_core_locked
 	else
-		_do_redirect 0
-		config_get "redirect" $CONFIGURATION "redirect" "none"
-		if [ "$redirect" != "none" ]; then
-			procd_open_instance "waitconfig"
-			procd_set_param command "/usr/share/AdGuardHome/watchconfig.sh"
-			procd_close_instance
-			echo "no config start watching"
-		fi
-	fi
-	echo "AdGuardHome service enabled"
-
-}
-
-reload_service()
-{
-	rm /var/run/AdGlucitest >/dev/null 2>&1
-	echo "AdGuardHome reloading"
-	start
-}
-
-del_querylog(){
-	local btarget=$(ls $backupwdpath/data | grep -F "querylog.json" | sort -r | head -n 1)
-	local wtarget=$(ls $workdir/data | grep -F "querylog.json" | sort -r | head -n 1)
-	if [ "$btarget"x == "$wtarget"x ]; then
-		[ -z "$btarget" ] && return 1
-		rm -f $workdir/data/$wtarget
-		rm -f $backupwdpath/data/$btarget
-		return 0
-	fi
-	if [ "$btarget" \> "$wtarget" ]; then
-		rm -f $backupwdpath/data/$btarget
-		return 0
-	else
-		rm -f $workdir/data/$wtarget
-		return 0
+		run_locked orchestrate_core_locked
 	fi
 }
 
-stop_service()
-{
-	config_load "${CONFIGURATION}"
-	_do_redirect 0
-	do_crontab
-	if [ "$1" != "nobackup" ]; then
-		config_get backupfile $CONFIGURATION backupfile "0"
-		if [ -n "$backupfile" ]; then
-			backup
-		fi
+stop_wrapper_locked() {
+	local shutdown_mode="$1"
+	[ "$shutdown_mode" = 1 ] && RELOAD_SERVICES=0
+	clear_recorded_integration_locked || return 1
+	if [ "$shutdown_mode" != 1 ]; then
+		disable_official_autostart || return 1
+		[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+		wait_for_core_stopped || return 1
 	fi
-	echo "AdGuardHome service disabled"
-	touch /var/run/AdGserverdis
+}
+
+stop_service() {
+	run_locked stop_wrapper_locked "${WRAPPER_SHUTDOWN:-0}"
+}
+
+service_triggers() {
+	procd_add_reload_trigger "$LEGACY_CONFIG"
+}
+
+restart() {
+	reload
 }
 
 boot() {
-	rc_procd boot_service "$@"
-	if eval "type service_started" 2>/dev/null >/dev/null; then
-		service_started
-	fi
+	WRAPPER_BOOT=1
+	start
 }
 
-test_crontab(){
-	config_load "${CONFIGURATION}"
-	do_crontab
-}
-
-do_crontab(){
-	config_get_bool enabled $CONFIGURATION enabled 0
-	config_get crontab $CONFIGURATION crontab ""
-	local findstr default cronenable replace commit
-	local cronreload=0
-	local commit=0
-	findstr="/usr/share/AdGuardHome/update_core.sh"
-	default="30 3 * * * /usr/share/AdGuardHome/update_core.sh 2>&1"
-	[ "$enabled" == "0" ] || [ "${crontab//autoupdate/}" == "$crontab" ] && cronenable=0 || cronenable=1
-	crontab_editor
-
-	config_get workdir $CONFIGURATION workdir "/etc/AdGuardHome"
-	config_get lastworkdir $CONFIGURATION lastworkdir "/etc/AdGuardHome"
-	findstr="/usr/share/AdGuardHome/tailto.sh [0-9]* \$(uci get AdGuardHome.AdGuardHome.workdir)/data/querylog.json"
-	#[ -n "$lastworkdir" ] && findstr="/usr/share/AdGuardHome/tailto.sh [0-9]* $lastworkdir/data/querylog.json" && [ "$lastworkdir" != "$workdir" ] && replace="${lastworkdir//\//\\/}/${workdir//\//\\/}"
-	default="0 * * * * /usr/share/AdGuardHome/tailto.sh 2000 \$(uci get AdGuardHome.AdGuardHome.workdir)/data/querylog.json"
-	[ "$enabled" == "0" ] || [ "${crontab//cutquerylog/}" == "$crontab" ] && cronenable=0 || cronenable=1
-	crontab_editor
-	#[ "$lastworkdir" != "$workdir" ] && uci set AdGuardHome.AdGuardHome.lastworkdir="$workdir" && commit=1
-
-	config_get logfile $CONFIGURATION logfile ""
-	config_get lastlogfile $CONFIGURATION lastlogfile ""
-	findstr="/usr/share/AdGuardHome/tailto.sh [0-9]* \$(uci get AdGuardHome.AdGuardHome.logfile)"
-	default="30 3 * * * /usr/share/AdGuardHome/tailto.sh 2000 \$(uci get AdGuardHome.AdGuardHome.logfile)"
-	#[ -n "$lastlogfile" ] && findstr="/usr/share/AdGuardHome/tailto.sh [0-9]* $lastlogfile" && [ -n "$logfile" ] && [ "$lastlogfile" != "$logfile" ] && replace="${lastlogfile//\//\\/}/${logfile//\//\\/}"
-	[ "$logfile" == "syslog" ] || [ "$logfile" == "" ] || [ "$enabled" == "0" ] || [ "${crontab//cutruntimelog/}" == "$crontab" ] && cronenable=0 || cronenable=1
-	crontab_editor
-	#[ -n "$logfile" ] && [ "$lastlogfile" != "$logfile" ] && uci set AdGuardHome.AdGuardHome.lastlogfile="$logfile" && commit=1
-
-	findstr="/usr/share/AdGuardHome/addhost.sh"
-	default="0 * * * * /usr/share/AdGuardHome/addhost.sh"
-	[ "$enabled" == "0" ] || [ "${crontab//autohost/}" == "$crontab" ] && cronenable=0 || cronenable=1
-	crontab_editor
-	[ "$cronenable" == "0" ] && /usr/share/AdGuardHome/addhost.sh "del" "noreload" || /usr/share/AdGuardHome/addhost.sh "" "noreload"
-
-	findstr="/usr/share/AdGuardHome/gfw2adg.sh"
-	default="30 3 * * * /usr/share/AdGuardHome/gfw2adg.sh"
-	[ "$enabled" == "0" ] || [ "${crontab//autogfw/}" == "$crontab" ] && cronenable=0 || cronenable=1
-	crontab_editor
-	findstr="/usr/share/AdGuardHome/gfwipset2adg.sh"
-	default="31 3 * * * /usr/share/AdGuardHome/gfwipset2adg.sh"
-	[ "$enabled" == "0" ] || [ "${crontab//autogfwipset/}" == "$crontab" ] && cronenable=0 || cronenable=1
-	crontab_editor
-	[ "$cronreload" -gt 0 ] && /etc/init.d/cron restart
-	#[ "$commit" -gt 0 ] && uci commit AdGuardHome
-}
-
-crontab_editor(){
-	[ ! -f "$CRON_FILE" ] && mkdir -p ${CRON_FILE%/*} && touch "$CRON_FILE" && chmod 600 "$CRON_FILE"
-	#usage input:
-	#findstr=
-	#default=
-	#cronenable=
-	#replace="${last//\//\\/}/${now//\//\\/}"
-	#output:cronreload:if >1 please /etc/init.d/cron restart manual
-	local testline reload
-	local line="$(grep "$findstr" $CRON_FILE)"
-	[ -n "$replace" ] && [ -n "$line" ] && eval testline="\${line//$replace}" && [ "$testline" != "$line" ] && line="$testline" && reload="1" && replace=""
-	if [ "${line:0:1}" != "#" ]; then
-		if [ $cronenable -eq 1 ]; then
-			[ -z "$line" ] && line="$default" && reload="1"
-			if [ -n "$reload" ]; then
-				sed -i "\,$findstr,d" $CRON_FILE
-				echo "$line" >> $CRON_FILE
-				cronreload=$((cronreload+1))
-			fi
-		elif [ -n "$line" ]; then
-			sed -i "\,$findstr,d" $CRON_FILE
-			echo "#$line" >> $CRON_FILE
-			cronreload=$((cronreload+1))
-		fi
-	else
-		if [ $cronenable -eq 1 ]; then
-			sed -i "\,$findstr,d" $CRON_FILE
-			echo "${line:1}" >> $CRON_FILE
-			cronreload=$((cronreload+1))
-		elif [ -z "$reload" ]; then
-			sed -i "\,$findstr,d" $CRON_FILE
-			echo "$line" >> $CRON_FILE
-		fi
-	fi
+shutdown() {
+	WRAPPER_SHUTDOWN=1
+	stop
 }

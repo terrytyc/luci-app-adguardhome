@@ -1,301 +1,121 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-adguardhome 2.0.0\n"
+"PO-Revision-Date: 2026-08-27 00:00+0800\n"
+"Last-Translator: terrytyc\n"
+"Language-Team: Chinese (Simplified)\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: zh_CN\n"
 
+msgid "AdGuard Home"
+msgstr "AdGuard Home"
 
-msgid "Log"
-msgstr "日志"
+msgid "The core is provided and updated by the official ImmortalWrt adguardhome package. Default web login: admin / admin."
+msgstr "核心由 ImmortalWrt 官方 adguardhome 软件包提供和更新。默认网页登录用户名和密码为 admin / admin。"
 
-msgid "AdGuardHome's version"
-msgstr "AdGuardHome 版本"
+msgid "Overview"
+msgstr "概览"
 
-msgid "Needed to click 'save&apply' to generate the configuration file"
-msgstr "需要点击“保存并应用”才能生成配置文件"
+msgid "Service status"
+msgstr "服务状态"
 
-msgid "In case of the latest realease is a source code that can not download the binary file"
-msgstr "防止最新release只有源码，导致下载不成功"
-
-msgid "Manual Config"
-msgstr "手动设置"
-
-msgid "Free and open source, powerful network-wide ads & trackers blocking DNS server."
-msgstr "全网络广告和跟踪程序拦截DNS服务器，默认账号和密码均为：admin"
-
-msgid "RUNNING"
+msgid "Running"
 msgstr "运行中"
 
-msgid "NOT RUNNING"
+msgid "Not running"
 msgstr "未运行"
 
-msgid "Redirected"
-msgstr "已重定向"
+msgid "Core version"
+msgstr "核心版本"
 
-msgid "Not redirect"
-msgstr "未重定向"
+msgid "Unknown"
+msgstr "未知"
 
-msgid "Collecting data..."
-msgstr "获取数据中..."
+msgid "Unavailable"
+msgstr "不可用"
+
+msgid "Management interface"
+msgstr "管理界面"
+
+msgid "Open Web Interface"
+msgstr "打开 Web 管理界面"
+
+msgid "Enable AdGuard Home and click Save & Apply; the management interface becomes available after the service is running."
+msgstr "请启用 AdGuard Home 并点击“保存并应用”；服务运行后方可打开管理界面。"
+
+msgid "The YAML management endpoint is unavailable or invalid."
+msgstr "YAML 中的管理端点不可用或无效。"
+
+msgid "HTTP keeps the host used to access LuCI and uses the port from YAML http.address. HTTPS uses YAML tls.server_name and tls.port_https."
+msgstr "HTTP 沿用访问 LuCI 时的主机地址并使用 YAML http.address 中的端口；HTTPS 使用 YAML tls.server_name 和 tls.port_https。"
+
+msgid "Settings"
+msgstr "设置"
+
+msgid "General Settings"
+msgstr "常规设置"
+
+msgid "DNS Integration"
+msgstr "DNS 集成"
+
+msgid "Paths"
+msgstr "路径"
 
 msgid "Enable"
 msgstr "启用"
 
-msgid "Browser management port"
-msgstr "网页管理端口"
+msgid "DNS listening port (YAML)"
+msgstr "DNS 监听端口（YAML）"
 
-msgid "Upgrade Core"
-msgstr "更新核心"
+msgid "DNS redirect mode"
+msgstr "DNS 重定向模式"
 
-msgid "Update core version"
-msgstr "更新核心版本"
+msgid "Choose how LAN DNS traffic is routed to the DNS port read dynamically from WORKDIR/AdGuardHome.yaml."
+msgstr "选择如何将 LAN 的 DNS 流量转发到从 WORKDIR/AdGuardHome.yaml 动态读取的 DNS 端口。"
 
-msgid "Check..."
-msgstr "检查中..."
-
-msgid "Updated"
-msgstr "已更新"
-
-msgid "Force update"
-msgstr "强制更新核心"
-
-msgid "Fast config"
-msgstr "快速配置"
-
-msgid "Core Version"
-msgstr "核心版本"
-
-msgid "Latest Version"
-msgstr "最新版"
-
-msgid "Beta Version"
-msgstr "测试版"
-
-msgid "Current core version:"
-msgstr "当前核心版本:"
-
-msgid "core version:"
-msgstr "核心版本:"
-
-msgid "no config"
-msgstr "没有配置文件"
-
-msgid "no core"
-msgstr "没有核心"
-
-msgid "Redirect"
-msgstr "重定向"
-
-msgid "none"
+msgid "None"
 msgstr "无"
 
-msgid "Run as dnsmasq upstream server"
-msgstr "作为dnsmasq的上游服务器"
+msgid "Use AdGuard Home as dnsmasq upstream"
+msgstr "将 AdGuard Home 用作 dnsmasq 上游"
 
-msgid "Redirect 53 port to AdGuardHome"
-msgstr "重定向53端口到AdGuardHome"
+msgid "Redirect LAN port 53 to AdGuard Home"
+msgstr "将 LAN 的 53 端口重定向到 AdGuard Home"
 
-msgid "Use port 53 replace dnsmasq"
-msgstr "使用53端口替换dnsmasq"
-
-msgid "AdGuardHome redirect mode"
-msgstr "AdGuardHome重定向模式"
-
-msgid "Bin Path"
-msgstr "执行文件路径"
-
-msgid "AdGuardHome Bin path if no bin will auto download"
-msgstr "AdGuardHome 执行文件路径 如果没有执行文件将自动下载"
-
-msgid "use upx to compress bin after download"
-msgstr "下载后使用upx压缩执行文件"
-
-msgid "compress faster"
-msgstr "快速压缩"
-
-msgid "compress better"
-msgstr "更好的压缩"
-
-msgid "compress best(can be slow for big files)"
-msgstr "最好的压缩(大文件可能慢)"
-
-msgid "try all available compression methods & filters [slow]"
-msgstr "尝试所有可能的压缩方法和过滤器[慢]"
-
-msgid "try even more compression variants [very slow]"
-msgstr "尝试更多变体压缩手段[很慢]"
-
-msgid "bin use less space,but may have compatibility issues"
-msgstr "减小执行文件空间占用，但是可能压缩后有兼容性问题"
-
-msgid "Config Path"
-msgstr "配置文件路径"
-
-msgid "AdGuardHome config path"
-msgstr "AdGuardHome 配置文件路径"
-
-msgid "Work dir"
+msgid "Working directory"
 msgstr "工作目录"
 
-msgid "AdGuardHome work dir include rules,audit log and database"
-msgstr "AdGuardHome 工作目录包含规则，审计日志和数据库"
+msgid "Runtime data is stored here. The YAML configuration is fixed at WORKDIR/AdGuardHome.yaml."
+msgstr "运行数据存放于此目录；YAML 配置固定为 WORKDIR/AdGuardHome.yaml。"
 
-msgid "Runtime log file"
-msgstr "运行日志路径"
+msgid "Verbose logging"
+msgstr "详细日志"
 
-msgid "AdGuardHome runtime Log file if 'syslog': write to system log;if empty no log"
-msgstr "AdGuardHome 运行日志, 如果填 syslog 将写入系统日志; 如果该项为空则不记录运行日志"
+msgid "This field is required."
+msgstr "此字段为必填项。"
 
-msgid "Verbose log"
-msgstr "输出详细日志"
+msgid "Path must be absolute."
+msgstr "必须使用绝对路径。"
 
-msgid "Add gfwlist"
-msgstr "添加 GFW 列表"
+msgid "The working directory must not be the filesystem root."
+msgstr "工作目录不能是文件系统根目录。"
 
-msgid "Add"
-msgstr "添加"
+msgid "Path must not contain repeated slashes."
+msgstr "路径不能包含连续的斜杠。"
 
-msgid "Added"
-msgstr "已添加"
+msgid "Path must not end with a slash."
+msgstr "路径不能以斜杠结尾。"
 
-msgid "Not added"
-msgstr "未添加"
+msgid "Path contains characters that are unsafe for the current service script."
+msgstr "路径包含当前服务脚本不接受的字符。"
 
-msgid "Del gfwlist"
-msgstr "删除gfw列表"
+msgid "Path must not contain \".\" or \"..\" components."
+msgstr "路径不能包含“.”或“..”路径段。"
 
-msgid "Del"
-msgstr "删除"
+msgid "The working directory must contain at least two path components below the filesystem root (for example, /etc/AdGuardHome)."
+msgstr "工作目录必须在文件系统根目录下至少包含两级路径（例如 /etc/AdGuardHome）。"
 
-msgid "Gfwlist upstream dns server"
-msgstr "gfw列表上游服务器"
-
-msgid "Gfwlist domain upstream dns service"
-msgstr "gfw列表域名上游服务器"
-
-msgid "Change management password"
-msgstr "更改登录密码"
-
-msgid "Culculate"
-msgstr "计算"
-
-msgid "Load culculate model"
-msgstr "载入计算模块"
-
-msgid "loading..."
-msgstr "载入中"
-
-msgid "Please save/apply"
-msgstr "请点击[保存/应用]"
-
-msgid "is empty"
-msgstr "为空"
-
-msgid "Press load culculate model and culculate finally save/apply"
-msgstr "先输入你想要的密码, 点击[载入计算模块], 然后点击[计算], 最后点击下方[保存&应用]"
-
-msgid "Keep files when system upgrade"
-msgstr "系统升级时保留文件"
-
-msgid "core bin"
-msgstr "核心执行文件"
-
-msgid "config file"
-msgstr "配置文件"
-
-msgid "log file"
-msgstr "日志文件"
-
-msgid "querylog.json"
-msgstr "审计日志.json"
-
-msgid "On boot when network ok restart"
-msgstr "开机后网络准备好时重启"
-
-msgid "Backup workdir files when shutdown"
-msgstr "在关机时备份工作目录文件"
-
-msgid "Will be restore when workdir/data is empty"
-msgstr "在工作目录/data为空的时候恢复"
-
-msgid "Backup workdir path"
-msgstr "工作目录备份路径"
-
-msgid "Crontab task"
-msgstr "计划任务"
-
-msgid "Auto update core"
-msgstr "自动升级核心"
-
-msgid "Auto tail querylog"
-msgstr "自动截短查询日志"
-
-msgid "Auto tail runtime log"
-msgstr "自动截短运行日志"
-
-msgid "Auto update ipv6 hosts and restart AdGuardHome"
-msgstr "自动更新ipv6主机并重启AdGuardHome"
-
-msgid "Auto update gfwlist and restart AdGuardHome"
-msgstr "自动更新gfw列表并重启AdGuardHome"
-
-msgid "Auto update ipset list and restart AdGuardHome"
-msgstr "自动更新ipset列表并重启AdGuardHome"
-
-msgid "Please change time and args in crontab"
-msgstr "请在计划任务中修改时间和参数"
-
-msgid "Core Update URL"
-msgstr "核心更新地址"
-
-msgid "reverse"
-msgstr "逆序"
-
-msgid "localtime"
-msgstr "本地时间"
-
-msgid "Please add log path in config to enable log"
-msgstr "请在设置里填写日志路径以启用日志"
-
-msgid "dellog"
-msgstr "删除日志"
-
-msgid "download log"
-msgstr "下载日志"
-
-msgid "Use template"
-msgstr "使用模板"
-
-msgid "Reload Config"
-msgstr "重新载入配置"
-
-msgid "WARNING!!! no bin found apply config will not be test"
-msgstr "警告！！！未找到执行文件，提交配置将不会进行校验"
-
-msgid "Change browser management username"
-msgstr "改变网页登录用户名"
-
-msgid "Username"
-msgstr "用户名"
-
-msgid "Check Config"
-msgstr "检查配置"
-
-msgid "unknown"
-msgstr "未知"
-
-msgid "Keep database when system upgrade"
-msgstr "系统升级时保留数据"
-
-msgid "Start up only when the network is normal"
-msgstr "开机网络正常才启动"
-
-msgid "Main Config"
-msgstr "主要设置"
-
-msgid "Other Config"
-msgstr "其它设置"
-
-msgid "Core Config"
-msgstr "内核设置"
-
-msgid "will set to name gfwlist"
-msgstr "将设置为gfwlist名称"
-
-msgid ""
-msgstr ""
+msgid "Working directories under /tmp or /var are volatile on ImmortalWrt and are not allowed."
+msgstr "ImmortalWrt 中 /tmp 或 /var 下的目录是易失存储，不能用作工作目录。"

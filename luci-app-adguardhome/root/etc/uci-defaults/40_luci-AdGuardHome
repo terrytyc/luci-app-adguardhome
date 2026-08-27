@@ -1,12 +1,873 @@
 #!/bin/sh
-chmod +x /etc/init.d/AdGuardHome
-uci -q batch <<-EOF >/dev/null 2>&1
-	delete ucitrack.@AdGuardHome[-1]
-	add ucitrack AdGuardHome
-	set ucitrack.@AdGuardHome[-1].init=AdGuardHome
-	commit ucitrack
-	delete AdGuardHome.AdGuardHome.ucitracktest
-EOF
+# SPDX-License-Identifier: Apache-2.0
 
-rm -f /tmp/luci-indexcache
+UCI_CONFIG="AdGuardHome"
+UCI_SECTION="AdGuardHome"
+OFFICIAL_CONFIG="adguardhome"
+OFFICIAL_SECTION="config"
+
+DEFAULT_WORK_DIR="/etc/AdGuardHome"
+DEFAULT_CONFIG_FILE="${DEFAULT_WORK_DIR}/AdGuardHome.yaml"
+LEGACY_ROOT_CONFIG="/etc/AdGuardHome.yaml"
+OFFICIAL_DEFAULT_CONFIG="/etc/adguardhome/adguardhome.yaml"
+OFFICIAL_DEFAULT_WORK_DIR="/var/lib/adguardhome"
+CORE_BINARY="/usr/bin/AdGuardHome"
+CRON_FILE="/etc/crontabs/root"
+KEEP_FILE="/lib/upgrade/keep.d/luci-app-adguardhome"
+
+UPPER_CHANGED=0
+LOWER_CHANGED=0
+DHCP_CHANGED=0
+IMPORT_OFFICIAL=0
+OFFICIAL_WAS_RUNNING=0
+OFFICIAL_PAUSED=0
+IS_UPGRADE=0
+DATA_SOURCE_WORK_DIR=""
+
+[ "$PKG_UPGRADE" = 1 ] && IS_UPGRADE=1
+[ -f /tmp/luci-app-adguardhome.upgrade ] && IS_UPGRADE=1
+
+# APK protects locally changed files below /etc by unpacking their replacement
+# as .apk-new.  The 1.x package shipped this init script as a protected,
+# non-executable CRLF file, so an upgrade can otherwise restart the obsolete
+# root-owned supervisor after its helper files have already been removed.
+# Resolve only the exact package-owned init candidate; the active UCI and YAML
+# conffiles are migrated below instead of being overwritten by defaults.
+if [ "$IS_UPGRADE" = 1 ] &&
+   { [ -e /etc/init.d/AdGuardHome.apk-new ] || [ -L /etc/init.d/AdGuardHome.apk-new ]; }; then
+	if [ ! -f /etc/init.d/AdGuardHome.apk-new ] ||
+	   [ -L /etc/init.d/AdGuardHome.apk-new ]; then
+		echo "Unsafe AdGuard Home init upgrade candidate; upgrade aborted." >&2
+		exit 1
+	fi
+	chmod 0755 /etc/init.d/AdGuardHome.apk-new || exit 1
+	mv -f /etc/init.d/AdGuardHome.apk-new /etc/init.d/AdGuardHome || exit 1
+	# The legacy script used a different START priority.  APK upgrades do not
+	# call rc.common enable, so replace any stale S??/K?? links with the modern
+	# S18/K90 pair before default_postinst starts the compatibility wrapper.
+	/etc/init.d/AdGuardHome disable || exit 1
+	/etc/init.d/AdGuardHome enable || exit 1
+	echo "Activated the packaged AdGuard Home compatibility init script."
+fi
+
+is_valid_port() {
+	case "$1" in
+		""|*[!0-9]*) return 1 ;;
+	esac
+	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+canonical_port() {
+	awk -v value="$1" 'BEGIN { printf "%d\n", value + 0 }'
+}
+
+is_valid_dns_port() {
+	is_valid_port "$1" || return 1
+	[ "$(canonical_port "$1")" -ne 53 ]
+}
+
+normalize_bool() {
+	case "$1" in
+		1|on|true|yes|enabled) printf '1\n' ;;
+		*) printf '0\n' ;;
+	esac
+}
+
+path_contains_symlink() {
+	local remaining="${1#/}" component current=""
+	while [ -n "$remaining" ]; do
+		component="${remaining%%/*}"
+		current="${current}/${component}"
+		if [ -L "$current" ]; then
+			# The exact 25.12.1 base-files layout provides /var -> /tmp and the
+			# official package defaults to /var/lib/adguardhome.  Permit only this
+			# verified system link while rejecting all other symlink components.
+			if [ "$current" = /var ]; then
+				case "$(readlink "$current" 2>/dev/null)" in
+					tmp|/tmp)
+						[ "$remaining" = "$component" ] && break
+						remaining="${remaining#*/}"
+						continue
+						;;
+				esac
+			fi
+			return 0
+		fi
+		[ "$remaining" = "$component" ] && break
+		remaining="${remaining#*/}"
+	done
+	return 1
+}
+
+is_safe_work_dir() {
+	local value="$1"
+	case "$value" in
+		""|/|//*|*//*|*/) return 1 ;;
+		/*) ;;
+		*) return 1 ;;
+	esac
+	case "$value" in
+		/*/*) ;;
+		*) return 1 ;;
+	esac
+	case "$value" in
+		*[!A-Za-z0-9_./+@%:,=-]*) return 1 ;;
+	esac
+	case "${value}/" in
+		*/./*|*/../*) return 1 ;;
+	esac
+	! path_contains_symlink "$value"
+}
+
+normalize_work_dir() {
+	local value="${1%/}"
+	is_safe_work_dir "$value" || return 1
+	printf '%s\n' "$value"
+}
+
+is_persistent_work_dir() {
+	case "$1" in
+		/tmp|/tmp/*|/var|/var/*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+ensure_upper_section() {
+	uci -q get "${UCI_CONFIG}.${UCI_SECTION}" >/dev/null 2>&1 && return 0
+	uci -q set "${UCI_CONFIG}.${UCI_SECTION}=AdGuardHome" || return 1
+	UPPER_CHANGED=1
+}
+
+set_upper_option() {
+	local option="$1"
+	local value="$2"
+
+	[ "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.${option}")" = "$value" ] && return 0
+	uci -q set "${UCI_CONFIG}.${UCI_SECTION}.${option}=${value}" || return 1
+	UPPER_CHANGED=1
+}
+
+delete_upper_option() {
+	local option="$1"
+
+	uci -q get "${UCI_CONFIG}.${UCI_SECTION}.${option}" >/dev/null 2>&1 || return 0
+	uci -q delete "${UCI_CONFIG}.${UCI_SECTION}.${option}" || return 1
+	UPPER_CHANGED=1
+}
+
+ensure_lower_section() {
+	uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1 && return 0
+	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}=adguardhome" || return 1
+	LOWER_CHANGED=1
+}
+
+set_lower_option() {
+	local option="$1"
+	local value="$2"
+
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.${option}")" = "$value" ] && return 0
+	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.${option}=${value}" || return 1
+	LOWER_CHANGED=1
+}
+
+delete_lower_option() {
+	local option="$1"
+
+	uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.${option}" >/dev/null 2>&1 || return 0
+	uci -q delete "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.${option}" || return 1
+	LOWER_CHANGED=1
+}
+
+yaml_get_section_value() {
+	local section="$1"
+	local key="$2"
+	local file="$3"
+
+	[ -f "$file" ] || return 0
+	awk -v section="$section" -v key="$key" '
+		function top(s) { return s ~ /^[^[:space:]#][^:]*:/ }
+		function indent(s) { match(s, /^ */); return RLENGTH }
+		{ line[++n] = $0 }
+		END {
+			for (i = 1; i <= n; i++)
+				if (line[i] ~ ("^" section ":[[:space:]]*($|#)")) { sections++; if (!first) first = i }
+			if (sections != 1) exit
+			last = n
+			for (i = first + 1; i <= n; i++)
+				if (top(line[i])) { last = i - 1; break }
+			depth = 0
+			for (i = first + 1; i <= last; i++) {
+				if (line[i] ~ /^[[:space:]]*($|#)/ || line[i] !~ /^ +/) continue
+				d = indent(line[i]); if (!depth || d < depth) depth = d
+			}
+			if (!depth) depth = 2
+			for (i = first + 1; i <= last; i++) {
+				if (indent(line[i]) != depth) continue
+				value = substr(line[i], depth + 1)
+				if (value !~ ("^" key ":[[:space:]]*")) continue
+				matches++
+				sub("^" key ":[[:space:]]*", "", value)
+				sub(/[[:space:]]+#.*$/, "", value)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+				if ((substr(value, 1, 1) == "\"" && substr(value, length(value), 1) == "\"") ||
+				    (substr(value, 1, 1) == "\047" && substr(value, length(value), 1) == "\047"))
+					value = substr(value, 2, length(value) - 2)
+				result = value
+			}
+			if (matches == 1) print result
+		}
+	' "$file"
+}
+
+next_backup_path() {
+	local target="$1"
+	local candidate suffix
+
+	candidate="${target}.pre-migration"
+	suffix=0
+	while [ -e "$candidate" ] || [ -L "$candidate" ]; do
+		suffix=$((suffix + 1))
+		candidate="${target}.pre-migration.${suffix}"
+	done
+	printf '%s\n' "$candidate"
+}
+
+migrate_yaml() {
+	local source="$1"
+	local target="$2"
+	local backup target_dir temporary
+
+	[ "$source" = "$target" ] && [ -f "$target" ] && [ ! -L "$target" ] && return 0
+	if [ ! -f "$source" ] && [ ! -L "$source" ]; then
+		[ -f "$target" ] && return 0
+		echo "AdGuard Home config source is missing: '$source'." >&2
+		return 1
+	fi
+
+	target_dir="${target%/*}"
+	mkdir -m 0750 -p "$target_dir" || return 1
+
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		[ -L "$target" ] || { cmp -s "$source" "$target" && return 0; }
+	fi
+
+	temporary="$(mktemp "${target}.migration.XXXXXX")" || return 1
+	if ! cp -p "$source" "$temporary"; then
+		rm -f "$temporary"
+		return 1
+	fi
+
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		backup="$(next_backup_path "$target")" || {
+			rm -f "$temporary"
+			return 1
+		}
+		mv "$target" "$backup" || {
+			rm -f "$temporary"
+			return 1
+		}
+		if ! mv "$temporary" "$target"; then
+			mv "$backup" "$target" >/dev/null 2>&1 || true
+			rm -f "$temporary"
+			return 1
+		fi
+		echo "Preserved existing config as '$backup'."
+	else
+		mv "$temporary" "$target" || {
+			rm -f "$temporary"
+			return 1
+		}
+	fi
+	echo "Migrated AdGuard Home config from '$source' to '$target'."
+}
+
+# Keep the official local-filter allowlist usable when a volatile workdir is
+# imported into persistent storage.  Replace only the exact generated list
+# item, preserve every user-added pattern, and ask the official core to verify
+# the rewritten YAML before accepting it.
+rewrite_migrated_workdir_pattern() {
+	local old_work="${1%/}" new_work="${2%/}" file="$3"
+	local old_pattern new_pattern generated replacement backup validation rc
+
+	[ -n "$old_work" ] || return 0
+	[ "$old_work" != "$new_work" ] || return 0
+	is_safe_work_dir "$old_work" || return 1
+	is_safe_work_dir "$new_work" || return 1
+	is_persistent_work_dir "$new_work" || return 1
+	[ -f "$file" ] && [ ! -L "$file" ] || return 1
+	[ -x "$CORE_BINARY" ] || {
+		echo "AdGuard Home binary is missing: '$CORE_BINARY'." >&2
+		return 1
+	}
+
+	old_pattern="${old_work}/data/userfilters/*"
+	new_pattern="${new_work}/data/userfilters/*"
+	generated="$(mktemp "${file}.workdir.XXXXXX")" || return 1
+	awk -v old="$old_pattern" -v replacement="$new_pattern" '
+		function top(s) { return s ~ /^[^[:space:]#][^:]*:/ }
+		function indent(s) { match(s, /^ */); return RLENGTH }
+		function pad(count, s, i) { s=""; for (i=0; i<count; i++) s=s " "; return s }
+		{ line[++n]=$0 }
+		END {
+			for (i=1; i<=n; i++)
+				if (line[i] ~ /^filtering:[[:space:]]*($|#)/) { first=i; break }
+			if (!first) { for (i=1; i<=n; i++) print line[i]; exit 3 }
+			last=n
+			for (i=first+1; i<=n; i++) if (top(line[i])) { last=i-1; break }
+			depth=0
+			for (i=first+1; i<=last; i++) {
+				if (line[i] ~ /^[[:space:]]*($|#)/ || line[i] !~ /^ +/) continue
+				d=indent(line[i]); if (!depth || d<depth) depth=d
+			}
+			if (!depth) depth=2
+			for (i=first+1; i<=last; i++) {
+				if (indent(line[i]) != depth) continue
+				candidate=substr(line[i], depth+1)
+				if (candidate ~ /^safe_fs_patterns:[[:space:]]*/) { key_line=i; break }
+			}
+			if (!key_line) { for (i=1; i<=n; i++) print line[i]; exit 3 }
+			block_last=last
+			for (i=key_line+1; i<=last; i++) {
+				if (line[i] ~ /^[[:space:]]*($|#)/) continue
+				if (indent(line[i]) <= depth) { block_last=i-1; break }
+			}
+			for (i=key_line+1; i<=block_last; i++) {
+				if (indent(line[i]) <= depth) continue
+				value=substr(line[i], indent(line[i])+1)
+				if (value !~ /^-[[:space:]]*/) continue
+				sub(/^-[[:space:]]*/, "", value)
+				comment=""
+				if (match(value, /[[:space:]]+#.*/)) {
+					comment=substr(value, RSTART)
+					value=substr(value, 1, RSTART-1)
+				}
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+				if ((substr(value,1,1)=="\"" && substr(value,length(value),1)=="\"") ||
+				    (substr(value,1,1)=="\047" && substr(value,length(value),1)=="\047"))
+					value=substr(value,2,length(value)-2)
+				if (value == old) {
+					line[i]=pad(indent(line[i])) "- " replacement comment
+					changed=1
+				}
+			}
+			for (i=1; i<=n; i++) print line[i]
+			if (!changed) exit 3
+		}' "$file" >"$generated"
+	rc=$?
+	case "$rc" in
+		3)
+			rm -f "$generated"
+			return 0
+			;;
+		0) ;;
+		*)
+			rm -f "$generated"
+			return 1
+			;;
+	esac
+
+	backup="$(mktemp "${file}.workdir-backup.XXXXXX")" || {
+		rm -f "$generated"
+		return 1
+	}
+	replacement="$(mktemp "${file}.workdir-install.XXXXXX")" || {
+		rm -f "$generated" "$backup"
+		return 1
+	}
+	if ! cp -p "$file" "$backup"; then
+		rm -f "$generated" "$replacement" "$backup"
+		return 1
+	fi
+	if ! cp -p "$file" "$replacement" ||
+	   ! cat "$generated" >"$replacement"; then
+		rm -f "$generated" "$replacement" "$backup"
+		return 1
+	fi
+	rm -f "$generated"
+	if ! mv "$replacement" "$file"; then
+		rm -f "$replacement" "$backup"
+		return 1
+	fi
+	validation="$(mktemp "${file}.workdir-check.XXXXXX")" || {
+		mv -f "$backup" "$file" || return 1
+		return 1
+	}
+	if ! cp -p "$file" "$validation"; then
+		rm -f "$validation"
+		mv -f "$backup" "$file" || return 1
+		return 1
+	fi
+	# v0.107.76 may migrate an old schema even in --check-config mode.  Point
+	# it at a disposable metadata-preserving copy so the active YAML remains
+	# exactly the file produced by the migration transaction.
+	if ! "$CORE_BINARY" --check-config --config "$validation" \
+		--work-dir "$new_work" >/dev/null 2>&1; then
+		rm -f "$validation"
+		echo "AdGuard Home rejected the migrated workdir path; restoring the YAML." >&2
+		mv -f "$backup" "$file" || return 1
+		return 1
+	fi
+	rm -f "$validation" || return 1
+	rm -f "$backup" || return 1
+	echo "Updated AdGuard Home local-filter path for '$new_work'."
+}
+
+# Preserve runtime history, filters, and query data when a volatile official or
+# legacy workdir must be moved.  The source is deliberately retained for
+# rollback and an existing unrelated target is never merged or overwritten.
+migrate_runtime_data() {
+	local old_work="${1%/}" new_work="${2%/}" source_data target_data marker temporary
+	[ -n "$old_work" ] || return 0
+	[ "$old_work" != "$new_work" ] || return 0
+	is_safe_work_dir "$old_work" || return 1
+	is_safe_work_dir "$new_work" || return 1
+	is_persistent_work_dir "$new_work" || return 1
+	source_data="${old_work}/data"
+	target_data="${new_work}/data"
+	marker="${target_data}/.luci-app-adguardhome-migrated-from"
+	[ -d "$source_data" ] || return 0
+	[ ! -L "$source_data" ] || return 1
+	mkdir -m 0700 -p "$new_work" || return 1
+	path_contains_symlink "$new_work" && return 1
+	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
+		if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$old_work" ]; then
+			chmod 0700 "$target_data" || return 1
+			return 0
+		fi
+		echo "Target data directory '$target_data' already exists; refusing to overwrite it." >&2
+		return 1
+	fi
+	temporary="$(mktemp -d "${new_work}/.data-migration.XXXXXX")" || return 1
+	if ! cp -pR "${source_data}/." "$temporary/"; then
+		rm -rf "$temporary"
+		return 1
+	fi
+	printf '%s\n' "$old_work" >"${temporary}/.luci-app-adguardhome-migrated-from" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	chmod 0600 "${temporary}/.luci-app-adguardhome-migrated-from" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
+		rm -rf "$temporary"
+		return 1
+	fi
+	mv "$temporary" "$target_data" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	chmod 0700 "$target_data" || return 1
+	echo "Copied AdGuard Home runtime data from '$source_data' to '$target_data'; source retained."
+}
+
+read_official_state() {
+	local legacy_value
+
+	legacy_value="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
+	if [ -n "$legacy_value" ]; then
+		OFFICIAL_CONFIG_FILE="$legacy_value"
+	else
+		OFFICIAL_CONFIG_FILE="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	fi
+	[ -n "$OFFICIAL_CONFIG_FILE" ] || OFFICIAL_CONFIG_FILE="$OFFICIAL_DEFAULT_CONFIG"
+
+	legacy_value="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	if [ -n "$legacy_value" ]; then
+		OFFICIAL_WORK_DIR="$legacy_value"
+	else
+		OFFICIAL_WORK_DIR="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	fi
+	[ -n "$OFFICIAL_WORK_DIR" ] || OFFICIAL_WORK_DIR="$OFFICIAL_DEFAULT_WORK_DIR"
+
+	OFFICIAL_ENABLED="$(normalize_bool "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")")"
+	OFFICIAL_VERBOSE="$(normalize_bool "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")")"
+	if [ -x /etc/init.d/adguardhome ] && /etc/init.d/adguardhome running >/dev/null 2>&1; then
+		OFFICIAL_WAS_RUNNING=1
+		OFFICIAL_ENABLED=1
+	fi
+}
+
+official_state_is_meaningful() {
+	[ "$OFFICIAL_WAS_RUNNING" = 1 ] && return 0
+	[ "$OFFICIAL_ENABLED" = 1 ] && return 0
+	[ -f "$OFFICIAL_CONFIG_FILE" ] && return 0
+	[ "$OFFICIAL_CONFIG_FILE" != "$OFFICIAL_DEFAULT_CONFIG" ] && return 0
+	[ "$OFFICIAL_WORK_DIR" != "$OFFICIAL_DEFAULT_WORK_DIR" ] && return 0
+	return 1
+}
+
+select_migration_source() {
+	local legacy_config_path upper_work_dir
+
+	legacy_config_path="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.configpath")"
+	upper_work_dir="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.workdir")"
+	if [ -n "$upper_work_dir" ]; then
+		upper_work_dir="$(normalize_work_dir "$upper_work_dir")" || {
+			echo "Unsafe existing AdGuard Home workdir; refusing to abandon its runtime data." >&2
+			return 1
+		}
+	else
+		upper_work_dir="$DEFAULT_WORK_DIR"
+	fi
+	if ! is_persistent_work_dir "$upper_work_dir"; then
+		DATA_SOURCE_WORK_DIR="$upper_work_dir"
+		upper_work_dir="$DEFAULT_WORK_DIR"
+		echo "Moving volatile AdGuard Home workdir '$DATA_SOURCE_WORK_DIR' to persistent '$upper_work_dir'."
+	fi
+
+	if [ "$IS_UPGRADE" != 1 ] && official_state_is_meaningful; then
+		IMPORT_OFFICIAL=1
+		DATA_SOURCE_WORK_DIR=""
+		# The official package normally separates its YAML under /etc from its
+		# runtime data under volatile /var/lib.  The refactored app requires YAML
+		# inside a persistent workdir, so move volatile state to the default.
+		TARGET_WORK_DIR="$(normalize_work_dir "$OFFICIAL_WORK_DIR")" || {
+			echo "Unsafe official AdGuard Home workdir '$OFFICIAL_WORK_DIR'; import aborted to preserve its runtime data." >&2
+			return 1
+		}
+		if ! is_persistent_work_dir "$TARGET_WORK_DIR"; then
+			DATA_SOURCE_WORK_DIR="$TARGET_WORK_DIR"
+			TARGET_WORK_DIR="$DEFAULT_WORK_DIR"
+			echo "Moving volatile official workdir '$DATA_SOURCE_WORK_DIR' to persistent '$TARGET_WORK_DIR'."
+		fi
+		if [ -f "$OFFICIAL_CONFIG_FILE" ] || [ -L "$OFFICIAL_CONFIG_FILE" ]; then
+			SOURCE_CONFIG_FILE="$OFFICIAL_CONFIG_FILE"
+		else
+			SOURCE_CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+		fi
+		return 0
+	fi
+
+	TARGET_WORK_DIR="$upper_work_dir"
+	if [ -n "$legacy_config_path" ]; then
+		if [ -f "$legacy_config_path" ] || [ -L "$legacy_config_path" ]; then
+			SOURCE_CONFIG_FILE="$legacy_config_path"
+			return 0
+		fi
+		if [ -f "$LEGACY_ROOT_CONFIG" ] || [ -L "$LEGACY_ROOT_CONFIG" ]; then
+			SOURCE_CONFIG_FILE="$LEGACY_ROOT_CONFIG"
+			return 0
+		fi
+	fi
+
+	# On a genuine first install, preserve an orphaned pre-2.0 root YAML.  Once
+	# configpath has been removed, subsequent upgrades must prefer the active
+	# workdir copy so that the stale legacy file cannot roll back user changes.
+	if [ "$IS_UPGRADE" != 1 ] && { [ -f "$LEGACY_ROOT_CONFIG" ] || [ -L "$LEGACY_ROOT_CONFIG" ]; }; then
+		SOURCE_CONFIG_FILE="$LEGACY_ROOT_CONFIG"
+		return 0
+	fi
+	if [ -n "$DATA_SOURCE_WORK_DIR" ] &&
+	   { [ -f "${DATA_SOURCE_WORK_DIR}/AdGuardHome.yaml" ] || [ -L "${DATA_SOURCE_WORK_DIR}/AdGuardHome.yaml" ]; }; then
+		SOURCE_CONFIG_FILE="${DATA_SOURCE_WORK_DIR}/AdGuardHome.yaml"
+		return 0
+	fi
+	if [ -f "${TARGET_WORK_DIR}/AdGuardHome.yaml" ] || [ -L "${TARGET_WORK_DIR}/AdGuardHome.yaml" ]; then
+		SOURCE_CONFIG_FILE="${TARGET_WORK_DIR}/AdGuardHome.yaml"
+		return 0
+	fi
+	if [ -f "$LEGACY_ROOT_CONFIG" ] || [ -L "$LEGACY_ROOT_CONFIG" ]; then
+		SOURCE_CONFIG_FILE="$LEGACY_ROOT_CONFIG"
+		return 0
+	fi
+
+	SOURCE_CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+}
+
+resume_paused_official() {
+	[ "$OFFICIAL_PAUSED" = 1 ] || return 0
+	OFFICIAL_PAUSED=0
+	/etc/init.d/adguardhome restart >/dev/null 2>&1 || true
+}
+
+pause_official_for_import() {
+	[ "$IMPORT_OFFICIAL" = 1 ] && [ "$OFFICIAL_WAS_RUNNING" = 1 ] || return 0
+	OFFICIAL_PAUSED=1
+	trap 'resume_paused_official' 0
+	if ! /etc/init.d/adguardhome stop >/dev/null 2>&1; then
+		echo "Unable to stop the running official AdGuard Home service before migration." >&2
+		return 1
+	fi
+	if /etc/init.d/adguardhome running >/dev/null 2>&1; then
+		echo "Official AdGuard Home is still running; refusing to copy its live configuration." >&2
+		return 1
+	fi
+}
+
+initialize_upper_options() {
+	local enabled verbose redirect
+
+	if [ "$IMPORT_OFFICIAL" = 1 ]; then
+		enabled="$OFFICIAL_ENABLED"
+		verbose="$OFFICIAL_VERBOSE"
+	else
+		enabled="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.enabled")")"
+		verbose="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.verbose")")"
+	fi
+	set_upper_option enabled "$enabled" || return 1
+	set_upper_option verbose "$verbose" || return 1
+	set_upper_option workdir "$TARGET_WORK_DIR" || return 1
+
+	if [ "$IMPORT_OFFICIAL" = 1 ]; then
+		# Existing official installations may already integrate with dnsmasq or
+		# own port 53.  Import them without changing that network policy.
+		set_upper_option redirect none || return 1
+	else
+		redirect="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.redirect")"
+		case "$redirect" in
+			none|redirect|dnsmasq-upstream|exchange) ;;
+			*) set_upper_option redirect dnsmasq-upstream || return 1 ;;
+		esac
+	fi
+
+}
+
+# Rewrite only the exchange-mode DNS port required to move dnsmasq back to 53.
+# The active YAML is otherwise always authoritative for both DNS and Web ports.
+rewrite_migrated_dns_port() {
+	local chosen_port="$1" file="$2"
+	local current generated backup replacement validation rc
+
+	is_valid_dns_port "$chosen_port" || return 1
+	[ -f "$file" ] && [ ! -L "$file" ] || return 1
+	current="$(yaml_get_section_value dns port "$file")"
+	[ "$current" != "$chosen_port" ] || return 0
+	generated="$(mktemp "${file}.dns-port.XXXXXX")" || return 1
+	awk -v replacement="$chosen_port" '
+		function top(s) { return s ~ /^[^[:space:]#][^:]*:/ }
+		function indent(s) { match(s, /^ */); return RLENGTH }
+		function pad(count, s, i) { s=""; for (i=0; i<count; i++) s=s " "; return s }
+		{ line[++n]=$0 }
+		END {
+			for (i=1; i<=n; i++)
+				if (line[i] ~ /^dns:[[:space:]]*($|#)/) { sections++; if (!first) first=i }
+			if (sections != 1) exit 4
+			last=n
+			for (i=first+1; i<=n; i++) if (top(line[i])) { last=i-1; break }
+			depth=0
+			for (i=first+1; i<=last; i++) {
+				if (line[i] ~ /^[[:space:]]*($|#)/ || line[i] !~ /^ +/) continue
+				d=indent(line[i]); if (!depth || d<depth) depth=d
+			}
+			if (!depth) exit 4
+			for (i=first+1; i<=last; i++) {
+				if (indent(line[i]) != depth) continue
+				candidate=substr(line[i],depth+1)
+				if (candidate ~ /^port:[[:space:]]*/) { matches++; key_line=i }
+			}
+			if (matches != 1) exit 4
+			for (i=1; i<=n; i++) {
+				if (i == key_line) print pad(depth) "port: " replacement
+				else print line[i]
+			}
+		}' "$file" >"$generated"
+	rc=$?
+	[ "$rc" = 0 ] || {
+		rm -f "$generated"
+		return 1
+	}
+
+	backup="$(mktemp "${file}.dns-port-backup.XXXXXX")" || {
+		rm -f "$generated"
+		return 1
+	}
+	replacement="$(mktemp "${file}.dns-port-install.XXXXXX")" || {
+		rm -f "$generated" "$backup"
+		return 1
+	}
+	if ! cp -p "$file" "$backup" || ! cp -p "$file" "$replacement" ||
+	   ! cat "$generated" >"$replacement"; then
+		rm -f "$generated" "$replacement" "$backup"
+		return 1
+	fi
+	rm -f "$generated"
+	if ! mv "$replacement" "$file"; then
+		rm -f "$replacement" "$backup"
+		return 1
+	fi
+	validation="$(mktemp "${file}.dns-port-check.XXXXXX")" || {
+		mv -f "$backup" "$file" || return 1
+		return 1
+	}
+	if ! cp -p "$file" "$validation" ||
+	   ! "$CORE_BINARY" --check-config --config "$validation" \
+		--work-dir "$TARGET_WORK_DIR" >/dev/null 2>&1; then
+		rm -f "$validation"
+		echo "AdGuard Home rejected migrated DNS port ${chosen_port}; restoring the YAML." >&2
+		mv -f "$backup" "$file" || return 1
+		return 1
+	fi
+	rm -f "$validation" "$backup" || return 1
+	echo "Migrated legacy exchange mode to YAML DNS port ${chosen_port}."
+}
+
+migrate_legacy_dns_port() {
+	local redirect yaml_port legacy_port
+	redirect="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.redirect")"
+	[ "$redirect" != exchange ] || return 0
+	yaml_port="$(yaml_get_section_value dns port "$TARGET_CONFIG_FILE")"
+	if is_valid_port "$yaml_port"; then
+		if [ "$(canonical_port "$yaml_port")" -eq 53 ] && [ "$redirect" != none ]; then
+			echo "YAML DNS port 53 requires integration mode none." >&2
+			return 1
+		fi
+		return 0
+	fi
+	legacy_port="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.dnsport")"
+	if ! is_valid_dns_port "$legacy_port"; then
+		echo "AdGuard Home YAML has no valid dns.port and no safe legacy value is available." >&2
+		return 1
+	fi
+	rewrite_migrated_dns_port "$(canonical_port "$legacy_port")" "$TARGET_CONFIG_FILE"
+}
+
+migrate_exchange_mode() {
+	local redirect chosen_port dnsmasq_port old_port yaml_port legacy_port
+
+	redirect="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.redirect")"
+	[ "$redirect" = exchange ] || return 0
+
+	dnsmasq_port="$(uci -q get dhcp.@dnsmasq[0].port)"
+	old_port="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.old_port")"
+	legacy_port="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.dnsport")"
+	yaml_port="$(yaml_get_section_value dns port "$TARGET_CONFIG_FILE")"
+	if is_valid_dns_port "$dnsmasq_port"; then
+		chosen_port="$dnsmasq_port"
+	elif is_valid_dns_port "$old_port"; then
+		chosen_port="$old_port"
+	elif is_valid_dns_port "$legacy_port"; then
+		chosen_port="$legacy_port"
+	elif is_valid_dns_port "$yaml_port"; then
+		chosen_port="$yaml_port"
+	else
+		chosen_port=53335
+	fi
+
+	chosen_port="$(canonical_port "$chosen_port")"
+	rewrite_migrated_dns_port "$chosen_port" "$TARGET_CONFIG_FILE" || return 1
+	set_upper_option redirect redirect || return 1
+
+	if uci -q get dhcp.@dnsmasq[0] >/dev/null 2>&1 &&
+	   [ "$(uci -q get dhcp.@dnsmasq[0].port)" != 53 ]; then
+		uci -q set dhcp.@dnsmasq[0].port='53' || return 1
+		DHCP_CHANGED=1
+	fi
+}
+
+remove_obsolete_options() {
+	local option
+
+	for option in \
+		configpath binpath logfile waitonboot core_version upxflag update_url hashpass \
+		crontab upprotect backupfile backupwdpath lastworkdir lastlogfile \
+		gfwupstream gfwlistmd5 ipsetlistmd5 hostsmd5 \
+		dnsport httpport old_redirect old_port old_enabled ucitracktest; do
+		delete_upper_option "$option" || return 1
+	done
+}
+
+sync_official_config() {
+	local enabled verbose
+
+	enabled="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.enabled")")"
+	verbose="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.verbose")")"
+	ensure_lower_section || return 1
+	set_lower_option enabled "$enabled" || return 1
+	set_lower_option config_file "$TARGET_CONFIG_FILE" || return 1
+	set_lower_option work_dir "$TARGET_WORK_DIR" || return 1
+	set_lower_option verbose "$verbose" || return 1
+	delete_lower_option config || return 1
+	delete_lower_option workdir || return 1
+}
+
+remove_legacy_cron_jobs() {
+	[ -f "$CRON_FILE" ] || return 0
+	grep -Eq '/usr/share/AdGuardHome/(update_core|gfw2adg|gfwipset2adg|addhost|tailto)\.sh' "$CRON_FILE" || return 0
+
+	sed -i \
+		-e '/\/usr\/share\/AdGuardHome\/update_core\.sh/d' \
+		-e '/\/usr\/share\/AdGuardHome\/gfw2adg\.sh/d' \
+		-e '/\/usr\/share\/AdGuardHome\/gfwipset2adg\.sh/d' \
+		-e '/\/usr\/share\/AdGuardHome\/addhost\.sh/d' \
+		-e '/\/usr\/share\/AdGuardHome\/tailto\.sh/d' \
+		"$CRON_FILE" || return 1
+	/etc/init.d/cron reload >/dev/null 2>&1 || true
+}
+
+keep_active_config() {
+	[ -z "$IPKG_INSTROOT" ] || return 0
+	mkdir -p "${KEEP_FILE%/*}" || return 1
+	touch "$KEEP_FILE" || return 1
+	grep -Fqx "$TARGET_CONFIG_FILE" "$KEEP_FILE" 2>/dev/null || printf '%s\n' "$TARGET_CONFIG_FILE" >>"$KEEP_FILE"
+}
+
+secure_active_config() {
+	local target_data="${TARGET_WORK_DIR}/data"
+	# APK preserves modified conffiles during upgrades, including their old
+	# mode.  Enforce the official service's private-directory policy on the
+	# active file after every clean install, import, and migration.
+	chmod 0700 "$TARGET_WORK_DIR" || return 1
+	chmod 0600 "$TARGET_CONFIG_FILE" || return 1
+	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
+		if [ ! -d "$target_data" ] || [ -L "$target_data" ]; then
+			echo "Unsafe AdGuard Home data path '$target_data'; refusing to change it." >&2
+			return 1
+		fi
+		chmod 0700 "$target_data" || return 1
+	fi
+}
+
+remove_resolved_upgrade_candidate() {
+	local candidate="$1"
+	[ ! -e "$candidate" ] && [ ! -L "$candidate" ] && return 0
+	if [ ! -f "$candidate" ] || [ -L "$candidate" ]; then
+		echo "Unsafe resolved upgrade candidate '$candidate'; refusing to remove it." >&2
+		return 1
+	fi
+	rm -f "$candidate"
+}
+
+ensure_upper_section || exit 1
+read_official_state
+select_migration_source || exit 1
+TARGET_CONFIG_FILE="${TARGET_WORK_DIR}/AdGuardHome.yaml"
+pause_official_for_import || exit 1
+migrate_runtime_data "$DATA_SOURCE_WORK_DIR" "$TARGET_WORK_DIR" || exit 1
+migrate_yaml "$SOURCE_CONFIG_FILE" "$TARGET_CONFIG_FILE" || exit 1
+rewrite_migrated_workdir_pattern "$DATA_SOURCE_WORK_DIR" "$TARGET_WORK_DIR" \
+	"$TARGET_CONFIG_FILE" || exit 1
+secure_active_config || exit 1
+
+if [ "$IMPORT_OFFICIAL" = 1 ] && [ "$OFFICIAL_WORK_DIR" != "$TARGET_WORK_DIR" ]; then
+	echo "Existing official data remains in '$OFFICIAL_WORK_DIR'; managed workdir is now '$TARGET_WORK_DIR'."
+fi
+
+initialize_upper_options || exit 1
+migrate_legacy_dns_port || exit 1
+migrate_exchange_mode || exit 1
+remove_obsolete_options || exit 1
+sync_official_config || exit 1
+remove_legacy_cron_jobs || exit 1
+keep_active_config || exit 1
+
+[ "$UPPER_CHANGED" = 0 ] || uci -q commit "$UCI_CONFIG" || exit 1
+[ "$LOWER_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || exit 1
+[ "$DHCP_CHANGED" = 0 ] || uci -q commit dhcp || exit 1
+
+if [ -z "$IPKG_INSTROOT" ] && [ "$DHCP_CHANGED" = 1 ]; then
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+fi
+
+resume_paused_official
+trap - 0
+
+if [ "$IS_UPGRADE" = 1 ]; then
+	remove_resolved_upgrade_candidate /etc/config/AdGuardHome.apk-new || exit 1
+	remove_resolved_upgrade_candidate "${DEFAULT_CONFIG_FILE}.apk-new" || exit 1
+fi
+
+rm -f /tmp/luci-app-adguardhome.upgrade
+
 exit 0

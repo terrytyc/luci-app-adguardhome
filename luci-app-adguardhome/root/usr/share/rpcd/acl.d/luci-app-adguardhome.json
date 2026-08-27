@@ -1,19 +1,9 @@
 {
 	"luci-app-adguardhome": {
-		"description": "Grant UCI access for luci-app-adguardhome",
+		"description": "Grant permissions for the AdGuard Home LuCI app",
 		"read": {
-		"file": {
-			"/usr/share/AdGuardHome/addhost.sh": [ "exec" ],
-			"/usr/share/AdGuardHome/AdGuardHome_template.yaml": [ "read" ],
-			"/usr/share/AdGuardHome/getsyslog.sh": [ "exec" ],
-			"/usr/share/AdGuardHome/gfw2adg.sh": [ "exec" ],
-			"/usr/share/AdGuardHome/gfwipset2adg.sh": [ "exec" ],
-			"/usr/share/AdGuardHome/update_core.sh": [ "exec" ],
-			"/usr/share/AdGuardHome/waitnet.sh": [ "exec" ],
-			"/usr/share/AdGuardHome/watchconfig.sh": [ "exec" ],
-			"/etc/init.d/AdGuardHome": [ "exec" ],
-			"/etc/init.d/dnsmasq": [ "exec" ],
-			"/usr/bin/AdGuardHome/AdGuardHome": [ "exec" ]
+			"ubus": {
+				"luci.adguardhome": [ "get_status", "get_version", "get_config_info" ]
 			},
 			"uci": [ "AdGuardHome" ]
 		},

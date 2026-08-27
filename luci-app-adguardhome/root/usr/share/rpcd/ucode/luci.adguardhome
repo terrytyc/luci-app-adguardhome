@@ -1,0 +1,350 @@
+// SPDX-License-Identifier: Apache-2.0
+
+'use strict';
+
+import { lstat, open, popen } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+
+const SERVICE_NAME = 'adguardhome';
+const INSTANCE_NAME = 'adguardhome';
+const VERSION_COMMAND = '/usr/bin/AdGuardHome --version 2>/dev/null';
+const MAX_VERSION_LENGTH = 256;
+const MAX_CONFIG_LENGTH = 1024 * 1024;
+const CONFIG_NAME = 'AdGuardHome';
+const CONFIG_SECTION = 'AdGuardHome';
+const CONFIG_FILENAME = 'AdGuardHome.yaml';
+
+function valid_work_dir(value) {
+	if (type(value) != 'string' ||
+	    !match(value, /^\/[A-Za-z0-9_./+@%:,=-]+$/) ||
+	    match(value, /\/\//) ||
+	    substr(value, length(value) - 1, 1) == '/')
+		return null;
+
+	let components = split(substr(value, 1), '/');
+	if (length(components) < 2 || value == '/tmp' || match(value, /^\/tmp\//) ||
+	    value == '/var' || match(value, /^\/var\//))
+		return null;
+
+	let current = '';
+	for (let component in components) {
+		if (!length(component) || component == '.' || component == '..')
+			return null;
+
+		current += `/${component}`;
+		let metadata = lstat(current);
+		if (metadata?.type == 'link')
+			return null;
+	}
+
+	return value;
+}
+
+function config_path() {
+	let uci = null;
+	let work_dir = null;
+
+	try {
+		uci = cursor();
+		work_dir = valid_work_dir(uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir'));
+	}
+	catch (error) {
+		work_dir = null;
+	}
+
+	if (uci) {
+		try {
+			uci.unload(CONFIG_NAME);
+		}
+		catch (error) {
+			// Failure to unload a read-only cursor does not alter the result.
+		}
+	}
+
+	return work_dir ? `${work_dir}/${CONFIG_FILENAME}` : null;
+}
+
+function read_config() {
+	let path = config_path();
+	let file = null;
+	let content = null;
+	let metadata = null;
+
+	try {
+		metadata = path ? lstat(path) : null;
+		if (!metadata || metadata.type != 'file' || metadata.size <= 0 ||
+		    metadata.size > MAX_CONFIG_LENGTH)
+			return null;
+
+		file = open(path, 'r');
+		if (!file)
+			return null;
+
+		content = file.read(MAX_CONFIG_LENGTH + 1);
+		file.close();
+		file = null;
+	}
+	catch (error) {
+		if (file) {
+			try {
+				file.close();
+			}
+			catch (close_error) {
+				// Ignore cleanup errors and report an unavailable configuration.
+			}
+		}
+
+		return null;
+	}
+
+	if (type(content) != 'string' || !length(content) ||
+	    length(content) > MAX_CONFIG_LENGTH)
+		return null;
+
+	return replace(content, /\r\n?/g, '\n');
+}
+
+function yaml_scalar(value) {
+	value = trim(replace(value, /[ \t]+#.*$/, ''));
+	if (length(value) >= 2) {
+		let first = substr(value, 0, 1);
+		let last = substr(value, length(value) - 1, 1);
+		if ((first == '"' && last == '"') || (first == "'" && last == "'"))
+			value = substr(value, 1, length(value) - 2);
+	}
+
+	return trim(value);
+}
+
+function yaml_section_value(content, section, key) {
+	let lines = split(content, '\n');
+	let first = -1;
+	let last = length(lines);
+	let depth = 0;
+	let sections = 0;
+
+	for (let i = 0; i < length(lines); i++) {
+		let line = lines[i];
+		if (match(line, /^[^ \t#]/) &&
+		    trim(replace(line, /[ \t]+#.*$/, '')) == `${section}:`) {
+			if (first < 0)
+				first = i;
+			sections++;
+		}
+	}
+
+	if (sections != 1)
+		return null;
+
+	for (let i = first + 1; i < length(lines); i++) {
+		if (match(lines[i], /^[^ \t#][^:]*:/)) {
+			last = i;
+			break;
+		}
+	}
+
+	for (let i = first + 1; i < last; i++) {
+		let indent = match(lines[i], /^( +)\S/);
+		if (indent && (!depth || length(indent[1]) < depth))
+			depth = length(indent[1]);
+	}
+
+	if (!depth)
+		return null;
+
+	let found = null;
+	let count = 0;
+	for (let i = first + 1; i < last; i++) {
+		let item = match(lines[i], /^( +)([^:]+):[ \t]*(.*)$/);
+		if (!item || length(item[1]) != depth || trim(item[2]) != key)
+			continue;
+
+		found = yaml_scalar(item[3]);
+		count++;
+	}
+
+	return count == 1 && length(found) ? found : null;
+}
+
+function valid_port(value, allow_dns_port_53) {
+	if (allow_dns_port_53 == null)
+		allow_dns_port_53 = true;
+
+	if (type(value) != 'string' || !match(value, /^[0-9]+$/))
+		return null;
+
+	let port = int(value);
+	if (type(port) != 'int' || port < 1 || port > 65535 ||
+	    (!allow_dns_port_53 && port == 53))
+		return null;
+
+	return port;
+}
+
+function yaml_bool(value) {
+	if (type(value) != 'string')
+		return null;
+
+	switch (lc(value)) {
+		case '1':
+		case 'on':
+		case 'true':
+		case 'yes':
+			return true;
+		case '0':
+		case 'false':
+		case 'no':
+		case 'off':
+			return false;
+		default:
+			return null;
+	}
+}
+
+function valid_dns_name(value) {
+	if (type(value) != 'string' || !length(value) || length(value) > 253 ||
+	    !match(value, /^[A-Za-z0-9.-]+$/))
+		return null;
+
+	let name = value;
+	if (substr(name, length(name) - 1, 1) == '.')
+		name = substr(name, 0, length(name) - 1);
+
+	if (!length(name))
+		return null;
+
+	let labels = split(name, '.');
+	for (let label in labels) {
+		if (!length(label) || length(label) > 63 ||
+		    !match(label, /^[A-Za-z0-9]/) || !match(label, /[A-Za-z0-9]$/))
+			return null;
+	}
+
+	// WHATWG URLs reinterpret names ending in an IPv4-number component
+	// (including abbreviated, octal, and hexadecimal forms) as an IP address.
+	// tls.server_name is a DNS name here, so reject those ambiguous spellings.
+	let final_label = labels[length(labels) - 1];
+	if (match(final_label, /^[0-9]+$/) ||
+	    match(final_label, /^0[xX][0-9A-Fa-f]+$/))
+		return null;
+
+	return value;
+}
+
+function http_port(content) {
+	let address = yaml_section_value(content, 'http', 'address');
+	let matched = address ? match(address, /:([0-9]+)$/) : null;
+	return matched ? valid_port(matched[1]) : null;
+}
+
+function config_info() {
+	let content = read_config();
+	let result = { dns_port: null, web: null };
+	if (!content)
+		return result;
+
+	result.dns_port = valid_port(
+		yaml_section_value(content, 'dns', 'port'),
+		true
+	);
+
+	let tls_enabled = yaml_bool(yaml_section_value(content, 'tls', 'enabled'));
+	if (tls_enabled == null)
+		return result;
+
+	if (tls_enabled) {
+		let host = valid_dns_name(yaml_section_value(content, 'tls', 'server_name'));
+		let port = valid_port(yaml_section_value(content, 'tls', 'port_https'));
+		if (host && port)
+			result.web = { scheme: 'https', host, port };
+	} else {
+		let port = http_port(content);
+		if (port)
+			result.web = { scheme: 'http', host: null, port };
+	}
+
+	return result;
+}
+
+function service_running() {
+	let connection = null;
+	let service = null;
+
+	try {
+		connection = connect();
+		if (connection)
+			service = connection.call('service', 'list', { name: SERVICE_NAME });
+	}
+	catch (error) {
+		service = null;
+	}
+
+	if (connection) {
+		try {
+			connection.disconnect();
+		}
+		catch (error) {
+			// A failed disconnect does not change the status result.
+		}
+	}
+
+	return service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true;
+}
+
+function core_version() {
+	let pipe = null;
+	let output = null;
+	let status = -1;
+
+	try {
+		pipe = popen(VERSION_COMMAND, 'r');
+		if (!pipe)
+			return null;
+
+		output = pipe.read(MAX_VERSION_LENGTH + 1);
+		status = pipe.close();
+		pipe = null;
+	}
+	catch (error) {
+		if (pipe) {
+			try {
+				pipe.close();
+			}
+			catch (close_error) {
+				// Ignore cleanup errors and report an unavailable version.
+			}
+		}
+
+		return null;
+	}
+
+	if (status != 0 || type(output) != 'string' || length(output) > MAX_VERSION_LENGTH)
+		return null;
+
+	let version = trim(split(output, '\n')[0] || '');
+	if (!length(version))
+		return null;
+
+	return substr(version, 0, MAX_VERSION_LENGTH);
+}
+
+const methods = {
+	get_status: {
+		call: function() {
+			return { running: service_running() };
+		},
+	},
+	get_version: {
+		call: function() {
+			return { version: core_version() };
+		},
+	},
+	get_config_info: {
+		call: function() {
+			return config_info();
+		},
+	},
+};
+
+return { 'luci.adguardhome': methods };
