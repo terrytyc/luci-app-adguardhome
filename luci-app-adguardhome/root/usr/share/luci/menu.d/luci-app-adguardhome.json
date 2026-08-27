@@ -3,14 +3,37 @@
 		"title": "AdGuard Home",
 		"order": 11,
 		"action": {
-			"type": "view",
-			"path": "adguardhome/overview"
+			"type": "firstchild"
 		},
 		"depends": {
 			"acl": [ "luci-app-adguardhome" ],
 			"uci": {
 				"AdGuardHome": true
 			}
+		}
+	},
+	"admin/services/adguardhome/settings": {
+		"title": "Settings",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "adguardhome/overview"
+		}
+	},
+	"admin/services/adguardhome/log": {
+		"title": "Runtime Log",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "adguardhome/log"
+		}
+	},
+	"admin/services/adguardhome/yaml": {
+		"title": "YAML Configuration",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "adguardhome/yaml"
 		}
 	}
 }

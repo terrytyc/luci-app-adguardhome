@@ -1,6 +1,6 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-adguardhome 2.0.0\n"
+"Project-Id-Version: luci-app-adguardhome 2.1.0\n"
 "PO-Revision-Date: 2026-08-27 00:00+0800\n"
 "Last-Translator: terrytyc\n"
 "Language-Team: Chinese (Simplified)\n"
@@ -119,3 +119,90 @@ msgstr "工作目录必须在文件系统根目录下至少包含两级路径（
 
 msgid "Working directories under /tmp or /var are volatile on ImmortalWrt and are not allowed."
 msgstr "ImmortalWrt 中 /tmp 或 /var 下的目录是易失存储，不能用作工作目录。"
+
+msgid "Use /etc/AdGuardHome, an /etc/AdGuardHome-* directory, or a dedicated AdGuardHome[-*] directory below /mnt."
+msgstr "请使用 /etc/AdGuardHome、/etc/AdGuardHome-*，或 /mnt 下以 AdGuardHome[-*] 命名的专用目录。"
+
+msgid "Runtime Log"
+msgstr "运行日志"
+
+msgid "View recent service messages from the system log. This page is read-only."
+msgstr "查看系统日志中的近期服务消息；此页面为只读。"
+
+msgid "Lines:"
+msgstr "行数："
+
+msgid "%d lines"
+msgstr "%d 行"
+
+msgid "Refresh"
+msgstr "刷新"
+
+msgid "No log output."
+msgstr "暂无日志输出。"
+
+msgid "Showing up to %d lines (%d returned)."
+msgstr "最多显示 %d 行（实际返回 %d 行）。"
+
+msgid "Unable to read the runtime log: %s"
+msgstr "无法读取运行日志：%s"
+
+msgid "Unknown error"
+msgstr "未知错误"
+
+msgid "YAML Configuration"
+msgstr "YAML 配置"
+
+msgid "Edit the active AdGuard Home configuration file directly."
+msgstr "直接编辑当前生效的 AdGuard Home 配置文件。"
+
+msgid "Saving validates and atomically applies the YAML. A running service is restarted; a disabled service remains stopped."
+msgstr "保存时会校验并原子应用 YAML；服务原本运行时会重启，原本停用时会保持停用。"
+
+msgid "Path"
+msgstr "路径"
+
+msgid "A content hash prevents overwriting changes made after this page was loaded. If a conflict is reported, reload the file and merge your changes before saving. Invalid YAML is rejected without replacing the current file."
+msgstr "内容哈希会防止覆盖页面加载后产生的新改动。若报告冲突，请重新载入文件并合并改动后再保存。无效 YAML 会被拒绝，不会替换当前文件。"
+
+msgid "Validate, Save & Apply"
+msgstr "校验、保存并应用"
+
+msgid "Reload from disk"
+msgstr "从磁盘重新载入"
+
+msgid "Unable to read the YAML configuration: %s"
+msgstr "无法读取 YAML 配置：%s"
+
+msgid "The YAML configuration is unavailable."
+msgstr "YAML 配置不可用。"
+
+msgid "The YAML configuration was reloaded from disk."
+msgstr "已从磁盘重新载入 YAML 配置。"
+
+msgid "Save YAML Configuration"
+msgstr "保存 YAML 配置"
+
+msgid "The configuration will be validated and applied atomically. A running service will restart; a disabled service will remain stopped. Continue?"
+msgstr "配置将接受校验并原子应用；服务原本运行时会重启，原本停用时会保持停用。是否继续？"
+
+msgid "Cancel"
+msgstr "取消"
+
+msgid "The server rejected the YAML configuration. Check its syntax and protected settings."
+msgstr "服务器拒绝了 YAML 配置。请检查语法及受保护的设置。"
+
+msgid "The YAML configuration was saved and AdGuard Home restarted successfully."
+msgstr "YAML 配置已保存，AdGuard Home 已成功重启。"
+
+msgid "The YAML configuration was saved."
+msgstr "YAML 配置已保存。"
+
+msgid "The YAML configuration was saved, but the editor could not reload it: %s"
+msgstr "YAML 配置已保存，但编辑器无法重新载入：%s"
+
+msgid "Unable to save the YAML configuration: %s"
+msgstr "无法保存 YAML 配置：%s"
+
+msgid "If the file changed since it was loaded, reload it and merge your changes. Otherwise, check the YAML syntax and protected settings."
+msgstr "若文件在加载后已发生变化，请重新载入并合并改动；否则请检查 YAML 语法和受保护的设置。"

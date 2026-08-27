@@ -3,11 +3,14 @@
 		"description": "Grant permissions for the AdGuard Home LuCI app",
 		"read": {
 			"ubus": {
-				"luci.adguardhome": [ "get_status", "get_version", "get_config_info" ]
+				"luci.adguardhome": [ "get_status", "get_version", "get_config_info", "get_log" ]
 			},
 			"uci": [ "AdGuardHome" ]
 		},
 		"write": {
+			"ubus": {
+				"luci.adguardhome": [ "get_yaml", "set_yaml" ]
+			},
 			"uci": [ "AdGuardHome" ]
 		}
 	}

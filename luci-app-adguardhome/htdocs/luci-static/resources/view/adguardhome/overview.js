@@ -188,12 +188,21 @@ function validateWorkDir(_sectionId, value) {
 	if (segments.includes('.') || segments.includes('..'))
 		return _('Path must not contain "." or ".." components.');
 
-	if (segments.filter(Boolean).length < 2)
+	const components = segments.filter(Boolean);
+	if (components.length < 2)
 		return _('The working directory must contain at least two path components below the filesystem root (for example, /etc/AdGuardHome).');
 
 	if (value === '/tmp' || value.startsWith('/tmp/') ||
 	    value === '/var' || value.startsWith('/var/'))
 		return _('Working directories under /tmp or /var are volatile on ImmortalWrt and are not allowed.');
+
+	const leaf = components[components.length - 1];
+	const dedicatedLeaf = leaf === 'AdGuardHome' ||
+		(leaf.startsWith('AdGuardHome-') && leaf.length > 'AdGuardHome-'.length);
+	const dedicatedEtc = components[0] === 'etc' && components.length === 2;
+	const dedicatedMount = components[0] === 'mnt' && components.length >= 3;
+	if (!dedicatedLeaf || (!dedicatedEtc && !dedicatedMount))
+		return _('Use /etc/AdGuardHome, an /etc/AdGuardHome-* directory, or a dedicated AdGuardHome[-*] directory below /mnt.');
 
 	return true;
 }
@@ -261,16 +270,11 @@ return view.extend({
 		);
 		section.addremove = false;
 
-		section.tab('general', _('General Settings'));
-		section.tab('dns', _('DNS Integration'));
-		section.tab('paths', _('Paths'));
-
-		let option = section.taboption('general', form.Flag, 'enabled', _('Enable'));
+		let option = section.option(form.Flag, 'enabled', _('Enable'));
 		option.default = '0';
 		option.rmempty = false;
 
-		option = section.taboption(
-			'dns',
+		option = section.option(
 			form.ListValue,
 			'redirect',
 			_('DNS redirect mode'),
@@ -282,8 +286,7 @@ return view.extend({
 		option.default = 'dnsmasq-upstream';
 		option.rmempty = false;
 
-		option = section.taboption(
-			'paths',
+		option = section.option(
 			form.Value,
 			'workdir',
 			_('Working directory'),
@@ -294,7 +297,7 @@ return view.extend({
 		option.rmempty = false;
 		option.validate = validateWorkDir;
 
-		option = section.taboption('general', form.Flag, 'verbose', _('Verbose logging'));
+		option = section.option(form.Flag, 'verbose', _('Verbose logging'));
 		option.default = '0';
 		option.rmempty = false;
 

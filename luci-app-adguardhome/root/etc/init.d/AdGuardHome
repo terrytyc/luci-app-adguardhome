@@ -16,6 +16,12 @@ OFFICIAL_SERVICE="/etc/init.d/adguardhome"
 DEFAULT_WORK_DIR="/etc/AdGuardHome"
 DEFAULT_CONFIG_FILE="${DEFAULT_WORK_DIR}/AdGuardHome.yaml"
 CORE_BINARY="/usr/bin/AdGuardHome"
+ADGUARD_UID=853
+ADGUARD_GID=853
+MAX_YAML_SIZE=524288
+MAX_TLS_FILE_SIZE=1048576
+MANAGED_JAIL_OPTION="managed_jail_mount"
+MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
 
 INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
 MONITOR_INTERVAL=2
@@ -38,10 +44,14 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config yaml_update tls_refresh"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
-\treconcile\t\tReconcile DNS integration with the core state"
+\treconcile\t\tReconcile DNS integration with the core state
+\tweb_listening <port>\tVerify an official-core TCP listener
+\tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
+\tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
+\ttls_refresh\t\tRecheck ACME material after renewal"
 
 log_error() {
 	logger -t AdGuardHome "$*"
@@ -97,14 +107,69 @@ validate_work_dir() {
 	[ -n "$value" ] && [ "$value" != / ] && ! path_contains_symlink "$value"
 }
 
-validate_managed_work_dir() {
+validate_mnt_ancestors() {
+	local value="${1%/}" parent remaining component current="" metadata mode owner
+	local links group remainder
+	case "$value" in /mnt/*) ;; *) return 0 ;; esac
+	parent="${value%/*}"
+	remaining="${parent#/}"
+	while [ -n "$remaining" ]; do
+		component="${remaining%%/*}"
+		current="${current}/${component}"
+		if [ -e "$current" ] || [ -L "$current" ]; then
+			if [ ! -d "$current" ] || [ -L "$current" ]; then
+				log_error "Untrusted work-directory ancestor: '$current'"
+				return 1
+			fi
+			metadata="$(LC_ALL=C ls -ldn "$current" 2>/dev/null)" || return 1
+			read -r mode links owner group remainder <<-EOF
+			$metadata
+			EOF
+			if [ "$owner" != 0 ]; then
+				log_error "Work-directory ancestor is not root-owned: '$current'"
+				return 1
+			fi
+			case "$mode" in
+				?????w*|????????w*)
+					log_error "Work-directory ancestor is group/world-writable: '$current'"
+					return 1
+					;;
+			esac
+		fi
+		[ "$remaining" = "$component" ] && break
+		remaining="${remaining#*/}"
+	done
+}
+
+validate_managed_work_dir_namespace() {
+	local value="${1%/}"
 	validate_work_dir "$1" || return 1
-	case "${1%/}" in
-		/tmp|/tmp/*|/var|/var/*)
-			log_error "Working directories under /tmp or /var are volatile and are not allowed: '$1'"
+	case "$value" in
+		/etc/AdGuardHome|/etc/AdGuardHome-?*|/mnt/*/AdGuardHome|/mnt/*/AdGuardHome-?*)
+			;;
+		*)
+			log_error "Work directory is outside the dedicated AdGuard Home namespace: '$value'"
 			return 1
 			;;
 	esac
+	validate_mnt_ancestors "$value"
+}
+
+validate_managed_work_dir() {
+	local value="${1%/}" official_work official_config
+	validate_managed_work_dir_namespace "$1" || return 1
+	[ "$value" = "$DEFAULT_WORK_DIR" ] && return 0
+	[ -e "$value" ] || [ -L "$value" ] || return 0
+	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	[ -n "$official_work" ] ||
+		official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	official_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	if [ "${official_work%/}" = "$value" ] &&
+	   [ "$official_config" = "${value}/AdGuardHome.yaml" ]; then
+		return 0
+	fi
+	log_error "Refusing an existing custom work directory not anchored by official adguardhome UCI: '$value'"
+	return 1
 }
 
 path_contains_symlink() {
@@ -164,13 +229,21 @@ load_legacy_settings() {
 # packaged value 53335 is only present in the clean-install template; an
 # existing missing or invalid value must fail closed instead of being replaced.
 load_runtime_dns_port() {
-	local value address web_port
+	local value address web_port directory snapshot
 	if [ ! -f "$config_file" ] || [ -L "$config_file" ]; then
 		log_error "Config file is unavailable while reading the DNS port: ${config_file}"
 		return 1
 	fi
-
-	value="$(yaml_get_section_value dns port "$config_file")"
+	directory="$(mktemp -d /tmp/AdGuardHome-runtime.XXXXXX)" || return 1
+	snapshot="${directory}/AdGuardHome.yaml"
+	if ! snapshot_config_file "$config_file" "$snapshot" "" ""; then
+		rm -rf "$directory"
+		log_error "Unable to take a safe YAML snapshot: ${config_file}"
+		return 1
+	fi
+	value="$(yaml_get_section_value dns port "$snapshot")"
+	address="$(yaml_get_section_value http address "$snapshot")"
+	rm -rf "$directory" || return 1
 	is_valid_port "$value" || {
 		log_error "Invalid or ambiguous dns.port in ${config_file}"
 		return 1
@@ -181,7 +254,6 @@ load_runtime_dns_port() {
 		return 1
 	fi
 
-	address="$(yaml_get_section_value http address "$config_file")"
 	if [ -n "$address" ]; then
 		case "$address" in
 			*:*) web_port="${address##*:}" ;;
@@ -234,13 +306,17 @@ yaml_get_section_value() {
 install_yaml_temp() {
 	local generated="$1" file="$2" replacement
 	replacement="$(mktemp "${file}.install.XXXXXX")" || return 1
-	# BusyBox in ImmortalWrt 25.12.1 does not provide stat(1).  Seed a
-	# separate inode with cp -p so ownership and mode are retained, then write
-	# the generated content into that inode before the atomic rename.
-	if ! cp -p "$file" "$replacement" || ! cat "$generated" >"$replacement"; then
+	# The generated file is already root-private.  Do not root-copy the
+	# replaceable source pathname merely to preserve metadata; apply the narrow
+	# managed permissions directly to the new inode before the atomic rename.
+	if ! cat "$generated" >"$replacement"; then
 		rm -f "$replacement"
 		return 1
 	fi
+	chmod 0600 "$replacement" || {
+		rm -f "$replacement"
+		return 1
+	}
 	rm -f "$generated" || {
 		rm -f "$replacement"
 		return 1
@@ -322,26 +398,68 @@ yaml_replace_section_list_item() {
 	esac
 }
 
-secure_active_config() {
-	local data_dir="${work_dir}/data"
+secure_active_paths() {
+	local data_dir="${work_dir}/data" metadata mode links owner group remainder
 	[ -d "$work_dir" ] || return 1
 	[ ! -L "$work_dir" ] || return 1
 	[ -f "$config_file" ] || return 1
 	[ ! -L "$config_file" ] || return 1
 	path_contains_symlink "$work_dir" && return 1
-	chmod 0700 "$work_dir" || return 1
-	chmod 0600 "$config_file" || return 1
+	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	case "$owner:$group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		*) return 1 ;;
+	esac
 	if [ -e "$data_dir" ] || [ -L "$data_dir" ]; then
 		if [ ! -d "$data_dir" ] || [ -L "$data_dir" ]; then
 			log_error "Unsafe AdGuard Home data path: ${data_dir}"
 			return 1
 		fi
-		chmod 0700 "$data_dir" || return 1
 	fi
 }
 
+secure_active_config() {
+	local directory snapshot
+	secure_active_paths || return 1
+	directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || return 1
+	snapshot="${directory}/AdGuardHome.yaml"
+	if ! snapshot_config_file "$config_file" "$snapshot" "" ""; then
+		rm -rf "$directory"
+		return 1
+	fi
+	rm -rf "$directory"
+}
+
+secure_config_inode() {
+	local inode_path="$1" metadata mode owner links group remainder
+	case "$inode_path" in /proc/self/fd/[0-9]*|/proc/[0-9]*/fd/[0-9]*) ;; *) return 1 ;; esac
+	[ -f "$inode_path" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	case "$owner" in
+		0)
+			chown 0:0 "$inode_path" && chmod 0600 "$inode_path"
+			;;
+		"$ADGUARD_UID")
+			# A previously-running official service owns the workdir.  Keep an
+			# edited, root-owned YAML group-readable so disabled -> edit -> enable
+			# can still be opened by the official uid without making it writable.
+			chown "0:${ADGUARD_GID}" "$inode_path" && chmod 0640 "$inode_path"
+			;;
+		*)
+			log_error "Unexpected AdGuard Home work-directory owner: ${owner}"
+			return 1
+			;;
+	esac
+}
+
 ensure_config_file() {
-	local previous_config source tmp
+	local previous_config source directory candidate candidate_hash
 	if [ -L "$config_file" ]; then
 		log_error "The AdGuard Home configuration file must not be a symlink: ${config_file}"
 		return 1
@@ -358,20 +476,26 @@ ensure_config_file() {
 		[ "$source" != "$config_file" ] || continue
 		[ -f "$source" ] || continue
 		[ ! -L "$source" ] || continue
-		tmp="$(mktemp "${config_file}.new.XXXXXX")" || return 1
-		if ! cp -p "$source" "$tmp"; then
-			rm -f "$tmp"
+		directory="$(mktemp -d /tmp/AdGuardHome-seed.XXXXXX)" || return 1
+		candidate="${directory}/AdGuardHome.yaml"
+		if ! snapshot_config_file "$source" "$candidate" "" ""; then
+			rm -rf "$directory"
 			return 1
 		fi
+		candidate_hash="$(yaml_file_hash "$candidate")" || {
+			rm -rf "$directory"
+			return 1
+		}
 		if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-			rm -f "$tmp"
+			rm -rf "$directory"
 			log_error "Configuration path appeared while migrating: ${config_file}"
 			return 1
 		fi
-		mv "$tmp" "$config_file" || {
-			rm -f "$tmp"
+		install_config_candidate "$candidate" absent "$candidate_hash" "" || {
+			rm -rf "$directory"
 			return 1
 		}
+		rm -rf "$directory" || return 1
 		secure_active_config
 		return
 	done
@@ -382,8 +506,58 @@ ensure_config_file() {
 # Preserve the official core's runtime history and filter data when the managed
 # work directory changes.  Copy into an atomic sibling first, keep the source
 # untouched for rollback, and refuse to merge with an unrelated target tree.
+uid853_tree_is_plain() {
+	local tree="$1"
+	[ -d "$tree" ] && [ ! -L "$tree" ] || return 1
+	# $1 and found intentionally expand only in the lowered child shell.
+	# shellcheck disable=SC2016
+	/usr/bin/timeout -k 2s 30s \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHDataScan -x /bin/sh -- -c '
+			set -o pipefail
+			found="$(/usr/bin/find "$1" ! -type f ! -type d -print 2>/dev/null |
+				/usr/bin/head -n 1)" || exit 1
+			[ -z "$found" ]
+		' sh "$tree" >/dev/null 2>&1
+}
+
+uid853_read_small_file() {
+	/usr/bin/timeout -k 1s 3s \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHDataRead -x /bin/dd -- if="$1" bs=4096 count=1 2>/dev/null
+}
+
+restore_migration_workdir_access() {
+	chown "$2:$3" "$1" && chmod 0700 "$1"
+}
+
+read_migration_marker() {
+	local marker="$1" metadata mode links owner group remainder value
+	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	case "$owner:$group:$mode" in
+		"$ADGUARD_UID":"$ADGUARD_GID":drwx------)
+			uid853_read_small_file "$marker"
+			return
+			;;
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------) ;;
+		*) return 1 ;;
+	esac
+	value="$(
+		trap 'restore_migration_workdir_access "$work_dir" "$owner" "$group" >/dev/null 2>&1 || true' EXIT
+		chown "0:${ADGUARD_GID}" "$work_dir" && chmod 0710 "$work_dir" || exit 1
+		uid853_read_small_file "$marker" || exit 1
+		restore_migration_workdir_access "$work_dir" "$owner" "$group" || exit 1
+		trap - EXIT
+	)" || return 1
+	printf '%s' "$value"
+}
+
 migrate_work_data() {
-	local old_work source_data target_data marker temporary
+	local old_work source_data target_data marker temporary marker_value metadata
+	local mode links original_owner original_group remainder
 	old_work="${previous_work_dir%/}"
 	[ -n "$old_work" ] || return 0
 	[ "$old_work" != "$work_dir" ] || return 0
@@ -392,52 +566,85 @@ migrate_work_data() {
 	target_data="${work_dir}/data"
 	marker="${target_data}/.luci-app-adguardhome-migrated-from"
 	[ -d "$source_data" ] || return 0
-	if [ -L "$source_data" ] || path_contains_symlink "$old_work"; then
+	if [ -L "$source_data" ] || path_contains_symlink "$old_work" ||
+	   ! uid853_tree_is_plain "$source_data"; then
 		log_error "Refusing to migrate data through a symlinked source: ${source_data}"
 		return 1
 	fi
 	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
-		if [ -f "$marker" ] && [ "$(cat "$marker" 2>/dev/null)" = "$old_work" ]; then
-			chmod 0700 "$target_data" || return 1
+		marker_value=""
+		if [ -f "$marker" ] && [ ! -L "$marker" ]; then
+			marker_value="$(read_migration_marker "$marker")" || marker_value=""
+		fi
+		if [ "$marker_value" = "$old_work" ]; then
 			return 0
 		fi
 		log_error "Target data directory already exists; refusing to overwrite it: ${target_data}"
 		return 1
 	fi
 	temporary="$(mktemp -d "${work_dir}/.data-migration.XXXXXX")" || return 1
-	if ! cp -pR "${source_data}/." "$temporary/"; then
+	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || {
+		rm -rf "$temporary"
+		return 1
+	}
+	read -r mode links original_owner original_group remainder <<-EOF
+	$metadata
+	EOF
+	case "$original_owner:$original_group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		*)
+			rm -rf "$temporary"
+			return 1
+			;;
+	esac
+	# Give uid 853 only traverse access to the parent during the copy; it can
+	# write solely inside the dedicated temporary directory.  The EXIT trap
+	# restores the exact owner/group and mode even on timeout or signal.
+	if ! (
+		target_installed=0
+		trap '[ "$target_installed" != 1 ] || rm -rf "$target_data"; restore_migration_workdir_access "$work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
+		chown "0:${ADGUARD_GID}" "$work_dir" && chmod 0710 "$work_dir" || exit 1
+		chown "${ADGUARD_UID}:${ADGUARD_GID}" "$temporary" &&
+			chmod 0700 "$temporary" || exit 1
+		# The source tree is controlled by the official uid.  Copy as that uid so
+		# a path substitution cannot make root read host secrets; scan again to
+		# reject any symlink introduced during the copy.
+		/usr/bin/timeout -k 2s 120s \
+			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+			-n AGHDataCopy -x /bin/cp -- -pR "${source_data}/." "$temporary/" || exit 1
+		uid853_tree_is_plain "$temporary" || exit 1
+		printf '%s\n' "$old_work" | /usr/bin/timeout -k 1s 3s \
+			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+			-n AGHDataMark -x /bin/dd -- \
+			of="${temporary}/.luci-app-adguardhome-migrated-from" \
+			bs=4096 count=1 2>/dev/null || exit 1
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+			-n AGHDataMode -x /bin/chmod -- 0600 \
+			"${temporary}/.luci-app-adguardhome-migrated-from" || exit 1
+		uid853_tree_is_plain "$temporary" || exit 1
+		[ ! -e "$target_data" ] && [ ! -L "$target_data" ] || exit 1
+		target_installed=1
+		mv "$temporary" "$target_data" || exit 1
+		[ -d "$target_data" ] && [ ! -L "$target_data" ] || exit 1
+		restore_migration_workdir_access "$work_dir" \
+			"$original_owner" "$original_group" || exit 1
+		target_installed=0
+		trap - EXIT
+	); then
 		rm -rf "$temporary"
 		return 1
 	fi
-	printf '%s\n' "$old_work" >"${temporary}/.luci-app-adguardhome-migrated-from" || {
-		rm -rf "$temporary"
-		return 1
-	}
-	chmod 0600 "${temporary}/.luci-app-adguardhome-migrated-from" || {
-		rm -rf "$temporary"
-		return 1
-	}
-	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
-		rm -rf "$temporary"
-		log_error "Target data path appeared during migration: ${target_data}"
-		return 1
-	fi
-	mv "$temporary" "$target_data" || {
-		rm -rf "$temporary"
-		return 1
-	}
-	chmod 0700 "$target_data" || return 1
 	log_error "Copied AdGuard Home runtime data from ${source_data} to ${target_data}"
 }
 
 sync_yaml_workdir_pattern() {
-	local old_pattern desired_pattern replace_rc=0
+	local target_file="${1:-$config_file}" old_pattern desired_pattern replace_rc=0
 	[ -n "$previous_work_dir" ] || return 0
 	old_pattern="${previous_work_dir%/}/data/userfilters/*"
 	desired_pattern="${work_dir}/data/userfilters/*"
 	[ "$old_pattern" != "$desired_pattern" ] || return 0
 	yaml_replace_section_list_item filtering safe_fs_patterns \
-		"$old_pattern" "$desired_pattern" "$config_file" || replace_rc=$?
+		"$old_pattern" "$desired_pattern" "$target_file" || replace_rc=$?
 	case "$replace_rc" in
 		0|3) ;;
 		*) return 1 ;;
@@ -445,60 +652,324 @@ sync_yaml_workdir_pattern() {
 }
 
 sync_yaml_managed_fields() {
-	sync_yaml_workdir_pattern
+	sync_yaml_workdir_pattern "$1"
 }
 
-check_core_config() {
-	local validation rc
+root_private_config_source() {
+	local candidate="$1" parent mode
+	parent="${candidate%/*}"
+	[ -n "$parent" ] || parent=/
+	[ -O "$candidate" ] && [ -O "$parent" ] || return 1
+	path_contains_symlink "$parent" && return 1
+	mode="$(LC_ALL=C ls -ldn "$parent" 2>/dev/null)" || return 1
+	mode="${mode%% *}"
+	# Reject group- or world-writable parents.  A root-owned file under such a
+	# directory could still be renamed between the identity check and open.
+	case "$mode" in ?????w*|????????w*) return 1 ;; esac
+}
+
+snapshot_config_file() {
+	local candidate="$1" target="$2" expected_hash="$3" inherited_fd="$4"
+	local allow_detached="$5" fd_path size hash capture_rc=0
+	if [ -n "$inherited_fd" ]; then
+		case "$inherited_fd" in ""|*[!0-9]*) return 1 ;; esac
+		[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
+		fd_path="/proc/$$/fd/${inherited_fd}"
+		[ -f "$fd_path" ] || return 1
+		if [ "$allow_detached" != 1 ]; then
+			[ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+			[ "$fd_path" -ef "$candidate" ] || return 1
+		fi
+		/usr/bin/timeout -k 1s 3s /bin/dd if="$fd_path" bs=4096 count=129 \
+			of="$target" 2>/dev/null || capture_rc=$?
+		[ "$capture_rc" = 0 ] || return 1
+		# The pathname is needed later for a same-filesystem rename.  Reject an
+		# unlink or replacement that occurred while the held inode was copied.
+		if [ "$allow_detached" != 1 ]; then
+			[ -f "$candidate" ] && [ ! -L "$candidate" ] &&
+				[ "$fd_path" -ef "$candidate" ] || return 1
+		fi
+	else
+		[ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+		# A root-owned private workdir cannot be renamed by uid 853 (clean,
+		# disabled installation).  Otherwise capture as uid 853 so a concurrent
+		# symlink swap can never grant the snapshotter root read access.
+		if root_private_config_source "$candidate"; then
+			capture_root_file_bytes "$candidate" "$target" 129 || capture_rc=$?
+		else
+			/usr/bin/timeout -k 1s 3s \
+				/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+				-n AGHSnapshot -x /bin/dd -- if="$candidate" bs=4096 count=129 \
+				>"$target" 2>/dev/null || capture_rc=$?
+		fi
+		[ "$capture_rc" = 0 ] || return 1
+	fi
+	size="$(wc -c <"$target" 2>/dev/null)" || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || return 1
+	hash="$(yaml_file_hash "$target")" || return 1
+	if [ -n "$expected_hash" ]; then
+		[ "$hash" = "$expected_hash" ] || return 1
+	fi
+	SNAPSHOT_CONFIG_HASH="$hash"
+}
+
+check_core_config_file() {
+	local candidate="$1" expected_hash="$2" inherited_fd="$3" repair_tls="$4"
+	local validation_dir validation_work validation rc
 	[ -x "$CORE_BINARY" ] || {
 		log_error "AdGuard Home binary is missing: ${CORE_BINARY}"
 		return 1
 	}
-	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
-	validation="$(mktemp "${config_file}.check.XXXXXX")" || return 1
-	if ! cp -p "$config_file" "$validation"; then
-		rm -f "$validation"
+	[ -x /usr/bin/timeout ] || {
+		log_error "The required coreutils timeout helper is missing"
+		return 1
+	}
+	[ -x /sbin/start-stop-daemon ] || {
+		log_error "The required start-stop-daemon helper is missing"
+		return 1
+	}
+	validation_dir="$(mktemp -d /tmp/AdGuardHome-check.XXXXXX)" || return 1
+	validation="${validation_dir}/AdGuardHome.yaml"
+	validation_work="${validation_dir}/work"
+	mkdir "$validation_work" || {
+		rm -rf "$validation_dir"
+		return 1
+	}
+	if ! snapshot_config_file "$candidate" "$validation" \
+		"$expected_hash" "$inherited_fd"; then
+		rm -rf "$validation_dir"
 		return 1
 	fi
+	# When activating an installed YAML, repair only an allowlisted external
+	# private key and then prove uid-853 readability.  A staged candidate remains
+	# strictly read-only; prepare_tls_validation_files() gives the lowered core
+	# bounded private copies so a first root:root 0600 ACME key can be validated
+	# without changing the live key before commit.
+	if [ "$repair_tls" = 1 ] && ! load_tls_access "$validation"; then
+		rm -rf "$validation_dir"
+		return 1
+	fi
+	if ! prepare_tls_validation_files "$validation" "$validation_dir"; then
+		rm -rf "$validation_dir"
+		return 1
+	fi
+	# Root retains ownership of both path components.  Group 853 may only
+	# traverse the directory and read the disposable YAML, so it cannot replace
+	# the validation pathname before the lowered checker opens it.
+	chown "0:${ADGUARD_GID}" "$validation_dir" "$validation" || {
+		rm -rf "$validation_dir"
+		return 1
+	}
+	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$validation_work" || {
+		rm -rf "$validation_dir"
+		return 1
+	}
+	chmod 0710 "$validation_dir" || {
+		rm -rf "$validation_dir"
+		return 1
+	}
+	chmod 0640 "$validation" || {
+		rm -rf "$validation_dir"
+		return 1
+	}
+	chmod 0700 "$validation_work" || {
+		rm -rf "$validation_dir"
+		return 1
+	}
 	# AdGuard Home may migrate an old schema during --check-config.  Validate a
 	# disposable copy so this helper is genuinely read-only for the active YAML,
-	# including while the official service is running.
-	"$CORE_BINARY" --check-config --config "$validation" \
-		--work-dir "$work_dir" >/dev/null 2>&1
+	# including while the official service is running.  A hard timeout bounds
+	# FIFOs or slow filesystem references in fields not interpreted above, and
+	# uid/gid 853 prevents the checker from reading root-only host files.
+	/usr/bin/timeout -k 2s 15s \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHConfigCheck -x "$CORE_BINARY" -- \
+		--check-config --config "$validation" --work-dir "$validation_work" \
+		>/dev/null 2>&1
 	rc=$?
-	rm -f "$validation" || return 1
+	rm -rf "$validation_dir" || return 1
 	return "$rc"
+}
+
+check_core_config() {
+	# Only the root-owned snapshot is parsed while repairing access for an
+	# external ACME/certs key.  Staged RPC candidates never take that mutating
+	# path.
+	check_core_config_file "$config_file" "" "" 1
+}
+
+valid_config_candidate_path() {
+	local value="$1"
+	case "$value" in
+		""|/|//*|*//*|*/|*[!A-Za-z0-9_./+@%:,=-]*) return 1 ;;
+		/*) ;;
+		*) return 1 ;;
+	esac
+	case "${value}/" in */./*|*/../*) return 1 ;; esac
+	[ -f "$value" ] && [ ! -L "$value" ] || return 1
+	! path_contains_symlink "$value"
+}
+
+# Restricted validator for the clean-install/migration script.  It accepts no
+# UCI state and performs no writes outside a root-owned disposable directory.
+# snapshot_config_file() either uses a root-private source or reads as uid 853,
+# so a pathname race cannot turn this command into a privileged file reader.
+check_config() {
+	local candidate="$1" requested_work_dir="$2"
+	valid_config_candidate_path "$candidate" || return 1
+	# This root-only migration validator may run immediately before the official
+	# lower UCI is anchored to a newly-created custom directory.  Enforce the
+	# namespace and trusted ancestors here; runtime entry points additionally
+	# require the exact existing-directory UCI anchor.
+	validate_managed_work_dir_namespace "$requested_work_dir" || return 1
+	work_dir="${requested_work_dir%/}"
+	check_core_config_file "$candidate"
 }
 
 restore_yaml_backup() {
 	local backup="$1"
-	if [ -L "$config_file" ]; then
-		log_error "Refusing to restore over a configuration symlink: ${config_file}"
-		return 1
-	fi
-	mv -f "$backup" "$config_file"
+	install_config_candidate "$backup" "" ""
 }
 
-# Keep a complete, metadata-preserving copy until the managed workdir rewrite
-# and AdGuard Home's own parser have accepted the result.
+open_fd_hash() {
+	local fd_path="$1" digest
+	[ -f "$fd_path" ] || return 1
+	digest="$(/usr/bin/sha256sum "$fd_path" 2>/dev/null)" || return 1
+	digest="${digest%% *}"
+	case "$digest" in
+		????????????????????????????????????????????????????????????????)
+			case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+			printf '%s\n' "$digest"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+install_config_candidate_attempt() (
+	local source="$1" source_hash="$2" expected_active="$3" stage="$4"
+	local replacement_marker="$5" fd_path size installed_hash current_hash cleanup_stage=""
+	trap '[ -z "$cleanup_stage" ] || rm -f "$cleanup_stage"' EXIT
+	# noclobber makes the redirection an exclusive create.  Keep descriptor 9
+	# open through the pathname identity checks and atomic rename, so root never
+	# writes a stage pathname that uid 853 replaced with a symlink.
+	set -C
+	exec 9>"$stage" || exit 1
+	set +C
+	cleanup_stage="$stage"
+	fd_path=/proc/self/fd/9
+	/bin/cat "$source" >&9 || exit 1
+	[ -f "$fd_path" ] || exit 1
+	size="$(wc -c <"$fd_path" 2>/dev/null)" || exit 1
+	case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
+	installed_hash="$(open_fd_hash "$fd_path")" || exit 1
+	[ "$installed_hash" = "$source_hash" ] || exit 1
+	[ -f "$stage" ] && [ ! -L "$stage" ] && [ "$fd_path" -ef "$stage" ] || exit 1
+	if [ "$expected_active" = absent ]; then
+		[ ! -e "$config_file" ] && [ ! -L "$config_file" ] || exit 1
+	elif [ -n "$expected_active" ]; then
+		current_hash="$(active_config_hash)" || exit 1
+		[ "$current_hash" = "$expected_active" ] || exit 1
+	fi
+	secure_config_inode "$fd_path" || exit 1
+	[ -f "$stage" ] && [ ! -L "$stage" ] && [ "$fd_path" -ef "$stage" ] || exit 1
+	[ -z "$replacement_marker" ] || : >"$replacement_marker" || exit 1
+	mv "$stage" "$config_file" || exit 1
+	cleanup_stage=""
+	[ "$fd_path" -ef "$config_file" ] || exit 1
+	current_hash="$(active_config_hash)" || exit 1
+	[ "$current_hash" = "$source_hash" ] || exit 1
+	exec 9>&-
+)
+
+install_config_candidate() {
+	local source="$1" expected_active="$2" desired_hash="$3"
+	local replacement_marker="$4" source_hash attempt=0 stage
+	[ -f "$source" ] && [ ! -L "$source" ] || return 1
+	root_private_config_source "$source" || return 1
+	source_hash="$(yaml_file_hash "$source")" || return 1
+	[ -z "$desired_hash" ] || [ "$source_hash" = "$desired_hash" ] || return 1
+	if [ -n "$replacement_marker" ]; then
+		case "$replacement_marker" in
+			/tmp/AdGuardHome-managed.??????/install-replaced) ;;
+			*) return 1 ;;
+		esac
+		rm -f "$replacement_marker" || return 1
+	fi
+	while [ "$attempt" -lt 10 ]; do
+		stage="${config_file}.install.$$.$attempt"
+		if install_config_candidate_attempt "$source" "$source_hash" \
+			"$expected_active" "$stage" "$replacement_marker"; then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+	done
+	return 1
+}
+
+# Rewrite only a root-private bounded snapshot.  The official core validates
+# that candidate as uid 853, then the active revision is compared again at the
+# final atomic-install boundary.
 sync_yaml_managed_fields_checked() {
-	local backup
-	backup="$(mktemp "${config_file}.backup.XXXXXX")" || return 1
-	if ! cp -p "$config_file" "$backup"; then
-		rm -f "$backup"
+	local directory backup candidate replacement_marker
+	local expected_hash candidate_hash current_hash
+	directory="$(mktemp -d /tmp/AdGuardHome-managed.XXXXXX)" || return 1
+	backup="${directory}/original.yaml"
+	candidate="${directory}/AdGuardHome.yaml"
+	replacement_marker="${directory}/install-replaced"
+	expected_hash="$(active_config_hash)" || {
+		rm -rf "$directory"
+		return 1
+	}
+	if ! snapshot_config_file "$config_file" "$backup" "$expected_hash" "" ||
+	   ! /bin/cp "$backup" "$candidate" ||
+	   ! chmod 0600 "$candidate" ||
+	   ! sync_yaml_managed_fields "$candidate"; then
+		rm -rf "$directory"
+		log_error "Unable to update the managed YAML fields"
 		return 1
 	fi
-	if ! sync_yaml_managed_fields; then
-		log_error "Unable to update the managed YAML fields; restoring the original file"
-		restore_yaml_backup "$backup" || return 1
+	candidate_hash="$(yaml_file_hash "$candidate")" || {
+		rm -rf "$directory"
+		return 1
+	}
+	if [ "$candidate_hash" = "$expected_hash" ]; then
+		rm -rf "$directory"
+		return 0
+	fi
+	if ! check_core_config_file "$candidate" "$candidate_hash" "" 1; then
+		rm -rf "$directory"
+		log_error "AdGuard Home rejected the managed YAML candidate"
 		return 1
 	fi
-	if ! check_core_config; then
-		log_error "AdGuard Home rejected the updated YAML; restoring the original file"
-		restore_yaml_backup "$backup" || return 1
+	current_hash="$(active_config_hash)" || {
+		rm -rf "$directory"
+		return 1
+	}
+	if [ "$current_hash" != "$expected_hash" ]; then
+		rm -rf "$directory"
+		log_error "The active YAML changed during its managed-field update"
 		return 1
 	fi
-	rm -f "$backup"
+	if ! install_config_candidate "$candidate" "$expected_hash" \
+		"$candidate_hash" "$replacement_marker"; then
+		if [ -f "$replacement_marker" ] && [ ! -L "$replacement_marker" ]; then
+			if install_config_candidate "$backup" "" "$expected_hash" ""; then
+				rm -rf "$directory"
+				log_error "Restored the active YAML after a failed managed-field install"
+				return 1
+			fi
+			chmod 0700 "$directory" >/dev/null 2>&1 || true
+			chmod 0600 "$backup" >/dev/null 2>&1 || true
+			log_error "Preserved the original YAML after restore failure: ${backup}"
+			return 1
+		fi
+		rm -rf "$directory"
+		log_error "The managed YAML candidate was not installed"
+		return 1
+	fi
+	rm -rf "$directory"
 }
 
 uci_set_if_changed() {
@@ -516,6 +987,440 @@ uci_delete_if_present() {
 	UCI_CHANGED=1
 }
 
+line_list_contains() {
+	local needle="$1" list="$2" item
+	[ -n "$list" ] || return 1
+	while IFS= read -r item; do
+		[ "$item" = "$needle" ] && return 0
+	done <<-EOF
+	$list
+	EOF
+	return 1
+}
+
+append_tls_desired_mount() {
+	local value="$1"
+	line_list_contains "$value" "$TLS_DESIRED_MOUNTS" && return 0
+	if [ -n "$TLS_DESIRED_MOUNTS" ]; then
+		TLS_DESIRED_MOUNTS="${TLS_DESIRED_MOUNTS}
+${value}"
+	else
+		TLS_DESIRED_MOUNTS="$value"
+	fi
+}
+
+append_tls_old_mount() {
+	local value="$1"
+	line_list_contains "$value" "$TLS_OLD_MOUNTS" && return 0
+	if [ -n "$TLS_OLD_MOUNTS" ]; then
+		TLS_OLD_MOUNTS="${TLS_OLD_MOUNTS}
+${value}"
+	else
+		TLS_OLD_MOUNTS="$value"
+	fi
+}
+
+append_tls_new_managed_mount() {
+	local value="$1"
+	line_list_contains "$value" "$TLS_NEW_MANAGED_MOUNTS" && return 0
+	if [ -n "$TLS_NEW_MANAGED_MOUNTS" ]; then
+		TLS_NEW_MANAGED_MOUNTS="${TLS_NEW_MANAGED_MOUNTS}
+${value}"
+	else
+		TLS_NEW_MANAGED_MOUNTS="$value"
+	fi
+}
+
+append_tls_original_mount() {
+	local value="$1"
+	if [ -n "$TLS_ORIGINAL_MOUNTS" ]; then
+		TLS_ORIGINAL_MOUNTS="${TLS_ORIGINAL_MOUNTS}
+${value}"
+	else
+		TLS_ORIGINAL_MOUNTS="$value"
+	fi
+	if line_list_contains "$value" "$TLS_OLD_MOUNTS" ||
+	   line_list_contains "$value" "$TLS_PRESERVED_MOUNTS"; then
+		return 0
+	fi
+	if [ -n "$TLS_PRESERVED_MOUNTS" ]; then
+		TLS_PRESERVED_MOUNTS="${TLS_PRESERVED_MOUNTS}
+${value}"
+	else
+		TLS_PRESERVED_MOUNTS="$value"
+	fi
+}
+
+collect_tls_old_mount() {
+	append_tls_old_mount "$1"
+}
+
+collect_tls_official_mount() {
+	append_tls_original_mount "$1"
+}
+
+derive_tls_new_managed_mounts() {
+	local value
+	TLS_NEW_MANAGED_MOUNTS=""
+	[ -n "$TLS_DESIRED_MOUNTS" ] || return 0
+	while IFS= read -r value; do
+		[ -n "$value" ] || continue
+		# Continue owning mounts recorded by this package.  A desired mount
+		# already present without such a record is user-owned and is preserved,
+		# not silently adopted.  Only a missing desired path becomes new
+		# package-managed state.
+		if line_list_contains "$value" "$TLS_OLD_MOUNTS" ||
+		   ! line_list_contains "$value" "$TLS_ORIGINAL_MOUNTS"; then
+			append_tls_new_managed_mount "$value"
+		fi
+	done <<-EOF
+	$TLS_DESIRED_MOUNTS
+	EOF
+}
+
+valid_tls_path_syntax() {
+	local value="$1"
+	case "$value" in
+		""|/|//*|*//*|*/|*[!A-Za-z0-9_./+@%:,=-]*) return 1 ;;
+		/*) ;;
+		*) return 1 ;;
+	esac
+	case "${value}/" in
+		*/./*|*/../*) return 1 ;;
+	esac
+}
+
+# Require every ancestor of a root-read file to be root-owned.  Writable
+# ancestors are rejected except for the target's top-level /etc (exposed as
+# mode 0777 by this rootfs) and the root-owned sticky /tmp used by mktemp; every
+# deeper ancestor must be non-writable, and the held-FD identity checks below
+# reject replacement before bytes are accepted.
+trusted_root_file_source() {
+	local value="$1" parent remaining component current="" metadata mode owner
+	local links group remainder protected_ancestor=0
+	[ -f "$value" ] && [ ! -L "$value" ] && [ -O "$value" ] || return 1
+	parent="${value%/*}"
+	remaining="${parent#/}"
+	while [ -n "$remaining" ]; do
+		component="${remaining%%/*}"
+		current="${current}/${component}"
+		[ -d "$current" ] && [ ! -L "$current" ] || return 1
+		metadata="$(LC_ALL=C ls -ldn "$current" 2>/dev/null)" || return 1
+		read -r mode links owner group remainder <<-EOF
+		$metadata
+		EOF
+		[ "$owner" = 0 ] || return 1
+		case "$mode" in
+			?????w*|????????w*)
+				case "$current:$mode" in
+					/etc:*) ;;
+					/tmp:drwxrwxrwt) ;;
+					*) return 1 ;;
+				esac
+				;;
+		esac
+		case "$current" in /etc|/tmp) ;; *) protected_ancestor=1 ;; esac
+		[ "$remaining" = "$component" ] && break
+		remaining="${remaining#*/}"
+	done
+	[ "$protected_ancestor" = 1 ]
+}
+
+capture_root_file_bytes() {
+	local source="$1" target="$2" blocks="$3"
+	trusted_root_file_source "$source" || return 1
+	(
+		exec 8<"$source" || exit 1
+		[ -f /proc/self/fd/8 ] || exit 1
+		fd_metadata="$(LC_ALL=C ls -ldnL /proc/self/fd/8 2>/dev/null)" || exit 1
+		read -r fd_mode fd_links fd_owner fd_group fd_remainder <<-EOF
+		$fd_metadata
+		EOF
+		case "$fd_mode" in -*) ;; *) exit 1 ;; esac
+		[ "$fd_owner" = 0 ] || exit 1
+		[ ! -L "$source" ] && [ /proc/self/fd/8 -ef "$source" ] || exit 1
+		/usr/bin/timeout -k 1s 5s /bin/dd if=/proc/self/fd/8 \
+			bs=4096 count="$blocks" of="$target" 2>/dev/null || exit 1
+		[ ! -L "$source" ] && [ /proc/self/fd/8 -ef "$source" ] || exit 1
+		trusted_root_file_source "$source"
+	)
+}
+
+# Copy one TLS file into a root-private regular file with a strict byte and time
+# bound.  Workdir material is opened only as uid 853; external root-controlled
+# material may be captured as root after the ancestor ownership proof above.
+snapshot_tls_file() {
+	local source="$1" target="$2" access="$3" size capture_rc=0
+	[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+	(umask 077; : >"$target") || return 1
+	case "$access" in
+		root)
+			capture_root_file_bytes "$source" "$target" 257 || capture_rc=$?
+			;;
+		service)
+			/usr/bin/timeout -k 1s 5s \
+				/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+				-n AGHTLSRead -x /bin/dd -- if="$source" bs=4096 count=257 \
+				>"$target" 2>/dev/null || capture_rc=$?
+			;;
+		*) capture_rc=1 ;;
+	esac
+	[ "$capture_rc" = 0 ] || {
+		rm -f "$target"
+		return 1
+	}
+	size="$(wc -c <"$target" 2>/dev/null)" || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_TLS_FILE_SIZE" ] || return 1
+}
+
+# Resolve one YAML TLS pathname without widening the official service jail.
+# /etc/ssl/acme is intentionally file-by-file: a symlink is accepted only when
+# its canonical target remains under the acme package's /etc/acme tree.
+resolve_tls_path() {
+	local value="$1" remainder resolved
+	valid_tls_path_syntax "$value" || return 1
+	[ -f "$value" ] || return 1
+	resolved="$(readlink -f "$value" 2>/dev/null)" || return 1
+	[ -f "$resolved" ] || return 1
+	case "$value" in
+		"${work_dir}"/*)
+			case "$resolved" in "${work_dir}"/*) ;; *) return 1 ;; esac
+			;;
+		/etc/ssl/certs/*)
+			case "$resolved" in /etc/ssl/certs/*) ;; *) return 1 ;; esac
+			;;
+		/etc/ssl/acme/*)
+			remainder="${value#/etc/ssl/acme/}"
+			case "$remainder" in ""|*/*) return 1 ;; esac
+			path_contains_symlink /etc/ssl/acme && return 1
+			if [ -L "$value" ]; then
+				case "$resolved" in /etc/acme/*) ;; *) return 1 ;; esac
+			else
+				[ "$resolved" = "$value" ] || return 1
+			fi
+			append_tls_desired_mount "$value"
+			[ "$resolved" = "$value" ] || append_tls_desired_mount "$resolved"
+			TLS_USES_ACME=1
+			;;
+		*) return 1 ;;
+	esac
+	# Certificate expiry is owned by ACME/the official core and is deliberately
+	# not interpreted here.  snapshot_tls_file() separately enforces ordinary
+	# file, readability, byte and hard-time bounds before the core is invoked.
+	RESOLVED_TLS_PATH="$resolved"
+	case "$resolved" in
+		"${work_dir}"/*) RESOLVED_TLS_EXTERNAL=0 ;;
+		/etc/acme/*|/etc/ssl/acme/*|/etc/ssl/certs/*) RESOLVED_TLS_EXTERNAL=1 ;;
+		*) return 1 ;;
+	esac
+}
+
+tls_file_hash() {
+	local directory snapshot digest
+	directory="$(mktemp -d /tmp/AdGuardHome-tls-hash.XXXXXX)" || return 1
+	snapshot="${directory}/material"
+	if ! snapshot_tls_file "$1" "$snapshot" service; then
+		rm -rf "$directory"
+		return 1
+	fi
+	digest="$(yaml_file_hash "$snapshot")" || {
+		rm -rf "$directory"
+		return 1
+	}
+	rm -rf "$directory" || return 1
+	printf '%s\n' "$digest"
+}
+
+load_tls_access() {
+	local tls_config_file="${1:-$config_file}"
+	local enabled certificate_path private_key_path certificate_hash key_hash key_external
+	TLS_DESIRED_MOUNTS=""
+	TLS_CERT_REAL=""
+	TLS_KEY_REAL=""
+	TLS_CERT_EXTERNAL=0
+	TLS_KEY_EXTERNAL=0
+	TLS_USES_ACME=0
+	TLS_FINGERPRINT=""
+
+	enabled="$(yaml_get_section_value tls enabled "$tls_config_file")"
+	case "$enabled" in
+		1|on|true|TRUE|True|yes|YES|Yes) ;;
+		0|off|false|FALSE|False|no|NO|No|"") return 0 ;;
+		*) return 1 ;;
+	esac
+	certificate_path="$(yaml_get_section_value tls certificate_path "$tls_config_file")"
+	private_key_path="$(yaml_get_section_value tls private_key_path "$tls_config_file")"
+	# Inline certificate_chain/private_key needs no host filesystem access.
+	[ -n "$certificate_path" ] || [ -n "$private_key_path" ] || return 0
+	[ -n "$certificate_path" ] && [ -n "$private_key_path" ] || return 1
+
+	resolve_tls_path "$certificate_path" || return 1
+	TLS_CERT_REAL="$RESOLVED_TLS_PATH"
+	TLS_CERT_EXTERNAL="$RESOLVED_TLS_EXTERNAL"
+	resolve_tls_path "$private_key_path" || return 1
+	TLS_KEY_REAL="$RESOLVED_TLS_PATH"
+	TLS_KEY_EXTERNAL="$RESOLVED_TLS_EXTERNAL"
+	key_external="$RESOLVED_TLS_EXTERNAL"
+	# Candidate validation is read-only.  Permission repair occurs only when
+	# synchronizing the active YAML, never while parsing an RPC submission.
+	[ "${TLS_PREFLIGHT_ONLY:-0}" = 1 ] && return 0
+	# External certificate and key material are readable only by root and the
+	# official service group.  This is idempotent after ACME renewals (which may
+	# recreate either inode as root:root), and neither file is group-writable.
+	# Workdir material is never chowned from this root wrapper.
+	if [ "$TLS_CERT_EXTERNAL" = 1 ]; then
+		chown "0:${ADGUARD_GID}" "$TLS_CERT_REAL" || return 1
+		chmod 0640 "$TLS_CERT_REAL" || return 1
+	fi
+	if [ "$key_external" = 1 ]; then
+		chown "0:${ADGUARD_GID}" "$TLS_KEY_REAL" || return 1
+		chmod 0640 "$TLS_KEY_REAL" || return 1
+	fi
+
+	# Prove that the official uid can read a bounded regular snapshot of both
+	# configured files.  This also prevents FIFO/FUSE stalls from holding the
+	# integration lock indefinitely.  It does not inspect certificate dates.
+	certificate_hash="$(tls_file_hash "$TLS_CERT_REAL")" || return 1
+	key_hash="$(tls_file_hash "$TLS_KEY_REAL")" || return 1
+	if [ "$TLS_USES_ACME" = 1 ]; then
+		TLS_FINGERPRINT="$(printf '%s\n%s\n' "$certificate_hash" "$key_hash" |
+			sha256sum 2>/dev/null)" || return 1
+		TLS_FINGERPRINT="${TLS_FINGERPRINT%% *}"
+		[ "${#TLS_FINGERPRINT}" -eq 64 ] || return 1
+		case "$TLS_FINGERPRINT" in *[!0-9a-f]*) return 1 ;; esac
+	fi
+}
+
+yaml_replace_tls_scalar() {
+	local section="$1" key="$2" replacement="$3" file="$4" tmp rc
+	tmp="$(mktemp "${file}.tls.XXXXXX")" || return 1
+	awk -v section="$section" -v key="$key" -v replacement="$replacement" '
+		function top(s) { return s ~ /^[^[:space:]#][^:]*:/ }
+		function indent(s) { match(s, /^ */); return RLENGTH }
+		function pad(n, s, i) { s=""; for (i=0; i<n; i++) s=s " "; return s }
+		{ line[++n]=$0 }
+		END {
+			for (i=1; i<=n; i++)
+				if (line[i] ~ ("^" section ":[[:space:]]*($|#)")) { sections++; first=i }
+			if (sections != 1) exit 1
+			last=n
+			for (i=first+1; i<=n; i++) if (top(line[i])) { last=i-1; break }
+			depth=0
+			for (i=first+1; i<=last; i++) {
+				if (line[i] ~ /^[[:space:]]*($|#)/ || line[i] !~ /^ +/) continue
+				d=indent(line[i]); if (!depth || d<depth) depth=d
+			}
+			if (!depth) depth=2
+			for (i=first+1; i<=last; i++) {
+				if (indent(line[i]) != depth) continue
+				value=substr(line[i], depth+1)
+				if (value ~ ("^" key ":[[:space:]]*")) { matches++; found=i }
+			}
+			if (matches != 1) exit 1
+			line[found]=pad(depth) key ": " replacement
+			for (i=1; i<=n; i++) print line[i]
+		}' "$file" >"$tmp"
+	rc=$?
+	if [ "$rc" != 0 ] || ! mv "$tmp" "$file"; then
+		rm -f "$tmp"
+		return 1
+	fi
+}
+
+prepare_tls_validation_files() {
+	local yaml="$1" directory="$2" cert_copy key_copy cert_access key_access rc=0
+	TLS_PREFLIGHT_ONLY=1
+	load_tls_access "$yaml" || rc=$?
+	unset TLS_PREFLIGHT_ONLY
+	[ "$rc" = 0 ] || return 1
+	[ -n "$TLS_CERT_REAL" ] || return 0
+	cert_copy="${directory}/tls-certificate"
+	key_copy="${directory}/tls-private-key"
+	[ "$TLS_CERT_EXTERNAL" = 1 ] && cert_access=root || cert_access=service
+	[ "$TLS_KEY_EXTERNAL" = 1 ] && key_access=root || key_access=service
+	snapshot_tls_file "$TLS_CERT_REAL" "$cert_copy" "$cert_access" || return 1
+	snapshot_tls_file "$TLS_KEY_REAL" "$key_copy" "$key_access" || return 1
+	chown "0:${ADGUARD_GID}" "$cert_copy" "$key_copy" || return 1
+	chmod 0640 "$cert_copy" "$key_copy" || return 1
+	yaml_replace_tls_scalar tls certificate_path "$cert_copy" "$yaml" || return 1
+	yaml_replace_tls_scalar tls private_key_path "$key_copy" "$yaml"
+}
+
+load_active_tls_access() {
+	local directory snapshot rc=0
+	directory="$(mktemp -d /tmp/AdGuardHome-tls.XXXXXX)" || return 1
+	snapshot="${directory}/AdGuardHome.yaml"
+	if ! snapshot_config_file "$config_file" "$snapshot" "" "" ||
+	   ! load_tls_access "$snapshot"; then
+		rc=1
+	fi
+	rm -rf "$directory" || return 1
+	return "$rc"
+}
+
+write_mount_list() {
+	local target="$1" item list="$2"
+	[ -n "$list" ] || return 0
+	while IFS= read -r item; do
+		[ -n "$item" ] || continue
+		uci -q add_list "${target}=${item}" || return 1
+	done <<-EOF
+	$list
+	EOF
+}
+
+sync_tls_access() {
+	local expected current_fingerprint official_changed=0 legacy_changed=0
+	load_active_tls_access || {
+		log_error "TLS certificate or private-key path is unsafe or unavailable"
+		return 1
+	}
+
+	TLS_OLD_MOUNTS=""
+	TLS_ORIGINAL_MOUNTS=""
+	TLS_PRESERVED_MOUNTS=""
+	config_load "$LEGACY_CONFIG" || return 1
+	config_list_foreach "$LEGACY_SECTION" "$MANAGED_JAIL_OPTION" collect_tls_old_mount
+	config_load "$OFFICIAL_CONFIG" || return 1
+	config_list_foreach "$OFFICIAL_SECTION" jail_mount collect_tls_official_mount
+	derive_tls_new_managed_mounts
+
+	expected="$TLS_PRESERVED_MOUNTS"
+	if [ -n "$TLS_NEW_MANAGED_MOUNTS" ]; then
+		if [ -n "$expected" ]; then
+			expected="${expected}
+${TLS_NEW_MANAGED_MOUNTS}"
+		else
+			expected="$TLS_NEW_MANAGED_MOUNTS"
+		fi
+	fi
+	if [ "$TLS_ORIGINAL_MOUNTS" != "$expected" ]; then
+		uci -q delete "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount" 2>/dev/null || true
+		write_mount_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount" "$expected" || return 1
+		official_changed=1
+	fi
+	if [ "$TLS_OLD_MOUNTS" != "$TLS_NEW_MANAGED_MOUNTS" ]; then
+		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_JAIL_OPTION}" 2>/dev/null || true
+		write_mount_list "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_JAIL_OPTION}" \
+			"$TLS_NEW_MANAGED_MOUNTS" || return 1
+		legacy_changed=1
+	fi
+
+	current_fingerprint="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
+	if [ -n "$TLS_FINGERPRINT" ]; then
+		if [ "$current_fingerprint" != "$TLS_FINGERPRINT" ]; then
+			uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}=${TLS_FINGERPRINT}" || return 1
+			legacy_changed=1
+		fi
+	elif [ -n "$current_fingerprint" ]; then
+		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}" || return 1
+		legacy_changed=1
+	fi
+	[ "$official_changed" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
+	[ "$legacy_changed" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+}
+
 sync_official_uci() {
 	UCI_CHANGED=0
 	if ! uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1; then
@@ -528,7 +1433,8 @@ sync_official_uci() {
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" verbose "$verbose" || return 1
 	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config || return 1
 	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" workdir || return 1
-	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG"
+	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
+	sync_tls_access
 }
 
 disable_official_autostart() {
@@ -1048,6 +1954,18 @@ dns_ipv6_listening() {
 		official_owns_socket /proc/net/tcp6 ipv6-wildcard
 }
 
+web_listening() {
+	local port="$1"
+	is_valid_port "$port" || return 1
+	official_running || return 1
+	dns_port="$port"
+	if official_owns_socket /proc/net/tcp any ||
+	   official_owns_socket /proc/net/tcp6 any; then
+		return 0
+	fi
+	return 1
+}
+
 wait_for_core_ready() {
 	local expected_port="$1" expected_mode="$2" expected_work_dir="$3"
 	local elapsed=0 stable=0
@@ -1087,6 +2005,361 @@ wait_for_core_stopped() {
 		elapsed=$((elapsed + 1))
 	done
 	return 1
+}
+
+yaml_file_hash() {
+	local digest
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	digest="$(sha256sum "$1" 2>/dev/null)" || return 1
+	digest="${digest%% *}"
+	case "$digest" in
+		????????????????????????????????????????????????????????????????)
+			case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+			printf '%s\n' "$digest"
+			;;
+		*) return 1 ;;
+	esac
+}
+
+validate_yaml_stage() {
+	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
+	local name token fd_path
+	case "$expected_hash" in
+		????????????????????????????????????????????????????????????????)
+			case "$expected_hash" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	case "$candidate_hash" in
+		????????????????????????????????????????????????????????????????)
+			case "$candidate_hash" in *[!0-9a-f]*) return 1 ;; esac
+			;;
+		*) return 1 ;;
+	esac
+	[ "${stage%/*}" = "$work_dir" ] || return 1
+	name="${stage##*/}"
+	case "$name" in AdGuardHome.yaml.luci-*) ;; *) return 1 ;; esac
+	token="${name#AdGuardHome.yaml.luci-}"
+	[ "${#token}" -eq 32 ] || return 1
+	case "$token" in *[!0-9a-f]*) return 1 ;; esac
+	[ -f "$stage" ] && [ ! -L "$stage" ] || return 1
+	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
+	path_contains_symlink "$work_dir" && return 1
+	case "$inherited_fd" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
+	fd_path="/proc/$$/fd/${inherited_fd}"
+	[ -f "$fd_path" ] && [ "$fd_path" -ef "$stage" ]
+}
+
+active_config_hash() (
+	local directory snapshot
+	directory="$(mktemp -d /tmp/AdGuardHome-hash.XXXXXX)" || exit 1
+	trap 'rm -rf "$directory"' EXIT
+	snapshot="${directory}/AdGuardHome.yaml"
+	snapshot_config_file "$config_file" "$snapshot" "" "" || exit 1
+	printf '%s\n' "$SNAPSHOT_CONFIG_HASH"
+)
+
+held_config_hash() (
+	local expected_hash="$1" inherited_fd="$2" allow_detached="$3"
+	local directory snapshot
+	directory="$(mktemp -d /tmp/AdGuardHome-held-hash.XXXXXX)" || exit 1
+	trap 'rm -rf "$directory"' EXIT
+	snapshot="${directory}/AdGuardHome.yaml"
+	snapshot_config_file "$config_file" "$snapshot" \
+		"$expected_hash" "$inherited_fd" "$allow_detached" || exit 1
+	printf '%s\n' "$SNAPSHOT_CONFIG_HASH"
+)
+
+resume_yaml_runtime() {
+	local was_running="$1"
+	[ "$was_running" = 1 ] || return 0
+	load_legacy_settings || return 1
+	[ "$legacy_enabled" = 1 ] || return 0
+	load_runtime_dns_port || return 1
+	sync_official_uci || return 1
+	if ! official_running; then
+		"$OFFICIAL_SERVICE" start >/dev/null 2>&1 || return 1
+	fi
+	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || return 1
+	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
+}
+
+rollback_yaml_update() {
+	local backup="$1" was_running="$2"
+	clear_recorded_integration_locked >/dev/null 2>&1 || true
+	if official_running; then
+		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+		wait_for_core_stopped || return 1
+	fi
+	[ -f "$backup" ] && [ ! -L "$backup" ] || return 1
+	[ ! -L "$config_file" ] || return 1
+	restore_yaml_backup "$backup" || return 1
+	secure_active_config || return 1
+	load_legacy_settings || return 1
+	load_runtime_dns_port || return 1
+	sync_official_uci || return 1
+	resume_yaml_runtime "$was_running" || return 1
+	remove_yaml_backup "$backup"
+}
+
+remove_yaml_backup() {
+	local backup="$1" directory
+	directory="${backup%/*}"
+	case "$backup" in
+		/tmp/AdGuardHome-yaml-backup.??????/AdGuardHome.yaml) ;;
+		*) return 1 ;;
+	esac
+	rm -f "$backup" || return 1
+	rmdir "$directory" 2>/dev/null || return 1
+}
+
+cleanup_yaml_update() {
+	[ -z "$YAML_STAGE_CLEANUP" ] || rm -f "$YAML_STAGE_CLEANUP"
+	[ -z "$YAML_BACKUP_CLEANUP" ] ||
+		remove_yaml_backup "$YAML_BACKUP_CLEANUP" >/dev/null 2>&1 || true
+}
+
+attempt_yaml_rollback() {
+	local backup="$1" was_running="$2"
+	if rollback_yaml_update "$backup" "$was_running" >/dev/null 2>&1; then
+		YAML_BACKUP_CLEANUP=""
+		YAML_INSTALLED=0
+		YAML_RUNTIME_PAUSED=0
+		return 0
+	fi
+	# Never let the EXIT cleanup destroy the sole known-good copy if restoring
+	# it failed before the atomic move.  Its fixed prefix and 0600 mode make it
+	# available for explicit administrator recovery without exposing contents.
+	if [ -f "$backup" ] && [ ! -L "$backup" ]; then
+		chmod 0600 "$backup" >/dev/null 2>&1 || true
+		YAML_BACKUP_CLEANUP=""
+		log_error "Preserved the previous YAML after rollback failure: ${backup}"
+	fi
+	return 1
+}
+
+abort_yaml_update() {
+	# Ignore a second termination signal while restoring the sole known-good
+	# runtime; interruption here could otherwise defeat the recovery trap itself.
+	trap '' HUP INT QUIT TERM
+	if [ "${YAML_INSTALLED:-0}" = 1 ] && [ -n "$YAML_BACKUP_CLEANUP" ]; then
+		attempt_yaml_rollback "$YAML_BACKUP_CLEANUP" "$YAML_WAS_RUNNING" || true
+	elif [ "${YAML_RUNTIME_PAUSED:-0}" = 1 ]; then
+		resume_yaml_runtime "$YAML_WAS_RUNNING" >/dev/null 2>&1 ||
+			log_error "Unable to restore the interrupted YAML runtime"
+	fi
+	exit 1
+}
+
+resume_paused_yaml_runtime() {
+	if resume_yaml_runtime "$YAML_WAS_RUNNING"; then
+		YAML_RUNTIME_PAUSED=0
+		return 0
+	fi
+	return 1
+}
+
+# The RPC layer creates a same-directory O_EXCL staging file and invokes this
+# transaction without a shell.  Revalidate everything under the integration
+# lock, validate a disposable candidate, stop the sole YAML writer, then make
+# the final optimistic-lock comparison before the atomic rename.
+yaml_update_locked() (
+	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
+	local before_hash final_hash held_hash fd_path
+	local was_running=0 backup="" backup_directory=""
+	load_legacy_settings || return 1
+	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
+		"$inherited_fd" || return 1
+	YAML_STAGE_CLEANUP="$stage"
+	YAML_BACKUP_CLEANUP=""
+	YAML_INSTALLED=0
+	YAML_WAS_RUNNING=0
+	YAML_RUNTIME_PAUSED=0
+	trap cleanup_yaml_update EXIT
+	trap abort_yaml_update HUP INT QUIT TERM
+
+	before_hash="$(active_config_hash)" || return 1
+	[ "$before_hash" = "$expected_hash" ] || return 1
+	check_core_config_file "$stage" "$candidate_hash" "$inherited_fd" || {
+		log_error "AdGuard Home rejected the staged LuCI YAML"
+		return 1
+	}
+	official_running && was_running=1
+	YAML_WAS_RUNNING="$was_running"
+	YAML_RUNTIME_PAUSED=1
+
+	# Resolver takeover must be removed before the listener is stopped.  A
+	# cleanup failure leaves the working core and active YAML untouched.
+	if ! clear_recorded_integration_locked; then
+		resume_paused_yaml_runtime >/dev/null 2>&1 ||
+			log_error "Unable to restore the YAML runtime after integration cleanup failed"
+		return 1
+	fi
+	if [ "$was_running" = 1 ]; then
+		if ! "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || ! wait_for_core_stopped; then
+			resume_paused_yaml_runtime >/dev/null 2>&1 ||
+				log_error "Unable to restore the YAML runtime after stop failed"
+			return 1
+		fi
+	fi
+	final_hash="$(active_config_hash)" || {
+		resume_paused_yaml_runtime >/dev/null 2>&1 || true
+		return 1
+	}
+	if [ "$final_hash" != "$expected_hash" ] ||
+	   ! validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
+		"$inherited_fd"; then
+		resume_paused_yaml_runtime >/dev/null 2>&1 || true
+		return 1
+	fi
+	check_core_config_file "$stage" "$candidate_hash" "$inherited_fd" || {
+		resume_paused_yaml_runtime >/dev/null 2>&1 || true
+		return 1
+	}
+
+	backup_directory="$(mktemp -d /tmp/AdGuardHome-yaml-backup.XXXXXX)" || {
+		resume_paused_yaml_runtime >/dev/null 2>&1 || true
+		return 1
+	}
+	backup="${backup_directory}/AdGuardHome.yaml"
+	YAML_BACKUP_CLEANUP="$backup"
+	# Create the rollback image through the same bounded, lowered snapshot path
+	# and recheck its optimistic hash.  Never let root cp a replaceable active
+	# pathname after the core validation window.
+	snapshot_config_file "$config_file" "$backup" "$expected_hash" || {
+		resume_paused_yaml_runtime >/dev/null 2>&1 || true
+		return 1
+	}
+	YAML_INSTALLED=1
+	if ! mv "$stage" "$config_file"; then
+		YAML_INSTALLED=0
+		resume_paused_yaml_runtime >/dev/null 2>&1 || true
+		return 1
+	fi
+	YAML_STAGE_CLEANUP=""
+	fd_path="/proc/$$/fd/${inherited_fd}"
+	if [ ! -f "$fd_path" ] || [ ! "$fd_path" -ef "$config_file" ] ||
+	   ! secure_config_inode "$fd_path"; then
+		log_error "The installed LuCI YAML no longer matches its held descriptor"
+		attempt_yaml_rollback "$backup" "$was_running" ||
+			log_error "Failed to restore the previous YAML runtime"
+		return 1
+	fi
+
+	if ! secure_active_paths ||
+	   ! check_core_config_file "$config_file" "$candidate_hash" "$inherited_fd" 1 ||
+	   ! load_runtime_dns_port ||
+	   ! sync_official_uci; then
+		log_error "Unable to activate the LuCI YAML; restoring the previous file"
+		attempt_yaml_rollback "$backup" "$was_running" ||
+			log_error "Failed to restore the previous YAML runtime"
+		return 1
+	fi
+	if [ "$legacy_enabled" = 1 ]; then
+		if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1 ||
+		   ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" ||
+		   ! apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; then
+			log_error "The edited YAML failed at runtime; restoring the previous file"
+			attempt_yaml_rollback "$backup" "$was_running" ||
+				log_error "Failed to restore the previous YAML runtime"
+			return 1
+		fi
+	fi
+	YAML_RUNTIME_PAUSED=0
+
+	held_hash="$(held_config_hash "$candidate_hash" "$inherited_fd" 1)" || {
+		attempt_yaml_rollback "$backup" "$was_running" ||
+			log_error "Failed to restore the previous YAML runtime"
+		return 1
+	}
+	final_hash="$(active_config_hash)" || {
+		attempt_yaml_rollback "$backup" "$was_running" ||
+			log_error "Failed to restore the previous YAML runtime"
+		return 1
+	}
+	if [ "$held_hash" != "$candidate_hash" ] ||
+	   [ "$final_hash" != "$candidate_hash" ] ||
+	   { [ "$legacy_enabled" != 1 ] && [ ! "$fd_path" -ef "$config_file" ]; }; then
+		log_error "The running core changed the submitted YAML; restoring the previous file"
+		attempt_yaml_rollback "$backup" "$was_running" ||
+			log_error "Failed to restore the previous YAML runtime"
+		return 1
+	fi
+	if [ "$fd_path" -ef "$config_file" ]; then
+		secure_config_inode "$fd_path" || {
+			attempt_yaml_rollback "$backup" "$was_running" ||
+				log_error "Failed to restore the previous YAML runtime"
+			return 1
+		}
+	fi
+	if remove_yaml_backup "$backup"; then
+		YAML_BACKUP_CLEANUP=""
+	else
+		log_error "Unable to remove the completed LuCI YAML backup"
+	fi
+	YAML_INSTALLED=0
+	trap - HUP INT QUIT TERM
+	return 0
+)
+
+yaml_update() {
+	run_locked yaml_update_locked "$1" "$2" "$3" "$4"
+}
+
+restore_tls_fingerprint() {
+	local value="$1" option="${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}"
+	if [ -n "$value" ]; then
+		uci -q set "${option}=${value}" || return 1
+	else
+		uci -q delete "$option" 2>/dev/null || true
+	fi
+	uci -q commit "$LEGACY_CONFIG"
+}
+
+tls_refresh_locked() {
+	local old_fingerprint was_running=0
+	load_legacy_settings || return 1
+	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 0
+	old_fingerprint="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
+	load_active_tls_access || return 1
+	# A system-wide ACME event must have no effect on installations whose YAML
+	# does not consume file-by-file /etc/ssl/acme material.
+	[ "$TLS_USES_ACME" = 1 ] || return 0
+	check_core_config || return 1
+	sync_tls_access || return 1
+	[ "$old_fingerprint" != "$TLS_FINGERPRINT" ] || return 0
+	[ "$legacy_enabled" = 1 ] || return 0
+	official_running && was_running=1
+
+	if ! clear_recorded_integration_locked; then
+		restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 || true
+		resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
+		return 1
+	fi
+	if official_running; then
+		if ! "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || ! wait_for_core_stopped; then
+			restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 || true
+			resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
+			return 1
+		fi
+	fi
+	if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1 ||
+	   ! load_runtime_dns_port ||
+	   ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" ||
+	   ! apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; then
+		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 ||
+			log_error "Unable to restore the previous ACME retry fingerprint"
+		resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
+		log_error "Unable to restart AdGuard Home after ACME renewal"
+		return 1
+	fi
+}
+
+tls_refresh() {
+	case "${ACTION:-renewed}" in issued|renewed) ;; *) return 0 ;; esac
+	run_locked tls_refresh_locked
 }
 
 fail_safe_locked() {

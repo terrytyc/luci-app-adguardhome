@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+
+case "$ACTION" in
+	issued|renewed)
+		[ -x /etc/init.d/AdGuardHome ] || exit 0
+		if ! /etc/init.d/AdGuardHome tls_refresh >/dev/null 2>&1; then
+			logger -t AdGuardHome \
+				"Unable to refresh ACME certificate access after ${ACTION}"
+			exit 1
+		fi
+		;;
+esac
+
+exit 0

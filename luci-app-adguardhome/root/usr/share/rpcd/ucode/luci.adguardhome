@@ -2,7 +2,8 @@
 
 'use strict';
 
-import { lstat, open, popen } from 'fs';
+import { lstat, open, popen, stat, unlink } from 'fs';
+import { sha256 } from 'digest';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
 
@@ -10,12 +11,14 @@ const SERVICE_NAME = 'adguardhome';
 const INSTANCE_NAME = 'adguardhome';
 const VERSION_COMMAND = '/usr/bin/AdGuardHome --version 2>/dev/null';
 const MAX_VERSION_LENGTH = 256;
-const MAX_CONFIG_LENGTH = 1024 * 1024;
+const MAX_CONFIG_LENGTH = 512 * 1024;
+const MAX_LOG_LENGTH = 512 * 1024;
+const YAML_UPDATE_COMMAND = '/etc/init.d/AdGuardHome';
 const CONFIG_NAME = 'AdGuardHome';
 const CONFIG_SECTION = 'AdGuardHome';
 const CONFIG_FILENAME = 'AdGuardHome.yaml';
 
-function valid_work_dir(value) {
+function valid_work_dir(value, official_work_dir, official_config_file) {
 	if (type(value) != 'string' ||
 	    !match(value, /^\/[A-Za-z0-9_./+@%:,=-]+$/) ||
 	    match(value, /\/\//) ||
@@ -26,8 +29,12 @@ function valid_work_dir(value) {
 	if (length(components) < 2 || value == '/tmp' || match(value, /^\/tmp\//) ||
 	    value == '/var' || match(value, /^\/var\//))
 		return null;
+	if (!match(value, /^\/etc\/AdGuardHome(-[A-Za-z0-9_.+@%:,=-]+)?$/) &&
+	    !match(value, /^\/mnt\/([A-Za-z0-9_.+@%:,=-]+\/)+AdGuardHome(-[A-Za-z0-9_.+@%:,=-]+)?$/))
+		return null;
 
 	let current = '';
+	let final_metadata = null;
 	for (let component in components) {
 		if (!length(component) || component == '.' || component == '..')
 			return null;
@@ -36,7 +43,23 @@ function valid_work_dir(value) {
 		let metadata = lstat(current);
 		if (metadata?.type == 'link')
 			return null;
+		// Custom /mnt locations are allowed only below trusted mountpoint
+		// ancestors.  The leaf itself is normally owned by uid 853, but every
+		// existing ancestor that can redirect or replace it must be a root-owned,
+		// non-group/world-writable directory.
+		if (match(value, /^\/mnt\//) && current != value && metadata &&
+		    (metadata.type != 'directory' || metadata.uid != 0 ||
+		     metadata.perm?.group_write || metadata.perm?.other_write))
+			return null;
+		if (current == value)
+			final_metadata = metadata;
 	}
+	if (final_metadata && final_metadata.type != 'directory')
+		return null;
+	if (value != '/etc/AdGuardHome' && final_metadata &&
+	    (official_work_dir != value ||
+	     official_config_file != `${value}/${CONFIG_FILENAME}`))
+		return null;
 
 	return value;
 }
@@ -47,7 +70,14 @@ function config_path() {
 
 	try {
 		uci = cursor();
-		work_dir = valid_work_dir(uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir'));
+		let official_work_dir = uci.get('adguardhome', 'config', 'work_dir') ||
+			uci.get('adguardhome', 'config', 'workdir');
+		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
+		work_dir = valid_work_dir(
+			uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir'),
+			official_work_dir,
+			official_config_file
+		);
 	}
 	catch (error) {
 		work_dir = null;
@@ -56,6 +86,7 @@ function config_path() {
 	if (uci) {
 		try {
 			uci.unload(CONFIG_NAME);
+			uci.unload('adguardhome');
 		}
 		catch (error) {
 			// Failure to unload a read-only cursor does not alter the result.
@@ -65,23 +96,170 @@ function config_path() {
 	return work_dir ? `${work_dir}/${CONFIG_FILENAME}` : null;
 }
 
-function read_config() {
+function service_running() {
+	let connection = null;
+	let service = null;
+
+	try {
+		connection = connect();
+		if (connection)
+			service = connection.call('service', 'list', { name: SERVICE_NAME });
+	}
+	catch (error) {
+		service = null;
+	}
+
+	if (connection) {
+		try {
+			connection.disconnect();
+		}
+		catch (error) {
+			// A failed disconnect does not change the status result.
+		}
+	}
+
+	return service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true;
+}
+
+function read_yaml() {
 	let path = config_path();
 	let file = null;
 	let content = null;
-	let metadata = null;
+	let digest = null;
+	let descriptor = null;
+	let before = null;
+	let opened = null;
+	let after = null;
+	let valid = false;
 
 	try {
-		metadata = path ? lstat(path) : null;
-		if (!metadata || metadata.type != 'file' || metadata.size <= 0 ||
-		    metadata.size > MAX_CONFIG_LENGTH)
+		before = path ? lstat(path) : null;
+		if (!before || before.type != 'file' || before.size <= 0 ||
+		    before.size > MAX_CONFIG_LENGTH)
 			return null;
 
 		file = open(path, 'r');
 		if (!file)
 			return null;
 
+		descriptor = file.fileno();
+		opened = type(descriptor) == 'int'
+			? stat(`/proc/self/fd/${descriptor}`)
+			: null;
 		content = file.read(MAX_CONFIG_LENGTH + 1);
+		digest = type(content) == 'string' ? sha256(content) : null;
+		// Keep the descriptor open until the pathname has been checked again.
+		// This proves that the bytes read came from the same inode observed at
+		// both pathname checks, even if the uid-853 work directory is renamed.
+		after = lstat(path);
+		valid = opened?.type == 'file' && after?.type == 'file' &&
+			before.inode == opened.inode && before.inode == after.inode &&
+			before.dev?.major == opened.dev?.major &&
+			before.dev?.minor == opened.dev?.minor &&
+			before.dev?.major == after.dev?.major &&
+			before.dev?.minor == after.dev?.minor &&
+			before.size == opened.size && before.size == after.size &&
+			type(content) == 'string' && length(content) > 0 &&
+			length(content) <= MAX_CONFIG_LENGTH &&
+			length(content) == opened.size && !!digest;
+		if (!file.close())
+			valid = false;
+		file = null;
+	}
+	catch (error) {
+		if (file) {
+			try {
+				file.close();
+			}
+			catch (close_error) {
+				// Report the YAML as unavailable if cleanup also fails.
+			}
+		}
+
+		return null;
+	}
+
+	if (!valid)
+		return null;
+
+	return { content, sha256: digest, path };
+}
+
+function read_config() {
+	let result = read_yaml();
+	return result ? replace(result.content, /\r\n?/g, '\n') : null;
+}
+
+function requested_log_lines(value) {
+	if (type(value) != 'int' || value <= 100)
+		return 100;
+	if (value <= 300)
+		return 300;
+	return 500;
+}
+
+function read_log(value) {
+	let requested = requested_log_lines(value);
+	let pipe = null;
+	let output = null;
+	let status = -1;
+
+	try {
+		// ImmortalWrt 25.12.1's ucode popen() accepts a command string only.
+		// The sole interpolation has already been reduced to one of three
+		// decimal literals; every other byte is a fixed constant.
+		pipe = popen(
+			`/sbin/logread -l ${requested} -e '[Aa]d[Gg]uard[Hh]ome'`,
+			'r'
+		);
+		if (!pipe)
+			return { log: '', lines: 0 };
+
+		output = pipe.read(MAX_LOG_LENGTH + 1);
+		status = pipe.close();
+		pipe = null;
+	}
+	catch (error) {
+		if (pipe) {
+			try {
+				pipe.close();
+			}
+			catch (close_error) {
+				// Ignore cleanup errors and return an empty bounded result.
+			}
+		}
+
+		return { log: '', lines: 0 };
+	}
+
+	if (status != 0 || type(output) != 'string')
+		return { log: '', lines: 0 };
+
+	if (length(output) > MAX_LOG_LENGTH) {
+		output = substr(output, length(output) - MAX_LOG_LENGTH);
+		let newline = index(output, '\n');
+		if (newline >= 0)
+			output = substr(output, newline + 1);
+	}
+
+	let actual = 0;
+	for (let line in split(output, '\n'))
+		if (length(line))
+			actual++;
+
+	return { log: output, lines: actual };
+}
+
+function random_token() {
+	let file = null;
+	let bytes = null;
+
+	try {
+		file = open('/dev/urandom', 'r');
+		if (!file)
+			return null;
+
+		bytes = file.read(16);
 		file.close();
 		file = null;
 	}
@@ -91,18 +269,136 @@ function read_config() {
 				file.close();
 			}
 			catch (close_error) {
-				// Ignore cleanup errors and report an unavailable configuration.
+				// Ignore cleanup errors and report random generation failure.
 			}
 		}
 
 		return null;
 	}
 
-	if (type(content) != 'string' || !length(content) ||
-	    length(content) > MAX_CONFIG_LENGTH)
-		return null;
+	return type(bytes) == 'string' && length(bytes) == 16 ? hexenc(bytes) : null;
+}
 
-	return replace(content, /\r\n?/g, '\n');
+function update_yaml(content, expected_hash) {
+	if (type(content) != 'string' || !length(content) ||
+	    length(content) > MAX_CONFIG_LENGTH || index(content, "\u0000") >= 0)
+		return { error: 'Invalid YAML content' };
+	if (type(expected_hash) != 'string' ||
+	    !match(expected_hash, /^[0-9a-f]{64}$/))
+		return { error: 'Invalid or missing YAML revision' };
+
+	let path = config_path();
+	let token = random_token();
+	if (!path || !token)
+		return { error: 'YAML configuration is unavailable' };
+
+	let stage = `${path}.luci-${token}`;
+	if (!match(stage, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml\.luci-[0-9a-f]{32}$/))
+		return { error: 'Unsafe YAML staging path' };
+	let candidate_hash = sha256(content);
+	let file = null;
+	let descriptor = null;
+	let status = -1;
+
+	try {
+		// Exclusive creation prevents a symlink or another request from
+		// claiming the staging pathname.  The init script revalidates it under
+		// its integration lock before using it.
+		file = open(stage, 'wx', 0o600);
+		if (!file || file.write(content) != length(content)) {
+			if (file)
+				file.close();
+			unlink(stage);
+			return { error: 'Unable to stage YAML configuration' };
+		}
+		if (!candidate_hash || !file.flush()) {
+			file.close();
+			file = null;
+			unlink(stage);
+			return { error: 'Unable to flush staged YAML configuration' };
+		}
+
+		let metadata = lstat(stage);
+		descriptor = file.fileno();
+		let opened = type(descriptor) == 'int'
+			? stat(`/proc/self/fd/${descriptor}`)
+			: null;
+		if (!metadata || metadata.type != 'file' || opened?.type != 'file' ||
+		    metadata.size != length(content) || metadata.inode != opened.inode ||
+		    metadata.dev?.major != opened.dev?.major ||
+		    metadata.dev?.minor != opened.dev?.minor) {
+			file.close();
+			file = null;
+			unlink(stage);
+			return { error: 'Unsafe YAML staging file' };
+		}
+		// Reopen the already-held inode read-only through procfs, then close the
+		// writable handle.  Every helper spawned by the transaction inherits only
+		// a read descriptor, regardless of the pathname's later state.
+		let reader = open(`/proc/self/fd/${descriptor}`, 'r');
+		let reader_descriptor = reader ? reader.fileno() : null;
+		let reader_opened = type(reader_descriptor) == 'int'
+			? stat(`/proc/self/fd/${reader_descriptor}`)
+			: null;
+		if (!reader || reader_opened?.type != 'file' ||
+		    reader_opened.inode != opened.inode ||
+		    reader_opened.dev?.major != opened.dev?.major ||
+		    reader_opened.dev?.minor != opened.dev?.minor) {
+			if (reader)
+				reader.close();
+			file.close();
+			file = null;
+			unlink(stage);
+			return { error: 'Unable to hold staged YAML configuration' };
+		}
+		if (!file.close()) {
+			reader.close();
+			file = null;
+			unlink(stage);
+			return { error: 'Unable to close writable YAML staging handle' };
+		}
+		file = reader;
+		descriptor = reader_descriptor;
+
+		// Unlike fs.popen() in 25.12.1, the core system() builtin supports an
+		// argv array and invokes execvp() directly.  Deliberately keep this
+		// O_EXCL descriptor open across exec: the init transaction snapshots only
+		// the inherited inode, never a replaceable candidate pathname.
+		status = system([
+			YAML_UPDATE_COMMAND, 'yaml_update', expected_hash,
+			candidate_hash, stage, `${descriptor}`,
+		]);
+		let closed = file.close();
+		file = null;
+		if (!closed) {
+			unlink(stage);
+			return { error: 'Unable to close staged YAML configuration' };
+		}
+	}
+	catch (error) {
+		if (file) {
+			try { file.close(); }
+			catch (close_error) { }
+		}
+		unlink(stage);
+		return { error: 'YAML update transaction failed' };
+	}
+
+	unlink(stage);
+	if (status != 0)
+		return { error: 'YAML was rejected or changed concurrently' };
+
+	let result = read_yaml();
+	if (!result || type(result.sha256) != 'string')
+		return { error: 'YAML update transaction did not complete' };
+	if (result.sha256 != candidate_hash)
+		return { error: 'YAML changed after the committed update' };
+
+	return {
+		ok: true,
+		sha256: result.sha256,
+		restarted: service_running(),
+	};
 }
 
 function yaml_scalar(value) {
@@ -235,7 +531,47 @@ function valid_dns_name(value) {
 function http_port(content) {
 	let address = yaml_section_value(content, 'http', 'address');
 	let matched = address ? match(address, /:([0-9]+)$/) : null;
+	if (address && (match(address, /^127(?:\.[0-9]+){3}:/) ||
+	                match(address, /^\[::1\]:/)))
+		return null;
 	return matched ? valid_port(matched[1]) : null;
+}
+
+function yaml_material_value(content, key) {
+	let value = yaml_section_value(content, 'tls', key);
+	if (!value || value == '~' || lc(value) == 'null')
+		return null;
+	return value;
+}
+
+function tls_material_complete(content) {
+	let certificate_path = yaml_material_value(content, 'certificate_path');
+	let private_key_path = yaml_material_value(content, 'private_key_path');
+
+	// Explicit file paths take precedence.  Do not silently fall back to stale
+	// inline material when a user has configured only one half of a path pair.
+	if (certificate_path || private_key_path)
+		return !!certificate_path && !!private_key_path;
+
+	// AdGuard Home also supports embedded PEM values.  A YAML block scalar is
+	// represented by its non-empty "|"/">" marker here, which is sufficient
+	// for this completeness gate; the core remains the authoritative parser.
+	return !!yaml_material_value(content, 'certificate_chain') &&
+	       !!yaml_material_value(content, 'private_key');
+}
+
+function web_port_listening(port) {
+	if (!service_running() || type(port) != 'int')
+		return false;
+
+	try {
+		return system([
+			YAML_UPDATE_COMMAND, 'web_listening', `${port}`,
+		]) == 0;
+	}
+	catch (error) {
+		return false;
+	}
 }
 
 function config_info() {
@@ -256,40 +592,21 @@ function config_info() {
 	if (tls_enabled) {
 		let host = valid_dns_name(yaml_section_value(content, 'tls', 'server_name'));
 		let port = valid_port(yaml_section_value(content, 'tls', 'port_https'));
-		if (host && port)
+		if (host && port && tls_material_complete(content) && web_port_listening(port))
 			result.web = { scheme: 'https', host, port };
-	} else {
-		let port = http_port(content);
-		if (port)
-			result.web = { scheme: 'http', host: null, port };
+		if (result.web ||
+		    yaml_bool(yaml_section_value(content, 'tls', 'force_https')) === true)
+			return result;
 	}
+
+	// When HTTPS is incomplete or not listening, AdGuard Home may still expose
+	// its HTTP endpoint unless force_https is explicitly enabled.  The frontend
+	// intentionally reuses the LuCI page host for this result.
+	let port = http_port(content);
+	if (port && web_port_listening(port))
+		result.web = { scheme: 'http', host: null, port };
 
 	return result;
-}
-
-function service_running() {
-	let connection = null;
-	let service = null;
-
-	try {
-		connection = connect();
-		if (connection)
-			service = connection.call('service', 'list', { name: SERVICE_NAME });
-	}
-	catch (error) {
-		service = null;
-	}
-
-	if (connection) {
-		try {
-			connection.disconnect();
-		}
-		catch (error) {
-			// A failed disconnect does not change the status result.
-		}
-	}
-
-	return service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true;
 }
 
 function core_version() {
@@ -343,6 +660,23 @@ const methods = {
 	get_config_info: {
 		call: function() {
 			return config_info();
+		},
+	},
+	get_log: {
+		args: { lines: 100 },
+		call: function(request) {
+			return read_log(request.args.lines);
+		},
+	},
+	get_yaml: {
+		call: function() {
+			return read_yaml() || { error: 'YAML configuration is unavailable' };
+		},
+	},
+	set_yaml: {
+		args: { content: '', sha256: '' },
+		call: function(request) {
+			return update_yaml(request.args.content, request.args.sha256);
 		},
 	},
 };
