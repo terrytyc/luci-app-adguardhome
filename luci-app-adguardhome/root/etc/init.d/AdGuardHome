@@ -421,17 +421,98 @@ secure_active_paths() {
 	fi
 }
 
-secure_active_config() {
-	local directory snapshot
-	secure_active_paths || return 1
-	directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || return 1
+secure_active_config() (
+	local directory snapshot metadata mode links owner group size remainder
+	local workdir_fd old_fd stage_fd stage="" old_hash stage_hash snapshot_fd=""
+	secure_active_paths || exit 1
+	directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || exit 1
+	trap '[ -z "$stage" ] || rm -f "$stage"; rm -rf "$directory"' EXIT
 	snapshot="${directory}/AdGuardHome.yaml"
-	if ! snapshot_config_file "$config_file" "$snapshot" "" ""; then
-		rm -rf "$directory"
-		return 1
-	fi
-	rm -rf "$directory"
-}
+
+	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || exit 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	case "$owner:$group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------)
+			metadata="$(LC_ALL=C ls -ldn "$config_file" 2>/dev/null)" || exit 1
+			read -r mode links owner group size remainder <<-EOF
+			$metadata
+			EOF
+			case "$owner" in
+				0) ;;
+				"$ADGUARD_UID")
+					# The package installer can leave a service-owned YAML inside a
+					# root-private directory before the official service first starts.
+					# Do not relax the directory or chown that inode: an old writer FD
+					# would retain access.  With the namespace frozen at 0700, copy the
+					# exact bounded inode into a new private inode and atomically replace
+					# it.  The official service will chown it back on its next start.
+					[ "$group:$mode:$links" = "$ADGUARD_GID:-rw-------:1" ] ||
+						[ "$group:$mode:$links" = "$ADGUARD_GID:-rw-r-----:1" ] || exit 1
+					case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+					[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
+					official_running && exit 1
+					exec 7<"$work_dir" || exit 1
+					workdir_fd=/proc/self/fd/7
+					[ -d "$workdir_fd" ] && [ "$workdir_fd" -ef "$work_dir" ] || exit 1
+					exec 8<"$config_file" || exit 1
+					old_fd=/proc/self/fd/8
+					[ -f "$old_fd" ] && [ "$old_fd" -ef "$config_file" ] || exit 1
+					metadata="$(LC_ALL=C ls -ldnL "$old_fd" 2>/dev/null)" || exit 1
+					read -r mode links owner group size remainder <<-EOF
+					$metadata
+					EOF
+					case "$owner:$group:$mode:$links" in
+						"$ADGUARD_UID":"$ADGUARD_GID":-rw-------:1|"$ADGUARD_UID":"$ADGUARD_GID":-rw-r-----:1) ;;
+						*) exit 1 ;;
+					esac
+					case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+					[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
+					old_hash="$(open_fd_hash "$old_fd")" || exit 1
+					umask 077
+					stage="$(mktemp "${work_dir}/.AdGuardHome-secure.XXXXXX")" || exit 1
+					exec 9<>"$stage" || exit 1
+					stage_fd=/proc/self/fd/9
+					[ -f "$stage_fd" ] && [ "$stage_fd" -ef "$stage" ] || exit 1
+					/usr/bin/timeout -k 1s 3s /bin/dd if="$old_fd" bs=4096 count=129 \
+						of="$stage_fd" 2>/dev/null || exit 1
+					secure_config_inode "$stage_fd" || exit 1
+					stage_hash="$(open_fd_hash "$stage_fd")" || exit 1
+					[ "$stage_hash" = "$old_hash" ] || exit 1
+					[ "$(open_fd_hash "$old_fd")" = "$old_hash" ] || exit 1
+					[ -f "$old_fd" ] && [ ! -L "$config_file" ] &&
+						[ "$old_fd" -ef "$config_file" ] || exit 1
+					[ -d "$workdir_fd" ] && [ "$workdir_fd" -ef "$work_dir" ] || exit 1
+					metadata="$(LC_ALL=C ls -ldnL "$workdir_fd" 2>/dev/null)" || exit 1
+					read -r mode links owner group remainder <<-EOF
+					$metadata
+					EOF
+					case "$owner:$group:$mode" in
+						0:0:drwx------|0:"$ADGUARD_GID":drwx------) ;;
+						*) exit 1 ;;
+					esac
+					official_running && exit 1
+					mv "$stage" "$config_file" || exit 1
+					stage=""
+					[ "$stage_fd" -ef "$config_file" ] || exit 1
+					metadata="$(LC_ALL=C ls -ldnL "$stage_fd" 2>/dev/null)" || exit 1
+					read -r mode links owner group size remainder <<-EOF
+					$metadata
+					EOF
+					[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || exit 1
+					[ "$(open_fd_hash "$stage_fd")" = "$old_hash" ] || exit 1
+					snapshot_fd=9
+					;;
+				*) exit 1 ;;
+			esac
+			;;
+		"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		*) exit 1 ;;
+	esac
+
+	snapshot_config_file "$config_file" "$snapshot" "" "$snapshot_fd" || exit 1
+)
 
 secure_config_inode() {
 	local inode_path="$1" metadata mode owner links group remainder
@@ -674,7 +755,7 @@ snapshot_config_file() {
 	if [ -n "$inherited_fd" ]; then
 		case "$inherited_fd" in ""|*[!0-9]*) return 1 ;; esac
 		[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
-		fd_path="/proc/$$/fd/${inherited_fd}"
+		fd_path="/proc/self/fd/${inherited_fd}"
 		[ -f "$fd_path" ] || return 1
 		if [ "$allow_detached" != 1 ]; then
 			[ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
