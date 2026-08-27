@@ -1,27 +1,87 @@
+<%
+local configpath = luci.model.uci.cursor():get("AdGuardHome", "AdGuardHome", "configpath") or "/etc/AdGuardHome/AdGuardHome.yaml"
+local httpport = luci.model.uci.cursor():get("AdGuardHome", "AdGuardHome", "httpport") or "3000"
+local httpsport = ""
+local tlsenabled = false
+local servername = ""
+
+local f = io.open(configpath, "r")
+if not f then
+    f = io.open("/etc/adguardhome.yaml", "r")
+end
+
+if f then
+    local content = f:read("*a")
+    f:close()
+    if content then
+        local tls_block = content:match("\ntls:(.-)\n%w+:") or content:match("^tls:(.-)\n%w+:") or content:match("\ntls:(.*)")
+        if tls_block then
+            local enabled = tls_block:match("enabled:%s*(%w+)")
+            if enabled then tlsenabled = (enabled == "true") end
+
+            local port = tls_block:match("port_https:%s*(%d+)")
+            if port then httpsport = port end
+
+            local name = tls_block:match("server_name:%s*([^\r\n]+)")
+            if name then
+                servername = name:gsub('^["%s]*', ''):gsub('["%s]*$', '')
+            end
+        end
+    end
+end
+%>
 
 <script type="text/javascript">//<![CDATA[
 XHR.poll(3, '<%=url([[admin]], [[services]], [[AdGuardHome]], [[status]])%>', null,
-	function(x, data) {
-		var tb = document.getElementById('AdGuardHome_status');
-		if (data && tb) {
-			if (data.running) {
-				tb.innerHTML = '<em><b style=color:green>AdGuardHome <%:RUNNING%></b></em>';
-  			  URL = window.location.protocol.toLowerCase() + "//" + window.location.hostname + ":<%=luci.model.uci.cursor():get("AdGuardHome", "AdGuardHome", "httpport") %>";
-  			  tb.innerHTML+='<em> <b style=color:green><%:Redirected%></b> </em> '
-  			  tb.innerHTML += "<input class=\"cbi-button cbi-button-reload \" type=\"button\" value=\"  <%: Open Web Interface%>\" onclick=\"window.open('"+URL+"')\"/>";
-			} else {
-				tb.innerHTML = '<em><b style=color:red>AdGuardHome <%:NOT RUNNING%></b></em>';
-				tb.innerHTML+='<em><b style=color:red><%:Not redirect%></b></em>'	
-			}
+        function(x, data) {
+                var tb = document.getElementById('AdGuardHome_status');
+                if (data && tb) {
+                        if (data.running) {
+                                tb.innerHTML = '<em><b style=color:green>AdGuardHome <%:RUNNING%></b></em>';
 
-		}
-	}
+                                var currentProtocol = window.location.protocol;
+                                var currentHost = window.location.hostname;
+                                var httpPort = "<%=httpport%>";
+                                var httpsPort = "<%=httpsport%>";
+                                var tlsEnabled = <%=tlsenabled and "true" or "false"%>;
+                                var yamlServerName = "<%=servername%>";
+
+                                var finalProtocol = currentProtocol;
+                                var targetPort = httpPort;
+                                var targetHost = currentHost;
+
+                                if (tlsEnabled && httpsPort && httpsPort !== "0") {
+                                    targetHost = (yamlServerName && yamlServerName.length > 0) ? yamlServerName : currentHost;
+
+                                    if (currentProtocol === 'https:') {
+                                        finalProtocol = 'https:';
+                                        targetPort = httpsPort;
+                                    } else {
+                                        finalProtocol = 'http:';
+                                        targetPort = httpPort;
+                                    }
+                                } else {
+                                    finalProtocol = 'http:';
+                                    targetPort = httpPort;
+                                    targetHost = currentHost;
+                                }
+
+                                var targetURL = finalProtocol + "//" + targetHost + (targetPort ? ":" + targetPort : "");
+
+                                tb.innerHTML += '<em> <b style=color:green><%:Redirected%></b> </em> ';
+                                tb.innerHTML += '<input class="cbi-button cbi-button-reload" type="button" value="  <%: Open Web Interface%>" onclick="window.open(\'' + targetURL + '\')"/>';
+                        } else {
+                                tb.innerHTML = '<em><b style=color:red>AdGuardHome <%:NOT RUNNING%></b></em>';
+                                tb.innerHTML += '<em><b style=color:red><%:Not redirect%></b></em>';
+                        }
+                }
+        }
 );
 //]]>
 </script>
 <style>.mar-10 {margin-left: 50px; margin-right: 10px;}</style>
 <fieldset class="cbi-section">
-	<p id="AdGuardHome_status">
-		<em><%:Collecting data...%></em>
-	</p>
+        <p id="AdGuardHome_status">
+                <em><%:Collecting data...%></em>
+        </p>
 </fieldset>
