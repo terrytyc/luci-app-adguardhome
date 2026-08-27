@@ -531,7 +531,7 @@ function valid_dns_name(value) {
 function http_port(content) {
 	let address = yaml_section_value(content, 'http', 'address');
 	let matched = address ? match(address, /:([0-9]+)$/) : null;
-	if (address && (match(address, /^127(?:\.[0-9]+){3}:/) ||
+	if (address && (match(address, /^127(\.[0-9]+){3}:/) ||
 	                match(address, /^\[::1\]:/)))
 		return null;
 	return matched ? valid_port(matched[1]) : null;
