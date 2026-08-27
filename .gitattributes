@@ -10,4 +10,5 @@ README.md text eol=lf
 luci-app-adguardhome/root/etc/config/* text eol=lf
 luci-app-adguardhome/root/etc/init.d/* text eol=lf
 luci-app-adguardhome/root/etc/uci-defaults/* text eol=lf
+luci-app-adguardhome/root/etc/hotplug.d/acme/* text eol=lf
 luci-app-adguardhome/root/usr/share/rpcd/ucode/* text eol=lf
