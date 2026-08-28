@@ -2,10 +2,11 @@
 
 'use strict';
 
-import { lstat, open, popen, stat, unlink } from 'fs';
+import { chmod, chown, lstat, lsdir, mkdir, open, popen, readfile, rename, stat, unlink } from 'fs';
 import { sha256 } from 'digest';
 import { connect } from 'ubus';
 import { cursor } from 'uci';
+import * as uloop from 'uloop';
 
 const SERVICE_NAME = 'adguardhome';
 const INSTANCE_NAME = 'adguardhome';
@@ -14,6 +15,10 @@ const MAX_VERSION_LENGTH = 256;
 const MAX_CONFIG_LENGTH = 512 * 1024;
 const MAX_LOG_LENGTH = 512 * 1024;
 const YAML_UPDATE_COMMAND = '/etc/init.d/AdGuardHome';
+const YAML_JOB_DIRECTORY = '/var/run/luci-app-adguardhome-yaml';
+const YAML_JOB_LOCK = `${YAML_JOB_DIRECTORY}/update.lock`;
+const YAML_MAINTENANCE_MARKER = `${YAML_JOB_DIRECTORY}/removing`;
+const YAML_JOB_STATE_LIMIT = 256;
 const CONFIG_NAME = 'AdGuardHome';
 const CONFIG_SECTION = 'AdGuardHome';
 const CONFIG_FILENAME = 'AdGuardHome.yaml';
@@ -279,6 +284,485 @@ function random_token() {
 	return type(bytes) == 'string' && length(bytes) == 16 ? hexenc(bytes) : null;
 }
 
+function yaml_job_path(token) {
+	return type(token) == 'string' && match(token, /^[0-9a-f]{32}$/)
+		? `${YAML_JOB_DIRECTORY}/${token}`
+		: null;
+}
+
+function root_private_directory(metadata) {
+	return metadata?.type == 'directory' && metadata.uid == 0 &&
+		metadata.gid == 0 && metadata.mode == 0o700;
+}
+
+function root_private_file(metadata) {
+	return metadata?.type == 'file' && metadata.uid == 0 && metadata.gid == 0 &&
+		metadata.mode == 0o600 && metadata.nlink == 1 &&
+		metadata.size > 0 && metadata.size <= YAML_JOB_STATE_LIMIT;
+}
+
+function root_private_temporary_file(metadata) {
+	return metadata?.type == 'file' && metadata.uid == 0 && metadata.gid == 0 &&
+		metadata.mode == 0o600 && metadata.nlink == 1 &&
+		metadata.size >= 0 && metadata.size <= YAML_JOB_STATE_LIMIT;
+}
+
+function root_private_lock_file(metadata) {
+	return metadata?.type == 'file' && metadata.uid == 0 && metadata.gid == 0 &&
+		metadata.mode == 0o600 && metadata.nlink == 1 && metadata.size == 0;
+}
+
+function same_inode(left, right) {
+	return left?.type == 'file' && right?.type == 'file' &&
+		left.inode == right.inode &&
+		left.dev?.major == right.dev?.major &&
+		left.dev?.minor == right.dev?.minor;
+}
+
+function ensure_yaml_job_directory() {
+	let metadata = lstat(YAML_JOB_DIRECTORY);
+	if (metadata)
+		return root_private_directory(metadata);
+
+	if (!mkdir(YAML_JOB_DIRECTORY, 0o700))
+		return root_private_directory(lstat(YAML_JOB_DIRECTORY));
+	if (!chown(YAML_JOB_DIRECTORY, 0, 0) || !chmod(YAML_JOB_DIRECTORY, 0o700))
+		return false;
+
+	return root_private_directory(lstat(YAML_JOB_DIRECTORY));
+}
+
+function open_yaml_job_lock() {
+	let metadata = null;
+	let opened = null;
+	let file = null;
+	let descriptor = null;
+	let created = false;
+
+	if (!ensure_yaml_job_directory())
+		return { error: 'YAML update state is unavailable' };
+
+	metadata = lstat(YAML_JOB_LOCK);
+	if (metadata && !root_private_lock_file(metadata))
+		return { error: 'YAML update lock is unsafe' };
+
+	try {
+		file = open(YAML_JOB_LOCK, metadata ? 'r+' : 'wx', 0o600);
+		created = !!file && !metadata;
+		if (!file && !metadata) {
+			metadata = lstat(YAML_JOB_LOCK);
+			if (root_private_lock_file(metadata))
+				file = open(YAML_JOB_LOCK, 'r+', 0o600);
+		}
+		if (!file)
+			return { error: 'YAML update lock is unavailable' };
+
+		if (created &&
+		    (!chown(YAML_JOB_LOCK, 0, 0) || !chmod(YAML_JOB_LOCK, 0o600))) {
+			file.close();
+			return { error: 'Unable to secure YAML update lock' };
+		}
+
+		metadata = lstat(YAML_JOB_LOCK);
+		descriptor = file.fileno();
+		opened = type(descriptor) == 'int'
+			? stat(`/proc/self/fd/${descriptor}`)
+			: null;
+		if (!root_private_lock_file(metadata) || !same_inode(metadata, opened) ||
+		    descriptor < 3 || descriptor == 1000) {
+			file.close();
+			return { error: 'YAML update lock is unsafe' };
+		}
+
+		if (!file.lock('xn')) {
+			file.close();
+			return { busy: true };
+		}
+	}
+	catch (error) {
+		if (file) {
+			try { file.close(); }
+			catch (close_error) { }
+		}
+		return { error: 'YAML update lock failed' };
+	}
+
+	return { file, descriptor };
+}
+
+function parse_yaml_job_state(content) {
+	if (type(content) != 'string' || !length(content) ||
+	    length(content) > YAML_JOB_STATE_LIMIT)
+		return null;
+
+	let fields = match(content,
+		/^pending:([0-9a-f]{64}):([0-9a-f]{64})\n$/);
+	if (fields)
+		return {
+			state: 'pending',
+			expected_hash: fields[1],
+			candidate_hash: fields[2],
+		};
+
+	fields = match(content,
+		/^running:([1-9][0-9]*):([0-9a-f]{64}):([0-9a-f]{64})\n$/);
+	if (fields)
+		return {
+			state: 'running',
+			pid: fields[1],
+			expected_hash: fields[2],
+			candidate_hash: fields[3],
+		};
+
+	fields = match(content,
+		/^success:([0-9a-f]{64}):([01]):([0-9a-f]{64}):([0-9a-f]{64})\n$/);
+	if (fields)
+		return {
+			state: 'success',
+			sha256: fields[1],
+			restarted: fields[2] == '1',
+			expected_hash: fields[3],
+			candidate_hash: fields[4],
+		};
+
+	fields = match(content,
+		/^failure:([0-9a-f]{64}):([0-9a-f]{64})\n$/);
+	if (fields)
+		return {
+			state: 'failure',
+			expected_hash: fields[1],
+			candidate_hash: fields[2],
+		};
+
+	fields = match(content,
+		/^indeterminate:([0-9a-f]{64}):([0-9a-f]{64})\n$/);
+	if (fields)
+		return {
+			state: 'indeterminate',
+			expected_hash: fields[1],
+			candidate_hash: fields[2],
+		};
+
+	return null;
+}
+
+function read_yaml_job(token) {
+	let path = yaml_job_path(token);
+	if (!path || !root_private_directory(lstat(YAML_JOB_DIRECTORY)))
+		return null;
+
+	let metadata = lstat(path);
+	if (!root_private_file(metadata))
+		return null;
+
+	return parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
+}
+
+function yaml_job_active() {
+	let metadata = lstat(YAML_JOB_DIRECTORY);
+	if (!metadata)
+		return false;
+	if (!root_private_directory(metadata))
+		return true;
+
+	let entries = lsdir(YAML_JOB_DIRECTORY);
+	if (type(entries) != 'array')
+		return true;
+	for (let name in entries) {
+		if (name == 'update.lock')
+			continue;
+		if (name == 'removing')
+			return true;
+		if (!match(name, /^[0-9a-f]{32}$/))
+			return true;
+		let record = read_yaml_job(name);
+		if (!record || record.state == 'pending' || record.state == 'running')
+			return true;
+	}
+
+	return false;
+}
+
+function write_new_yaml_job(token, expected_hash, candidate_hash) {
+	let path = yaml_job_path(token);
+	let suffix = random_token();
+	let temporary = path && suffix ?
+		`${YAML_JOB_DIRECTORY}/.${token}.rpcd-${suffix}` : null;
+	let content = `pending:${expected_hash}:${candidate_hash}\n`;
+	let file = null;
+	let created = false;
+
+	if (!temporary || !ensure_yaml_job_directory())
+		return false;
+
+	try {
+		file = open(temporary, 'wx', 0o600);
+		created = !!file;
+		if (!file || file.write(content) != length(content) || !file.flush()) {
+			if (file)
+				file.close();
+			if (created)
+				unlink(temporary);
+			return false;
+		}
+		if (!file.close()) {
+			file = null;
+			unlink(temporary);
+			return false;
+		}
+		file = null;
+		if (!root_private_file(lstat(temporary)) ||
+		    !parse_yaml_job_state(readfile(temporary, YAML_JOB_STATE_LIMIT + 1)) ||
+		    lstat(path) || !rename(temporary, path)) {
+			unlink(temporary);
+			return false;
+		}
+	}
+	catch (error) {
+		if (file) {
+			try { file.close(); }
+			catch (close_error) { }
+		}
+		if (created)
+			unlink(temporary);
+		return false;
+	}
+
+	let valid = root_private_file(lstat(path)) &&
+		!!parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
+	if (!valid && root_private_file(lstat(path)))
+		unlink(path);
+
+	return valid;
+}
+
+function replace_yaml_job(token, content) {
+	let path = yaml_job_path(token);
+	let suffix = random_token();
+	let temporary = path && suffix ?
+		`${YAML_JOB_DIRECTORY}/.${token}.rpcd-${suffix}` : null;
+	let file = null;
+	let created = false;
+
+	if (!temporary || !root_private_directory(lstat(YAML_JOB_DIRECTORY)) ||
+	    type(content) != 'string' || !parse_yaml_job_state(content))
+		return false;
+
+	try {
+		file = open(temporary, 'wx', 0o600);
+		created = !!file;
+		if (!file || file.write(content) != length(content) || !file.flush()) {
+			if (file)
+				file.close();
+			if (created)
+				unlink(temporary);
+			return false;
+		}
+		if (!file.close()) {
+			file = null;
+			unlink(temporary);
+			return false;
+		}
+		file = null;
+		if (!root_private_file(lstat(temporary)) || !rename(temporary, path)) {
+			unlink(temporary);
+			return false;
+		}
+	}
+	catch (error) {
+		if (file) {
+			try { file.close(); }
+			catch (close_error) { }
+		}
+		if (created)
+			unlink(temporary);
+		return false;
+	}
+
+	return root_private_file(lstat(path)) &&
+		!!parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
+}
+
+function discard_yaml_job(token) {
+	let path = yaml_job_path(token);
+	if (!path || !root_private_directory(lstat(YAML_JOB_DIRECTORY)))
+		return false;
+
+	let metadata = lstat(path);
+	return !metadata || (root_private_file(metadata) && !!unlink(path));
+}
+
+function yaml_stage_path(token) {
+	let path = config_path();
+	let stage = path && yaml_job_path(token) ? `${path}.luci-${token}` : null;
+
+	return stage &&
+		match(stage, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml\.luci-[0-9a-f]{32}$/)
+		? stage
+		: null;
+}
+
+function remove_yaml_stage(token, original, explicit_stage) {
+	let stage = explicit_stage || yaml_stage_path(token);
+	let suffix = `/AdGuardHome.yaml.luci-${token}`;
+	let metadata = stage ? lstat(stage) : null;
+
+	if (!stage ||
+	    !match(stage, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml\.luci-[0-9a-f]{32}$/) ||
+	    substr(stage, length(stage) - length(suffix)) != suffix)
+		return false;
+	if (!metadata)
+		return true;
+	if (metadata.type != 'file' || metadata.uid != 0 || metadata.gid != 0 ||
+	    metadata.mode != 0o600 || metadata.nlink != 1 ||
+	    metadata.size <= 0 || metadata.size > MAX_CONFIG_LENGTH ||
+	    (original && !same_inode(metadata, original)))
+		return false;
+
+	return !!unlink(stage);
+}
+
+function scan_yaml_jobs(clean_temporary) {
+	let entries = lsdir(YAML_JOB_DIRECTORY);
+	let result = { active: [], terminal: [] };
+
+	if (type(entries) != 'array')
+		return { error: 'YAML update state is unavailable' };
+
+	for (let name in entries) {
+		if (name == 'update.lock')
+			continue;
+		if (name == 'removing') {
+			if (!root_private_lock_file(lstat(YAML_MAINTENANCE_MARKER)))
+				return { error: 'YAML update maintenance marker is unsafe' };
+			result.maintenance = true;
+			continue;
+		}
+		if (match(name, /^\.[0-9a-f]{32}(\.rpcd-[0-9a-f]{32}|\.[A-Za-z0-9]{6})$/)) {
+			if (clean_temporary) {
+				let temporary = `${YAML_JOB_DIRECTORY}/${name}`;
+				if (!root_private_temporary_file(lstat(temporary)) || !unlink(temporary))
+					return { error: 'YAML update state is unsafe' };
+			}
+			continue;
+		}
+		if (!match(name, /^[0-9a-f]{32}$/))
+			return { error: 'YAML update state is unsafe' };
+
+		let record = read_yaml_job(name);
+		if (!record)
+			return { error: 'YAML update state is unsafe' };
+
+		let item = { token: name, record };
+		if (record.state == 'pending' || record.state == 'running')
+			result.active.push(item);
+		else
+			result.terminal.push(item);
+	}
+
+	return result;
+}
+
+function close_yaml_job_lock(lock) {
+	if (!lock?.file)
+		return true;
+
+	try {
+		return !!lock.file.close();
+	}
+	catch (error) {
+		return false;
+	}
+}
+
+function mark_yaml_job_indeterminate(item) {
+	if (!item || !item.token || !item.record)
+		return false;
+
+	return remove_yaml_stage(item.token, null) &&
+		replace_yaml_job(item.token,
+			`indeterminate:${item.record.expected_hash}:${item.record.candidate_hash}\n`);
+}
+
+function prepare_yaml_job(token, expected_hash, candidate_hash) {
+	let lock = open_yaml_job_lock();
+	let jobs = scan_yaml_jobs(!!lock.file);
+	if (jobs.error) {
+		close_yaml_job_lock(lock);
+		return jobs;
+	}
+	if (jobs.maintenance) {
+		close_yaml_job_lock(lock);
+		return { error: 'YAML updates are temporarily unavailable during package maintenance' };
+	}
+
+	let exact_active = null;
+	for (let item in jobs.active)
+		if (item.record.expected_hash == expected_hash &&
+		    item.record.candidate_hash == candidate_hash)
+			exact_active = item;
+
+	if (!lock.file) {
+		if (lock.error)
+			return { error: lock.error };
+		if (!lock.busy)
+			return { error: 'YAML update lock is unavailable' };
+		if (exact_active && length(jobs.active) == 1)
+			return { token: exact_active.token, reused: true };
+		if (length(jobs.active))
+			return { error: 'Another YAML update is already in progress' };
+		return { error: lock.error || 'Another YAML update is still finishing' };
+	}
+
+	if (length(jobs.active)) {
+		let marked = true;
+		for (let item in jobs.active)
+			marked = mark_yaml_job_indeterminate(item) && marked;
+		close_yaml_job_lock(lock);
+		if (!marked)
+			return { error: 'Unable to recover interrupted YAML update state' };
+		if (exact_active && length(jobs.active) == 1)
+			return { token: exact_active.token, reused: true };
+		return { error: 'A previous YAML update was interrupted; reload the YAML before editing it again' };
+	}
+
+	// Normally the editor consumes terminal records.  Bound abandoned results
+	// without making a recent result disappear merely because another editor
+	// begins a later, revision-checked transaction.
+	if (length(jobs.terminal) >= 16)
+		for (let item in jobs.terminal)
+			if (!discard_yaml_job(item.token)) {
+				close_yaml_job_lock(lock);
+				return { error: 'Unable to clean completed YAML update state' };
+			}
+
+	if (!write_new_yaml_job(token, expected_hash, candidate_hash)) {
+		close_yaml_job_lock(lock);
+		return { error: 'Unable to create YAML update state' };
+	}
+
+	return {
+		token,
+		reused: false,
+		lock: lock.file,
+		lock_descriptor: lock.descriptor,
+	};
+}
+
+function finish_yaml_process(token, expected_hash, candidate_hash, stage, original) {
+	let lock = open_yaml_job_lock();
+	if (!lock.file)
+		return;
+
+	let record = read_yaml_job(token);
+	if (record && (record.state == 'pending' || record.state == 'running'))
+		replace_yaml_job(token,
+			`indeterminate:${expected_hash}:${candidate_hash}\n`);
+
+	remove_yaml_stage(token, original, stage);
+	close_yaml_job_lock(lock);
+}
+
 function update_yaml(content, expected_hash) {
 	if (type(content) != 'string' || !length(content) ||
 	    length(content) > MAX_CONFIG_LENGTH || index(content, "\u0000") >= 0)
@@ -289,36 +773,52 @@ function update_yaml(content, expected_hash) {
 
 	let path = config_path();
 	let token = random_token();
-	if (!path || !token)
+	let candidate_hash = sha256(content);
+	if (!path || !token || !candidate_hash)
 		return { error: 'YAML configuration is unavailable' };
+	let job = prepare_yaml_job(token, expected_hash, candidate_hash);
+	if (job.error)
+		return job;
+	if (job.reused)
+		return { accepted: true, token: job.token, reused: true };
 
 	let stage = `${path}.luci-${token}`;
-	if (!match(stage, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml\.luci-[0-9a-f]{32}$/))
+	if (!match(stage, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml\.luci-[0-9a-f]{32}$/)) {
+		discard_yaml_job(token);
+		close_yaml_job_lock({ file: job.lock });
 		return { error: 'Unsafe YAML staging path' };
-	let candidate_hash = sha256(content);
+	}
 	let file = null;
 	let descriptor = null;
-	let status = -1;
+	let metadata = null;
+	let stage_created = false;
+	let launched = false;
 
 	try {
 		// Exclusive creation prevents a symlink or another request from
 		// claiming the staging pathname.  The init script revalidates it under
 		// its integration lock before using it.
 		file = open(stage, 'wx', 0o600);
+		stage_created = !!file;
 		if (!file || file.write(content) != length(content)) {
 			if (file)
 				file.close();
-			unlink(stage);
+			if (stage_created)
+				unlink(stage);
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
 			return { error: 'Unable to stage YAML configuration' };
 		}
-		if (!candidate_hash || !file.flush()) {
+		if (!file.flush()) {
 			file.close();
 			file = null;
 			unlink(stage);
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
 			return { error: 'Unable to flush staged YAML configuration' };
 		}
 
-		let metadata = lstat(stage);
+		metadata = lstat(stage);
 		descriptor = file.fileno();
 		let opened = type(descriptor) == 'int'
 			? stat(`/proc/self/fd/${descriptor}`)
@@ -330,6 +830,8 @@ function update_yaml(content, expected_hash) {
 			file.close();
 			file = null;
 			unlink(stage);
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
 			return { error: 'Unsafe YAML staging file' };
 		}
 		// Reopen the already-held inode read-only through procfs, then close the
@@ -349,58 +851,147 @@ function update_yaml(content, expected_hash) {
 			file.close();
 			file = null;
 			unlink(stage);
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
 			return { error: 'Unable to hold staged YAML configuration' };
 		}
 		if (!file.close()) {
 			reader.close();
 			file = null;
 			unlink(stage);
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
 			return { error: 'Unable to close writable YAML staging handle' };
 		}
 		file = reader;
 		descriptor = reader_descriptor;
 
-		// Unlike fs.popen() in 25.12.1, the core system() builtin supports an
-		// argv array and invokes execvp() directly.  Deliberately keep this
-		// O_EXCL descriptor open across exec: the init transaction snapshots only
-		// the inherited inode, never a replaceable candidate pathname.
-		status = system([
-			YAML_UPDATE_COMMAND, 'yaml_update', expected_hash,
-			candidate_hash, stage, `${descriptor}`,
-		]);
-		let closed = file.close();
-		file = null;
-		if (!closed) {
+		let lock_metadata = lstat(YAML_JOB_LOCK);
+		let lock_opened = type(job.lock_descriptor) == 'int'
+			? stat(`/proc/self/fd/${job.lock_descriptor}`)
+			: null;
+		if (!root_private_lock_file(lock_metadata) ||
+		    !same_inode(lock_metadata, lock_opened) ||
+		    descriptor == job.lock_descriptor || descriptor == 1000) {
+			file.close();
+			file = null;
 			unlink(stage);
-			return { error: 'Unable to close staged YAML configuration' };
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
+			return { error: 'Unsafe YAML update descriptors' };
 		}
+
+		// The core validation/restart transaction may legitimately take longer
+		// than LuCI's request timeout.  Fork it without a shell while this read-only
+		// descriptor is held; the worker inherits the immutable staged inode and
+		// publishes an atomic root-private result for short polling calls.
+		let child = uloop.process(YAML_UPDATE_COMMAND, [
+			'yaml_update_job', expected_hash, candidate_hash, stage,
+			`${descriptor}`, `${job.lock_descriptor}`, token,
+		], { PATH: '/usr/sbin:/usr/bin:/sbin:/bin' }, function(status) {
+			finish_yaml_process(token, expected_hash, candidate_hash, stage, metadata);
+		});
+		if (!child) {
+			file.close();
+			file = null;
+			unlink(stage);
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
+			return { error: 'Unable to start YAML update transaction' };
+		}
+		launched = true;
+
+		let stage_closed = file.close();
+		file = null;
+		let lock_closed = close_yaml_job_lock({ file: job.lock });
+		job.lock = null;
+		// A failed parent-side close cannot revoke the descriptor already inherited
+		// by the worker.  Let the persistent job result remain authoritative.
+		if (!stage_closed || !lock_closed)
+			return { accepted: true, token, reused: false };
 	}
 	catch (error) {
 		if (file) {
 			try { file.close(); }
 			catch (close_error) { }
 		}
-		unlink(stage);
+		if (launched)
+		{
+			close_yaml_job_lock({ file: job.lock });
+			return { accepted: true, token, reused: false };
+		}
+		if (stage_created)
+			unlink(stage);
+		discard_yaml_job(token);
+		close_yaml_job_lock({ file: job.lock });
 		return { error: 'YAML update transaction failed' };
 	}
 
-	unlink(stage);
-	if (status != 0)
-		return { error: 'YAML was rejected or changed concurrently' };
+	return { accepted: true, token, reused: false };
+}
 
-	let result = read_yaml();
-	if (!result || type(result.sha256) != 'string')
-		return { error: 'YAML update transaction did not complete' };
-	// A running official core may atomically serialize the accepted candidate
-	// into its canonical form.  The privileged transaction validates a stable
-	// canonical runtime before returning; expose the coherent current revision
-	// so the editor can immediately reload the latest authorized content.
+function yaml_job_status(token, consume) {
+	let record = read_yaml_job(token);
+	if (!record)
+		return { error: 'YAML update job is unavailable' };
 
-	return {
-		ok: true,
-		sha256: result.sha256,
-		restarted: service_running(),
-	};
+	// Serialize terminal observation and consumption with both the worker and
+	// set_yaml() directory scans.  A worker publishes its terminal bytes just
+	// before releasing this lock, so hide that short handoff as "running" until
+	// the complete transaction is quiescent.
+	let lock = open_yaml_job_lock();
+	if (!lock.file) {
+		if (lock.error)
+			return { error: lock.error };
+		return { state: record.state == 'pending' ? 'pending' : 'running' };
+	}
+
+	record = read_yaml_job(token);
+	if (!record) {
+		close_yaml_job_lock(lock);
+		return { error: 'YAML update job is unavailable' };
+	}
+	if (record.state == 'pending' || record.state == 'running') {
+		let item = { token, record };
+		if (!mark_yaml_job_indeterminate(item)) {
+			close_yaml_job_lock(lock);
+			return { error: 'Unable to recover interrupted YAML update state' };
+		}
+		record = read_yaml_job(token);
+		if (!record) {
+			close_yaml_job_lock(lock);
+			return { error: 'YAML update job is unavailable' };
+		}
+	}
+
+	let result = record.state == 'success'
+		? {
+			state: 'done',
+			ok: true,
+			sha256: record.sha256,
+			restarted: record.restarted,
+		}
+		: record.state == 'indeterminate'
+		? {
+			state: 'done',
+			ok: false,
+			indeterminate: true,
+			error: 'The YAML update was interrupted; reload the current YAML before editing it again',
+		}
+		: {
+			state: 'done',
+			ok: false,
+			error: 'YAML was rejected or changed concurrently',
+		};
+
+	if (consume === true && !discard_yaml_job(token)) {
+		close_yaml_job_lock(lock);
+		return { error: 'Unable to consume YAML update result' };
+	}
+	if (!close_yaml_job_lock(lock))
+		return { error: 'Unable to release YAML update lock' };
+
+	return result;
 }
 
 function yaml_scalar(value) {
@@ -563,7 +1154,10 @@ function tls_material_complete(content) {
 }
 
 function web_port_listening(port) {
-	if (!service_running() || type(port) != 'int')
+	// An asynchronous YAML transaction owns rc.common's per-service lock until
+	// validation, restart and rollback checks finish.  Do not synchronously enter
+	// the same init script from an unrelated status request while that job runs.
+	if (yaml_job_active() || !service_running() || type(port) != 'int')
 		return false;
 
 	try {
@@ -679,6 +1273,12 @@ const methods = {
 		args: { content: '', sha256: '' },
 		call: function(request) {
 			return update_yaml(request.args.content, request.args.sha256);
+		},
+	},
+	get_yaml_update: {
+		args: { token: '', consume: false },
+		call: function(request) {
+			return yaml_job_status(request.args.token, request.args.consume);
 		},
 	},
 };

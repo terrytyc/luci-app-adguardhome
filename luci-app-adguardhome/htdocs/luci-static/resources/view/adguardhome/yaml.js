@@ -17,9 +17,20 @@ const callSetYaml = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'set_yaml',
 	params: [ 'content', 'sha256' ],
-	expect: { '': { ok: false, sha256: '', restarted: false } },
+	expect: { '': { accepted: false, token: '', reused: false } },
 	reject: true,
 });
+
+const callGetYamlUpdate = rpc.declare({
+	object: 'luci.adguardhome',
+	method: 'get_yaml_update',
+	params: [ 'token', 'consume' ],
+	expect: { '': { state: '', ok: false, sha256: '', restarted: false } },
+	reject: true,
+});
+
+const YAML_POLL_INTERVAL = 1000;
+const YAML_POLL_LIMIT = 360;
 
 function normalizeYaml(result) {
 	return {
@@ -32,6 +43,10 @@ function normalizeYaml(result) {
 
 function errorMessage(error) {
 	return String(error?.message ?? error ?? _('Unknown error'));
+}
+
+function delay(milliseconds) {
+	return new Promise(resolve => window.setTimeout(resolve, milliseconds));
 }
 
 return view.extend({
@@ -150,11 +165,21 @@ return view.extend({
 		const content = String(this.yamlEditor.value ?? '').replace(/\r\n?/g, '\n');
 
 		try {
-			const result = await callSetYaml(content, this.yamlHash);
-			if (typeof result?.error === 'string' && result.error)
-				throw new Error(result.error);
+			const accepted = await callSetYaml(content, this.yamlHash);
+			if (typeof accepted?.error === 'string' && accepted.error)
+				throw new Error(accepted.error);
+			if (accepted?.accepted !== true ||
+			    typeof accepted.token !== 'string' ||
+			    !/^[0-9a-f]{32}$/.test(accepted.token))
+				throw new Error(_('The server did not accept the YAML update job.'));
+
+			ui.addNotification(null, E('p', {},
+				_('The YAML update was accepted and is being applied in the background.')), 'info');
+			const result = await this.waitForYamlUpdate(accepted.token);
 			if (result?.ok !== true || typeof result.sha256 !== 'string' || !result.sha256)
-				throw new Error(_('The server rejected the YAML configuration. Check its syntax and protected settings.'));
+				throw new Error(typeof result?.error === 'string' && result.error
+					? result.error
+					: _('The server rejected the YAML configuration. Check its syntax and protected settings.'));
 
 			this.yamlHash = result.sha256;
 			try {
@@ -183,6 +208,46 @@ return view.extend({
 		} finally {
 			this.saveButton.disabled = !this.yamlHash || !L.hasViewPermission();
 		}
+	},
+
+	async waitForYamlUpdate(token) {
+		let consecutiveErrors = 0;
+		let lastError = null;
+
+		for (let attempt = 0; attempt < YAML_POLL_LIMIT; attempt++) {
+			let result = null;
+			try {
+				result = await callGetYamlUpdate(token, false);
+				consecutiveErrors = 0;
+				lastError = null;
+			} catch (error) {
+				lastError = error;
+				consecutiveErrors++;
+				if (consecutiveErrors >= 10)
+					break;
+				await delay(YAML_POLL_INTERVAL);
+				continue;
+			}
+
+			if (result?.state == 'done') {
+				try {
+					await callGetYamlUpdate(token, true);
+				} catch (error) {
+					// The terminal result is already known; cleanup is best effort.
+				}
+				return result;
+			}
+			if (typeof result?.error === 'string' && result.error)
+				throw new Error(result.error);
+			if (result?.state != 'pending' && result?.state != 'running')
+				throw new Error(_('The YAML update returned an unknown job state.'));
+
+			await delay(YAML_POLL_INTERVAL);
+		}
+
+		throw new Error(lastError
+			? _('The YAML update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
+			: _('The YAML update is still running. Do not submit it again; reload this page later.'));
 	},
 
 	handleSaveApply: null,

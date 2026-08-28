@@ -206,3 +206,18 @@ msgstr "无法保存 YAML 配置：%s"
 
 msgid "If the file changed since it was loaded, reload it and merge your changes. Otherwise, check the YAML syntax and protected settings."
 msgstr "若文件在加载后已发生变化，请重新载入并合并改动；否则请检查 YAML 语法和受保护的设置。"
+
+msgid "The server did not accept the YAML update job."
+msgstr "服务器未接受 YAML 更新任务。"
+
+msgid "The YAML update was accepted and is being applied in the background."
+msgstr "YAML 更新任务已接受，正在后台应用。"
+
+msgid "The YAML update returned an unknown job state."
+msgstr "YAML 更新任务返回了未知状态。"
+
+msgid "The YAML update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later."
+msgstr "YAML 更新仍在运行，但暂时无法获取其状态：%s。请勿重复提交，稍后重新加载此页面。"
+
+msgid "The YAML update is still running. Do not submit it again; reload this page later."
+msgstr "YAML 更新仍在运行。请勿重复提交，稍后重新加载此页面。"

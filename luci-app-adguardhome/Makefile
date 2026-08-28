@@ -10,7 +10,7 @@ PKG_LICENSE:=Apache-2.0
 
 LUCI_TITLE:=LuCI support for AdGuard Home
 LUCI_PKGARCH:=all
-LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +coreutils-timeout +procd-ujail +adguardhome
+LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +ucode-mod-uloop +coreutils-timeout +flock +procd-ujail +adguardhome
 LUCI_EXTRA_DEPENDS:=adguardhome (>=0.107.76-r1)
 LUCI_DESCRIPTION:=LuCI integration for the packaged AdGuard Home service
 LUCI_MAINTAINER:=terrytyc
@@ -39,7 +39,7 @@ define Package/$(PKG_NAME)/conffiles
 /root/.luci-app-adguardhome/
 endef
 
-# APK runs this hook for both install and upgrade; its generated pre-upgrade
+# APK maps this hook to both pre-install and pre-upgrade; its generated upgrade
 # wrapper supplies PKG_UPGRADE=1, while opkg passes "upgrade" as argv[1].
 # Snapshot the untouched official UCI/runtime state on the first install, then
 # stop the legacy mixed-case supervisor before an upgrade replaces it.
@@ -54,6 +54,11 @@ snapshot_version="$${snapshot_dir}/snapshot-version"
 runtime_dir=/var/run/luci-app-adguardhome
 upgrade_marker="$${runtime_dir}/upgrade"
 init_enabled_marker="$${runtime_dir}/init-enabled"
+yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
+yaml_update_lock="$${yaml_runtime_dir}/update.lock"
+yaml_maintenance_marker="$${yaml_runtime_dir}/removing"
+yaml_maintenance_created=0
+yaml_maintenance_committed=0
 snapshot_stage=""
 
 # Historical versions trusted these world-writable marker paths.  Never read
@@ -96,6 +101,59 @@ root_private_file() {
 	$$metadata
 	EOF
 	[ "$$mode" = "-rw-------" ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+root_private_empty_file() {
+	local metadata mode links owner group size
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+		[ "$$owner" = 0 ] && [ "$$group" = 0 ] || return 1
+	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+	[ "$$size" = 0 ]
+}
+
+quiesce_yaml_updates() {
+	if [ -e "$$yaml_runtime_dir" ] || [ -L "$$yaml_runtime_dir" ]; then
+		root_private_directory "$$yaml_runtime_dir" || return 1
+	else
+		mkdir -m 0700 "$$yaml_runtime_dir" || return 1
+		chown 0:0 "$$yaml_runtime_dir" && chmod 0700 "$$yaml_runtime_dir" || return 1
+		root_private_directory "$$yaml_runtime_dir" || return 1
+	fi
+	if [ -e "$$yaml_update_lock" ] || [ -L "$$yaml_update_lock" ]; then
+		root_private_empty_file "$$yaml_update_lock" || return 1
+	else
+		(umask 077; : >"$$yaml_update_lock") || return 1
+		chown 0:0 "$$yaml_update_lock" && chmod 0600 "$$yaml_update_lock" || return 1
+		root_private_empty_file "$$yaml_update_lock" || return 1
+	fi
+	[ ! -e /proc/self/fd/191 ] || return 1
+	exec 191>>"$$yaml_update_lock" || return 1
+	[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || return 1
+	/usr/bin/flock -x 191 || return 1
+	[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || return 1
+	if [ -e "$$yaml_maintenance_marker" ] || [ -L "$$yaml_maintenance_marker" ]; then
+		root_private_empty_file "$$yaml_maintenance_marker" || return 1
+	else
+		(umask 077; : >"$$yaml_maintenance_marker") || return 1
+		chown 0:0 "$$yaml_maintenance_marker" &&
+			chmod 0600 "$$yaml_maintenance_marker" || return 1
+		root_private_empty_file "$$yaml_maintenance_marker" || return 1
+		yaml_maintenance_created=1
+	fi
+}
+
+cleanup_yaml_maintenance() {
+	[ "$$yaml_maintenance_committed" != 1 ] || return 0
+	[ "$$yaml_maintenance_created" = 1 ] || return 0
+	[ -e /proc/self/fd/191 ] &&
+		[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] &&
+		root_private_empty_file "$$yaml_maintenance_marker" || return 0
+	rm -f "$$yaml_maintenance_marker" 2>/dev/null || true
 }
 
 # /etc/config is mode 0777 on the supported rootfs.  Capture the fixed
@@ -335,6 +393,7 @@ write_runtime_marker() {
 }
 
 cleanup_upgrade_markers() {
+	cleanup_yaml_maintenance
 	cleanup_snapshot_stage "$$snapshot_stage"
 	if validate_runtime_dir; then
 		rm -f "$$upgrade_marker" "$$init_enabled_marker"
@@ -344,6 +403,10 @@ cleanup_upgrade_markers() {
 
 trap cleanup_upgrade_markers 0
 trap 'exit 1' HUP INT TERM
+quiesce_yaml_updates || {
+	echo "Unable to quiesce LuCI YAML updates; installation aborted." >&2
+	exit 1
+}
 ensure_original_snapshot || exit 1
 is_upgrade=0
 case "$${PKG_UPGRADE}:$$1" in
@@ -352,6 +415,7 @@ esac
 [ -f /usr/lib/opkg/info/luci-app-adguardhome.list ] && is_upgrade=1
 [ -f /lib/apk/packages/luci-app-adguardhome.list ] && is_upgrade=1
 [ "$$is_upgrade" = 1 ] || {
+	yaml_maintenance_committed=1
 	cleanup_upgrade_markers
 	trap - 0 HUP INT TERM
 	exit 0
@@ -586,6 +650,7 @@ if [ -x /etc/init.d/adguardhome ]; then
 	esac
 fi
 
+yaml_maintenance_committed=1
 trap - 0 HUP INT TERM
 exit 0
 endef
@@ -604,13 +669,83 @@ if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	exit 1
 fi
 
+entry_metadata() {
+	LC_ALL=C ls -ldn "$$1" 2>/dev/null
+}
+root_private_directory() {
+	local metadata
+	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode _links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "drwx------" ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+root_private_empty_file() {
+	local metadata mode links owner group size
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+		[ "$$owner" = 0 ] && [ "$$group" = 0 ] || return 1
+	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+	[ "$$size" = 0 ]
+}
+yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
+yaml_update_lock="$${yaml_runtime_dir}/update.lock"
+yaml_maintenance_marker="$${yaml_runtime_dir}/removing"
+
+# Defensively establish or repair the stable YAML lock again in postinst.  The
+# pre-install/pre-upgrade hook normally creates it, but postinst must not expose
+# the freshly installed rpcd object unless this safety boundary still exists.
+if [ -e "$$yaml_runtime_dir" ] || [ -L "$$yaml_runtime_dir" ]; then
+	root_private_directory "$$yaml_runtime_dir" || exit 1
+else
+	mkdir -m 0700 "$$yaml_runtime_dir" || exit 1
+	chown 0:0 "$$yaml_runtime_dir" && chmod 0700 "$$yaml_runtime_dir" || exit 1
+	root_private_directory "$$yaml_runtime_dir" || exit 1
+fi
+if [ -e "$$yaml_update_lock" ] || [ -L "$$yaml_update_lock" ]; then
+	root_private_empty_file "$$yaml_update_lock" || exit 1
+else
+	(umask 077; : >"$$yaml_update_lock") || exit 1
+	chown 0:0 "$$yaml_update_lock" && chmod 0600 "$$yaml_update_lock" || exit 1
+	root_private_empty_file "$$yaml_update_lock" || exit 1
+fi
+[ ! -e /proc/self/fd/191 ] || exit 1
+exec 191>>"$$yaml_update_lock" || exit 1
+[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || exit 1
+/usr/bin/flock -x 191 || exit 1
+[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || exit 1
+if [ -e "$$yaml_maintenance_marker" ] || [ -L "$$yaml_maintenance_marker" ]; then
+	root_private_empty_file "$$yaml_maintenance_marker" || exit 1
+else
+	(umask 077; : >"$$yaml_maintenance_marker") || exit 1
+	chown 0:0 "$$yaml_maintenance_marker" &&
+		chmod 0600 "$$yaml_maintenance_marker" || exit 1
+	root_private_empty_file "$$yaml_maintenance_marker" || exit 1
+fi
+
 rm -f /tmp/luci-indexcache.* || exit 1
 if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
 	rm -f /tmp/luci-modulecache || exit 1
 elif [ -d /tmp/luci-modulecache ]; then
 	rm -rf /tmp/luci-modulecache/ || exit 1
 fi
-[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1 || true
+if [ ! -x /etc/init.d/rpcd ] ||
+   ! /etc/init.d/rpcd reload >/dev/null 2>&1; then
+	echo "Unable to reload rpcd; YAML updates remain blocked." >&2
+	exit 1
+fi
+
+[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || exit 1
+root_private_directory "$$yaml_runtime_dir" &&
+	root_private_empty_file "$$yaml_update_lock" &&
+	root_private_empty_file "$$yaml_maintenance_marker" || exit 1
+rm -f "$$yaml_maintenance_marker" || exit 1
+[ ! -e "$$yaml_maintenance_marker" ] && [ ! -L "$$yaml_maintenance_marker" ] || exit 1
 exit 0
 endef
 
@@ -630,6 +765,11 @@ snapshot_config="$${snapshot_dir}/official-adguardhome.config"
 snapshot_state="$${snapshot_dir}/official-adguardhome.state"
 snapshot_version="$${snapshot_dir}/snapshot-version"
 runtime_dir=/var/run/luci-app-adguardhome
+yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
+yaml_update_lock="$${yaml_runtime_dir}/update.lock"
+yaml_removal_marker="$${yaml_runtime_dir}/removing"
+yaml_removal_created=0
+yaml_removal_committed=0
 verify_export=""
 verify_config_dir=""
 verify_package=""
@@ -674,6 +814,49 @@ root_private_file() {
 	$$metadata
 	EOF
 	[ "$$mode" = "-rw-------" ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+root_private_empty_file() {
+	local metadata mode links owner group size
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+		[ "$$owner" = 0 ] && [ "$$group" = 0 ] || return 1
+	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+	[ "$$size" = 0 ]
+}
+
+quiesce_yaml_updates() {
+	if [ -e "$$yaml_runtime_dir" ] || [ -L "$$yaml_runtime_dir" ]; then
+		root_private_directory "$$yaml_runtime_dir" || return 1
+	else
+		mkdir -m 0700 "$$yaml_runtime_dir" || return 1
+		chown 0:0 "$$yaml_runtime_dir" && chmod 0700 "$$yaml_runtime_dir" || return 1
+		root_private_directory "$$yaml_runtime_dir" || return 1
+	fi
+	if [ -e "$$yaml_update_lock" ] || [ -L "$$yaml_update_lock" ]; then
+		root_private_empty_file "$$yaml_update_lock" || return 1
+	else
+		(umask 077; : >>"$$yaml_update_lock") || return 1
+		chown 0:0 "$$yaml_update_lock" && chmod 0600 "$$yaml_update_lock" || return 1
+		root_private_empty_file "$$yaml_update_lock" || return 1
+	fi
+	[ ! -e /proc/self/fd/191 ] || return 1
+	exec 191>>"$$yaml_update_lock" || return 1
+	[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || return 1
+	/usr/bin/flock -x 191 || return 1
+	[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || return 1
+	if [ -e "$$yaml_removal_marker" ] || [ -L "$$yaml_removal_marker" ]; then
+		root_private_empty_file "$$yaml_removal_marker" || return 1
+	else
+		(umask 077; : >"$$yaml_removal_marker") || return 1
+		chown 0:0 "$$yaml_removal_marker" && chmod 0600 "$$yaml_removal_marker" || return 1
+		root_private_empty_file "$$yaml_removal_marker" || return 1
+		yaml_removal_created=1
+	fi
 }
 
 bounded_private_file() {
@@ -774,6 +957,13 @@ ensure_runtime_dir() {
 }
 
 cleanup_restore_files() {
+	if [ "$$yaml_removal_committed" != 1 ] &&
+	   [ "$$yaml_removal_created" = 1 ] &&
+	   [ -e /proc/self/fd/191 ] &&
+	   [ /proc/self/fd/191 -ef "$$yaml_update_lock" ] &&
+	   root_private_empty_file "$$yaml_removal_marker"; then
+		rm -f "$$yaml_removal_marker" 2>/dev/null || true
+	fi
 	case "$$verify_export" in "$$runtime_dir"/restore-export.*) rm -f "$$verify_export" ;; esac
 	case "$$verify_config_dir" in
 		"$$runtime_dir"/restore-config.*)
@@ -862,6 +1052,12 @@ restore_official_state() {
 	esac
 }
 
+trap cleanup_restore_files 0
+trap 'exit 1' HUP INT TERM
+quiesce_yaml_updates || {
+	echo "Unable to quiesce LuCI YAML updates; uninstall aborted." >&2
+	exit 1
+}
 validate_original_snapshot || {
 	echo "Original official adguardhome snapshot is unavailable or unsafe; uninstall aborted." >&2
 	exit 1
@@ -871,8 +1067,6 @@ discard_official_pending_delta || {
 	echo "Unsafe official adguardhome UCI delta; uninstall aborted." >&2
 	exit 1
 }
-trap cleanup_restore_files 0
-trap 'exit 1' HUP INT TERM
 
 if [ -x /etc/init.d/AdGuardHome ]; then
 	/etc/init.d/AdGuardHome do_redirect 0 >/dev/null 2>&1 || {
@@ -916,6 +1110,7 @@ if [ -x /etc/init.d/adguardhome ]; then
 fi
 
 restore_official_state || exit 1
+yaml_removal_committed=1
 cleanup_restore_files
 trap - 0 HUP INT TERM
 
@@ -946,13 +1141,28 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 		local metadata
 		[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
 		metadata="$$(entry_metadata "$$1")" || return 1
-		read -r mode _links owner group _remainder <<-EOF
+		read -r mode links owner group _remainder <<-EOF
 		$$metadata
 		EOF
-		[ "$$mode" = "-rw-------" ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
+		[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+			[ "$$owner" = 0 ] && [ "$$group" = 0 ]
+	}
+	root_private_empty_file() {
+		local size
+		root_private_file "$$1" || return 1
+		size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+		[ "$$size" = 0 ]
+	}
+	root_private_bounded_job_file() {
+		local size
+		root_private_file "$$1" || return 1
+		size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+		case "$$size" in ""|*[!0-9]*) return 1 ;; esac
+		[ "$$size" -le 256 ]
 	}
 	snapshot_dir=/root/.luci-app-adguardhome
 	runtime_dir=/var/run/luci-app-adguardhome
+	yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
 	if root_private_directory "$$snapshot_dir" &&
 	   root_private_file "$${snapshot_dir}/official-adguardhome.uci" &&
 	   root_private_file "$${snapshot_dir}/official-adguardhome.config" &&
@@ -968,6 +1178,50 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 		rm -f "$${runtime_dir}/upgrade" "$${runtime_dir}/init-enabled"
 		rmdir "$$runtime_dir" 2>/dev/null || true
 	fi
+	# The package files, including the RPC object, have already been removed.
+	# Unload the in-memory object before unlinking its stable lock inode.
+	if [ ! -x /etc/init.d/rpcd ] ||
+	   ! /etc/init.d/rpcd reload >/dev/null 2>&1; then
+		echo "Unable to unload the AdGuard Home RPC; YAML maintenance state was preserved." >&2
+		exit 1
+	fi
+	if [ -e "$$yaml_runtime_dir" ] || [ -L "$$yaml_runtime_dir" ]; then
+		yaml_update_lock="$${yaml_runtime_dir}/update.lock"
+		yaml_removal_marker="$${yaml_runtime_dir}/removing"
+		if ! root_private_directory "$$yaml_runtime_dir" ||
+		   ! root_private_empty_file "$$yaml_update_lock" ||
+		   ! root_private_empty_file "$$yaml_removal_marker"; then
+			echo "Unsafe YAML maintenance state was preserved after uninstall." >&2
+			exit 1
+		fi
+		[ ! -e /proc/self/fd/191 ] || exit 1
+		exec 191>>"$$yaml_update_lock" || exit 1
+		[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || exit 1
+		/usr/bin/flock -x 191 || exit 1
+		[ /proc/self/fd/191 -ef "$$yaml_update_lock" ] &&
+			root_private_empty_file "$$yaml_update_lock" &&
+			root_private_empty_file "$$yaml_removal_marker" || exit 1
+		for yaml_runtime_entry in \
+			"$$yaml_runtime_dir"/* \
+			"$$yaml_runtime_dir"/.[!.]* \
+			"$$yaml_runtime_dir"/..?*; do
+			[ -e "$$yaml_runtime_entry" ] || [ -L "$$yaml_runtime_entry" ] || continue
+			yaml_runtime_name="$${yaml_runtime_entry##*/}"
+			case "$$yaml_runtime_name" in update.lock|removing) continue ;; esac
+			printf '%s\n' "$$yaml_runtime_name" | grep -Eq \
+				'^([0-9a-f]{32}|\.[0-9a-f]{32}(\.rpcd-[0-9a-f]{32}|\.[A-Za-z0-9]{6}))$$' || {
+				echo "Unexpected YAML runtime entry was preserved: $$yaml_runtime_name" >&2
+				exit 1
+			}
+			root_private_bounded_job_file "$$yaml_runtime_entry" || exit 1
+			rm -f "$$yaml_runtime_entry" || exit 1
+		done
+		root_private_empty_file "$$yaml_removal_marker" &&
+			root_private_empty_file "$$yaml_update_lock" || exit 1
+		rm -f "$$yaml_removal_marker" || exit 1
+		rm -f "$$yaml_update_lock" || exit 1
+		rmdir "$$yaml_runtime_dir" || exit 1
+	fi
 	for legacy_marker in \
 		/tmp/luci-app-adguardhome.upgrade \
 		/tmp/luci-app-adguardhome.init-enabled; do
@@ -981,8 +1235,7 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	elif [ -d /tmp/luci-modulecache ]; then
 		rm -rf /tmp/luci-modulecache/
 	fi
-	[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1 || true
-fi
+	fi
 exit 0
 endef
 

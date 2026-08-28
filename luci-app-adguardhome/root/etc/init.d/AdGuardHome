@@ -29,6 +29,7 @@ MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
 INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
 NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
 NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
+YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
 MONITOR_INTERVAL=2
 # First boot can download and compile the packaged default filters before the
 # DNS sockets appear, especially on slower routers.  Keep takeover disabled
@@ -49,7 +50,7 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update tls_refresh"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update yaml_update_job tls_refresh"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
@@ -57,16 +58,41 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
+\tyaml_update_job <old-hash> <new-hash> <stage> <stage-fd> <lock-fd> <token>\tRun an asynchronous LuCI YAML edit
 \ttls_refresh\t\tRecheck ACME material after renewal"
 
 log_error() {
 	logger -t AdGuardHome "$*"
 }
 
+open_integration_lock_descriptor() {
+	case "$1" in
+		199) exec 199>>"$INTEGRATION_LOCK" ;;
+		198) exec 198>>"$INTEGRATION_LOCK" ;;
+		197) exec 197>>"$INTEGRATION_LOCK" ;;
+		196) exec 196>>"$INTEGRATION_LOCK" ;;
+		195) exec 195>>"$INTEGRATION_LOCK" ;;
+		194) exec 194>>"$INTEGRATION_LOCK" ;;
+		193) exec 193>>"$INTEGRATION_LOCK" ;;
+		192) exec 192>>"$INTEGRATION_LOCK" ;;
+		*) return 1 ;;
+	esac
+}
+
 run_locked() (
+	local lock_fd="" candidate
 	mkdir -p "${INTEGRATION_LOCK%/*}" || exit 1
-	lock "$INTEGRATION_LOCK" || exit 1
-	trap 'lock -u "$INTEGRATION_LOCK"' EXIT
+	# Pick an unused descriptor instead of clobbering a read-only staged YAML or
+	# the update lock inherited by an asynchronous worker.  The descriptor is
+	# owned by this subshell, so SIGKILL/OOM releases the kernel flock directly.
+	for candidate in 199 198 197 196 195 194 193 192; do
+		[ ! -e "/proc/self/fd/${candidate}" ] || continue
+		open_integration_lock_descriptor "$candidate" || exit 1
+		lock_fd="$candidate"
+		break
+	done
+	[ -n "$lock_fd" ] || exit 1
+	/usr/bin/flock -x "$lock_fd" || exit 1
 	"$@"
 )
 
@@ -2704,6 +2730,174 @@ yaml_update_locked() (
 yaml_update() {
 	run_locked yaml_update_locked "$1" "$2" "$3" "$4"
 }
+
+yaml_job_token_valid() {
+	[ "${#1}" = 32 ] || return 1
+	case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+yaml_job_hash_valid() {
+	[ "${#1}" = 64 ] || return 1
+	case "$1" in *[!0-9a-f]*) return 1 ;; esac
+}
+
+yaml_job_runtime_is_private() {
+	local metadata mode links owner group remainder
+	[ -d "$YAML_JOB_RUNTIME_DIR" ] && [ ! -L "$YAML_JOB_RUNTIME_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$YAML_JOB_RUNTIME_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = "0:0:drwx------" ]
+}
+
+yaml_job_file_is_private() {
+	local target="$1" metadata mode links owner group remainder size
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || return 1
+	size="$(wc -c <"$target" 2>/dev/null)" || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le 256 ]
+}
+
+yaml_job_lock_file_is_private() {
+	local target="${YAML_JOB_RUNTIME_DIR}/update.lock"
+	local metadata mode links owner group remainder size
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || return 1
+	size="$(wc -c <"$target" 2>/dev/null)" || return 1
+	[ "$size" = 0 ]
+}
+
+yaml_job_lock_fd_valid() {
+	local stage_fd="$1" lock_fd="$2" lock_path fd_path
+	case "$lock_fd" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$lock_fd" -ge 3 ] 2>/dev/null || return 1
+	[ "$lock_fd" != 1000 ] && [ "$lock_fd" != "$stage_fd" ] || return 1
+	lock_path="${YAML_JOB_RUNTIME_DIR}/update.lock"
+	fd_path="/proc/self/fd/${lock_fd}"
+	yaml_job_lock_file_is_private || return 1
+	[ -f "$fd_path" ] && [ "$fd_path" -ef "$lock_path" ]
+}
+
+write_yaml_job_state() {
+	local token="$1" state="$2" target temporary
+	yaml_job_token_valid "$token" || return 1
+	yaml_job_runtime_is_private || return 1
+	target="${YAML_JOB_RUNTIME_DIR}/${token}"
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	temporary="$(mktemp "${YAML_JOB_RUNTIME_DIR}/.${token}.XXXXXX")" || return 1
+	if ! printf '%s\n' "$state" >"$temporary" ||
+	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! yaml_job_file_is_private "$temporary" ||
+	   ! mv -f "$temporary" "$target" ||
+	   ! yaml_job_file_is_private "$target"; then
+		rm -f "$temporary"
+		return 1
+	fi
+}
+
+yaml_job_pending_matches() {
+	local token="$1" expected_hash="$2" candidate_hash="$3"
+	local target="${YAML_JOB_RUNTIME_DIR}/${token}"
+	yaml_job_file_is_private "$target" || return 1
+	grep -Fqx "pending:${expected_hash}:${candidate_hash}" "$target"
+}
+
+close_yaml_job_inherited_fds() {
+	local inherited_fd="$1" job_lock_fd="$2" fd_path fd
+	case "$inherited_fd:$job_lock_fd" in *[!0-9:]*) return 1 ;; esac
+	[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
+	[ "$job_lock_fd" -ge 3 ] 2>/dev/null || return 1
+	[ "$inherited_fd" != "$job_lock_fd" ] || return 1
+	for fd_path in /proc/self/fd/[0-9]*; do
+		[ -e "$fd_path" ] || continue
+		fd="${fd_path##*/}"
+		case "$fd" in
+			0|1|2|1000|"$inherited_fd"|"$job_lock_fd") continue ;;
+			*[!0-9]*) return 1 ;;
+		esac
+		# fd is numeric and came from procfs; eval is needed because BusyBox ash
+		# does not support a variable file-descriptor operand for exec.
+		eval "exec ${fd}>&-" || return 1
+	done
+}
+
+cleanup_yaml_job_stage() {
+	local stage="$1" inherited_fd="$2" fd_path="/proc/self/fd/${inherited_fd}"
+	[ -f "$fd_path" ] || return 0
+	if [ -f "$stage" ] && [ ! -L "$stage" ] && [ "$fd_path" -ef "$stage" ]; then
+		rm -f "$stage"
+	fi
+}
+
+yaml_update_job_locked() {
+	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
+	local token="$5" final_hash restarted=0
+	yaml_job_pending_matches "$token" "$expected_hash" "$candidate_hash" || return 1
+	write_yaml_job_state "$token" \
+		"running:$$:${expected_hash}:${candidate_hash}" || return 1
+
+	if ! yaml_update_locked "$expected_hash" "$candidate_hash" \
+		"$stage" "$inherited_fd"; then
+		cleanup_yaml_job_stage "$stage" "$inherited_fd"
+		# yaml_update_locked() can fail after an attempted rollback.  Its single
+		# return code cannot prove that the old runtime was restored completely,
+		# so never publish a definitive rejection that might invite an unsafe retry.
+		write_yaml_job_state "$token" \
+			"indeterminate:${expected_hash}:${candidate_hash}" >/dev/null 2>&1 || true
+		return 1
+	fi
+
+	cleanup_yaml_job_stage "$stage" "$inherited_fd"
+	if load_legacy_settings && final_hash="$(active_config_hash)" &&
+	   yaml_job_hash_valid "$final_hash"; then
+		official_running && restarted=1
+		if write_yaml_job_state "$token" \
+			"success:${final_hash}:${restarted}:${expected_hash}:${candidate_hash}"; then
+			return 0
+		fi
+	fi
+
+	# The transaction may already be committed.  Never turn a reporting failure
+	# into a false rejection that could encourage an unsafe automatic retry.
+	write_yaml_job_state "$token" \
+		"indeterminate:${expected_hash}:${candidate_hash}" >/dev/null 2>&1 || true
+	return 1
+}
+
+yaml_update_job() (
+	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
+	local job_lock_fd="$5" token="$6"
+	yaml_job_hash_valid "$expected_hash" || exit 1
+	yaml_job_hash_valid "$candidate_hash" || exit 1
+	yaml_job_token_valid "$token" || exit 1
+	case "$stage" in
+		*/AdGuardHome.yaml.luci-"$token") ;;
+		*) exit 1 ;;
+	esac
+	yaml_job_runtime_is_private || exit 1
+	yaml_job_pending_matches "$token" "$expected_hash" "$candidate_hash" || exit 1
+	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" || exit 1
+	/usr/bin/flock -n -x "$job_lock_fd" || exit 1
+	close_yaml_job_inherited_fds "$inherited_fd" "$job_lock_fd" || exit 1
+	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" || exit 1
+	/usr/bin/flock -n -x "$job_lock_fd" || exit 1
+
+	if run_locked yaml_update_job_locked "$expected_hash" "$candidate_hash" \
+		"$stage" "$inherited_fd" "$token"; then
+		exit 0
+	fi
+	exit 1
+)
 
 restore_tls_fingerprint() {
 	local value="$1" option="${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}"
