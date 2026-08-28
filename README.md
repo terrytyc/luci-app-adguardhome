@@ -9,7 +9,7 @@ luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
 - 使用 ImmortalWrt 官方 `adguardhome` 软件包提供和更新核心
 - 使用现代 LuCI JavaScript 页面和专用 ucode RPC 后端，不依赖 Lua、CBI 或 `luci-compat`
 - 通过官方 `/etc/init.d/adguardhome` 管理核心进程
-- 保留旧版 `AdGuardHome` UCI 配置兼容层和 DNS 重定向模式
+- 使用独立的 `AdGuardHome` UCI 配置和 `none`、`redirect`、`dnsmasq-upstream` 三种 DNS 集成模式
 - 默认 YAML 的 Web 管理端口为 `3000`，默认用户名和密码均为 `admin`
 - 默认 YAML 的 DNS 监听端口为 `53335`；运行时会动态读取实际的 `dns.port`
 - 只需配置工作目录；配置文件固定为 `<工作目录>/AdGuardHome.yaml`
@@ -21,7 +21,7 @@ luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
 - “运行日志”页可直接查看插件与 AdGuard Home 的运行日志
 - “YAML 配置”页提供事务式编辑：新配置通过校验并安全落盘后才会生效，失败时不会留下半写入的活动配置
 - LuCI 入口统一为小写 `/admin/services/adguardhome`，三个子页分别为 `/settings`、`/log` 和 `/yaml`
-- v2.1 升级会刷新 LuCI 运行缓存并重建旧版启动优先级链接，同时保留原有的启用或禁用状态
+- v2.1 是新的洁净安装基线，不支持从任何旧版 `luci-app-adguardhome` 原位升级
 - 更换工作目录时会安全复制现有 `data` 运行数据并保留原目录作为回退
 - 导入官方默认的易失 `/var/lib/adguardhome` 时，会把 YAML 与现有 `data` 迁移到持久目录；新的工作目录不允许位于 `/tmp` 或 `/var`
 - Web 跳转按钮从 YAML 读取管理端点：HTTP 沿用当前 LuCI 的 IP/域名并使用 `http.address` 的端口，HTTPS 使用 `tls.server_name` 和 `tls.port_https`
@@ -41,6 +41,8 @@ AdGuard Home 的 HTTPS 文件证书应在 YAML 中使用 `tls.certificate_path` 
 核心升级请使用 ImmortalWrt 的 APK 软件包管理，不再由 LuCI 插件自行下载或替换二进制。
 官方 `adguardhome` APK 的文件、服务名、UCI 配置名和 `/usr/bin/AdGuardHome` 二进制名称保持原样；本插件仅通过官方服务与 UCI 接口集成，不覆盖官方包载荷。
 旧版核心更新器、UPX 和 GFW 列表功能已经移除。
+
+若路由器已安装任意旧版（包括 1.x 或 2.0.x），必须先安全卸载旧的 LuCI 插件，再安装 v2.1；不承诺保留旧插件的 UCI、YAML 或运行数据。官方 `adguardhome` 核心包无需卸载，洁净安装时会按当前安全生命周期接管，并在卸载 v2.1 时恢复安装前保存的官方状态。
 
 `dnsmasq-upstream` 模式要求系统只有一个 dnsmasq UCI 实例；检测到多个实例时会拒绝接管，避免误改非 LAN 实例。此类系统可选择 `redirect` 或 `none` 模式。
 
