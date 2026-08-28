@@ -615,7 +615,7 @@ function remove_yaml_stage(token, original, explicit_stage) {
 		return true;
 	if (metadata.type != 'file' || metadata.uid != 0 || metadata.gid != 0 ||
 	    metadata.mode != 0o600 || metadata.nlink != 1 ||
-	    metadata.size <= 0 || metadata.size > MAX_CONFIG_LENGTH ||
+	    metadata.size < 0 || metadata.size > MAX_CONFIG_LENGTH ||
 	    (original && !same_inode(metadata, original)))
 		return false;
 
@@ -655,9 +655,9 @@ function scan_yaml_jobs(clean_temporary) {
 
 		let item = { token: name, record };
 		if (record.state == 'pending' || record.state == 'running')
-			result.active.push(item);
+			push(result.active, item);
 		else
-			result.terminal.push(item);
+			push(result.terminal, item);
 	}
 
 	return result;
@@ -1154,20 +1154,29 @@ function tls_material_complete(content) {
 }
 
 function web_port_listening(port) {
-	// An asynchronous YAML transaction owns rc.common's per-service lock until
-	// validation, restart and rollback checks finish.  Do not synchronously enter
-	// the same init script from an unrelated status request while that job runs.
-	if (yaml_job_active() || !service_running() || type(port) != 'int')
+	if (type(port) != 'int')
 		return false;
 
+	// Serialize the entire status probe with YAML updates.  Checking the state
+	// before entering the init script leaves a race where a new worker can acquire
+	// rc.common's service lock first and block rpcd for the whole transaction.
+	let lock = open_yaml_job_lock();
+	if (!lock.file)
+		return false;
+
+	let listening = false;
 	try {
-		return system([
-			YAML_UPDATE_COMMAND, 'web_listening', `${port}`,
-		]) == 0;
+		if (!yaml_job_active() && service_running())
+			listening = system([
+				YAML_UPDATE_COMMAND, 'web_listening', `${port}`,
+			]) == 0;
 	}
 	catch (error) {
-		return false;
+		listening = false;
 	}
+
+	let closed = close_yaml_job_lock(lock);
+	return closed && listening;
 }
 
 function config_info() {
