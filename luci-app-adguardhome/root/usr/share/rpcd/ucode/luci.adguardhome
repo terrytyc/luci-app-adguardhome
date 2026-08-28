@@ -441,9 +441,10 @@ function read_log(value) {
 	try {
 		// ImmortalWrt 25.12.1's ucode popen() accepts a command string only.
 		// The sole interpolation has already been reduced to one of three
-		// decimal literals; every other byte is a fixed constant.
+		// decimal literals; every other byte is a fixed constant.  Filter
+		// before tailing because logread applies its own -l limit before -e.
 		pipe = popen(
-			`/sbin/logread -l ${requested} -e '[Aa]d[Gg]uard[Hh]ome'`,
+			`set -o pipefail; /sbin/logread -e '[Aa]d[Gg]uard[Hh]ome' | /usr/bin/tail -n ${requested}`,
 			'r'
 		);
 		if (!pipe)

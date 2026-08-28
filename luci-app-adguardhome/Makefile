@@ -500,6 +500,10 @@ ensure_no_official_pending_delta() {
 	fi
 	root_private_directory "$$delta_dir" || return 1
 	if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
+		# ImmortalWrt's UCI commit truncates its saved delta to zero bytes but
+		# may leave the file in place.  That is committed state, not a pending
+		# user change; accept only the exact root-private empty-file form.
+		root_private_empty_file "$$delta_file" && return 0
 		echo "Pending official adguardhome UCI changes must be committed or reverted before installing this plugin." >&2
 		return 1
 	fi
@@ -1586,6 +1590,9 @@ clear_owned_memory_delta_or_refuse() {
 			uci -q revert adguardhome.config.work_dir || return 1
 		fi
 		if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
+			# Both UCI commit and reverting the plugin-owned RAM overrides may
+			# leave an empty saved-delta inode.  It contains no pending state.
+			root_private_empty_file "$$delta_file" && return 0
 			echo "Pending official adguardhome UCI changes must be committed or reverted before uninstalling this plugin." >&2
 			return 1
 		fi

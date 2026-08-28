@@ -278,6 +278,13 @@ ensure_no_official_pending_delta() {
 		return 1
 	}
 	if [ -e "$delta_file" ] || [ -L "$delta_file" ]; then
+		# A successful UCI commit can leave a root-private, zero-byte saved
+		# delta behind.  Accept that committed-state marker while retaining
+		# the refusal for non-empty or unsafe entries.
+		if root_private_single_file "$delta_file" &&
+		   [ "$(wc -c <"$delta_file" 2>/dev/null)" = 0 ]; then
+			return 0
+		fi
 		echo "Pending official adguardhome UCI changes must be committed or reverted before installing this plugin." >&2
 		return 1
 	fi
