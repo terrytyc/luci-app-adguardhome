@@ -2091,8 +2091,8 @@ refresh_luci_runtime() {
 		/etc/init.d/rpcd reload >/dev/null 2>&1 || true
 }
 
-ensure_original_snapshot || exit 1
 ensure_no_official_pending_delta || exit 1
+ensure_original_snapshot || exit 1
 ensure_upper_section || exit 1
 read_official_state || exit 1
 load_upgrade_snapshot || {
