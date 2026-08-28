@@ -96,6 +96,53 @@ run_locked() (
 	"$@"
 )
 
+close_integration_lock_descriptor() {
+	case "$1" in
+		199) exec 199>&- ;;
+		198) exec 198>&- ;;
+		197) exec 197>&- ;;
+		196) exec 196>&- ;;
+		195) exec 195>&- ;;
+		194) exec 194>&- ;;
+		193) exec 193>&- ;;
+		192) exec 192>&- ;;
+		*) return 1 ;;
+	esac
+}
+
+# YAML updates install signal traps only after validating their held staging
+# descriptor.  Run those transactions in rc.common's action process so TERM or
+# an RPC worker cancellation reaches the rollback trap instead of killing an
+# untrapped parent while an orphaned locking subshell continues the commit.
+run_yaml_locked() {
+	local lock_fd="" candidate command_rc
+	mkdir -p "${INTEGRATION_LOCK%/*}" || return 1
+	for candidate in 199 198 197 196 195 194 193 192; do
+		[ ! -e "/proc/self/fd/${candidate}" ] || continue
+		open_integration_lock_descriptor "$candidate" || return 1
+		lock_fd="$candidate"
+		break
+	done
+	[ -n "$lock_fd" ] || return 1
+	if ! /usr/bin/flock -x "$lock_fd"; then
+		close_integration_lock_descriptor "$lock_fd" >/dev/null 2>&1 || true
+		return 1
+	fi
+
+	YAML_STAGE_CLEANUP=""
+	YAML_BACKUP_CLEANUP=""
+	YAML_INSTALLED=0
+	YAML_WAS_RUNNING=0
+	YAML_RUNTIME_PAUSED=0
+	"$@"
+	command_rc=$?
+	finalize_yaml_update_process
+	if ! close_integration_lock_descriptor "$lock_fd"; then
+		[ "$command_rc" -ne 0 ] || command_rc=1
+	fi
+	return "$command_rc"
+}
+
 is_valid_port() {
 	case "$1" in
 		""|*[!0-9]*) return 1 ;;
@@ -2503,6 +2550,15 @@ cleanup_yaml_update() {
 		remove_yaml_backup "$YAML_BACKUP_CLEANUP" >/dev/null 2>&1 || true
 }
 
+finalize_yaml_update_process() {
+	# Normal function returns do not run an EXIT trap.  Finish cleanup while the
+	# integration lock is still held, then disarm transaction-local traps before
+	# the current rc.common action releases its descriptor.
+	cleanup_yaml_update
+	trap - EXIT
+	trap - HUP INT QUIT TERM
+}
+
 attempt_yaml_rollback() {
 	local backup="$1" was_running="$2"
 	if rollback_yaml_update "$backup" "$was_running" >/dev/null 2>&1; then
@@ -2547,7 +2603,7 @@ resume_paused_yaml_runtime() {
 # transaction without a shell.  Revalidate everything under the integration
 # lock, validate a disposable candidate, stop the sole YAML writer, then make
 # the final optimistic-lock comparison before the atomic rename.
-yaml_update_locked() (
+yaml_update_locked() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local before_hash final_hash verify_hash held_hash fd_path
 	local committed_port committed_mode committed_work_dir committed_tls_mounts
@@ -2725,10 +2781,10 @@ yaml_update_locked() (
 	YAML_INSTALLED=0
 	trap - HUP INT QUIT TERM
 	return 0
-)
+}
 
 yaml_update() {
-	run_locked yaml_update_locked "$1" "$2" "$3" "$4"
+	run_yaml_locked yaml_update_locked "$1" "$2" "$3" "$4"
 }
 
 yaml_job_token_valid() {
@@ -2874,7 +2930,7 @@ yaml_update_job_locked() {
 	return 1
 }
 
-yaml_update_job() (
+yaml_update_job() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local job_lock_fd="$5" token="$6"
 	yaml_job_hash_valid "$expected_hash" || exit 1
@@ -2892,12 +2948,12 @@ yaml_update_job() (
 	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" || exit 1
 	/usr/bin/flock -n -x "$job_lock_fd" || exit 1
 
-	if run_locked yaml_update_job_locked "$expected_hash" "$candidate_hash" \
+	if run_yaml_locked yaml_update_job_locked "$expected_hash" "$candidate_hash" \
 		"$stage" "$inherited_fd" "$token"; then
 		exit 0
 	fi
 	exit 1
-)
+}
 
 restore_tls_fingerprint() {
 	local value="$1" option="${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}"
