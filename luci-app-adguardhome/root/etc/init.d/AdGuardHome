@@ -23,12 +23,32 @@ ADGUARD_GROUP="adguardhome"
 NORMALIZER_GROUP="root"
 MAX_YAML_SIZE=524288
 MAX_TLS_FILE_SIZE=1048576
+MAX_UCI_CONFIG_SIZE=1048576
 MANAGED_JAIL_OPTION="managed_jail_mount"
 MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
+UCI_CONFIG_DIRECTORY="/etc/config"
+UCI_DELTA_DIRECTORY="/tmp/.uci"
+
+# The configured workdir is always the persistent backing store.  Memory mode
+# mirrors only its active YAML and data tree into this fixed plugin namespace;
+# the packaged binary and official lowercase service remain unchanged.
+MEMORY_RUNTIME_DIR="/tmp/luci-app-adguardhome-memory"
+MEMORY_WORK_DIR="${MEMORY_RUNTIME_DIR}/work"
+MEMORY_CONFIG_FILE="${MEMORY_WORK_DIR}/AdGuardHome.yaml"
+MEMORY_STATE_FILE="${MEMORY_RUNTIME_DIR}/state"
+MEMORY_JOURNAL_DIR="/root/.luci-app-adguardhome-memory"
+MEMORY_JOURNAL_FILE="${MEMORY_JOURNAL_DIR}/checkpoint"
+MEMORY_MIN_TMP_RESERVE_KIB=16384
+MEMORY_MIN_SYSTEM_RESERVE_KIB=32768
+MEMORY_WRITEBACK_DEFAULT_MINUTES=60
+MEMORY_WRITEBACK_MAX_MINUTES=10080
+MEMORY_LIVE_RUNTIME_DIR="/var/run/luci-app-adguardhome-memory-writeback"
+MEMORY_LIVE_MARKER="${MEMORY_LIVE_RUNTIME_DIR}/active"
 
 INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
 NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
 NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
+UPGRADE_STOPPED_MARKER="${NORMALIZER_RUNTIME_DIR}/upgrade-was-stopped"
 YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
 MONITOR_INTERVAL=2
 # First boot can download and compile the packaged default filters before the
@@ -50,7 +70,7 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update yaml_update_job tls_prepare tls_refresh"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_cleanup memory_prepare memory_status"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
@@ -60,11 +80,96 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
 \tyaml_update_job <old-hash> <new-hash> <stage> <stage-fd> <lock-fd> <token>\tRun an asynchronous LuCI YAML edit
 \ttls_prepare\t\tPrepare current YAML TLS access before core start
-\ttls_refresh\t\tRecheck ACME material after renewal"
+\ttls_refresh\t\tRecheck ACME material after renewal
+\tmemory_checkpoint\tPersist a stopped RAM workdir without removing it
+\tmemory_writeback\tPersist and restart a live RAM workdir safely
+\tmemory_cleanup\t\tPersist and remove a stopped RAM workdir
+\tmemory_prepare\t\tPrepare the requested RAM workdir while stopped
+\tmemory_status\t\tReport requested/active/backing RAM state"
 
 log_error() {
 	logger -t AdGuardHome "$*"
 }
+
+# Run one command in its own session with a self-contained wall-clock guard.
+# Descriptor 187 preserves pipeline input before ash starts the async child.
+run_bounded() (
+	local limit="$1" grace="$2" marker="" child="" watchdog="" rc=0 expired=0
+	shift 2
+	case "$limit" in ""|*[!0-9]*) exit 125 ;; esac
+	case "$grace" in ""|*[!0-9]*) exit 125 ;; esac
+	[ "$#" -gt 0 ] || exit 125
+	[ -x /usr/bin/setsid ] || exit 125
+	marker="$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
+	chmod 0600 "$marker" || {
+		rm -f "$marker"
+		exit 125
+	}
+	printf '0\n' >"$marker" || {
+		rm -f "$marker"
+		exit 125
+	}
+	bounded_signal_session() {
+		/bin/kill "-$1" -- "-$child" 2>/dev/null ||
+			/bin/kill "-$1" "$child" 2>/dev/null || true
+	}
+	bounded_abort() {
+		trap - HUP INT QUIT TERM
+		[ -z "$watchdog" ] || /bin/kill -TERM "$watchdog" 2>/dev/null || true
+		[ -z "$watchdog" ] || wait "$watchdog" 2>/dev/null || true
+		if [ -n "$child" ]; then
+			bounded_signal_session TERM
+			sleep "$grace" 2>/dev/null || true
+			bounded_signal_session KILL
+			wait "$child" 2>/dev/null || true
+		fi
+		rm -f "$marker"
+		exit 125
+	}
+	trap bounded_abort HUP INT QUIT TERM
+	[ ! -e /proc/self/fd/187 ] || bounded_abort
+	exec 187<&0 || bounded_abort
+	/usr/bin/setsid "$@" <&187 187<&- &
+	child=$!
+	exec 187<&-
+	(
+		bounded_sleeper=""
+		bounded_watchdog_abort() {
+			trap - HUP INT QUIT TERM
+			[ -z "$bounded_sleeper" ] || /bin/kill -TERM "$bounded_sleeper" 2>/dev/null || true
+			[ -z "$bounded_sleeper" ] || wait "$bounded_sleeper" 2>/dev/null || true
+			exit 1
+		}
+		bounded_watchdog_sleep() {
+			sleep "$1" &
+			bounded_sleeper=$!
+			wait "$bounded_sleeper"
+			bounded_sleep_rc=$?
+			bounded_sleeper=""
+			return "$bounded_sleep_rc"
+		}
+		trap bounded_watchdog_abort HUP INT QUIT TERM
+		bounded_watchdog_sleep "$limit" || exit 1
+		/bin/kill -0 -- "-$child" 2>/dev/null || /bin/kill -0 "$child" 2>/dev/null || exit 1
+		printf '1\n' >"$marker" || exit 1
+		bounded_signal_session TERM
+		bounded_watchdog_sleep "$grace" || exit 0
+		bounded_signal_session KILL
+	) &
+	watchdog=$!
+	wait "$child" 2>/dev/null || rc=$?
+	read -r expired <"$marker" 2>/dev/null || expired=0
+	if [ "$expired" = 1 ]; then
+		wait "$watchdog" 2>/dev/null || true
+	else
+		/bin/kill -TERM "$watchdog" 2>/dev/null || true
+		wait "$watchdog" 2>/dev/null || true
+	fi
+	trap - HUP INT QUIT TERM
+	rm -f "$marker"
+	[ "$expired" = 1 ] && exit 124
+	exit "$rc"
+)
 
 open_integration_lock_descriptor() {
 	case "$1" in
@@ -149,6 +254,30 @@ is_valid_port() {
 		""|*[!0-9]*) return 1 ;;
 	esac
 	[ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null
+}
+
+normalize_memory_writeback_interval() {
+	local value="$1"
+	case "$value" in ""|*[!0-9]*) value="$MEMORY_WRITEBACK_DEFAULT_MINUTES" ;; esac
+	while [ "${value#0}" != "$value" ]; do
+		value="${value#0}"
+	done
+	[ -n "$value" ] || value=0
+	if [ "${#value}" -gt 5 ] ||
+	   [ "$value" -gt "$MEMORY_WRITEBACK_MAX_MINUTES" ] 2>/dev/null; then
+		value="$MEMORY_WRITEBACK_DEFAULT_MINUTES"
+	fi
+	printf '%s\n' "$value"
+}
+
+monotonic_seconds() {
+	local seconds fraction extra
+	read -r seconds fraction extra </proc/uptime || return 1
+	seconds="${seconds%%.*}"
+	case "$seconds:$extra" in
+		*[!0-9:]*|:*) return 1 ;;
+	esac
+	printf '%s\n' "$seconds"
 }
 
 validate_work_dir() {
@@ -240,6 +369,12 @@ validate_managed_work_dir() {
 	validate_managed_work_dir_namespace "$1" || return 1
 	[ "$value" = "$DEFAULT_WORK_DIR" ] && return 0
 	[ -e "$value" ] || [ -L "$value" ] || return 0
+	# While the official service runs from the fixed RAM mirror its effective
+	# lower UCI deliberately points at MEMORY_WORK_DIR.  A root-private state
+	# record is then the anchor for the still-persistent custom backing path.
+	if memory_state_binds_persistent "$value"; then
+		return 0
+	fi
 	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
 	[ -n "$official_work" ] ||
 		official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
@@ -280,20 +415,348 @@ path_contains_symlink() {
 	return 1
 }
 
+memory_runtime_dir_valid() {
+	local metadata mode links owner group remainder
+	[ -d "$MEMORY_RUNTIME_DIR" ] && [ ! -L "$MEMORY_RUNTIME_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_RUNTIME_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "drwx--x---" ] && [ "$links" -ge 2 ] 2>/dev/null &&
+		[ "$owner" = 0 ] && [ "$group" = "$ADGUARD_GID" ]
+}
+
+# A prepare WAL is durable before this namespace is created.  Recovery may
+# therefore observe either side of the root:root -> root:853 ownership handoff;
+# accept those exact non-writable transitional modes only in journal recovery.
+memory_prepare_runtime_dir_valid() {
+	local metadata mode links owner group remainder
+	[ -d "$MEMORY_RUNTIME_DIR" ] && [ ! -L "$MEMORY_RUNTIME_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_RUNTIME_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$links" -ge 2 ] 2>/dev/null || return 1
+	case "$owner:$group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|0:"$ADGUARD_GID":drwx--x---) ;;
+		*) return 1 ;;
+	esac
+}
+
+memory_private_state_file() {
+	local target="$1" metadata mode links owner group size remainder
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
+		[ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le 1024 ]
+}
+
+memory_active_tree_valid() {
+	local metadata mode links owner group size remainder data_dir="${MEMORY_WORK_DIR}/data"
+	memory_runtime_dir_valid || return 1
+	[ -d "$MEMORY_WORK_DIR" ] && [ ! -L "$MEMORY_WORK_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_WORK_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = \
+		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || return 1
+	[ -f "$MEMORY_CONFIG_FILE" ] && [ ! -L "$MEMORY_CONFIG_FILE" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_CONFIG_FILE" 2>/dev/null)" || return 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	case "$owner:$group:$mode:$links" in
+		0:"$ADGUARD_GID":-rw-r-----:1|"$ADGUARD_UID":"$ADGUARD_GID":-rw-------:1|"$ADGUARD_UID":"$ADGUARD_GID":-rw-r-----:1) ;;
+		*) return 1 ;;
+	esac
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || return 1
+	[ -d "$data_dir" ] && [ ! -L "$data_dir" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$data_dir" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = \
+		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || return 1
+	uid853_tree_is_plain "$MEMORY_WORK_DIR"
+}
+
+# Return 0 for a complete state, 1 when no memory state exists, and 2 for an
+# unsafe/incomplete namespace.  Callers must never delete a status-2 object.
+memory_state_load() {
+	local version backing device inode line_count
+	MEMORY_STATE_PERSISTENT_WORK_DIR=""
+	MEMORY_STATE_BACKING_DEVICE=""
+	MEMORY_STATE_BACKING_INODE=""
+	if [ ! -e "$MEMORY_RUNTIME_DIR" ] && [ ! -L "$MEMORY_RUNTIME_DIR" ]; then
+		return 1
+	fi
+	memory_runtime_dir_valid || return 2
+	memory_private_state_file "$MEMORY_STATE_FILE" || return 2
+	line_count="$(wc -l <"$MEMORY_STATE_FILE" 2>/dev/null)" || return 2
+	[ "$line_count" = 4 ] || return 2
+	version="$(sed -n 's/^version=//p' "$MEMORY_STATE_FILE")"
+	backing="$(sed -n 's/^persistent_work_dir=//p' "$MEMORY_STATE_FILE")"
+	device="$(sed -n 's/^backing_device=//p' "$MEMORY_STATE_FILE")"
+	inode="$(sed -n 's/^backing_inode=//p' "$MEMORY_STATE_FILE")"
+	[ "$version" = 2 ] || return 2
+	[ "$(grep -c '^version=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^persistent_work_dir=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^backing_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^backing_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	case "$device:$inode" in
+		*[!0-9:]*|:*|*::*) return 2 ;;
+		[0-9]*:[0-9]*) ;;
+		*) return 2 ;;
+	esac
+	validate_managed_work_dir_namespace "$backing" || return 2
+	memory_backing_identity "$backing" || return 2
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = "$device:$inode" ] || return 2
+	memory_active_tree_valid || return 2
+	MEMORY_STATE_PERSISTENT_WORK_DIR="${backing%/}"
+	MEMORY_STATE_BACKING_DEVICE="$device"
+	MEMORY_STATE_BACKING_INODE="$inode"
+	return 0
+}
+
+memory_state_binds_persistent() {
+	local requested="${1%/}" state_rc=0
+	memory_state_load || state_rc=$?
+	[ "$state_rc" = 0 ] &&
+		[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$requested" ]
+}
+
+memory_live_runtime_dir_valid() {
+	local metadata mode links owner group remainder
+	[ -d "$MEMORY_LIVE_RUNTIME_DIR" ] &&
+		[ ! -L "$MEMORY_LIVE_RUNTIME_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode:$owner:$group" = "drwx------:0:0" ] &&
+		[ "$links" -ge 2 ] 2>/dev/null
+}
+
+# A killed writer before the final marker rename has not yet changed DNS or
+# stopped the core.  Discard only that exact root-private unpublished object;
+# any other content is treated as unsafe and left untouched.
+memory_discard_unpublished_live_marker() {
+	local entry orphan="" found=0 metadata mode links owner group size remainder
+	memory_live_runtime_dir_valid || return 1
+	[ ! -e "$MEMORY_LIVE_MARKER" ] && [ ! -L "$MEMORY_LIVE_MARKER" ] || return 1
+	for entry in \
+		"$MEMORY_LIVE_RUNTIME_DIR"/* \
+		"$MEMORY_LIVE_RUNTIME_DIR"/.[!.]* \
+		"$MEMORY_LIVE_RUNTIME_DIR"/..?*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		[ "$found" = 0 ] || return 1
+		case "$entry" in "$MEMORY_LIVE_RUNTIME_DIR"/.active.??????) ;;
+			*) return 1 ;;
+		esac
+		case "${entry##*.}" in *[!A-Za-z0-9]*) return 1 ;; esac
+		metadata="$(LC_ALL=C ls -ldn "$entry" 2>/dev/null)" || return 1
+		read -r mode links owner group size remainder <<-EOF
+		$metadata
+		EOF
+		[ "$mode:$links:$owner:$group" = "-rw-------:1:0:0" ] || return 1
+		case "$size" in ""|*[!0-9]*) return 1 ;; esac
+		[ "$size" -le 1024 ] 2>/dev/null || return 1
+		found=1
+		orphan="$entry"
+	done
+	[ "$found" = 0 ] || rm -f "$orphan" || return 1
+	rmdir "$MEMORY_LIVE_RUNTIME_DIR"
+}
+
+# Return 0 for a published operation, 1 when none exists, and 2 for an unsafe
+# marker.  The marker is volatile, but binds the same persistent inode as the
+# RAM state so a stale or substituted pathname can never trigger a restart.
+memory_live_marker_load() {
+	local version backing device inode line_count entry found=0
+	MEMORY_LIVE_BACKING=""
+	MEMORY_LIVE_DEVICE=""
+	MEMORY_LIVE_INODE=""
+	if [ ! -e "$MEMORY_LIVE_RUNTIME_DIR" ] &&
+	   [ ! -L "$MEMORY_LIVE_RUNTIME_DIR" ]; then
+		return 1
+	fi
+	memory_live_runtime_dir_valid || return 2
+	if [ ! -e "$MEMORY_LIVE_MARKER" ] && [ ! -L "$MEMORY_LIVE_MARKER" ]; then
+		memory_discard_unpublished_live_marker || return 2
+		return 1
+	fi
+	memory_private_state_file "$MEMORY_LIVE_MARKER" || return 2
+	for entry in \
+		"$MEMORY_LIVE_RUNTIME_DIR"/* \
+		"$MEMORY_LIVE_RUNTIME_DIR"/.[!.]* \
+		"$MEMORY_LIVE_RUNTIME_DIR"/..?*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		[ "$entry" = "$MEMORY_LIVE_MARKER" ] && [ "$found" = 0 ] || return 2
+		found=1
+	done
+	[ "$found" = 1 ] || return 2
+	line_count="$(wc -l <"$MEMORY_LIVE_MARKER" 2>/dev/null)" || return 2
+	[ "$line_count" = 4 ] || return 2
+	version="$(sed -n 's/^version=//p' "$MEMORY_LIVE_MARKER")"
+	backing="$(sed -n 's/^persistent_work_dir=//p' "$MEMORY_LIVE_MARKER")"
+	device="$(sed -n 's/^backing_device=//p' "$MEMORY_LIVE_MARKER")"
+	inode="$(sed -n 's/^backing_inode=//p' "$MEMORY_LIVE_MARKER")"
+	[ "$version" = 1 ] || return 2
+	[ "$(grep -c '^version=' "$MEMORY_LIVE_MARKER" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^persistent_work_dir=' "$MEMORY_LIVE_MARKER" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^backing_device=' "$MEMORY_LIVE_MARKER" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^backing_inode=' "$MEMORY_LIVE_MARKER" 2>/dev/null)" = 1 ] || return 2
+	case "$device:$inode" in
+		*[!0-9:]*|:*|*::*) return 2 ;;
+		[0-9]*:[0-9]*) ;;
+		*) return 2 ;;
+	esac
+	validate_managed_work_dir_namespace "$backing" || return 2
+	memory_backing_identity "$backing" || return 2
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = "$device:$inode" ] || return 2
+	MEMORY_LIVE_BACKING="${backing%/}"
+	MEMORY_LIVE_DEVICE="$device"
+	MEMORY_LIVE_INODE="$inode"
+	return 0
+}
+
+memory_begin_live_checkpoint() {
+	local temporary="" device inode
+	[ "$MEMORY_ACTIVE" = 1 ] && [ -n "$MEMORY_BACKING_WORK_DIR" ] || return 1
+	memory_state_load || return 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || return 1
+	device="$MEMORY_STATE_BACKING_DEVICE"
+	inode="$MEMORY_STATE_BACKING_INODE"
+	if [ -e "$MEMORY_LIVE_RUNTIME_DIR" ] || [ -L "$MEMORY_LIVE_RUNTIME_DIR" ]; then
+		memory_live_marker_load >/dev/null 2>&1
+		return 1
+	fi
+	mkdir -m 0700 "$MEMORY_LIVE_RUNTIME_DIR" || return 1
+	if ! chown 0:0 "$MEMORY_LIVE_RUNTIME_DIR" ||
+	   ! chmod 0700 "$MEMORY_LIVE_RUNTIME_DIR" ||
+	   ! memory_live_runtime_dir_valid; then
+		rmdir "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null || true
+		return 1
+	fi
+	temporary="$(mktemp "$MEMORY_LIVE_RUNTIME_DIR/.active.XXXXXX")" || {
+		rmdir "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null || true
+		return 1
+	}
+	if ! printf 'version=1\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\n' \
+		"$MEMORY_BACKING_WORK_DIR" "$device" "$inode" >"$temporary" ||
+	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! memory_private_state_file "$temporary" ||
+	   ! mv "$temporary" "$MEMORY_LIVE_MARKER" ||
+	   ! memory_live_marker_load; then
+		rm -f "$temporary" 2>/dev/null || true
+		if [ ! -e "$MEMORY_LIVE_MARKER" ] && [ ! -L "$MEMORY_LIVE_MARKER" ]; then
+			rmdir "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null || true
+		fi
+		return 1
+	fi
+}
+
+memory_clear_live_checkpoint() {
+	memory_live_marker_load || return 1
+	rm -f "$MEMORY_LIVE_MARKER" || return 1
+	[ ! -e "$MEMORY_LIVE_MARKER" ] && [ ! -L "$MEMORY_LIVE_MARKER" ] || return 1
+	rmdir "$MEMORY_LIVE_RUNTIME_DIR"
+}
+
 load_legacy_settings() {
-	local configured_work_dir
+	local configured_work_dir official_work official_config legacy_work legacy_config state_rc=0
 	config_load "$LEGACY_CONFIG"
 	config_get_bool legacy_enabled "$LEGACY_SECTION" enabled 0
 	config_get configured_work_dir "$LEGACY_SECTION" workdir "$DEFAULT_WORK_DIR"
 	config_get redirect_mode "$LEGACY_SECTION" redirect "dnsmasq-upstream"
 	config_get_bool verbose "$LEGACY_SECTION" verbose 0
-	previous_work_dir="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
-	[ -n "$previous_work_dir" ] ||
-		previous_work_dir="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	config_get_bool memory_requested "$LEGACY_SECTION" run_from_memory 0
+	config_get memory_writeback_interval "$LEGACY_SECTION" memory_writeback_interval \
+		"$MEMORY_WRITEBACK_DEFAULT_MINUTES"
+	memory_writeback_interval="$(normalize_memory_writeback_interval \
+		"$memory_writeback_interval")" || return 1
+	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	official_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
+	previous_work_dir="$official_work"
+	[ -n "$previous_work_dir" ] || previous_work_dir="$legacy_work"
+	# Recover a durable RAM copy/checkpoint transaction before validating the
+	# backing metadata.  A crash may intentionally leave that inode frozen at
+	# root:853/0710, which is accepted only while the root-private journal binds
+	# its path and device/inode identity.
+	# The durable journal binds its own backing path and device/inode.  Recover it
+	# before interpreting a possibly newer upper-UCI workdir request; otherwise a
+	# path change made just before a crash could permanently block safe recovery.
+	memory_recover_journal_locked "" || return 1
+
+	MEMORY_ACTIVE=0
+	MEMORY_BACKING_WORK_DIR=""
+	memory_state_load || state_rc=$?
+	case "$state_rc" in
+		0)
+			;;
+		1)
+			# A generic `uci commit` can persist the otherwise volatile RAM
+			# delta.  After reboot /tmp is empty, so repair only the exact fixed
+			# pair from the trusted upper workdir before validating its anchor.
+			if [ "${official_work%/}" = "$MEMORY_WORK_DIR" ] ||
+			   [ "$official_config" = "$MEMORY_CONFIG_FILE" ] ||
+			   [ "${legacy_work%/}" = "$MEMORY_WORK_DIR" ] ||
+			   [ "$legacy_config" = "$MEMORY_CONFIG_FILE" ]; then
+				if [ "${official_work%/}" != "$MEMORY_WORK_DIR" ] ||
+				   [ "$official_config" != "$MEMORY_CONFIG_FILE" ]; then
+					log_error "Incomplete committed AdGuard Home memory paths"
+					return 1
+				fi
+				memory_commit_official_persistent_paths "$configured_work_dir" || return 1
+				official_work="${configured_work_dir%/}"
+				official_config="${official_work}/AdGuardHome.yaml"
+				legacy_work=""
+				legacy_config=""
+				previous_work_dir="$official_work"
+				log_error "Repaired committed AdGuard Home memory paths after reboot"
+			fi
+			;;
+		2)
+			# An invalid RAM namespace matters only when it was requested or the
+			# official service is effectively pointed at it.  Disk mode otherwise
+			# remains available without touching the foreign object.
+			if [ "$memory_requested" = 1 ] ||
+			   [ "${official_work%/}" = "$MEMORY_WORK_DIR" ] ||
+			   [ "$official_config" = "$MEMORY_CONFIG_FILE" ] ||
+			   [ "${legacy_work%/}" = "$MEMORY_WORK_DIR" ] ||
+			   [ "$legacy_config" = "$MEMORY_CONFIG_FILE" ]; then
+				log_error "Unsafe or incomplete AdGuard Home memory namespace"
+				return 1
+			fi
+			;;
+		*) return 1 ;;
+	esac
 
 	validate_managed_work_dir "$configured_work_dir" || return 1
-	work_dir="${configured_work_dir%/}"
-	config_file="${work_dir}/AdGuardHome.yaml"
+	persistent_work_dir="${configured_work_dir%/}"
+	persistent_config_file="${persistent_work_dir}/AdGuardHome.yaml"
+	work_dir="$persistent_work_dir"
+	config_file="$persistent_config_file"
+	if [ "$state_rc" = 0 ]; then
+		MEMORY_ACTIVE=1
+		MEMORY_BACKING_WORK_DIR="$MEMORY_STATE_PERSISTENT_WORK_DIR"
+		previous_work_dir="$MEMORY_BACKING_WORK_DIR"
+		work_dir="$MEMORY_WORK_DIR"
+		config_file="$MEMORY_CONFIG_FILE"
+		# Recover the volatile lower-UCI pair after a killed commit guard or an
+		# accidental global UCI commit in the same boot.  The v2 state record has
+		# already bound both the RAM tree and the persistent inode.
+		memory_apply_official_path_delta || return 1
+	fi
 
 	case "$redirect_mode" in
 		none|redirect|dnsmasq-upstream) ;;
@@ -562,7 +1025,7 @@ secure_active_config() (
 					exec 9<>"$stage" || exit 1
 					stage_fd=/proc/self/fd/9
 					[ -f "$stage_fd" ] && [ "$stage_fd" -ef "$stage" ] || exit 1
-					/usr/bin/timeout -k 1s 3s /bin/dd if="$capture" bs=4096 count=129 \
+					run_bounded 3 1 /bin/dd if="$capture" bs=4096 count=129 \
 						of="$stage_fd" 2>/dev/null || exit 1
 					secure_config_inode "$stage_fd" || exit 1
 					# This is the final size/hash gate before rename.  A truncate or
@@ -676,20 +1139,42 @@ ensure_config_file() {
 uid853_tree_is_plain() {
 	local tree="$1"
 	[ -d "$tree" ] && [ ! -L "$tree" ] || return 1
+	tree_is_mount_free "$tree" || return 1
 	# $1 and found intentionally expand only in the lowered child shell.
 	# shellcheck disable=SC2016
-	/usr/bin/timeout -k 2s 30s \
+	run_bounded 30 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataScan -x /bin/sh -- -c '
 			set -o pipefail
-			found="$(/usr/bin/find "$1" ! -type f ! -type d -print 2>/dev/null |
+			found="$(/usr/bin/find "$1" -xdev ! -type f ! -type d -print 2>/dev/null |
 				/usr/bin/head -n 1)" || exit 1
 			[ -z "$found" ]
-		' sh "$tree" >/dev/null 2>&1
+		' sh "$tree" >/dev/null 2>&1 || return 1
+	tree_is_mount_free "$tree"
+}
+
+# `find -xdev` rejects entries on another filesystem but cannot identify a
+# same-device bind mount.  Consult mountinfo as well before any recursive copy
+# or removal so a nested mount can never turn a private data-tree operation
+# into an operation on the mounted target.  Managed paths exclude whitespace
+# and backslashes, so its literal prefix can be compared directly with the
+# escaped mountpoint field (escapes may occur only after that safe prefix).
+tree_is_mount_free() {
+	local tree="${1%/}"
+	case "$tree" in /*) ;; *) return 1 ;; esac
+	[ -r /proc/self/mountinfo ] || return 1
+	awk -v base="$tree" '
+		{
+			path = $5
+			if (path == base || index(path, base "/") == 1)
+				found = 1
+		}
+		END { exit found ? 1 : 0 }
+	' /proc/self/mountinfo
 }
 
 uid853_read_small_file() {
-	/usr/bin/timeout -k 1s 3s \
+	run_bounded 3 1 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataRead -x /bin/dd -- if="$1" bs=4096 count=1 2>/dev/null
 }
@@ -776,11 +1261,13 @@ migrate_work_data() {
 		# The source tree is controlled by the official uid.  Copy as that uid so
 		# a path substitution cannot make root read host secrets; scan again to
 		# reject any symlink introduced during the copy.
-		/usr/bin/timeout -k 2s 120s \
+		run_bounded 120 2 \
 			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 			-n AGHDataCopy -x /bin/cp -- -pR "${source_data}/." "$temporary/" || exit 1
+		chown "${ADGUARD_UID}:${ADGUARD_GID}" "$temporary" &&
+			chmod 0700 "$temporary" || exit 1
 		uid853_tree_is_plain "$temporary" || exit 1
-		printf '%s\n' "$old_work" | /usr/bin/timeout -k 1s 3s \
+		printf '%s\n' "$old_work" | run_bounded 3 1 \
 			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 			-n AGHDataMark -x /bin/dd -- \
 			of="${temporary}/.luci-app-adguardhome-migrated-from" \
@@ -822,6 +1309,1068 @@ sync_yaml_managed_fields() {
 	sync_yaml_workdir_pattern "$1"
 }
 
+memory_rewrite_workdir_pattern() {
+	local old_value="$1" new_value="$2" target="$3" rewrite_rc=0
+	yaml_replace_section_list_item filtering safe_fs_patterns \
+		"${old_value%/}/data/userfilters/*" \
+		"${new_value%/}/data/userfilters/*" "$target" || rewrite_rc=$?
+	case "$rewrite_rc" in
+		0|3) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+root_held_tree_is_plain() {
+	local descriptor="$1" original="$2"
+	case "$descriptor" in /proc/self/fd/[0-9]*|/proc/[0-9]*/fd/[0-9]*) ;; *) return 1 ;; esac
+	[ -d "$descriptor" ] && [ "$descriptor" -ef "$original" ] || return 1
+	tree_is_mount_free "$original" || return 1
+	# find does not follow symlinks by default.  Traverse the held directory
+	# inode, not its mutable pathname, and reject every non-file/non-directory
+	# entry without opening file contents as root.
+	# shellcheck disable=SC2016
+	run_bounded 30 2 /bin/sh -c '
+		set -o pipefail
+		mounts_before="$(/usr/bin/sha256sum /proc/self/mountinfo 2>/dev/null)" || exit 1
+		mounts_before="${mounts_before%% *}"
+		case "$mounts_before" in *[!0-9a-f]*) exit 1 ;; esac
+		[ "${#mounts_before}" = 64 ] || exit 1
+		found="$(/usr/bin/find "$1/." -xdev ! -type f ! -type d -print 2>/dev/null |
+			/usr/bin/head -n 1)" || exit 1
+		[ -z "$found" ] || exit 1
+		mounts_after="$(/usr/bin/sha256sum /proc/self/mountinfo 2>/dev/null)" || exit 1
+		mounts_after="${mounts_after%% *}"
+		case "$mounts_after" in *[!0-9a-f]*) exit 1 ;; esac
+		[ "${#mounts_after}" = 64 ] || exit 1
+		[ "$mounts_before" = "$mounts_after" ]
+	' sh "$descriptor" >/dev/null 2>&1 || return 1
+	[ -d "$descriptor" ] && [ "$descriptor" -ef "$original" ] &&
+		tree_is_mount_free "$original"
+}
+
+memory_source_size_kib() (
+	local data_dir="${persistent_work_dir}/data" data_size=0 yaml_size data_fd
+	[ -f "$persistent_config_file" ] && [ ! -L "$persistent_config_file" ] || return 1
+	yaml_size="$(wc -c <"$persistent_config_file" 2>/dev/null)" || return 1
+	case "$yaml_size" in ""|*[!0-9]*) return 1 ;; esac
+	if [ -e "$data_dir" ] || [ -L "$data_dir" ]; then
+		[ -d "$data_dir" ] && [ ! -L "$data_dir" ] || return 1
+		exec 8<"$data_dir" || return 1
+		data_fd=/proc/self/fd/8
+		root_held_tree_is_plain "$data_fd" "$data_dir" || return 1
+		data_size="$(
+			run_bounded 30 2 \
+				/usr/bin/du -sk "${data_fd}/." 2>/dev/null |
+				awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
+		)" || return 1
+		case "$data_size" in ""|*[!0-9]*) return 1 ;; esac
+		root_held_tree_is_plain "$data_fd" "$data_dir" || return 1
+	fi
+	printf '%s\n' "$((data_size + (yaml_size + 1023) / 1024))"
+)
+
+memory_start_prepare_journal() {
+	local stage="$1" suffix metadata mode links original_owner original_group remainder
+	local backing_device backing_inode
+	case "$stage" in "${MEMORY_RUNTIME_DIR}/.work."??????) ;;
+		*) return 1 ;;
+	esac
+	[ ! -e "$stage" ] && [ ! -L "$stage" ] || return 1
+	memory_journal_dir_valid || return 1
+	[ ! -e "$MEMORY_JOURNAL_FILE" ] && [ ! -L "$MEMORY_JOURNAL_FILE" ] || return 1
+	suffix="${stage##*.}"
+	case "$suffix" in ??????) case "$suffix" in *[!A-Za-z0-9]*) return 1 ;; esac ;;
+		*) return 1 ;;
+	esac
+	metadata="$(LC_ALL=C ls -ldn "$persistent_work_dir" 2>/dev/null)" || return 1
+	read -r mode links original_owner original_group remainder <<-EOF
+	$metadata
+	EOF
+	case "$original_owner:$original_group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		*) return 1 ;;
+	esac
+	memory_backing_identity "$persistent_work_dir" || return 1
+	backing_device="$MEMORY_IDENTITY_DEVICE"
+	backing_inode="$MEMORY_IDENTITY_INODE"
+	memory_write_journal prepare copying "$persistent_work_dir" \
+		"$backing_device" "$backing_inode" "$original_owner" "$original_group" \
+		"$suffix" 0 - -
+}
+
+memory_advance_journal() {
+	local operation="$1" phase="$2"
+	memory_load_journal || return 1
+	[ "$MEMORY_JOURNAL_OPERATION" = "$operation" ] || return 1
+	memory_write_journal "$operation" "$phase" "$MEMORY_JOURNAL_BACKING" \
+		"$MEMORY_JOURNAL_DEVICE" "$MEMORY_JOURNAL_INODE" \
+		"$MEMORY_JOURNAL_ORIGINAL_UID" "$MEMORY_JOURNAL_ORIGINAL_GID" \
+		"$MEMORY_JOURNAL_SUFFIX" "$MEMORY_JOURNAL_HAD_OLD" \
+		"$MEMORY_JOURNAL_YAML_OLD" "$MEMORY_JOURNAL_YAML_NEW"
+}
+
+memory_copy_data_to_runtime() (
+	local source="$1" target="$2" stage original_owner original_group
+	[ -e "$source" ] || [ -L "$source" ] || exit 0
+	stage="${target%/*}"
+	memory_load_journal || exit 1
+	[ "$MEMORY_JOURNAL_OPERATION:$MEMORY_JOURNAL_PHASE" = prepare:copying ] || exit 1
+	[ "$MEMORY_JOURNAL_BACKING" = "$persistent_work_dir" ] || exit 1
+	[ "$stage" = "${MEMORY_RUNTIME_DIR}/.work.${MEMORY_JOURNAL_SUFFIX}" ] || exit 1
+	original_owner="$MEMORY_JOURNAL_ORIGINAL_UID"
+	original_group="$MEMORY_JOURNAL_ORIGINAL_GID"
+	trap 'restore_migration_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
+	chown "0:${ADGUARD_GID}" "$persistent_work_dir" &&
+		chmod 0710 "$persistent_work_dir" || exit 1
+	[ -d "$source" ] && [ ! -L "$source" ] &&
+		uid853_tree_is_plain "$source" || exit 1
+	mkdir -m 0700 "$target" || exit 1
+	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" || exit 1
+	run_bounded 120 2 \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHMemoryCopy -x /bin/cp -- -pR "${source}/." "$target/" || exit 1
+	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" && chmod 0700 "$target" || exit 1
+	uid853_tree_is_plain "$target" || exit 1
+	memory_advance_journal prepare prepared || exit 1
+	restore_migration_workdir_access "$persistent_work_dir" \
+		"$original_owner" "$original_group" || exit 1
+	memory_durability_barrier || exit 1
+	trap - EXIT
+)
+
+memory_capacity_available() {
+	local source_size reserve required tmp_available memory_available
+	awk '$2 == "/tmp" && $3 == "tmpfs" { found = 1 } END { exit !found }' \
+		/proc/mounts 2>/dev/null || {
+		log_error "Memory mode requires /tmp to be a tmpfs"
+		return 1
+	}
+	source_size="$(memory_source_size_kib)" || return 1
+	reserve=$((source_size / 2))
+	[ "$reserve" -ge "$MEMORY_MIN_TMP_RESERVE_KIB" ] ||
+		reserve="$MEMORY_MIN_TMP_RESERVE_KIB"
+	required=$((source_size + reserve))
+	tmp_available="$(df -Pk /tmp 2>/dev/null |
+		awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4; exit }')" || return 1
+	memory_available="$(awk '$1 == "MemAvailable:" && $2 ~ /^[0-9]+$/ { print $2; exit }' \
+		/proc/meminfo 2>/dev/null)" || return 1
+	case "$tmp_available" in ""|*[!0-9]*) return 1 ;; esac
+	case "$memory_available" in ""|*[!0-9]*) return 1 ;; esac
+	if [ "$tmp_available" -lt "$required" ] 2>/dev/null ||
+	   [ "$memory_available" -lt $((source_size + MEMORY_MIN_SYSTEM_RESERVE_KIB)) ] 2>/dev/null; then
+		log_error "Insufficient RAM for AdGuard Home memory mode (need ${required} KiB tmpfs for ${source_size} KiB source)"
+		return 1
+	fi
+}
+
+memory_create_runtime_parent() {
+	if [ -e "$MEMORY_RUNTIME_DIR" ] || [ -L "$MEMORY_RUNTIME_DIR" ]; then
+		return 1
+	fi
+	# Start root-private.  The prepare WAL can safely recover if the process is
+	# killed before the subsequent group handoff and final traverse-only mode.
+	mkdir -m 0700 "$MEMORY_RUNTIME_DIR" || return 1
+	if ! chown "0:${ADGUARD_GID}" "$MEMORY_RUNTIME_DIR" ||
+	   ! chmod 0710 "$MEMORY_RUNTIME_DIR" ||
+	   ! memory_runtime_dir_valid; then
+		rmdir "$MEMORY_RUNTIME_DIR" 2>/dev/null || true
+		return 1
+	fi
+}
+
+memory_write_state() {
+	local backing="${1%/}" temporary device inode
+	memory_runtime_dir_valid || return 1
+	[ ! -e "$MEMORY_STATE_FILE" ] && [ ! -L "$MEMORY_STATE_FILE" ] || return 1
+	memory_backing_identity "$backing" || return 1
+	device="$MEMORY_IDENTITY_DEVICE"
+	inode="$MEMORY_IDENTITY_INODE"
+	temporary="$(mktemp "${MEMORY_RUNTIME_DIR}/.state.XXXXXX")" || return 1
+	if ! printf 'version=2\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\n' \
+		"$backing" "$device" "$inode" >"$temporary" ||
+	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! memory_private_state_file "$temporary" ||
+	   ! mv "$temporary" "$MEMORY_STATE_FILE"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	memory_private_state_file "$MEMORY_STATE_FILE"
+}
+
+memory_remove_active_tree() {
+	memory_active_tree_valid || return 1
+	# MEMORY_RUNTIME_DIR is root-owned and non-writable by uid 853, so the work
+	# leaf cannot be replaced while this exact fixed-path removal runs.
+	tree_is_mount_free "$MEMORY_WORK_DIR" || return 1
+	rm -rf "$MEMORY_WORK_DIR" || return 1
+	[ ! -e "$MEMORY_WORK_DIR" ] && [ ! -L "$MEMORY_WORK_DIR" ]
+}
+
+memory_prepare_runtime_locked() {
+	local stage="" suffix data_source data_target snapshot_hash
+	[ "$MEMORY_ACTIVE" != 1 ] || return 0
+	[ "$memory_requested" = 1 ] || return 0
+	official_running && return 1
+	adguard_uid_process_exists && return 1
+	memory_capacity_available || return 1
+	suffix="$(memory_allocate_journal_suffix)" || {
+		return 1
+	}
+	stage="${MEMORY_RUNTIME_DIR}/.work.${suffix}"
+	if ! memory_start_prepare_journal "$stage"; then
+		memory_clear_orphan_journal_dir >/dev/null 2>&1 || true
+		return 1
+	fi
+	if ! memory_create_runtime_parent; then
+		memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
+		return 1
+	fi
+	if ! mkdir -m 0710 "$stage" ||
+	   ! chown "0:${ADGUARD_GID}" "$stage" || ! chmod 0710 "$stage" ||
+	   ! snapshot_config_file "$persistent_config_file" \
+		"${stage}/AdGuardHome.yaml" "" "" ||
+	   ! memory_rewrite_workdir_pattern "$persistent_work_dir" \
+		"$MEMORY_WORK_DIR" "${stage}/AdGuardHome.yaml" ||
+	   ! chown "0:${ADGUARD_GID}" "${stage}/AdGuardHome.yaml" ||
+	   ! chmod 0640 "${stage}/AdGuardHome.yaml"; then
+		memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
+		return 1
+	fi
+	data_source="${persistent_work_dir}/data"
+	data_target="${stage}/data"
+	if [ -e "$data_source" ] || [ -L "$data_source" ]; then
+		if ! memory_copy_data_to_runtime "$data_source" "$data_target"; then
+			memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
+			return 1
+		fi
+	else
+		if ! mkdir -m 0700 "$data_target" ||
+		   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_target" ||
+		   ! uid853_tree_is_plain "$data_target" ||
+		   ! memory_advance_journal prepare prepared; then
+			memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
+			return 1
+		fi
+	fi
+	snapshot_hash="$(yaml_file_hash "${stage}/AdGuardHome.yaml")" || {
+		memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
+		return 1
+	}
+	if ! check_core_config_file "${stage}/AdGuardHome.yaml" "$snapshot_hash" ||
+	   [ -e "$MEMORY_WORK_DIR" ] || [ -L "$MEMORY_WORK_DIR" ] ||
+	   ! mv "$stage" "$MEMORY_WORK_DIR" ||
+	   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$MEMORY_WORK_DIR" ||
+	   ! chmod 0700 "$MEMORY_WORK_DIR" ||
+	   ! memory_active_tree_valid ||
+	   ! memory_advance_journal prepare new_installed ||
+	   ! memory_write_state "$persistent_work_dir" ||
+	   ! memory_advance_journal prepare committed ||
+	   ! memory_clear_journal; then
+		memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
+		return 1
+	fi
+	MEMORY_ACTIVE=1
+	MEMORY_BACKING_WORK_DIR="$persistent_work_dir"
+	previous_work_dir="$persistent_work_dir"
+	work_dir="$MEMORY_WORK_DIR"
+	config_file="$MEMORY_CONFIG_FILE"
+	log_error "AdGuard Home active workdir prepared in memory from ${persistent_work_dir}"
+}
+
+memory_journal_dir_valid() {
+	local metadata mode links owner group remainder
+	[ -d "$MEMORY_JOURNAL_DIR" ] && [ ! -L "$MEMORY_JOURNAL_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_JOURNAL_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "drwx------" ] && [ "$owner" = 0 ] && [ "$group" = 0 ]
+}
+
+memory_ensure_journal_dir() {
+	if [ -e "$MEMORY_JOURNAL_DIR" ] || [ -L "$MEMORY_JOURNAL_DIR" ]; then
+		memory_journal_dir_valid
+		return
+	fi
+	mkdir -m 0700 "$MEMORY_JOURNAL_DIR" || return 1
+	chown 0:0 "$MEMORY_JOURNAL_DIR" && chmod 0700 "$MEMORY_JOURNAL_DIR" &&
+		memory_journal_dir_valid
+}
+
+memory_durability_barrier() {
+	[ -x /bin/sync ] || return 1
+	run_bounded 30 2 /bin/sync >/dev/null 2>&1
+}
+
+memory_backing_identity() {
+	local value extra target="$1"
+	case "$target" in
+		/proc/self/fd/[0-9]*|/proc/[0-9]*/fd/[0-9]*)
+			[ -d "$target" ] || return 1
+			;;
+		*)
+			[ -d "$target" ] && [ ! -L "$target" ] || return 1
+			;;
+	esac
+	# ImmortalWrt's base BusyBox intentionally has no stat applet.  Bind an
+	# otherwise unused descriptor, read its mount-id/inode from procfs, then map
+	# the mount's major:minor pair through the kernel's documented device-number
+	# encoding.  This keeps the existing state/WAL identity compatible with the
+	# ucode fs metadata without adding a runtime package dependency.
+	value="$(
+		local fd_identity mount_id inode mount_device major minor device fd_extra
+		[ ! -e /proc/self/fd/189 ] || exit 1
+		exec 189<"$target" || exit 1
+		[ -d /proc/self/fd/189 ] && [ /proc/self/fd/189 -ef "$target" ] || exit 1
+		fd_identity="$(awk '
+			$1 == "mnt_id:" { mounts++; mount_id=$2 }
+			$1 == "ino:" { inodes++; inode=$2 }
+			END {
+				if (mounts == 1 && inodes == 1 &&
+				    mount_id ~ /^[0-9]+$/ && inode ~ /^[0-9]+$/)
+					print mount_id, inode
+				else
+					exit 1
+			}
+		' /proc/self/fdinfo/189)" || exit 1
+		read -r mount_id inode fd_extra <<-EOF
+		$fd_identity
+		EOF
+		[ -z "$fd_extra" ] || exit 1
+		mount_device="$(awk -v wanted="$mount_id" '
+			$1 == wanted { matches++; device=$3 }
+			END { if (matches == 1) print device; else exit 1 }
+		' /proc/self/mountinfo)" || exit 1
+		case "$mount_device" in
+			[0-9]*:[0-9]*) ;;
+			*) exit 1 ;;
+		esac
+		major="${mount_device%%:*}"
+		minor="${mount_device#*:}"
+		case "$major:$minor" in *[!0-9:]*|:*|*::*) exit 1 ;; esac
+		device=$((minor % 256 + major % 4096 * 256 +
+			(minor - minor % 256) * 4096 +
+			(major - major % 4096) * 4294967296))
+		printf '%s %s\n' "$device" "$inode"
+	)" || return 1
+	read -r MEMORY_IDENTITY_DEVICE MEMORY_IDENTITY_INODE extra <<-EOF
+	$value
+	EOF
+	case "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE:$extra" in
+		*[!0-9:]*|:*|*::*) return 1 ;;
+		[0-9]*:[0-9]*:) ;;
+		*) return 1 ;;
+	esac
+}
+
+memory_write_journal() {
+	local operation="$1" phase="$2" backing="${3%/}" device="$4" inode="$5"
+	local original_uid="$6" original_gid="$7" suffix="$8" had_old="$9"
+	local yaml_old="${10}" yaml_new="${11}" temporary
+	case "$operation:$phase" in
+		prepare:copying|prepare:prepared|prepare:new_installed|prepare:committed|\
+		checkpoint:copying|checkpoint:prepared|checkpoint:old_moved|\
+		checkpoint:new_installed|checkpoint:committed) ;;
+		*) return 1 ;;
+	esac
+	case "$suffix" in ??????) case "$suffix" in *[!A-Za-z0-9]*) return 1 ;; esac ;;
+		*) return 1 ;;
+	esac
+	case "$had_old" in 0|1) ;; *) return 1 ;; esac
+	case "$operation" in
+		prepare)
+			[ "$yaml_old:$yaml_new" = -:- ] || return 1
+			;;
+		checkpoint)
+			case "$yaml_old" in *[!0-9a-f]*) return 1 ;; esac
+			case "$yaml_new" in *[!0-9a-f]*) return 1 ;; esac
+			[ "${#yaml_old}" = 64 ] && [ "${#yaml_new}" = 64 ] || return 1
+			;;
+	esac
+	case "$device:$inode" in
+		*[!0-9:]*|:*|*::*) return 1 ;;
+		[0-9]*:[0-9]*) ;;
+		*) return 1 ;;
+	esac
+	case "$original_uid:$original_gid" in
+		0:0|0:"$ADGUARD_GID"|"$ADGUARD_UID":"$ADGUARD_GID") ;;
+		*) return 1 ;;
+	esac
+	validate_managed_work_dir_namespace "$backing" || return 1
+	memory_backing_identity "$backing" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = "$device:$inode" ] || return 1
+	memory_ensure_journal_dir || return 1
+	temporary="$(mktemp "${MEMORY_JOURNAL_DIR}/.checkpoint.XXXXXX")" || return 1
+	if ! printf 'version=3\noperation=%s\nphase=%s\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\noriginal_uid=%s\noriginal_gid=%s\noriginal_mode=0700\nsuffix=%s\nhad_old=%s\nyaml_old_sha256=%s\nyaml_new_sha256=%s\n' \
+		"$operation" "$phase" "$backing" "$device" "$inode" \
+		"$original_uid" "$original_gid" "$suffix" "$had_old" \
+		"$yaml_old" "$yaml_new" >"$temporary" ||
+	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! memory_private_state_file "$temporary" ||
+	   ! mv -f "$temporary" "$MEMORY_JOURNAL_FILE" ||
+	   ! memory_durability_barrier; then
+		rm -f "$temporary"
+		return 1
+	fi
+	memory_private_state_file "$MEMORY_JOURNAL_FILE"
+}
+
+memory_allocate_journal_suffix() (
+	local token suffix metadata mode links owner group size remainder
+	umask 077
+	memory_ensure_journal_dir || exit 1
+	token="$(mktemp "${MEMORY_JOURNAL_DIR}/.checkpoint.XXXXXX")" || exit 1
+	case "$token" in "${MEMORY_JOURNAL_DIR}/.checkpoint."??????) ;;
+		*) rm -f "$token"; exit 1 ;;
+	esac
+	suffix="${token##*.}"
+	case "$suffix" in ??????) case "$suffix" in *[!A-Za-z0-9]*) rm -f "$token"; exit 1 ;; esac ;;
+		*) rm -f "$token"; exit 1 ;;
+	esac
+	# A mktemp token is deliberately empty, whereas durable state files are not.
+	# Validate its exact root-private inode before releasing the random suffix.
+	metadata="$(LC_ALL=C ls -ldn "$token" 2>/dev/null)" || exit 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode:$links:$owner:$group:$size" = "-rw-------:1:0:0:0" ] || exit 1
+	rm -f "$token" || exit 1
+	printf '%s\n' "$suffix"
+)
+
+memory_load_journal() {
+	local line1 line2 line3 line4 line5 line6 line7 line8 line9 line10 line11
+	local line12 line13 extra
+	local metadata mode owner group
+	MEMORY_JOURNAL_OPERATION=""
+	MEMORY_JOURNAL_PHASE=""
+	MEMORY_JOURNAL_BACKING=""
+	MEMORY_JOURNAL_DEVICE=""
+	MEMORY_JOURNAL_INODE=""
+	MEMORY_JOURNAL_ORIGINAL_UID=""
+	MEMORY_JOURNAL_ORIGINAL_GID=""
+	MEMORY_JOURNAL_SUFFIX=""
+	MEMORY_JOURNAL_HAD_OLD=""
+	MEMORY_JOURNAL_YAML_OLD=""
+	MEMORY_JOURNAL_YAML_NEW=""
+	if [ ! -e "$MEMORY_JOURNAL_DIR" ] && [ ! -L "$MEMORY_JOURNAL_DIR" ]; then
+		return 1
+	fi
+	memory_journal_dir_valid || return 2
+	memory_private_state_file "$MEMORY_JOURNAL_FILE" || return 2
+	{
+		IFS= read -r line1 && IFS= read -r line2 && IFS= read -r line3 &&
+		IFS= read -r line4 && IFS= read -r line5 && IFS= read -r line6 &&
+		IFS= read -r line7 && IFS= read -r line8 && IFS= read -r line9 &&
+		IFS= read -r line10 && IFS= read -r line11 && IFS= read -r line12 &&
+		IFS= read -r line13 && ! IFS= read -r extra
+	} <"$MEMORY_JOURNAL_FILE" || return 2
+	[ "$line1" = version=3 ] || return 2
+	case "$line2" in operation=*) MEMORY_JOURNAL_OPERATION="${line2#operation=}" ;; *) return 2 ;; esac
+	case "$line3" in phase=*) MEMORY_JOURNAL_PHASE="${line3#phase=}" ;; *) return 2 ;; esac
+	case "$line4" in persistent_work_dir=*) MEMORY_JOURNAL_BACKING="${line4#persistent_work_dir=}" ;; *) return 2 ;; esac
+	case "$line5" in backing_device=*) MEMORY_JOURNAL_DEVICE="${line5#backing_device=}" ;; *) return 2 ;; esac
+	case "$line6" in backing_inode=*) MEMORY_JOURNAL_INODE="${line6#backing_inode=}" ;; *) return 2 ;; esac
+	case "$line7" in original_uid=*) MEMORY_JOURNAL_ORIGINAL_UID="${line7#original_uid=}" ;; *) return 2 ;; esac
+	case "$line8" in original_gid=*) MEMORY_JOURNAL_ORIGINAL_GID="${line8#original_gid=}" ;; *) return 2 ;; esac
+	[ "$line9" = original_mode=0700 ] || return 2
+	case "$line10" in suffix=*) MEMORY_JOURNAL_SUFFIX="${line10#suffix=}" ;; *) return 2 ;; esac
+	case "$line11" in had_old=*) MEMORY_JOURNAL_HAD_OLD="${line11#had_old=}" ;; *) return 2 ;; esac
+	case "$line12" in yaml_old_sha256=*) MEMORY_JOURNAL_YAML_OLD="${line12#yaml_old_sha256=}" ;; *) return 2 ;; esac
+	case "$line13" in yaml_new_sha256=*) MEMORY_JOURNAL_YAML_NEW="${line13#yaml_new_sha256=}" ;; *) return 2 ;; esac
+	case "$MEMORY_JOURNAL_OPERATION:$MEMORY_JOURNAL_PHASE" in
+		prepare:copying|prepare:prepared|prepare:new_installed|prepare:committed|\
+		checkpoint:copying|checkpoint:prepared|checkpoint:old_moved|\
+		checkpoint:new_installed|checkpoint:committed) ;;
+		*) return 2 ;;
+	esac
+	validate_managed_work_dir_namespace "$MEMORY_JOURNAL_BACKING" || return 2
+	case "$MEMORY_JOURNAL_DEVICE:$MEMORY_JOURNAL_INODE" in
+		*[!0-9:]*|:*|*::*) return 2 ;;
+		[0-9]*:[0-9]*) ;;
+		*) return 2 ;;
+	esac
+	case "$MEMORY_JOURNAL_ORIGINAL_UID:$MEMORY_JOURNAL_ORIGINAL_GID" in
+		0:0|0:"$ADGUARD_GID"|"$ADGUARD_UID":"$ADGUARD_GID") ;;
+		*) return 2 ;;
+	esac
+	case "$MEMORY_JOURNAL_SUFFIX" in
+		??????) case "$MEMORY_JOURNAL_SUFFIX" in *[!A-Za-z0-9]*) return 2 ;; esac ;;
+		*) return 2 ;;
+	esac
+	case "$MEMORY_JOURNAL_HAD_OLD" in 0|1) ;; *) return 2 ;; esac
+	case "$MEMORY_JOURNAL_OPERATION" in
+		prepare)
+			[ "$MEMORY_JOURNAL_YAML_OLD:$MEMORY_JOURNAL_YAML_NEW" = -:- ] || return 2
+			;;
+		checkpoint)
+			case "$MEMORY_JOURNAL_YAML_OLD" in *[!0-9a-f]*) return 2 ;; esac
+			case "$MEMORY_JOURNAL_YAML_NEW" in *[!0-9a-f]*) return 2 ;; esac
+			[ "${#MEMORY_JOURNAL_YAML_OLD}" = 64 ] &&
+				[ "${#MEMORY_JOURNAL_YAML_NEW}" = 64 ] || return 2
+			;;
+	esac
+	memory_backing_identity "$MEMORY_JOURNAL_BACKING" || return 2
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$MEMORY_JOURNAL_DEVICE:$MEMORY_JOURNAL_INODE" ] || return 2
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_JOURNAL_BACKING" 2>/dev/null)" || return 2
+	read -r mode _links owner group _remainder <<-EOF
+	$metadata
+	EOF
+	case "$owner:$group:$mode" in
+		"$MEMORY_JOURNAL_ORIGINAL_UID":"$MEMORY_JOURNAL_ORIGINAL_GID":drwx------|\
+		0:"$ADGUARD_GID":drwx------|0:"$ADGUARD_GID":drwx--x---) ;;
+		*) return 2 ;;
+	esac
+	return 0
+}
+
+memory_remove_service_tree() (
+	local target="${1%/}" parent name metadata mode links
+	local original_owner original_group original_permissions remainder
+	parent="${target%/*}"
+	name="${target##*/}"
+	validate_managed_work_dir_namespace "$parent" || exit 1
+	case "$name" in
+		data) ;;
+		.data-memory-next.??????|.data-memory-old.??????)
+			case "${name##*.}" in *[!A-Za-z0-9]*) exit 1 ;; esac
+			;;
+		*) exit 1 ;;
+	esac
+	metadata="$(LC_ALL=C ls -ldn "$parent" 2>/dev/null)" || exit 1
+	read -r mode links original_owner original_group remainder <<-EOF
+	$metadata
+	EOF
+	case "$original_owner:$original_group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------)
+			original_permissions=0700
+			;;
+		0:"$ADGUARD_GID":drwx--x---)
+			original_permissions=0710
+			;;
+		*) exit 1 ;;
+	esac
+	trap 'chown "$original_owner:$original_group" "$parent" >/dev/null 2>&1 && chmod "$original_permissions" "$parent" >/dev/null 2>&1 || true' EXIT
+	chown "0:${ADGUARD_GID}" "$parent" && chmod 0710 "$parent" || exit 1
+	[ -d "$target" ] && [ ! -L "$target" ] || exit 1
+	uid853_tree_is_plain "$target" || exit 1
+	# The frozen parent is intentionally non-writable by uid 853, so the exact
+	# child cannot be exchanged after validation.  Root performs only this fixed
+	# unlink; rm never follows a symlink encountered inside the plain tree.
+	run_bounded 30 2 /bin/rm -rf "$target" >/dev/null 2>&1 || exit 1
+	[ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
+	chown "$original_owner:$original_group" "$parent" &&
+		chmod "$original_permissions" "$parent" || exit 1
+	trap - EXIT
+)
+
+memory_clear_orphan_journal_dir() {
+	local orphan found=0 metadata mode links owner group size remainder
+	memory_journal_dir_valid || return 1
+	[ ! -e "$MEMORY_JOURNAL_FILE" ] && [ ! -L "$MEMORY_JOURNAL_FILE" ] || return 1
+	for orphan in "${MEMORY_JOURNAL_DIR}"/.checkpoint.??????; do
+		[ -e "$orphan" ] || [ -L "$orphan" ] || continue
+		found=1
+		case "${orphan##*.}" in *[!A-Za-z0-9]*) return 1 ;; esac
+		[ -f "$orphan" ] && [ ! -L "$orphan" ] || return 1
+		metadata="$(LC_ALL=C ls -ldn "$orphan" 2>/dev/null)" || return 1
+		read -r mode links owner group size remainder <<-EOF
+		$metadata
+		EOF
+		[ "$mode:$links:$owner:$group" = "-rw-------:1:0:0" ] || return 1
+		case "$size" in ""|*[!0-9]*) return 1 ;; esac
+		[ "$size" -le 1024 ] || return 1
+		rm -f "$orphan" || return 1
+	done
+	# rmdir is the final allowlist check: any unexpected or hidden entry keeps
+	# this root-private recovery namespace intact and fails closed.
+	rmdir "$MEMORY_JOURNAL_DIR" 2>/dev/null || return 1
+	[ "$found" = 0 ] || log_error "Removed an incomplete AdGuard Home checkpoint journal write"
+}
+
+memory_clear_journal() {
+	memory_journal_dir_valid || return 1
+	memory_private_state_file "$MEMORY_JOURNAL_FILE" || return 1
+	rm -f "$MEMORY_JOURNAL_FILE" || return 1
+	memory_durability_barrier || return 1
+	rmdir "$MEMORY_JOURNAL_DIR" 2>/dev/null || return 1
+}
+
+memory_discard_incomplete_prepare_runtime() {
+	local entry stage="${MEMORY_RUNTIME_DIR}/.work.${MEMORY_JOURNAL_SUFFIX}"
+	local metadata mode links owner group size remainder
+	if [ ! -e "$MEMORY_RUNTIME_DIR" ] && [ ! -L "$MEMORY_RUNTIME_DIR" ]; then
+		return 0
+	fi
+	memory_prepare_runtime_dir_valid || return 1
+	for entry in \
+		"$MEMORY_RUNTIME_DIR"/* \
+		"$MEMORY_RUNTIME_DIR"/.[!.]* \
+		"$MEMORY_RUNTIME_DIR"/..?*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		case "$entry" in
+			"$stage"|"$MEMORY_WORK_DIR")
+				[ -d "$entry" ] && [ ! -L "$entry" ] || return 1
+				;;
+			"$MEMORY_STATE_FILE"|"$MEMORY_RUNTIME_DIR"/.state.??????)
+				[ -f "$entry" ] && [ ! -L "$entry" ] || return 1
+				metadata="$(LC_ALL=C ls -ldn "$entry" 2>/dev/null)" || return 1
+				read -r mode links owner group size remainder <<-EOF
+				$metadata
+				EOF
+				[ "$mode:$links:$owner:$group" = "-rw-------:1:0:0" ] || return 1
+				case "$size" in ""|*[!0-9]*) return 1 ;; esac
+				[ "$size" -le 1024 ] || return 1
+				;;
+			*) return 1 ;;
+		esac
+	done
+	case "$MEMORY_JOURNAL_PHASE" in
+		committed)
+			memory_state_load || return 1
+			[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_JOURNAL_BACKING" ] || return 1
+			return 0
+			;;
+	esac
+	if [ -e "$stage" ] || [ -L "$stage" ]; then
+		[ -d "$stage" ] && [ ! -L "$stage" ] || return 1
+		memory_journal_tree_plain "$stage" || return 1
+		rm -rf "$stage" || return 1
+	fi
+	if [ -e "$MEMORY_WORK_DIR" ] || [ -L "$MEMORY_WORK_DIR" ]; then
+		[ -d "$MEMORY_WORK_DIR" ] && [ ! -L "$MEMORY_WORK_DIR" ] || return 1
+		memory_journal_tree_plain "$MEMORY_WORK_DIR" || return 1
+		rm -rf "$MEMORY_WORK_DIR" || return 1
+	fi
+	for entry in "$MEMORY_STATE_FILE" "$MEMORY_RUNTIME_DIR"/.state.??????; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		rm -f "$entry" || return 1
+	done
+	rmdir "$MEMORY_RUNTIME_DIR"
+}
+
+memory_restore_journal_backing_metadata() {
+	local metadata mode owner group
+	# Keep the only interrupted intermediate at root:853/0700, which remains
+	# non-writable by uid 853 and is explicitly journal-gated by the loader.
+	chmod 0700 "$MEMORY_JOURNAL_BACKING" &&
+		chown "${MEMORY_JOURNAL_ORIGINAL_UID}:${MEMORY_JOURNAL_ORIGINAL_GID}" \
+		"$MEMORY_JOURNAL_BACKING" || return 1
+	memory_backing_identity "$MEMORY_JOURNAL_BACKING" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$MEMORY_JOURNAL_DEVICE:$MEMORY_JOURNAL_INODE" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MEMORY_JOURNAL_BACKING" 2>/dev/null)" || return 1
+	read -r mode _links owner group _remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode" = \
+		"$MEMORY_JOURNAL_ORIGINAL_UID:$MEMORY_JOURNAL_ORIGINAL_GID:drwx------" ]
+}
+
+memory_freeze_journal_backing() {
+	memory_backing_identity "$MEMORY_JOURNAL_BACKING" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$MEMORY_JOURNAL_DEVICE:$MEMORY_JOURNAL_INODE" ] || return 1
+	chown "0:${ADGUARD_GID}" "$MEMORY_JOURNAL_BACKING" &&
+		chmod 0710 "$MEMORY_JOURNAL_BACKING"
+}
+
+memory_journal_tree_plain() (
+	local target="$1" descriptor=/proc/self/fd/8
+	[ -d "$target" ] && [ ! -L "$target" ] || exit 1
+	exec 8<"$target" || exit 1
+	root_held_tree_is_plain "$descriptor" "$target"
+)
+
+memory_remove_journal_tree() {
+	local target="$1"
+	case "$target" in
+		"${MEMORY_JOURNAL_BACKING}/data"|\
+		"${MEMORY_JOURNAL_BACKING}/.data-memory-next.${MEMORY_JOURNAL_SUFFIX}"|\
+		"${MEMORY_JOURNAL_BACKING}/.data-memory-old.${MEMORY_JOURNAL_SUFFIX}") ;;
+		*) return 1 ;;
+	esac
+	[ -d "$target" ] && [ ! -L "$target" ] || return 1
+	memory_journal_tree_plain "$target" || return 1
+	# The journal-bound parent is frozen at 0710, so this exact child cannot be
+	# exchanged.  rm does not follow symlinks found below the child.
+	rm -rf "$target" || return 1
+	[ ! -e "$target" ] && [ ! -L "$target" ]
+}
+
+memory_journal_yaml_hash() {
+	local target="${MEMORY_JOURNAL_BACKING}/AdGuardHome.yaml" size
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	size="$(wc -c <"$target" 2>/dev/null)" || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || return 1
+	yaml_file_hash "$target"
+}
+
+memory_recover_journal_locked() (
+	local expected_backing="${1%/}" journal_rc=0 backing next old data
+	local current_yaml roll_forward=0
+	if { [ -e "$MEMORY_JOURNAL_DIR" ] || [ -L "$MEMORY_JOURNAL_DIR" ]; } &&
+	   [ ! -e "$MEMORY_JOURNAL_FILE" ] && [ ! -L "$MEMORY_JOURNAL_FILE" ]; then
+		memory_clear_orphan_journal_dir || {
+			log_error "Unsafe incomplete AdGuard Home memory checkpoint journal"
+			exit 1
+		}
+		exit 0
+	fi
+	memory_load_journal || journal_rc=$?
+	case "$journal_rc" in
+		1) exit 0 ;;
+		0) ;;
+		*) log_error "Unsafe AdGuard Home memory checkpoint journal"; exit 1 ;;
+	esac
+	backing="${MEMORY_JOURNAL_BACKING%/}"
+	[ -z "$expected_backing" ] || [ "$expected_backing" = "$backing" ] || exit 1
+	official_running && exit 1
+	adguard_uid_process_exists && exit 1
+	if [ "$MEMORY_JOURNAL_OPERATION" = prepare ]; then
+		memory_discard_incomplete_prepare_runtime || exit 1
+		memory_restore_journal_backing_metadata || exit 1
+		memory_durability_barrier || exit 1
+		memory_clear_journal || exit 1
+		exit 0
+	fi
+	next="${backing}/.data-memory-next.${MEMORY_JOURNAL_SUFFIX}"
+	old="${backing}/.data-memory-old.${MEMORY_JOURNAL_SUFFIX}"
+	data="${backing}/data"
+	memory_freeze_journal_backing || exit 1
+	current_yaml="$(memory_journal_yaml_hash)" || exit 1
+	case "$MEMORY_JOURNAL_PHASE" in
+		copying|prepared)
+			[ "$current_yaml" = "$MEMORY_JOURNAL_YAML_OLD" ] || exit 1
+			if [ "$MEMORY_JOURNAL_HAD_OLD" = 1 ]; then
+				if [ -e "$old" ] || [ -L "$old" ]; then
+					[ ! -e "$data" ] && [ ! -L "$data" ] || exit 1
+					memory_journal_tree_plain "$old" || exit 1
+					mv "$old" "$data" || exit 1
+				else
+					memory_journal_tree_plain "$data" || exit 1
+				fi
+			elif [ -e "$old" ] || [ -L "$old" ] ||
+			     [ -e "$data" ] || [ -L "$data" ]; then
+				exit 1
+			fi
+			if [ -e "$next" ] || [ -L "$next" ]; then
+				memory_remove_journal_tree "$next" || exit 1
+			fi
+			;;
+		old_moved)
+			[ "$current_yaml" = "$MEMORY_JOURNAL_YAML_OLD" ] || exit 1
+			if [ "$MEMORY_JOURNAL_HAD_OLD" = 1 ]; then
+				if [ -e "$old" ] || [ -L "$old" ]; then
+					memory_journal_tree_plain "$old" || exit 1
+					if [ -e "$data" ] || [ -L "$data" ]; then
+						memory_journal_tree_plain "$data" || exit 1
+						memory_remove_journal_tree "$data" || exit 1
+					fi
+					mv "$old" "$data" || exit 1
+				else
+					# A prior recovery may already have restored old -> data before
+					# losing power.  Accept that terminal rollback layout.
+					memory_journal_tree_plain "$data" || exit 1
+				fi
+			else
+				[ ! -e "$old" ] && [ ! -L "$old" ] || exit 1
+				if [ -e "$data" ] || [ -L "$data" ]; then
+					memory_journal_tree_plain "$data" || exit 1
+					memory_remove_journal_tree "$data" || exit 1
+				fi
+			fi
+			if [ -e "$next" ] || [ -L "$next" ]; then
+				memory_remove_journal_tree "$next" || exit 1
+			fi
+			;;
+		new_installed)
+			if [ "$current_yaml" = "$MEMORY_JOURNAL_YAML_NEW" ]; then
+				roll_forward=1
+				memory_journal_tree_plain "$data" || exit 1
+				[ ! -e "$next" ] && [ ! -L "$next" ] || exit 1
+				if [ -e "$old" ] || [ -L "$old" ]; then
+					memory_journal_tree_plain "$old" || exit 1
+					memory_remove_journal_tree "$old" || exit 1
+				fi
+			elif [ "$current_yaml" = "$MEMORY_JOURNAL_YAML_OLD" ]; then
+				if [ "$MEMORY_JOURNAL_HAD_OLD" = 1 ]; then
+					if [ -e "$old" ] || [ -L "$old" ]; then
+						memory_journal_tree_plain "$old" || exit 1
+						if [ -e "$data" ] || [ -L "$data" ]; then
+							memory_journal_tree_plain "$data" || exit 1
+							memory_remove_journal_tree "$data" || exit 1
+						fi
+						mv "$old" "$data" || exit 1
+					else
+						memory_journal_tree_plain "$data" || exit 1
+					fi
+				else
+					[ ! -e "$old" ] && [ ! -L "$old" ] || exit 1
+					if [ -e "$data" ] || [ -L "$data" ]; then
+						memory_journal_tree_plain "$data" || exit 1
+						memory_remove_journal_tree "$data" || exit 1
+					fi
+				fi
+				if [ -e "$next" ] || [ -L "$next" ]; then
+					memory_remove_journal_tree "$next" || exit 1
+				fi
+			else
+				exit 1
+			fi
+			;;
+		committed)
+			[ "$current_yaml" = "$MEMORY_JOURNAL_YAML_NEW" ] || exit 1
+			roll_forward=1
+			memory_journal_tree_plain "$data" || exit 1
+			[ ! -e "$next" ] && [ ! -L "$next" ] || exit 1
+			if [ -e "$old" ] || [ -L "$old" ]; then
+				memory_remove_journal_tree "$old" || exit 1
+			fi
+			;;
+	esac
+	if [ "$roll_forward" != 1 ]; then
+		if [ "$MEMORY_JOURNAL_HAD_OLD" = 1 ]; then
+			memory_journal_tree_plain "$data" || exit 1
+		else
+			[ ! -e "$data" ] && [ ! -L "$data" ] || exit 1
+		fi
+		[ ! -e "$old" ] && [ ! -L "$old" ] &&
+			[ ! -e "$next" ] && [ ! -L "$next" ] || exit 1
+	fi
+	memory_durability_barrier || exit 1
+	memory_restore_journal_backing_metadata || exit 1
+	memory_durability_barrier || exit 1
+	memory_clear_journal || exit 1
+)
+
+memory_prepare_checkpoint_config_locked() (
+	local expected_active_hash="$1" candidate="$2" verify raw_hash candidate_hash
+	local persistent_hash old_work old_config
+	[ "$MEMORY_ACTIVE" = 1 ] || exit 1
+	[ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	case "$candidate" in /tmp/AdGuardHome-memory-checkpoint.??????/AdGuardHome.yaml) ;;
+		*) exit 1 ;;
+	esac
+	verify="${candidate%/*}/AdGuardHome.verify.yaml"
+	snapshot_config_file "$MEMORY_CONFIG_FILE" "$candidate" \
+		"$expected_active_hash" "" || exit 1
+	raw_hash="$SNAPSHOT_CONFIG_HASH"
+	# The stopped core cannot rewrite this inode, but two identical bounded
+	# captures also protect callers that reach this checkpoint immediately after
+	# the stop boundary.
+	snapshot_config_file "$MEMORY_CONFIG_FILE" "$verify" "$raw_hash" "" || exit 1
+	rm -f "$verify" || exit 1
+	memory_rewrite_workdir_pattern "$MEMORY_WORK_DIR" \
+		"$MEMORY_BACKING_WORK_DIR" "$candidate" || exit 1
+	candidate_hash="$(yaml_file_hash "$candidate")" || exit 1
+	check_core_config_file "$candidate" "$candidate_hash" || exit 1
+
+	old_work="$work_dir"
+	old_config="$config_file"
+	work_dir="$MEMORY_BACKING_WORK_DIR"
+	config_file="${work_dir}/AdGuardHome.yaml"
+	secure_active_paths || exit 1
+	persistent_hash="$(active_config_hash)" || exit 1
+	work_dir="$old_work"
+	config_file="$old_config"
+	printf '%s %s\n' "$persistent_hash" "$candidate_hash"
+)
+
+memory_install_checkpoint_config_locked() (
+	local candidate="$1" expected_old="$2" expected_new="$3" old_work old_config
+	local current_hash install_rc=0
+	case "$candidate" in /tmp/AdGuardHome-memory-checkpoint.??????/AdGuardHome.yaml) ;;
+		*) exit 1 ;;
+	esac
+	case "$expected_old:$expected_new" in *[!0-9a-f:]*|:*|*::*) exit 1 ;; esac
+	[ "${#expected_old}" = 64 ] && [ "${#expected_new}" = 64 ] || exit 1
+	old_work="$work_dir"
+	old_config="$config_file"
+	work_dir="$MEMORY_BACKING_WORK_DIR"
+	config_file="${work_dir}/AdGuardHome.yaml"
+	secure_active_paths || exit 1
+	current_hash="$(active_config_hash)" || exit 1
+	[ "$current_hash" = "$expected_old" ] || exit 1
+	# The monitor checks the RAM YAML frequently.  An unchanged YAML is already
+	# durable and must not trigger a global sync (or any persistent write).
+	if [ "$expected_old" = "$expected_new" ]; then
+		work_dir="$old_work"
+		config_file="$old_config"
+		exit 0
+	fi
+	if [ "$expected_old" != "$expected_new" ]; then
+		install_config_candidate "$candidate" "$expected_old" "$expected_new" "" || install_rc=$?
+	fi
+	current_hash="$(active_config_hash)" || exit 2
+	if [ "$current_hash" = "$expected_new" ]; then
+		# install_config_candidate() may have completed its atomic rename before a
+		# post-install verification failed.  The prevalidated new hash is then the
+		# authoritative successful result, not a reason to split RAM and disk.
+		memory_durability_barrier || exit 2
+	elif [ "$current_hash" = "$expected_old" ]; then
+		exit 1
+	else
+		exit 2
+	fi
+	[ "$install_rc" = 0 ] || log_error "Recovered a completed persistent YAML rename after its verifier failed"
+	work_dir="$old_work"
+	config_file="$old_config"
+)
+
+# Persist only the RAM YAML.  LuCI edits and the running core's periodic YAML
+# rewrites do not need a data-directory transaction, but they use the same
+# double-capture, validation, atomic install and durability boundary.
+memory_checkpoint_config_locked() (
+	local expected_active_hash="$1" directory candidate hash_pair yaml_old yaml_new extra
+	[ "$MEMORY_ACTIVE" = 1 ] || exit 0
+	[ -n "$expected_active_hash" ] ||
+		expected_active_hash="$(active_config_hash)" || exit 1
+	directory="$(mktemp -d /tmp/AdGuardHome-memory-checkpoint.XXXXXX)" || exit 1
+	trap 'rm -rf "$directory"' EXIT
+	candidate="${directory}/AdGuardHome.yaml"
+	hash_pair="$(memory_prepare_checkpoint_config_locked \
+		"$expected_active_hash" "$candidate")" || exit 1
+	read -r yaml_old yaml_new extra <<-EOF
+	$hash_pair
+	EOF
+	[ -z "$extra" ] || exit 1
+	case "$yaml_old" in *[!0-9a-f]*) exit 1 ;; esac
+	case "$yaml_new" in *[!0-9a-f]*) exit 1 ;; esac
+	[ "${#yaml_old}" = 64 ] && [ "${#yaml_new}" = 64 ] || exit 1
+	memory_install_checkpoint_config_locked "$candidate" "$yaml_old" "$yaml_new"
+)
+
+memory_checkpoint_data_locked() (
+	local source="${MEMORY_WORK_DIR}/data" target="${MEMORY_BACKING_WORK_DIR}/data"
+	local yaml_old="$1" yaml_new="$2"
+	local stage suffix old metadata mode links original_owner original_group remainder had_old=0
+	local backing_fd=/proc/self/fd/9 backing_device backing_inode
+	[ "$MEMORY_ACTIVE" = 1 ] || exit 0
+	official_running && exit 1
+	adguard_uid_process_exists && exit 1
+	[ -d "$source" ] && [ ! -L "$source" ] &&
+		uid853_tree_is_plain "$source" || exit 1
+	memory_state_load || exit 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_recover_journal_locked "$MEMORY_BACKING_WORK_DIR" || exit 1
+	[ -d "$MEMORY_BACKING_WORK_DIR" ] && [ ! -L "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	exec 9<"$MEMORY_BACKING_WORK_DIR" || exit 1
+	[ -d "$backing_fd" ] && [ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$backing_fd" 2>/dev/null)" || exit 1
+	read -r mode links original_owner original_group remainder <<-EOF
+	$metadata
+	EOF
+	case "$original_owner:$original_group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		*) exit 1 ;;
+	esac
+	memory_backing_identity "$backing_fd" || exit 1
+	backing_device="$MEMORY_IDENTITY_DEVICE"
+	backing_inode="$MEMORY_IDENTITY_INODE"
+	[ "$backing_device:$backing_inode" = \
+		"$MEMORY_STATE_BACKING_DEVICE:$MEMORY_STATE_BACKING_INODE" ] || exit 1
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		[ -d "$target" ] && [ ! -L "$target" ] &&
+			memory_journal_tree_plain "$target" || exit 1
+		had_old=1
+	fi
+	suffix="$(memory_allocate_journal_suffix)" || exit 1
+	stage="${MEMORY_BACKING_WORK_DIR}/.data-memory-next.${suffix}"
+	old="${MEMORY_BACKING_WORK_DIR}/.data-memory-old.${suffix}"
+	[ ! -e "$stage" ] && [ ! -L "$stage" ] || exit 1
+	if [ -e "$old" ] || [ -L "$old" ]; then
+		exit 1
+	fi
+	if ! memory_write_journal checkpoint copying "$MEMORY_BACKING_WORK_DIR" \
+		"$backing_device" "$backing_inode" "$original_owner" "$original_group" \
+		"$suffix" "$had_old" "$yaml_old" "$yaml_new"; then
+		exit 1
+	fi
+	mkdir -m 0700 "$stage" || exit 1
+	trap 'chmod 0700 "$backing_fd" >/dev/null 2>&1 && chown "$original_owner:$original_group" "$backing_fd" >/dev/null 2>&1 || true' EXIT
+	chown "0:${ADGUARD_GID}" "$backing_fd" || exit 1
+	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	chmod 0710 "$backing_fd" || exit 1
+	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	if ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$stage" || ! chmod 0700 "$stage"; then
+		exit 1
+	fi
+	if ! run_bounded 120 2 \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$stage/" ||
+	   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$stage" ||
+	   ! chmod 0700 "$stage" ||
+	   ! uid853_tree_is_plain "$stage"; then
+		exit 1
+	fi
+	uid853_tree_is_plain "$stage" || exit 1
+	memory_advance_journal checkpoint prepared || exit 1
+	if [ "$had_old" = 1 ]; then
+		mv "$target" "$old" || exit 1
+	fi
+	memory_advance_journal checkpoint old_moved || exit 1
+	mv "$stage" "$target" || exit 1
+	memory_advance_journal checkpoint new_installed || exit 1
+	chmod 0700 "$backing_fd" && chown "$original_owner:$original_group" "$backing_fd" || exit 1
+	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_durability_barrier || exit 1
+	trap - EXIT
+)
+
+memory_finish_data_checkpoint_locked() {
+	local journal_rc=0
+	memory_load_journal || journal_rc=$?
+	[ "$journal_rc" = 0 ] || return 1
+	[ "$MEMORY_JOURNAL_OPERATION" = checkpoint ] || return 1
+	case "$MEMORY_JOURNAL_PHASE" in
+		new_installed) memory_advance_journal checkpoint committed || return 1 ;;
+		committed) ;;
+		*) return 1 ;;
+	esac
+	memory_recover_journal_locked "$MEMORY_JOURNAL_BACKING"
+}
+
+memory_checkpoint_full_locked() (
+	local active_hash directory candidate hash_pair yaml_old yaml_new extra
+	[ "$MEMORY_ACTIVE" = 1 ] || return 0
+	official_running && {
+		log_error "Refusing to checkpoint a live AdGuard Home memory workdir"
+		return 1
+	}
+	memory_active_tree_valid || return 1
+	active_hash="$(active_config_hash)" || return 1
+	directory="$(mktemp -d /tmp/AdGuardHome-memory-checkpoint.XXXXXX)" || return 1
+	trap 'rm -rf "$directory"' EXIT
+	candidate="${directory}/AdGuardHome.yaml"
+	hash_pair="$(memory_prepare_checkpoint_config_locked "$active_hash" "$candidate")" || return 1
+	read -r yaml_old yaml_new extra <<-EOF
+	$hash_pair
+	EOF
+	[ -z "$extra" ] || return 1
+	case "$yaml_old" in *[!0-9a-f]*) return 1 ;; esac
+	case "$yaml_new" in *[!0-9a-f]*) return 1 ;; esac
+	[ "${#yaml_old}" = 64 ] && [ "${#yaml_new}" = 64 ] || return 1
+	if ! memory_checkpoint_data_locked "$yaml_old" "$yaml_new"; then
+		memory_recover_journal_locked "$MEMORY_BACKING_WORK_DIR" >/dev/null 2>&1 || true
+		return 1
+	fi
+	if ! memory_install_checkpoint_config_locked "$candidate" "$yaml_old" "$yaml_new"; then
+		memory_recover_journal_locked "$MEMORY_BACKING_WORK_DIR" >/dev/null 2>&1 || true
+		log_error "Unable to persist the AdGuard Home memory YAML"
+		return 1
+	fi
+	if ! memory_finish_data_checkpoint_locked; then
+		memory_recover_journal_locked "$MEMORY_BACKING_WORK_DIR" >/dev/null 2>&1 || true
+		return 1
+	fi
+	rm -rf "$directory" || return 1
+	trap - EXIT
+	log_error "Persisted AdGuard Home memory workdir to ${MEMORY_BACKING_WORK_DIR}"
+)
+
 root_private_config_source() {
 	local candidate="$1" parent mode
 	parent="${candidate%/*}"
@@ -847,7 +2396,7 @@ snapshot_config_file() {
 			[ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
 			[ "$fd_path" -ef "$candidate" ] || return 1
 		fi
-		/usr/bin/timeout -k 1s 3s /bin/dd if="$fd_path" bs=4096 count=129 \
+		run_bounded 3 1 /bin/dd if="$fd_path" bs=4096 count=129 \
 			of="$target" 2>/dev/null || capture_rc=$?
 		[ "$capture_rc" = 0 ] || return 1
 		# The pathname is needed later for a same-filesystem rename.  Reject an
@@ -864,7 +2413,7 @@ snapshot_config_file() {
 		if root_private_config_source "$candidate"; then
 			capture_root_file_bytes "$candidate" "$target" 129 || capture_rc=$?
 		else
-			/usr/bin/timeout -k 1s 3s \
+			run_bounded 3 1 \
 				/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 				-n AGHSnapshot -x /bin/dd -- if="$candidate" bs=4096 count=129 \
 				>"$target" 2>/dev/null || capture_rc=$?
@@ -886,10 +2435,6 @@ check_core_config_file() {
 	local validation_dir validation_work validation rc
 	[ -x "$CORE_BINARY" ] || {
 		log_error "AdGuard Home binary is missing: ${CORE_BINARY}"
-		return 1
-	}
-	[ -x /usr/bin/timeout ] || {
-		log_error "The required coreutils timeout helper is missing"
 		return 1
 	}
 	[ -x /sbin/start-stop-daemon ] || {
@@ -949,7 +2494,7 @@ check_core_config_file() {
 	# including while the official service is running.  A hard timeout bounds
 	# FIFOs or slow filesystem references in fields not interpreted above, and
 	# uid/gid 853 prevents the checker from reading root-only host files.
-	/usr/bin/timeout -k 2s 15s \
+	run_bounded 15 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHConfigCheck -x "$CORE_BINARY" -- \
 		--check-config --config "$validation" --work-dir "$validation_work" \
@@ -988,6 +2533,35 @@ normalizer_lock_directory_is_private() {
 	EOF
 	[ "$owner:$group:$mode" = "0:0:drwx------" ]
 }
+
+# ImmortalWrt's default package post-install helper invokes every packaged init
+# script once even during an upgrade.  Consume the root-private marker left by
+# a successful stopped v2.1 migration so that one automatic invocation is a
+# no-op; a later manual start or boot follows the normal enabled-state path.
+consume_upgrade_stopped_marker() (
+	local entry metadata mode links owner group size remainder
+	[ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ] || exit 1
+	normalizer_lock_directory_is_private || exit 2
+	for entry in \
+		"$NORMALIZER_RUNTIME_DIR"/* \
+		"$NORMALIZER_RUNTIME_DIR"/.[!.]* \
+		"$NORMALIZER_RUNTIME_DIR"/..?*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		[ "$entry" = "$UPGRADE_STOPPED_MARKER" ] || exit 2
+	done
+	exec 9<"$UPGRADE_STOPPED_MARKER" || exit 2
+	[ -f /proc/self/fd/9 ] && [ /proc/self/fd/9 -ef "$UPGRADE_STOPPED_MARKER" ] || exit 2
+	metadata="$(LC_ALL=C ls -ldnL /proc/self/fd/9 2>/dev/null)" || exit 2
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
+		[ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$size" = 2 ] || exit 2
+	grep -qx '1' /proc/self/fd/9 || exit 2
+	rm -f "$UPGRADE_STOPPED_MARKER" || exit 2
+	[ ! -e "$UPGRADE_STOPPED_MARKER" ] && [ ! -L "$UPGRADE_STOPPED_MARKER" ] || exit 2
+	rmdir "$NORMALIZER_RUNTIME_DIR" || exit 2
+)
 
 normalizer_lock_is_private() {
 	local metadata mode links owner group remainder
@@ -1123,7 +2697,7 @@ normalize_installer_config() (
 	fi
 	set -- "$@" -- "$CORE_BINARY" --check-config \
 		--config "$validation" --work-dir "$validation_work"
-	/usr/bin/timeout -k 4s 20s "$@" >/dev/null 2>&1 || rc=$?
+	run_bounded 20 4 "$@" >/dev/null 2>&1 || rc=$?
 	[ "$rc" = 0 ] || exit 1
 
 	# Revoke the bind source through its held descriptor before opening output.
@@ -1187,7 +2761,7 @@ normalize_installer_config() (
 	exec 6<>"$replacement" || exit 1
 	replacement_fd=/proc/self/fd/6
 	[ -f "$replacement_fd" ] && [ "$replacement_fd" -ef "$replacement" ] || exit 1
-	/usr/bin/timeout -k 1s 3s /bin/dd if="$normalized" \
+	run_bounded 3 1 /bin/dd if="$normalized" \
 		bs=4096 count=129 of="$replacement_fd" 2>/dev/null || exit 1
 	chown 0:0 "$replacement_fd" && chmod 0600 "$replacement_fd" || exit 1
 	metadata="$(LC_ALL=C ls -ldnL "$replacement_fd" 2>/dev/null)" || exit 1
@@ -1567,7 +3141,7 @@ capture_root_file_bytes() {
 		case "$fd_mode" in -*) ;; *) exit 1 ;; esac
 		[ "$fd_owner" = 0 ] || exit 1
 		[ ! -L "$source" ] && [ /proc/self/fd/8 -ef "$source" ] || exit 1
-		/usr/bin/timeout -k 1s 5s /bin/dd if=/proc/self/fd/8 \
+		run_bounded 5 1 /bin/dd if=/proc/self/fd/8 \
 			bs=4096 count="$blocks" of="$target" 2>/dev/null || exit 1
 		[ ! -L "$source" ] && [ /proc/self/fd/8 -ef "$source" ] || exit 1
 		trusted_root_file_source "$source"
@@ -1586,7 +3160,7 @@ snapshot_tls_file() {
 			capture_root_file_bytes "$source" "$target" 257 || capture_rc=$?
 			;;
 		service)
-			/usr/bin/timeout -k 1s 5s \
+			run_bounded 5 1 \
 				/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 				-n AGHTLSRead -x /bin/dd -- if="$source" bs=4096 count=257 \
 				>"$target" 2>/dev/null || capture_rc=$?
@@ -1801,8 +3375,380 @@ write_mount_list() {
 	EOF
 }
 
-sync_tls_access() {
-	local expected current_fingerprint official_changed=0 legacy_changed=0
+uci_guard_config_file_valid() {
+	local target="$1" metadata mode links owner group size remainder
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	case "$mode" in -rw-------|-rw-r-----|-rw-r--r--) ;; *) return 1 ;; esac
+	[ "$links:$owner:$group" = "1:0:0" ] || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_UCI_CONFIG_SIZE" ]
+}
+
+uci_guard_snapshot_dir_valid() {
+	local target="$1" metadata mode links owner group remainder
+	[ -d "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode:$owner:$group" = "drwx------:0:0" ] && [ "$links" -ge 2 ] 2>/dev/null
+}
+
+uci_guard_file_signature() {
+	local metadata mode links owner group size remainder
+	uci_guard_config_file_valid "$1" || return 1
+	metadata="$(LC_ALL=C ls -ldn "$1" 2>/dev/null)" || return 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	printf '%s:%s:%s:%s\n' "$owner" "$group" "$mode" "$size"
+}
+
+uci_guard_snapshot_file() {
+	local source="$1" target="$2" source_signature target_signature
+	source_signature="$(uci_guard_file_signature "$source")" || return 1
+	[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+	cp -p "$source" "$target" || return 1
+	target_signature="$(uci_guard_file_signature "$target")" || return 1
+	[ "$source_signature" = "$target_signature" ] && cmp -s "$source" "$target"
+}
+
+uci_guard_restore_file() {
+	local snapshot="$1" target="$2" temporary snapshot_signature target_signature
+	snapshot_signature="$(uci_guard_file_signature "$snapshot")" || return 1
+	temporary="$(mktemp "${UCI_GUARD_CONFIG_FD_PATH}/.luci-adguardhome-rollback.XXXXXX")" || return 1
+	case "$temporary" in
+		"${UCI_GUARD_CONFIG_FD_PATH}/.luci-adguardhome-rollback."??????) ;;
+		*) rm -f "$temporary"; return 1 ;;
+	esac
+	if ! cp -p "$snapshot" "$temporary" ||
+	   ! uci_guard_config_file_valid "$temporary" ||
+	   ! cmp -s "$snapshot" "$temporary"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	target_signature="$(uci_guard_file_signature "$temporary")" || {
+		rm -f "$temporary"
+		return 1
+	}
+	if [ "$snapshot_signature" != "$target_signature" ] ||
+	   ! mv -f "$temporary" "$target"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	target_signature="$(uci_guard_file_signature "$target")" || return 1
+	[ "$snapshot_signature" = "$target_signature" ] && cmp -s "$snapshot" "$target"
+}
+
+uci_guard_no_delta() {
+	local changes
+	changes="$(uci -q changes "$1" 2>/dev/null)" || return 1
+	[ -z "$changes" ]
+}
+
+uci_guard_expected_memory_delta() {
+	local changes line seen_config=0 seen_work=0 count=0
+	local effective_config effective_work legacy_config legacy_work
+	# UCI suppresses a set whose value already matches the committed file.  Thus
+	# a previous accidental global commit can yield zero or one delta here; every
+	# delta that does exist must still be one of the two exact volatile sets, and
+	# the complete effective pair must match the state-bound RAM generation.
+	changes="$(uci -q changes "$OFFICIAL_CONFIG" 2>/dev/null)" || return 1
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		count=$((count + 1))
+		if [ "$line" = "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file='${MEMORY_CONFIG_FILE}'" ]; then
+			[ "$seen_config" = 0 ] || return 1
+			seen_config=1
+		elif [ "$line" = "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir='${MEMORY_WORK_DIR}'" ]; then
+			[ "$seen_work" = 0 ] || return 1
+			seen_work=1
+		else
+			return 1
+		fi
+	done <<-EOF
+	$changes
+	EOF
+	[ "$count" -le 2 ] 2>/dev/null || return 1
+	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
+	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	[ "$effective_config" = "$MEMORY_CONFIG_FILE" ] &&
+		[ "${effective_work%/}" = "$MEMORY_WORK_DIR" ] &&
+		[ -z "$legacy_config" ] && [ -z "$legacy_work" ]
+}
+
+uci_guard_delta_dir_valid() {
+	local metadata mode links owner group remainder
+	[ -d "$UCI_DELTA_DIRECTORY" ] && [ ! -L "$UCI_DELTA_DIRECTORY" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$UCI_DELTA_DIRECTORY" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode:$owner:$group" = "drwx------:0:0" ] && [ "$links" -ge 2 ] 2>/dev/null
+}
+
+uci_guard_delta_file_valid() {
+	local target="$1" metadata mode links owner group size remainder
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode:$links:$owner:$group" = "-rw-------:1:0:0" ] || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -le "$MAX_UCI_CONFIG_SIZE" ]
+}
+
+uci_guard_clear_delta() {
+	local package="$1" delta
+	case "$package" in "$OFFICIAL_CONFIG"|"$LEGACY_CONFIG") ;; *) return 1 ;; esac
+	uci -q revert "$package" >/dev/null 2>&1 || true
+	uci_guard_no_delta "$package" && return 0
+	if [ ! -e "$UCI_DELTA_DIRECTORY" ] && [ ! -L "$UCI_DELTA_DIRECTORY" ]; then
+		return 0
+	fi
+	uci_guard_delta_dir_valid || return 1
+	exec 190<"$UCI_DELTA_DIRECTORY" || return 1
+	[ -d /proc/self/fd/190 ] && [ /proc/self/fd/190 -ef "$UCI_DELTA_DIRECTORY" ] || return 1
+	delta="/proc/self/fd/190/${package}"
+	if [ ! -e "$delta" ] && [ ! -L "$delta" ]; then
+		return 0
+	fi
+	uci_guard_delta_file_valid "$delta" || return 1
+	rm -f "$delta"
+}
+
+uci_guard_snapshot_configs() {
+	local directory
+	directory="$(mktemp -d /tmp/AdGuardHome-uci-guard.XXXXXX)" || return 1
+	if ! chown 0:0 "$directory" || ! chmod 0700 "$directory" ||
+	   ! uci_guard_snapshot_dir_valid "$directory" ||
+	   ! uci_guard_snapshot_file "${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}" \
+		"${directory}/${OFFICIAL_CONFIG}" ||
+	   ! uci_guard_snapshot_file "${UCI_GUARD_CONFIG_FD_PATH}/${LEGACY_CONFIG}" \
+		"${directory}/${LEGACY_CONFIG}"; then
+		rm -f "${directory}/${OFFICIAL_CONFIG}" "${directory}/${LEGACY_CONFIG}" 2>/dev/null || true
+		rmdir "$directory" 2>/dev/null || true
+		return 1
+	fi
+	printf '%s\n' "$directory"
+}
+
+uci_guard_discard_snapshot() {
+	local directory="$1"
+	uci_guard_snapshot_dir_valid "$directory" || return 1
+	uci_guard_config_file_valid "${directory}/${OFFICIAL_CONFIG}" || return 1
+	uci_guard_config_file_valid "${directory}/${LEGACY_CONFIG}" || return 1
+	rm -f "${directory}/${OFFICIAL_CONFIG}" "${directory}/${LEGACY_CONFIG}" || return 1
+	rmdir "$directory"
+}
+
+uci_guard_rollback_configs_once() {
+	local directory="$1"
+	uci_guard_snapshot_dir_valid "$directory" || return 1
+	uci_guard_clear_delta "$OFFICIAL_CONFIG" || return 1
+	uci_guard_clear_delta "$LEGACY_CONFIG" || return 1
+	uci_guard_restore_file "${directory}/${OFFICIAL_CONFIG}" \
+		"${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}" || return 1
+	uci_guard_restore_file "${directory}/${LEGACY_CONFIG}" \
+		"${UCI_GUARD_CONFIG_FD_PATH}/${LEGACY_CONFIG}" || return 1
+	memory_durability_barrier || return 1
+	cmp -s "${directory}/${OFFICIAL_CONFIG}" \
+		"${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}" || return 1
+	cmp -s "${directory}/${LEGACY_CONFIG}" \
+		"${UCI_GUARD_CONFIG_FD_PATH}/${LEGACY_CONFIG}" || return 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG" &&
+		uci_guard_no_delta "$LEGACY_CONFIG" &&
+		uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1 &&
+		uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}" >/dev/null 2>&1
+}
+
+uci_guard_rollback_configs() {
+	local directory="$1" attempt=0
+	while [ "$attempt" -lt 2 ]; do
+		attempt=$((attempt + 1))
+		uci_guard_rollback_configs_once "$directory" && return 0
+	done
+	return 1
+}
+
+memory_commit_official_persistent_paths() {
+	local backing="${1%/}"
+	validate_managed_work_dir_namespace "$backing" || return 1
+	uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1 || return 1
+	if ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file=${backing}/AdGuardHome.yaml" ||
+	   ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir=${backing}"; then
+		uci -q revert "$OFFICIAL_CONFIG" >/dev/null 2>&1 || true
+		return 1
+	fi
+	if uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config" >/dev/null 2>&1; then
+		uci -q delete "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config" || {
+			uci -q revert "$OFFICIAL_CONFIG" >/dev/null 2>&1 || true
+			return 1
+		}
+	fi
+	if uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir" >/dev/null 2>&1; then
+		uci -q delete "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir" || {
+			uci -q revert "$OFFICIAL_CONFIG" >/dev/null 2>&1 || true
+			return 1
+		}
+	fi
+	if ! uci -q commit "$OFFICIAL_CONFIG"; then
+		uci -q revert "$OFFICIAL_CONFIG" >/dev/null 2>&1 || true
+		return 1
+	fi
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = "${backing}/AdGuardHome.yaml" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$backing" ] &&
+		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")" ] &&
+		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")" ]
+}
+
+memory_clear_official_path_delta() {
+	local effective_config effective_work legacy_config legacy_work backing
+	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
+	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	if [ "$effective_config" != "$MEMORY_CONFIG_FILE" ] &&
+	   [ "${effective_work%/}" != "$MEMORY_WORK_DIR" ] &&
+	   [ "$legacy_config" != "$MEMORY_CONFIG_FILE" ] &&
+		[ "${legacy_work%/}" != "$MEMORY_WORK_DIR" ]; then
+		return 0
+	fi
+	if [ "$MEMORY_ACTIVE" = 1 ]; then
+		backing="${MEMORY_BACKING_WORK_DIR%/}"
+		[ -n "$backing" ] && memory_state_binds_persistent "$backing" || return 1
+	else
+		backing="${persistent_work_dir%/}"
+	fi
+	# Prefer dropping the known volatile pair.  A real commit is needed only when
+	# a global `uci commit` previously persisted the RAM paths themselves.
+	uci -q revert "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file" >/dev/null 2>&1 || true
+	uci -q revert "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir" >/dev/null 2>&1 || true
+	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
+	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
+	if [ "$effective_config" = "${backing}/AdGuardHome.yaml" ] &&
+	   [ "${effective_work%/}" = "$backing" ] &&
+	   [ -z "$legacy_config" ] && [ -z "$legacy_work" ]; then
+		return 0
+	fi
+	memory_commit_official_persistent_paths "$backing"
+}
+
+memory_apply_official_path_delta() {
+	local backing
+	[ "$MEMORY_ACTIVE" = 1 ] || return 0
+	memory_active_tree_valid || return 1
+	backing="${MEMORY_BACKING_WORK_DIR%/}"
+	[ -n "$backing" ] && memory_state_binds_persistent "$backing" || return 1
+	if ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file=${MEMORY_CONFIG_FILE}" ||
+	   ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir=${MEMORY_WORK_DIR}"; then
+		# Avoid leaving a half-applied volatile pair.  The committed backing paths
+		# are always the safe fallback and load_legacy_settings() will adopt the
+		# still-valid RAM generation from its state record on the next invocation.
+		memory_commit_official_persistent_paths "$backing" >/dev/null 2>&1 || true
+		return 1
+	fi
+	if [ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = "$MEMORY_CONFIG_FILE" ] &&
+	   [ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$MEMORY_WORK_DIR" ]; then
+		return 0
+	fi
+	memory_commit_official_persistent_paths "$backing" >/dev/null 2>&1 || true
+	return 1
+}
+
+memory_restore_official_persistent_paths() {
+	local backing
+	[ "$MEMORY_ACTIVE" = 1 ] || return 0
+	backing="${MEMORY_BACKING_WORK_DIR%/}"
+	[ -n "$backing" ] && memory_state_binds_persistent "$backing" || return 1
+	memory_commit_official_persistent_paths "$backing"
+}
+
+memory_run_with_official_path_guard() (
+	local restore_delta=0 snapshot_ready=0 transaction_complete=0
+	local primary_rc=1 final_rc snapshot_directory=""
+	[ "$MEMORY_ACTIVE" != 1 ] || restore_delta=1
+	cleanup_memory_path_guard() {
+		final_rc=$?
+		# Disable recursive EXIT handling, then make the compensating restore
+		# uninterruptible by catchable termination signals.  A second signal must
+		# never split the two raw config restores or their durability barrier.
+		trap - 0
+		trap '' HUP INT QUIT TERM
+		if [ "$snapshot_ready" = 1 ] && [ "$transaction_complete" != 1 ]; then
+			if uci_guard_rollback_configs "$snapshot_directory"; then
+				snapshot_ready=0
+				if ! uci_guard_discard_snapshot "$snapshot_directory"; then
+					log_error "UCI rollback completed but its temporary snapshot could not be removed"
+					final_rc=1
+				fi
+			else
+				log_error "UCI transaction outcome is indeterminate; retained rollback snapshot at ${snapshot_directory}"
+				final_rc=1
+			fi
+		fi
+		if [ "$restore_delta" = 1 ] && [ "$snapshot_ready" != 1 ] &&
+		   ! memory_apply_official_path_delta; then
+			final_rc=1
+		fi
+		exit "$final_rc"
+	}
+	trap cleanup_memory_path_guard 0
+	trap 'exit 1' HUP INT QUIT TERM
+	[ -d "$UCI_CONFIG_DIRECTORY" ] && [ ! -L "$UCI_CONFIG_DIRECTORY" ] || exit 1
+	exec 191<"$UCI_CONFIG_DIRECTORY" || exit 1
+	UCI_GUARD_CONFIG_FD_PATH=/proc/self/fd/191
+	[ -d "$UCI_GUARD_CONFIG_FD_PATH" ] &&
+		[ "$UCI_GUARD_CONFIG_FD_PATH" -ef "$UCI_CONFIG_DIRECTORY" ] || exit 1
+	# A package commit must never absorb user changes or make the volatile RAM
+	# workdir persistent.  Validate the complete delta, not only its effective
+	# values, before exposing a persistent two-package transaction.
+	if [ "$restore_delta" = 1 ]; then
+		if ! uci_guard_expected_memory_delta; then
+			# A newly prepared RAM generation has a durable state record before
+			# its volatile lower-UCI pair exists.  Bootstrap only that exact
+			# zero-delta state; a partial or unrelated pending change must remain
+			# an error and must not be hidden by applying our two values over it.
+			uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
+			memory_apply_official_path_delta || exit 1
+			uci_guard_expected_memory_delta || exit 1
+		fi
+	else
+		uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
+	fi
+	uci_guard_no_delta "$LEGACY_CONFIG" || exit 1
+	memory_clear_official_path_delta || exit 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
+	uci_guard_no_delta "$LEGACY_CONFIG" || exit 1
+	snapshot_directory="$(uci_guard_snapshot_configs)" || exit 1
+	snapshot_ready=1
+	"$@"
+	primary_rc=$?
+	[ "$primary_rc" = 0 ] || exit "$primary_rc"
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
+	uci_guard_no_delta "$LEGACY_CONFIG" || exit 1
+	memory_durability_barrier || exit 1
+	snapshot_ready=0
+	transaction_complete=1
+	if ! uci_guard_discard_snapshot "$snapshot_directory"; then
+		log_error "Committed the UCI transaction but could not remove its temporary snapshot"
+		exit 1
+	fi
+	exit 0
+)
+
+sync_tls_access_persistent() {
+	local expected expected_managed expected_fingerprint current_fingerprint
+	local verify_fingerprint official_changed=0 legacy_changed=0
 	load_active_tls_access || {
 		log_error "TLS certificate or private-key path is unsafe or unavailable"
 		return 1
@@ -1850,28 +3796,69 @@ ${TLS_NEW_MANAGED_MOUNTS}"
 	fi
 	[ "$official_changed" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
 	[ "$legacy_changed" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+
+	# A successful commit status is insufficient for this cross-package update.
+	# Reload both packages and prove that the complete list/marker state matches
+	# the transaction we just calculated before its guard discards the snapshot.
+	expected_managed="$TLS_NEW_MANAGED_MOUNTS"
+	expected_fingerprint="$TLS_FINGERPRINT"
+	TLS_ORIGINAL_MOUNTS=""
+	TLS_PRESERVED_MOUNTS=""
+	TLS_OLD_MOUNTS=""
+	config_load "$OFFICIAL_CONFIG" || return 1
+	config_list_foreach "$OFFICIAL_SECTION" jail_mount collect_tls_official_mount
+	config_load "$LEGACY_CONFIG" || return 1
+	config_list_foreach "$LEGACY_SECTION" "$MANAGED_JAIL_OPTION" collect_tls_old_mount
+	verify_fingerprint="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
+	[ "$TLS_ORIGINAL_MOUNTS" = "$expected" ] &&
+		[ "$TLS_OLD_MOUNTS" = "$expected_managed" ] &&
+		[ "$verify_fingerprint" = "$expected_fingerprint" ]
 }
 
-sync_official_uci() {
+sync_tls_access() {
+	memory_run_with_official_path_guard sync_tls_access_persistent
+}
+
+sync_official_uci_persistent() {
+	local official_work="$work_dir" official_config="$config_file"
+	if [ "$MEMORY_ACTIVE" = 1 ]; then
+		official_work="$MEMORY_BACKING_WORK_DIR"
+		official_config="${official_work}/AdGuardHome.yaml"
+	fi
 	UCI_CHANGED=0
 	if ! uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1; then
 		uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}=adguardhome" || return 1
 		UCI_CHANGED=1
 	fi
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" enabled "$legacy_enabled" || return 1
-	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config_file "$config_file" || return 1
-	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" work_dir "$work_dir" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config_file "$official_config" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" work_dir "$official_work" || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" verbose "$verbose" || return 1
 	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config || return 1
 	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" workdir || return 1
 	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
-	sync_tls_access
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = "$legacy_enabled" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = "$official_config" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$official_work" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")" = "$verbose" ] &&
+		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")" ] &&
+		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")" ] || return 1
+	sync_tls_access_persistent
+}
+
+sync_official_uci() {
+	memory_run_with_official_path_guard sync_official_uci_persistent
+}
+
+disable_official_autostart_persistent() {
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = 0 ] && return 0
+	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled=0" || return 1
+	uci -q commit "$OFFICIAL_CONFIG" || return 1
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = 0 ]
 }
 
 disable_official_autostart() {
-	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = 0 ] && return 0
-	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled=0" || return 1
-	uci -q commit "$OFFICIAL_CONFIG"
+	memory_run_with_official_path_guard disable_official_autostart_persistent
 }
 
 reload_service_if_present() {
@@ -2431,7 +4418,9 @@ wait_for_core_ready() {
 wait_for_core_stopped() {
 	local elapsed=0
 	while [ "$elapsed" -lt 10 ]; do
-		official_running || return 0
+		if ! official_running && ! adguard_uid_process_exists; then
+			return 0
+		fi
 		sleep 1
 		elapsed=$((elapsed + 1))
 	done
@@ -2608,7 +4597,7 @@ yaml_update_locked() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local before_hash final_hash verify_hash held_hash fd_path
 	local committed_port committed_mode committed_work_dir committed_tls_mounts
-	local was_running=0 backup="" backup_directory=""
+	local was_running=0 backup="" backup_directory="" checkpoint_rc=0
 	load_legacy_settings || return 1
 	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
 		"$inherited_fd" || return 1
@@ -2773,6 +4762,27 @@ yaml_update_locked() {
 				log_error "Failed to restore the previous YAML runtime"
 			return 1
 		}
+	fi
+	if [ "$MEMORY_ACTIVE" = 1 ]; then
+		checkpoint_rc=0
+		memory_checkpoint_config_locked "$final_hash" || checkpoint_rc=$?
+		case "$checkpoint_rc" in
+			0) ;;
+			1)
+				log_error "The LuCI YAML was active in RAM but could not be persisted; restoring the previous file"
+				attempt_yaml_rollback "$backup" "$was_running" ||
+					log_error "Failed to restore the previous YAML runtime"
+				return 1
+				;;
+			*)
+				# The persistent result cannot be proven old or new.  Keep the live
+				# validated RAM revision and preserve the old backup; the asynchronous
+				# RPC reports an indeterminate result and forces a fresh page reload.
+				YAML_BACKUP_CLEANUP=""
+				log_error "Persistent RAM YAML checkpoint is indeterminate; preserved the previous file at ${backup}"
+				return 1
+				;;
+		esac
 	fi
 	if remove_yaml_backup "$backup"; then
 		YAML_BACKUP_CLEANUP=""
@@ -3022,23 +5032,277 @@ tls_prepare() {
 }
 
 fail_safe_locked() {
-	clear_recorded_integration_locked || return 1
-	disable_official_autostart || return 1
-	[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+	local rc=0
+	clear_recorded_integration_locked || rc=1
+	if [ -x "$OFFICIAL_SERVICE" ]; then
+		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || rc=1
+		wait_for_core_stopped >/dev/null 2>&1 || rc=1
+	fi
+	disable_official_autostart || rc=1
+	return "$rc"
+}
+
+memory_deactivate_locked() {
+	local checkpoint="${1:-1}" old_backing
+	[ "$MEMORY_ACTIVE" = 1 ] || return 0
+	official_running && {
+		log_error "Refusing to remove a live AdGuard Home memory workdir"
+		return 1
+	}
+	old_backing="$MEMORY_BACKING_WORK_DIR"
+	if [ "$checkpoint" = 1 ]; then
+		memory_checkpoint_full_locked || return 1
+	else
+		memory_recover_journal_locked || return 1
+	fi
+	memory_restore_official_persistent_paths || return 1
+	memory_remove_active_tree || return 1
+	memory_private_state_file "$MEMORY_STATE_FILE" || return 1
+	rm -f "$MEMORY_STATE_FILE" || return 1
+	memory_runtime_dir_valid || return 1
+	rmdir "$MEMORY_RUNTIME_DIR" || return 1
+	MEMORY_ACTIVE=0
+	MEMORY_BACKING_WORK_DIR=""
+	previous_work_dir="$old_backing"
+	work_dir="$persistent_work_dir"
+	config_file="$persistent_config_file"
+	log_error "Removed the AdGuard Home memory workdir after a successful checkpoint"
+}
+
+# Reconcile an already-active RAM generation with the newly requested backing
+# path or checkbox value.  Changing either is a stop/checkpoint boundary; a
+# failed checkpoint leaves the RAM tree intact and never starts stale disk data.
+memory_reconcile_requested_storage_locked() {
+	if [ "$MEMORY_ACTIVE" = 1 ] &&
+	   { [ "$memory_requested" != 1 ] ||
+	     [ "$MEMORY_BACKING_WORK_DIR" != "$persistent_work_dir" ]; }; then
+		clear_recorded_integration_locked || return 1
+		if official_running; then
+			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+			wait_for_core_stopped || return 1
+		fi
+		memory_deactivate_locked 1 || return 1
+	fi
+	memory_recover_journal_locked
+}
+
+memory_prepare_or_fallback_locked() {
+	[ "$legacy_enabled" = 1 ] || return 0
+	[ "$memory_requested" = 1 ] || return 0
+	[ "$MEMORY_ACTIVE" != 1 ] || return 0
+	if memory_prepare_runtime_locked; then
+		return 0
+	fi
+	# Preparation has not changed lower UCI and has cleaned only objects created
+	# by this attempt.  Preserve availability by using the validated persistent
+	# tree for this start, while leaving the requested checkbox set for retry.
+	MEMORY_ACTIVE=0
+	MEMORY_BACKING_WORK_DIR=""
+	work_dir="$persistent_work_dir"
+	config_file="$persistent_config_file"
+	log_error "Memory mode was requested but could not be prepared; using the persistent workdir"
+	return 0
+}
+
+memory_checkpoint_locked_command() {
+	load_legacy_settings || return 1
+	[ "$MEMORY_ACTIVE" = 1 ] || return 0
+	official_running && return 1
+	memory_checkpoint_full_locked
+}
+
+memory_cleanup_locked_command() {
+	load_legacy_settings || return 1
+	[ "$MEMORY_ACTIVE" = 1 ] || {
+		memory_recover_journal_locked || return 1
+		memory_clear_official_path_delta
+		return
+	}
+	official_running && return 1
+	memory_deactivate_locked 1
+}
+
+memory_prepare_locked_command() {
+	load_legacy_settings || return 1
+	[ "$memory_requested" = 1 ] || return 1
+	official_running && return 1
+	memory_reconcile_requested_storage_locked || return 1
+	[ "$MEMORY_ACTIVE" = 1 ] || {
+		work_dir="$persistent_work_dir"
+		config_file="$persistent_config_file"
+		secure_active_config || return 1
+		memory_prepare_runtime_locked || return 1
+	}
+	sync_official_uci
+}
+
+# Complete an interrupted live write-back before normal reconciliation.  A
+# valid marker remains published until the desired service/DNS state is fully
+# restored, so SIGKILL at any point is retried by the respawned monitor.
+# Return 2 when there is no pending operation.
+memory_restore_live_checkpoint_locked() {
+	local recovery_context="$1" marker_rc=0 expected_port expected_mode expected_work_dir
+	memory_live_marker_load || marker_rc=$?
+	case "$marker_rc" in
+		0) ;;
+		1) return 2 ;;
+		*)
+			log_error "Unsafe AdGuard Home memory write-back marker"
+			return 1
+			;;
+	esac
+	if ! load_legacy_settings; then
+		log_error "Unable to recover settings for an interrupted memory write-back"
+		return 1
+	fi
+	# Reloading settings recovers any durable checkpoint WAL.  Revalidate the
+	# volatile marker afterwards so its persistent inode binding cannot change.
+	memory_live_marker_load || {
+		log_error "Memory write-back marker changed during recovery"
+		return 1
+	}
+	if [ "$MEMORY_ACTIVE" = 1 ] &&
+	   [ "$MEMORY_LIVE_BACKING" != "$MEMORY_BACKING_WORK_DIR" ]; then
+		log_error "Memory write-back marker does not bind the active RAM generation"
+		return 1
+	fi
+
+	if [ "$MEMORY_ACTIVE" = 1 ] && [ "$legacy_enabled" = 1 ] &&
+	   [ "$memory_requested" = 1 ] &&
+	   [ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ]; then
+		clear_recorded_integration_locked || return 1
+		sync_official_uci || return 1
+		load_runtime_dns_port || return 1
+		expected_port="$dns_port"
+		expected_mode="$redirect_mode"
+		expected_work_dir="$work_dir"
+		if ! official_running; then
+			[ -x "$OFFICIAL_SERVICE" ] || return 1
+			"$OFFICIAL_SERVICE" start >/dev/null 2>&1 || return 1
+		fi
+		wait_for_core_ready "$expected_port" "$expected_mode" \
+			"$expected_work_dir" || return 1
+		apply_integration_locked "$expected_port" "$expected_mode" \
+			"$expected_work_dir" || return 1
+	else
+		# The user may have changed the enabled flag, backing path or RAM toggle
+		# after a killed writer released the lock.  Converge that new request in
+		# one transaction before declaring the interrupted operation recovered.
+		orchestrate_core_locked || return 1
+	fi
+	memory_clear_live_checkpoint || return 1
+	[ "$recovery_context" = planned ] ||
+		log_error "Recovered the AdGuard Home service after an interrupted memory write-back"
+}
+
+memory_writeback_locked_command() {
+	local pending_rc=0 operation_rc=0 restore_rc=0
+	local expected_port expected_mode expected_work_dir
+	memory_restore_live_checkpoint_locked || pending_rc=$?
+	case "$pending_rc" in
+		0) return 0 ;;
+		2) ;;
+		*) return 1 ;;
+	esac
+	load_legacy_settings || return 1
+	[ "$legacy_enabled" = 1 ] && [ "$memory_requested" = 1 ] &&
+		[ "$MEMORY_ACTIVE" = 1 ] &&
+		[ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ] || return 2
+	load_runtime_dns_port || return 1
+	expected_port="$dns_port"
+	expected_mode="$redirect_mode"
+	expected_work_dir="$work_dir"
+	official_running || return 2
+	wait_for_core_ready "$expected_port" "$expected_mode" \
+		"$expected_work_dir" || return 2
+	memory_begin_live_checkpoint || return 1
+
+	clear_recorded_integration_locked || operation_rc=1
+	if [ "$operation_rc" = 0 ]; then
+		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || operation_rc=1
+	fi
+	if [ "$operation_rc" = 0 ]; then
+		wait_for_core_stopped || operation_rc=1
+	fi
+	if [ "$operation_rc" = 0 ]; then
+		memory_checkpoint_full_locked || operation_rc=1
+	fi
+
+	# Restore from the same validated RAM generation even when the checkpoint
+	# failed.  Its WAL recovery preserves either the complete old disk data or
+	# the complete new data, never a live partial copy.
+	memory_restore_live_checkpoint_locked planned || restore_rc=$?
+	if [ "$restore_rc" != 0 ]; then
+		log_error "Unable to restore AdGuard Home after a memory write-back attempt"
+		return 1
+	fi
+	if [ "$operation_rc" != 0 ]; then
+		log_error "Memory write-back failed; the RAM service was restored without replacing persistent data"
+		return 1
+	fi
+	log_error "Completed the scheduled AdGuard Home memory write-back"
+}
+
+memory_checkpoint() {
+	run_locked memory_checkpoint_locked_command
+}
+
+memory_writeback() {
+	run_locked memory_writeback_locked_command
+}
+
+memory_cleanup() {
+	run_locked memory_cleanup_locked_command
+}
+
+memory_prepare() {
+	run_locked memory_prepare_locked_command
+}
+
+memory_status() {
+	local load_rc=0
+	load_legacy_settings || load_rc=$?
+	if [ "$load_rc" != 0 ]; then
+		printf 'requested=unknown\nactive=invalid\n'
+		return 1
+	fi
+	printf 'requested=%s\nactive=%s\npersistent_work_dir=%s\n' \
+		"$memory_requested" "$MEMORY_ACTIVE" "$persistent_work_dir"
+	if [ "$MEMORY_ACTIVE" = 1 ]; then
+		printf 'active_work_dir=%s\nactive_config_file=%s\nbacking_work_dir=%s\n' \
+			"$MEMORY_WORK_DIR" "$MEMORY_CONFIG_FILE" "$MEMORY_BACKING_WORK_DIR"
+	else
+		printf 'active_work_dir=%s\nactive_config_file=%s\n' \
+			"$persistent_work_dir" "$persistent_config_file"
+	fi
 }
 
 prepare_wrapper_locked() {
+	local live_restore_rc=0
 	[ "${WRAPPER_BOOT:-0}" = 1 ] && RELOAD_SERVICES=0
 	if ! load_legacy_settings; then
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	fi
+	memory_restore_live_checkpoint_locked || live_restore_rc=$?
+	case "$live_restore_rc" in
+		0) load_legacy_settings || return 1 ;;
+		2) ;;
+		*) return 1 ;;
+	esac
 	if [ "$legacy_enabled" != 1 ]; then
 		clear_recorded_integration_locked || return 1
 		if official_running; then
 			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 			wait_for_core_stopped || return 1
 		fi
+		if [ "$MEMORY_ACTIVE" = 1 ]; then
+			memory_deactivate_locked 1 || return 1
+		else
+			memory_recover_journal_locked || return 1
+		fi
+		work_dir="$persistent_work_dir"
+		config_file="$persistent_config_file"
 		ensure_config_file || return 1
 		migrate_work_data || return 1
 		sync_yaml_managed_fields_checked || return 1
@@ -3047,6 +5311,23 @@ prepare_wrapper_locked() {
 		# monitor for a deliberately disabled installation.
 		return 2
 	fi
+	memory_reconcile_requested_storage_locked || return 1
+	if [ "$MEMORY_ACTIVE" = 1 ]; then
+		# A coordinator restart in the same boot adopts its validated RAM
+		# generation.  Recopying the persistent backing here would discard
+		# changes made by the official Web UI since the last checkpoint.
+		if official_running; then
+			check_core_config || return 1
+		else
+			sync_yaml_managed_fields_checked || return 1
+		fi
+		load_runtime_dns_port || return 1
+		[ "${WRAPPER_BOOT:-0}" != 1 ] || clear_recorded_integration_locked || return 1
+		sync_official_uci
+		return
+	fi
+	work_dir="$persistent_work_dir"
+	config_file="$persistent_config_file"
 	# A work-directory migration copies the lower service's current YAML.  Stop
 	# that writer before taking the copy so the new file cannot be torn.
 	if { [ ! -f "$config_file" ] || [ "${previous_work_dir%/}" != "$work_dir" ]; } &&
@@ -3060,6 +5341,14 @@ prepare_wrapper_locked() {
 		return 1
 	}
 	migrate_work_data || return 1
+	# Preserve the existing no-live-writer boundary in persistent mode.  Boot,
+	# migration, and the later orchestrator reach this block with the core
+	# stopped; an already-running disk core is validated here and transitioned
+	# by service_started(), which first stops it under the same integration lock.
+	if ! official_running; then
+		sync_yaml_managed_fields_checked || return 1
+		memory_prepare_or_fallback_locked || return 1
+	fi
 	load_runtime_dns_port || {
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
@@ -3071,13 +5360,9 @@ prepare_wrapper_locked() {
 		clear_recorded_integration_locked || return 1
 	fi
 
-	# Never enter a YAML writer while the core is live.  A running service can
-	# only reach this branch when no workdir rewrite is required.
-	if official_running; then
-		check_core_config || return 1
-	else
-		sync_yaml_managed_fields_checked || return 1
-	fi
+	# Any persistent migration and RAM copy-in completed while the core was
+	# stopped.  A pre-existing disk core reaches only this non-writing check.
+	check_core_config || return 1
 	sync_official_uci || return 1
 }
 
@@ -3094,16 +5379,34 @@ orchestrate_core_locked() {
 		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 		wait_for_core_stopped || return 1
 	fi
-	ensure_config_file || {
-		fail_safe_locked >/dev/null 2>&1 || true
-		return 1
-	}
-	migrate_work_data || return 1
-	load_runtime_dns_port || return 1
+	# rc.common maps this wrapper's reload/restart path to start_service() and
+	# service_started(), so an unchanged active RAM generation reaches this
+	# orchestrator.  Treat that stopped-core boundary as a full durable
+	# checkpoint while retaining the same RAM generation for the restart.
+	if [ "$MEMORY_ACTIVE" = 1 ] && [ "$legacy_enabled" = 1 ] &&
+	   [ "$memory_requested" = 1 ] &&
+	   [ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ]; then
+		memory_checkpoint_full_locked || return 1
+	fi
+	if [ "$legacy_enabled" != 1 ] && [ "$MEMORY_ACTIVE" = 1 ]; then
+		memory_deactivate_locked 1 || return 1
+	else
+		memory_reconcile_requested_storage_locked || return 1
+	fi
+	if [ "$MEMORY_ACTIVE" != 1 ]; then
+		work_dir="$persistent_work_dir"
+		config_file="$persistent_config_file"
+		ensure_config_file || {
+			fail_safe_locked >/dev/null 2>&1 || true
+			return 1
+		}
+		migrate_work_data || return 1
+	fi
 
 	# The core is stopped here, so the managed workdir rewrite cannot race its
 	# own configuration writer.  DNS and Web endpoints remain YAML-owned.
 	sync_yaml_managed_fields_checked || return 1
+	memory_prepare_or_fallback_locked || return 1
 	load_runtime_dns_port || return 1
 	sync_official_uci || return 1
 	[ "$legacy_enabled" = 1 ] || return 0
@@ -3123,13 +5426,35 @@ orchestrate_core_locked() {
 }
 
 reconcile_core_locked() {
+	local live_restore_rc=0
 	if ! load_legacy_settings; then
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	fi
+	memory_restore_live_checkpoint_locked || live_restore_rc=$?
+	case "$live_restore_rc" in
+		0) return 0 ;;
+		2) ;;
+		*) return 1 ;;
+	esac
+	if [ "$MEMORY_ACTIVE" = 1 ] &&
+	   { [ "$memory_requested" != 1 ] ||
+	     [ "$MEMORY_BACKING_WORK_DIR" != "$persistent_work_dir" ]; }; then
+		# A UCI apply normally restarts the wrapper.  Also converge here so an
+		# out-of-band commit cannot leave a live RAM generation attached to an
+		# obsolete backing directory indefinitely.
+		orchestrate_core_locked
+		return
+	fi
 	if [ "$legacy_enabled" != 1 ]; then
 		clear_recorded_integration_locked || return 1
-		[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || true
+		if official_running; then
+			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+			wait_for_core_stopped || return 1
+		fi
+		if [ "$MEMORY_ACTIVE" = 1 ]; then
+			memory_deactivate_locked 1 || return 1
+		fi
 		return 0
 	fi
 	if ! load_runtime_dns_port; then
@@ -3140,7 +5465,13 @@ reconcile_core_locked() {
 		clear_recorded_integration_locked || return 1
 		return 0
 	fi
-	integration_matches_desired && return 0
+	if integration_matches_desired; then
+		if [ "$MEMORY_ACTIVE" = 1 ]; then
+			memory_checkpoint_config_locked "" ||
+				log_error "Unable to checkpoint a changed RAM YAML to persistent storage"
+		fi
+		return 0
+	fi
 	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || {
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
@@ -3176,6 +5507,8 @@ reconcile() {
 # launches or adopts the core; it merely reconciles DNS takeover with the state
 # reported by the official lowercase procd service.
 monitor() {
+	local configured_interval interval last_interval="" interval_seconds=0
+	local now=0 next_writeback=0 writeback_rc=0
 	# rc.common serializes init commands with fd 1000.  This long-running
 	# procd command enters through rc.common as well, so release the inherited
 	# control lock before looping; otherwise every later start/stop/reload waits
@@ -3184,6 +5517,41 @@ monitor() {
 	trap 'exit 0' TERM INT
 	while :; do
 		run_locked reconcile_core_locked >/dev/null 2>&1 || true
+		configured_interval="$(uci -q get \
+			"${LEGACY_CONFIG}.${LEGACY_SECTION}.memory_writeback_interval")"
+		interval="$(normalize_memory_writeback_interval \
+			"$configured_interval")" || interval=0
+		now="$(monotonic_seconds)" || now=0
+		if [ "$interval" != "$last_interval" ] ||
+		   { [ "$interval" -ne 0 ] 2>/dev/null &&
+		     [ "$now" -ne 0 ] 2>/dev/null &&
+		     [ "$next_writeback" -eq 0 ] 2>/dev/null; }; then
+			last_interval="$interval"
+			if [ "$interval" -eq 0 ] 2>/dev/null || [ "$now" -eq 0 ] 2>/dev/null; then
+				next_writeback=0
+			else
+				interval_seconds=$((interval * 60))
+				next_writeback=$((now + interval_seconds))
+			fi
+		fi
+		if [ "$interval" -ne 0 ] 2>/dev/null && [ "$now" -ne 0 ] 2>/dev/null &&
+		   [ "$next_writeback" -ne 0 ] 2>/dev/null &&
+		   [ "$now" -ge "$next_writeback" ] 2>/dev/null; then
+			writeback_rc=0
+			run_locked memory_writeback_locked_command >/dev/null 2>&1 || writeback_rc=$?
+			now="$(monotonic_seconds)" || now=0
+			if [ "$now" -ne 0 ] 2>/dev/null; then
+				case "$writeback_rc" in
+					0|2) next_writeback=$((now + interval_seconds)) ;;
+					*)
+						next_writeback=$((now + 60))
+						log_error "Scheduled AdGuard Home memory write-back failed; retrying in 60 seconds"
+						;;
+				esac
+			else
+				next_writeback=0
+			fi
+		fi
 		sleep "$MONITOR_INTERVAL" &
 		wait $!
 	done
@@ -3197,7 +5565,7 @@ isrunning() {
 }
 
 start_service() {
-	local prepare_rc=0
+	local prepare_rc=0 marker_rc=1
 	if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	   [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
 		log_error "Configuration migration is incomplete; refusing to start the coordinator"
@@ -3205,6 +5573,25 @@ start_service() {
 	fi
 	START_PREPARED=0
 	START_DISABLED=0
+	if [ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ]; then
+		marker_rc=0
+		consume_upgrade_stopped_marker || marker_rc=$?
+		case "$marker_rc" in
+			0)
+				if [ "${PKG_UPGRADE:-0}" = 1 ]; then
+					START_PREPARED=1
+					START_DISABLED=1
+					log_error "Preserved the stopped AdGuard Home state across the v2.1 upgrade"
+					return 0
+				fi
+				log_error "Discarded a stale stopped-upgrade marker before a normal start"
+				;;
+			*)
+				log_error "Unsafe stopped-upgrade marker; refusing to start the coordinator"
+				return 1
+				;;
+		esac
+	fi
 	run_locked prepare_wrapper_locked || prepare_rc=$?
 	case "$prepare_rc" in
 		0) START_PREPARED=1 ;;
@@ -3239,13 +5626,40 @@ service_started() {
 }
 
 stop_wrapper_locked() {
-	local shutdown_mode="$1"
+	local shutdown_mode="$1" settings_rc=0 live_marker_rc=1
 	[ "$shutdown_mode" = 1 ] && RELOAD_SERVICES=0
+	load_legacy_settings || settings_rc=$?
+	if [ "$settings_rc" = 0 ]; then
+		memory_live_marker_load || live_marker_rc=$?
+		case "$live_marker_rc" in
+			0|1) ;;
+			*) log_error "Unsafe memory write-back marker remains while stopping" ;;
+		esac
+	fi
 	clear_recorded_integration_locked || return 1
+	if [ "$settings_rc" != 0 ]; then
+		[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || true
+		return 1
+	fi
+	if [ "$MEMORY_ACTIVE" = 1 ]; then
+		# K89 stops the official service before this K90 shutdown hook.  A
+		# manual stop reaches the same checkpoint boundary explicitly.
+		if official_running; then
+			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+		fi
+		wait_for_core_stopped || return 1
+		memory_deactivate_locked 1 || return 1
+	fi
 	if [ "$shutdown_mode" != 1 ]; then
 		disable_official_autostart || return 1
-		[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
-		wait_for_core_stopped || return 1
+		if official_running; then
+			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+			wait_for_core_stopped || return 1
+		fi
+	fi
+	if [ "$live_marker_rc" = 0 ]; then
+		memory_clear_live_checkpoint || return 1
+		log_error "Cleared an interrupted memory write-back after reaching the stopped state"
 	fi
 }
 

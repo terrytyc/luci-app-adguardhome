@@ -21,6 +21,9 @@ SNAPSHOT_VERSION="${SNAPSHOT_DIR}/snapshot-version"
 RUNTIME_DIR="/var/run/luci-app-adguardhome"
 UPGRADE_MARKER="${RUNTIME_DIR}/upgrade"
 INIT_ENABLED_MARKER="${RUNTIME_DIR}/init-enabled"
+UPGRADE_YAML_SNAPSHOT="${RUNTIME_DIR}/upgrade-active.yaml"
+UPGRADE_WORKDIR_METADATA="${RUNTIME_DIR}/upgrade-workdir.meta"
+UPGRADE_STOPPED_MARKER="${RUNTIME_DIR}/upgrade-was-stopped"
 MAX_YAML_SIZE=524288
 ADGUARD_UID=853
 ADGUARD_GID=853
@@ -33,11 +36,100 @@ OFFICIAL_WAS_RUNNING=0
 OFFICIAL_PAUSED=0
 IS_UPGRADE=0
 UPPER_WAS_ENABLED=0
+UPGRADE_MARKER_FOUND=0
 DATA_SOURCE_WORK_DIR=""
 TEMP_FILES=""
 NEW_PRIVATE_TEMP=""
 CREATED_MANAGED_WORK_DIR=""
 SNAPSHOT_STAGE=""
+INSTALL_COMMITTED=0
+UPGRADE_SOURCE_WORK_DIR=""
+UPGRADE_SOURCE_CONFIG_FILE=""
+UPGRADE_SOURCE_UID=""
+UPGRADE_SOURCE_GID=""
+UPGRADE_SOURCE_YAML_HASH=""
+UPGRADE_SOURCE_YAML_SIZE=""
+UPGRADE_WAS_RUNNING=0
+
+# Keep installer and upgrade operations bounded without an external timeout
+# package.  Descriptor 187 preserves pipeline input for the async child.
+run_bounded() (
+	local limit="$1" grace="$2" marker="" child="" watchdog="" rc=0 expired=0
+	shift 2
+	case "$limit" in ""|*[!0-9]*) exit 125 ;; esac
+	case "$grace" in ""|*[!0-9]*) exit 125 ;; esac
+	[ "$#" -gt 0 ] || exit 125
+	[ -x /usr/bin/setsid ] || exit 125
+	marker="$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
+	chmod 0600 "$marker" || {
+		rm -f "$marker"
+		exit 125
+	}
+	printf '0\n' >"$marker" || {
+		rm -f "$marker"
+		exit 125
+	}
+	bounded_signal_session() {
+		/bin/kill "-$1" -- "-$child" 2>/dev/null ||
+			/bin/kill "-$1" "$child" 2>/dev/null || true
+	}
+	bounded_abort() {
+		trap - HUP INT QUIT TERM
+		[ -z "$watchdog" ] || /bin/kill -TERM "$watchdog" 2>/dev/null || true
+		[ -z "$watchdog" ] || wait "$watchdog" 2>/dev/null || true
+		if [ -n "$child" ]; then
+			bounded_signal_session TERM
+			sleep "$grace" 2>/dev/null || true
+			bounded_signal_session KILL
+			wait "$child" 2>/dev/null || true
+		fi
+		rm -f "$marker"
+		exit 125
+	}
+	trap bounded_abort HUP INT QUIT TERM
+	[ ! -e /proc/self/fd/187 ] || bounded_abort
+	exec 187<&0 || bounded_abort
+	/usr/bin/setsid "$@" <&187 187<&- &
+	child=$!
+	exec 187<&-
+	(
+		bounded_sleeper=""
+		bounded_watchdog_abort() {
+			trap - HUP INT QUIT TERM
+			[ -z "$bounded_sleeper" ] || /bin/kill -TERM "$bounded_sleeper" 2>/dev/null || true
+			[ -z "$bounded_sleeper" ] || wait "$bounded_sleeper" 2>/dev/null || true
+			exit 1
+		}
+		bounded_watchdog_sleep() {
+			sleep "$1" &
+			bounded_sleeper=$!
+			wait "$bounded_sleeper"
+			bounded_sleep_rc=$?
+			bounded_sleeper=""
+			return "$bounded_sleep_rc"
+		}
+		trap bounded_watchdog_abort HUP INT QUIT TERM
+		bounded_watchdog_sleep "$limit" || exit 1
+		/bin/kill -0 -- "-$child" 2>/dev/null || /bin/kill -0 "$child" 2>/dev/null || exit 1
+		printf '1\n' >"$marker" || exit 1
+		bounded_signal_session TERM
+		bounded_watchdog_sleep "$grace" || exit 0
+		bounded_signal_session KILL
+	) &
+	watchdog=$!
+	wait "$child" 2>/dev/null || rc=$?
+	read -r expired <"$marker" 2>/dev/null || expired=0
+	if [ "$expired" = 1 ]; then
+		wait "$watchdog" 2>/dev/null || true
+	else
+		/bin/kill -TERM "$watchdog" 2>/dev/null || true
+		wait "$watchdog" 2>/dev/null || true
+	fi
+	trap - HUP INT QUIT TERM
+	rm -f "$marker"
+	[ "$expired" = 1 ] && exit 124
+	exit "$rc"
+)
 
 entry_metadata() {
 	LC_ALL=C ls -ldn "$1" 2>/dev/null
@@ -79,6 +171,17 @@ root_private_file() {
 	$metadata
 	EOF
 	[ "$mode" = "-rw-------" ] && [ "$owner" = 0 ] && [ "$group" = 0 ]
+}
+
+root_private_single_file() {
+	local metadata mode links owner group
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	metadata="$(entry_metadata "$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
+		[ "$owner" = 0 ] && [ "$group" = 0 ]
 }
 
 root_owned_regular_file() {
@@ -137,7 +240,7 @@ capture_root_file_bytes() {
 		case "$fd_mode" in -?????????) ;; *) exit 1 ;; esac
 		[ "$fd_owner" = 0 ] && [ "$fd_group" = 0 ] || exit 1
 		[ ! -L "$source" ] && [ "$fd_path" -ef "$source" ] || exit 1
-		/usr/bin/timeout -k 1s 5s /bin/dd if="$fd_path" \
+		run_bounded 5 1 /bin/dd if="$fd_path" \
 			bs=4096 count="$blocks" of="$target" 2>/dev/null || exit 1
 		[ ! -L "$source" ] && [ "$fd_path" -ef "$source" ] || exit 1
 		trusted_root_file_source "$source"
@@ -165,7 +268,7 @@ validate_original_snapshot() {
 	grep -Eq '^package[[:space:]]+adguardhome$' "$SNAPSHOT_UCI"
 }
 
-discard_official_pending_delta() {
+ensure_no_official_pending_delta() {
 	local delta_dir=/tmp/.uci delta_file=/tmp/.uci/adguardhome
 	if [ ! -e "$delta_dir" ] && [ ! -L "$delta_dir" ]; then
 		return 0
@@ -175,7 +278,8 @@ discard_official_pending_delta() {
 		return 1
 	}
 	if [ -e "$delta_file" ] || [ -L "$delta_file" ]; then
-		rm -f "$delta_file" || return 1
+		echo "Pending official adguardhome UCI changes must be committed or reverted before installing this plugin." >&2
+		return 1
 	fi
 	[ ! -e "$delta_file" ] && [ ! -L "$delta_file" ]
 }
@@ -203,10 +307,6 @@ ensure_original_snapshot() {
 		return 0
 	fi
 	root_owned_safe_directory /root || return 1
-	[ -x /usr/bin/timeout ] || {
-		echo "The required coreutils timeout helper is missing." >&2
-		return 1
-	}
 	stage="$(mktemp -d /root/.luci-app-adguardhome.XXXXXX)" || return 1
 	SNAPSHOT_STAGE="$stage"
 	if ! chown 0:0 "$stage" || ! chmod 0700 "$stage"; then
@@ -230,7 +330,7 @@ ensure_original_snapshot() {
 		echo "Unable to capture the original official adguardhome config file." >&2
 		return 1
 	fi
-	if ! /usr/bin/timeout -k 1s 5s uci -q -c "$stage" \
+	if ! run_bounded 5 1 uci -q -c "$stage" \
 		export "$snapshot_package" >"$raw_export" ||
 	   ! chown 0:0 "$raw_export" || ! chmod 0600 "$raw_export" ||
 	   ! bounded_regular_file "$raw_export" ||
@@ -252,7 +352,7 @@ ensure_original_snapshot() {
 		return 1
 	}
 	if [ -x /etc/init.d/adguardhome ]; then
-		/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+		run_bounded 5 1 /etc/init.d/adguardhome running \
 			>/dev/null 2>&1 || running_rc=$?
 		case "$running_rc" in
 			0) was_running=1 ;;
@@ -332,7 +432,7 @@ ensure_runtime_dir() {
 
 validate_runtime_marker() {
 	validate_runtime_dir || return 1
-	root_private_file "$1" || return 1
+	root_private_single_file "$1" || return 1
 	[ "$(wc -c <"$1" 2>/dev/null)" = 2 ] && grep -qx '1' "$1"
 }
 
@@ -345,7 +445,17 @@ validate_initial_runtime_contents() {
 		"$RUNTIME_DIR"/..?*; do
 		[ -e "$entry" ] || [ -L "$entry" ] || continue
 		case "$entry" in
-			"$UPGRADE_MARKER"|"$INIT_ENABLED_MARKER") ;;
+			"$UPGRADE_MARKER"|"$INIT_ENABLED_MARKER"|"$UPGRADE_STOPPED_MARKER")
+				validate_runtime_marker "$entry" || return 1
+				;;
+			"$UPGRADE_YAML_SNAPSHOT")
+				root_private_single_file "$entry" && bounded_regular_file "$entry" || return 1
+				;;
+			"$UPGRADE_WORKDIR_METADATA")
+				root_private_single_file "$entry" || return 1
+				[ "$(wc -c <"$entry" 2>/dev/null)" -ge 1 ] 2>/dev/null &&
+					[ "$(wc -c <"$entry" 2>/dev/null)" -le 4096 ] 2>/dev/null || return 1
+				;;
 			*) return 1 ;;
 		esac
 	done
@@ -372,8 +482,22 @@ new_private_temp() {
 	NEW_PRIVATE_TEMP="$temporary"
 }
 
+create_upgrade_stopped_marker() {
+	local stage
+	[ "$IS_UPGRADE" = 1 ] && [ "$UPGRADE_WAS_RUNNING" = 0 ] || return 0
+	[ ! -e "$UPGRADE_STOPPED_MARKER" ] && [ ! -L "$UPGRADE_STOPPED_MARKER" ] || return 1
+	new_private_temp upgrade-was-stopped || return 1
+	stage="$NEW_PRIVATE_TEMP"
+	printf '1\n' >"$stage" || return 1
+	chown 0:0 "$stage" && chmod 0600 "$stage" || return 1
+	root_private_single_file "$stage" || return 1
+	[ "$(wc -c <"$stage" 2>/dev/null)" = 2 ] && grep -qx '1' "$stage" || return 1
+	mv "$stage" "$UPGRADE_STOPPED_MARKER" || return 1
+	validate_runtime_marker "$UPGRADE_STOPPED_MARKER"
+}
+
 cleanup_runtime_artifacts() {
-	local temporary legacy_marker cleanup_rc=0
+	local temporary legacy_marker entry cleanup_rc=0 preserve_stopped=0
 	if validate_runtime_dir; then
 		while IFS= read -r temporary; do
 			[ -n "$temporary" ] || continue
@@ -383,8 +507,30 @@ cleanup_runtime_artifacts() {
 		done <<-EOF
 		$TEMP_FILES
 		EOF
-		rm -f "$UPGRADE_MARKER" "$INIT_ENABLED_MARKER" || cleanup_rc=1
-		rmdir "$RUNTIME_DIR" 2>/dev/null || cleanup_rc=1
+		if [ "$IS_UPGRADE" != 1 ] || [ "$INSTALL_COMMITTED" = 1 ]; then
+			rm -f "$UPGRADE_YAML_SNAPSHOT" "$UPGRADE_WORKDIR_METADATA" \
+				"$UPGRADE_MARKER" "$INIT_ENABLED_MARKER" || cleanup_rc=1
+			if [ "$IS_UPGRADE" = 1 ] && [ "$INSTALL_COMMITTED" = 1 ] &&
+			   [ "$UPGRADE_WAS_RUNNING" = 0 ]; then
+				validate_runtime_marker "$UPGRADE_STOPPED_MARKER" || cleanup_rc=1
+				preserve_stopped=1
+			else
+				rm -f "$UPGRADE_STOPPED_MARKER" || cleanup_rc=1
+			fi
+			if [ "$preserve_stopped" = 1 ]; then
+				for entry in \
+					"$RUNTIME_DIR"/* \
+					"$RUNTIME_DIR"/.[!.]* \
+					"$RUNTIME_DIR"/..?*; do
+					[ -e "$entry" ] || [ -L "$entry" ] || continue
+					[ "$entry" = "$UPGRADE_STOPPED_MARKER" ] || cleanup_rc=1
+				done
+			else
+				rmdir "$RUNTIME_DIR" 2>/dev/null || cleanup_rc=1
+			fi
+		else
+			rm -f "$UPGRADE_STOPPED_MARKER" || cleanup_rc=1
+		fi
 	fi
 	# Never use the historical world-writable markers as input.  Remove only
 	# those two exact legacy path objects after every attempted install.
@@ -423,6 +569,7 @@ if [ -e "$RUNTIME_DIR" ] || [ -L "$RUNTIME_DIR" ]; then
 			exit 1
 		}
 		IS_UPGRADE=1
+		UPGRADE_MARKER_FOUND=1
 	fi
 	if [ -e "$INIT_ENABLED_MARKER" ] || [ -L "$INIT_ENABLED_MARKER" ]; then
 		validate_runtime_marker "$INIT_ENABLED_MARKER" || {
@@ -431,6 +578,28 @@ if [ -e "$RUNTIME_DIR" ] || [ -L "$RUNTIME_DIR" ]; then
 		}
 		UPPER_WAS_ENABLED=1
 	fi
+	# This marker is consumed by default_postinst's one automatic wrapper start.
+	# If a previous package-manager process died after committing migration but
+	# before that start, validate and discard the stale marker before proceeding.
+	if [ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ]; then
+		validate_runtime_marker "$UPGRADE_STOPPED_MARKER" || {
+			echo "Unsafe stopped-upgrade marker; installation aborted." >&2
+			exit 1
+		}
+		rm -f "$UPGRADE_STOPPED_MARKER" || exit 1
+	fi
+fi
+if [ "$IS_UPGRADE" = 1 ]; then
+	if [ "$UPGRADE_MARKER_FOUND" != 1 ] ||
+	   [ ! -e "$UPGRADE_YAML_SNAPSHOT" ] || [ -L "$UPGRADE_YAML_SNAPSHOT" ] ||
+	   [ ! -e "$UPGRADE_WORKDIR_METADATA" ] || [ -L "$UPGRADE_WORKDIR_METADATA" ]; then
+		echo "Incomplete AdGuard Home v2.1 upgrade snapshot; installation aborted." >&2
+		exit 1
+	fi
+elif [ -e "$UPGRADE_YAML_SNAPSHOT" ] || [ -L "$UPGRADE_YAML_SNAPSHOT" ] ||
+     [ -e "$UPGRADE_WORKDIR_METADATA" ] || [ -L "$UPGRADE_WORKDIR_METADATA" ]; then
+	echo "Unexpected AdGuard Home upgrade snapshot on a clean installation; installation aborted." >&2
+	exit 1
 fi
 ensure_runtime_dir || exit 1
 trap cleanup_all 0
@@ -490,6 +659,28 @@ normalize_bool() {
 		1|on|true|yes|enabled) printf '1\n' ;;
 		*) printf '0\n' ;;
 	esac
+}
+
+normalize_memory_writeback_interval() {
+	local value="$1"
+	case "$value" in
+		""|*[!0-9]*)
+			printf '60\n'
+			return 0
+			;;
+	esac
+
+	# Canonicalize leading zeroes without relying on a non-base utility or on
+	# shell arithmetic accepting an implementation-specific octal spelling.
+	while [ "${value#0}" != "$value" ]; do
+		value="${value#0}"
+	done
+	[ -n "$value" ] || value=0
+
+	if [ "${#value}" -gt 5 ] || [ "$value" -gt 10080 ] 2>/dev/null; then
+		value=60
+	fi
+	printf '%s\n' "$value"
 }
 
 path_contains_symlink() {
@@ -601,6 +792,215 @@ normalize_work_dir() {
 	is_managed_work_dir "$value" || return 1
 	printf '%s\n' "$value"
 }
+
+snapshot_sha256() {
+	local digest
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	digest="$(sha256sum "$1" 2>/dev/null)" || return 1
+	digest="${digest%% *}"
+	[ "${#digest}" -eq 64 ] || return 1
+	case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+	printf '%s\n' "$digest"
+}
+
+held_root_private_file() {
+	local descriptor="$1" path="$2" minimum="$3" maximum="$4"
+	local metadata mode links owner group size
+	[ -f "$descriptor" ] && [ "$descriptor" -ef "$path" ] || return 1
+	metadata="$(LC_ALL=C ls -ldnL "$descriptor" 2>/dev/null)" || return 1
+	read -r mode links owner group size _remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
+		[ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -ge "$minimum" ] 2>/dev/null &&
+		[ "$size" -le "$maximum" ] 2>/dev/null
+}
+
+# A v2.2 in-place upgrade consumes only the cold, root-private snapshot made
+# by the v2.1 pre-upgrade hook.  Fixed line order plus exact field validation
+# rejects duplicated, missing, unknown, or injected metadata before the APK's
+# replacement conffile can be considered as a source.
+load_upgrade_snapshot() {
+	local line1 line2 line3 line4 line5 line6 line7 line8 line9 line10 extra
+	local work_dir uid gid config_file yaml_hash yaml_size was_running
+	local work_metadata work_mode work_owner work_group held_hash held_size valid=0
+	local upper_work_dir
+
+	[ "$IS_UPGRADE" = 1 ] || return 0
+	validate_runtime_marker "$UPGRADE_MARKER" || return 1
+	root_private_single_file "$UPGRADE_YAML_SNAPSHOT" &&
+		root_private_single_file "$UPGRADE_WORKDIR_METADATA" || return 1
+	[ "$(wc -l <"$UPGRADE_WORKDIR_METADATA" 2>/dev/null)" = 10 ] || return 1
+
+	exec 7<"$UPGRADE_WORKDIR_METADATA" || return 1
+	exec 8<"$UPGRADE_YAML_SNAPSHOT" || {
+		exec 7<&-
+		return 1
+	}
+	if held_root_private_file /proc/self/fd/7 "$UPGRADE_WORKDIR_METADATA" 1 4096 &&
+	   held_root_private_file /proc/self/fd/8 "$UPGRADE_YAML_SNAPSHOT" 1 "$MAX_YAML_SIZE" &&
+	   {
+		IFS= read -r line1 && IFS= read -r line2 &&
+		IFS= read -r line3 && IFS= read -r line4 &&
+		IFS= read -r line5 && IFS= read -r line6 &&
+		IFS= read -r line7 && IFS= read -r line8 &&
+		IFS= read -r line9 && IFS= read -r line10 &&
+		! IFS= read -r extra
+	   } </proc/self/fd/7 &&
+	   [ "$line1" = "format=1" ] &&
+	   [ "$line2" = "source_version=2.1.0-r1" ]; then
+		case "$line3" in workdir=*) work_dir="${line3#workdir=}" ;; *) work_dir="" ;; esac
+		case "$line4" in uid=*) uid="${line4#uid=}" ;; *) uid="" ;; esac
+		case "$line5" in gid=*) gid="${line5#gid=}" ;; *) gid="" ;; esac
+		case "$line7" in config_file=*) config_file="${line7#config_file=}" ;; *) config_file="" ;; esac
+		case "$line8" in yaml_sha256=*) yaml_hash="${line8#yaml_sha256=}" ;; *) yaml_hash="" ;; esac
+		case "$line9" in yaml_size=*) yaml_size="${line9#yaml_size=}" ;; *) yaml_size="" ;; esac
+		case "$line10" in was_running=*) was_running="${line10#was_running=}" ;; *) was_running="" ;; esac
+		upper_work_dir="$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.workdir")"
+		held_size="$(wc -c </proc/self/fd/8 2>/dev/null)"
+		held_hash="$(snapshot_sha256 /proc/self/fd/8)"
+		work_metadata="$(entry_metadata "$work_dir")"
+		read -r work_mode _work_links work_owner work_group _work_remainder <<-EOF
+		$work_metadata
+		EOF
+		if [ -n "$work_dir" ] &&
+		   [ "$(normalize_work_dir "$work_dir")" = "$work_dir" ] &&
+		   [ "$upper_work_dir" = "$work_dir" ] &&
+		   [ "${OFFICIAL_WORK_DIR%/}" = "$work_dir" ] &&
+		   [ "$OFFICIAL_CONFIG_FILE" = "${work_dir}/AdGuardHome.yaml" ] &&
+		   [ "$config_file" = "${work_dir}/AdGuardHome.yaml" ] &&
+		   [ "$line6" = "mode=0700" ] && [ "$work_mode" = "drwx------" ] &&
+		   { [ "$work_owner:$work_group" = "0:0" ] ||
+		     [ "$work_owner:$work_group" = "0:853" ] ||
+		     [ "$work_owner:$work_group" = "853:853" ]; } &&
+		   { [ "$uid:$gid" = "0:0" ] || [ "$uid:$gid" = "0:853" ] ||
+		     [ "$uid:$gid" = "853:853" ]; } &&
+		   [ "${#yaml_hash}" -eq 64 ] &&
+		   [ -n "$held_hash" ] && [ "$held_hash" = "$yaml_hash" ] &&
+		   [ "$yaml_size" = "$held_size" ] &&
+		   [ "$yaml_size" -ge 1 ] 2>/dev/null &&
+		   [ "$yaml_size" -le "$MAX_YAML_SIZE" ] 2>/dev/null &&
+		   { [ "$was_running" = 0 ] || [ "$was_running" = 1 ]; } &&
+		   held_root_private_file /proc/self/fd/7 "$UPGRADE_WORKDIR_METADATA" 1 4096 &&
+		   held_root_private_file /proc/self/fd/8 "$UPGRADE_YAML_SNAPSHOT" 1 "$MAX_YAML_SIZE"; then
+			valid=1
+		fi
+	fi
+	exec 8<&-
+	exec 7<&-
+	[ "$valid" = 1 ] || return 1
+
+	UPGRADE_SOURCE_WORK_DIR="$work_dir"
+	UPGRADE_SOURCE_CONFIG_FILE="$config_file"
+	UPGRADE_SOURCE_UID="$uid"
+	UPGRADE_SOURCE_GID="$gid"
+	UPGRADE_SOURCE_YAML_HASH="$yaml_hash"
+	UPGRADE_SOURCE_YAML_SIZE="$yaml_size"
+	UPGRADE_WAS_RUNNING="$was_running"
+}
+
+restore_upgrade_yaml_snapshot() {
+	local candidate candidate_hash candidate_size copied=0
+	[ "$IS_UPGRADE" = 1 ] || return 0
+	[ "$TARGET_WORK_DIR" = "$UPGRADE_SOURCE_WORK_DIR" ] &&
+		[ "$TARGET_CONFIG_FILE" = "$UPGRADE_SOURCE_CONFIG_FILE" ] || return 1
+	new_private_temp yaml-migration || return 1
+	candidate="$NEW_PRIVATE_TEMP"
+
+	# Keep the cold snapshot inode open while copying it into the only candidate
+	# namespace accepted by the packaged normalizer.  The snapshot is deliberately
+	# root-only, so this copy must not fall back to the uid-853 migration reader.
+	exec 7<"$UPGRADE_YAML_SNAPSHOT" || return 1
+	if held_root_private_file /proc/self/fd/7 "$UPGRADE_YAML_SNAPSHOT" 1 "$MAX_YAML_SIZE" &&
+	   [ "$(snapshot_sha256 /proc/self/fd/7)" = "$UPGRADE_SOURCE_YAML_HASH" ] &&
+	   [ "$(wc -c </proc/self/fd/7 2>/dev/null)" = "$UPGRADE_SOURCE_YAML_SIZE" ] &&
+	   run_bounded 5 1 /bin/dd if=/proc/self/fd/7 \
+		bs=4096 count=129 of="$candidate" 2>/dev/null &&
+	   chown 0:0 "$candidate" && chmod 0600 "$candidate" &&
+	   bounded_regular_file "$candidate"; then
+		candidate_hash="$(snapshot_sha256 "$candidate")"
+		candidate_size="$(wc -c <"$candidate" 2>/dev/null)"
+		if [ "$candidate_hash" = "$UPGRADE_SOURCE_YAML_HASH" ] &&
+		   [ "$candidate_size" = "$UPGRADE_SOURCE_YAML_SIZE" ] &&
+		   held_root_private_file /proc/self/fd/7 "$UPGRADE_YAML_SNAPSHOT" 1 "$MAX_YAML_SIZE" &&
+		   [ "$(snapshot_sha256 /proc/self/fd/7)" = "$UPGRADE_SOURCE_YAML_HASH" ]; then
+			copied=1
+		fi
+	fi
+	exec 7<&-
+	[ "$copied" = 1 ] || return 1
+
+	# normalize_config() validates and atomically replaces this candidate with
+	# the official core's normalized YAML.  Compare the installed file with that
+	# normalized result, not with the raw v2.1 bytes.
+	validate_yaml_candidate "$candidate" "$TARGET_WORK_DIR" || return 1
+	install_yaml_candidate "$candidate" "$TARGET_CONFIG_FILE" 0 || return 1
+	bounded_regular_file "$candidate" &&
+		root_private_file "$TARGET_CONFIG_FILE" &&
+		cmp -s "$candidate" "$TARGET_CONFIG_FILE"
+}
+
+restore_upgrade_workdir_metadata() (
+	local descriptor=/proc/self/fd/9 config_descriptor=/proc/self/fd/8
+	local metadata mode links owner group size config_owner config_group config_mode
+	[ "$IS_UPGRADE" = 1 ] || exit 0
+	[ "$TARGET_WORK_DIR" = "$UPGRADE_SOURCE_WORK_DIR" ] || exit 1
+	exec 9<"$TARGET_WORK_DIR" || exit 1
+	[ -d "$descriptor" ] && [ "$descriptor" -ef "$TARGET_WORK_DIR" ] || exit 1
+	exec 8<>"$TARGET_CONFIG_FILE" || exit 1
+	[ -f "$config_descriptor" ] && [ "$config_descriptor" -ef "$TARGET_CONFIG_FILE" ] || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$config_descriptor" 2>/dev/null)" || exit 1
+	read -r mode links owner group size _remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
+		[ "$owner" = 0 ] && [ "$group" = 0 ] || exit 1
+	case "$size" in ""|*[!0-9]*) exit 1 ;; esac
+	[ "$size" -ge 1 ] 2>/dev/null && [ "$size" -le "$MAX_YAML_SIZE" ] 2>/dev/null || exit 1
+	case "${UPGRADE_SOURCE_UID}:${UPGRADE_SOURCE_GID}" in
+		0:0)
+			config_owner=0
+			config_group=0
+			config_mode=0600
+			;;
+		0:"$ADGUARD_GID")
+			config_owner=0
+			config_group="$ADGUARD_GID"
+			config_mode=0640
+			;;
+		"$ADGUARD_UID":"$ADGUARD_GID")
+			config_owner="$ADGUARD_UID"
+			config_group="$ADGUARD_GID"
+			config_mode=0600
+			;;
+		*) exit 1 ;;
+	esac
+	chown "${config_owner}:${config_group}" "$config_descriptor" &&
+		chmod "$config_mode" "$config_descriptor" || exit 1
+	chown "${UPGRADE_SOURCE_UID}:${UPGRADE_SOURCE_GID}" "$descriptor" &&
+		chmod 0700 "$descriptor" || exit 1
+	[ "$descriptor" -ef "$TARGET_WORK_DIR" ] &&
+		[ "$config_descriptor" -ef "$TARGET_CONFIG_FILE" ] || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$descriptor" 2>/dev/null)" || exit 1
+	read -r mode _links owner group _remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = drwx------ ] && [ "$owner" = "$UPGRADE_SOURCE_UID" ] &&
+		[ "$group" = "$UPGRADE_SOURCE_GID" ] || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$config_descriptor" 2>/dev/null)" || exit 1
+	read -r mode links owner group size _remainder <<-EOF
+	$metadata
+	EOF
+	[ "$links" = 1 ] && [ "$owner" = "$config_owner" ] &&
+		[ "$group" = "$config_group" ] || exit 1
+	case "$config_mode:$mode" in
+		0600:-rw-------|0640:-rw-r-----) ;;
+		*) exit 1 ;;
+	esac
+	[ "$size" -ge 1 ] 2>/dev/null && [ "$size" -le "$MAX_YAML_SIZE" ] 2>/dev/null
+)
 
 is_allowed_data_source_work_dir() {
 	[ "${1%/}" = "$OFFICIAL_DEFAULT_WORK_DIR" ] &&
@@ -724,11 +1124,11 @@ copy_yaml_bounded() {
 	local source="$1" target="$2" capture_rc=0
 	valid_yaml_source_path "$source" || return 1
 	root_private_file "$target" || return 1
-	[ -x /usr/bin/timeout ] && [ -x /sbin/start-stop-daemon ] || return 1
+	[ -x /sbin/start-stop-daemon ] || return 1
 	if trusted_root_file_source "$source"; then
 		capture_root_file_bytes "$source" "$target" 129 || capture_rc=$?
 	else
-		/usr/bin/timeout -k 1s 3s \
+		run_bounded 3 1 \
 			/sbin/start-stop-daemon -S -c 853:853 -n AGHMigration \
 			-x /bin/dd -- if="$source" bs=4096 count=129 \
 			>"$target" 2>/dev/null || capture_rc=$?
@@ -747,7 +1147,7 @@ validate_yaml_candidate() {
 	fi
 	# Cover both bounded TLS snapshots, the writable schema-normalization jail,
 	# the read-only official-core recheck, and descriptor-based captures.
-	/usr/bin/timeout -k 5s 120s /etc/init.d/AdGuardHome \
+	run_bounded 120 5 /etc/init.d/AdGuardHome \
 		normalize_config "$candidate" "$requested_work_dir"
 }
 
@@ -815,7 +1215,7 @@ install_yaml_candidate() {
 		rm -f "$temporary"
 		return 1
 	fi
-	if ! /usr/bin/timeout -k 1s 3s dd if="$candidate" bs=4096 count=129 \
+	if ! run_bounded 3 1 dd if="$candidate" bs=4096 count=129 \
 		of="$temporary" 2>/dev/null ||
 	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
 	   ! bounded_regular_file "$temporary" || ! cmp -s "$candidate" "$temporary"; then
@@ -827,7 +1227,7 @@ install_yaml_candidate() {
 			rm -f "$temporary"
 			return 1
 		}
-		if ! /usr/bin/timeout -k 1s 3s dd if="$target" bs=4096 count=129 \
+		if ! run_bounded 3 1 dd if="$target" bs=4096 count=129 \
 			of="$backup" 2>/dev/null || ! chown 0:0 "$backup" ||
 		   ! chmod 0600 "$backup" || ! bounded_regular_file "$backup" ||
 		   ! cmp -s "$target" "$backup"; then
@@ -992,7 +1392,7 @@ uid853_tree_is_plain() {
 	[ -d "$tree" ] && [ ! -L "$tree" ] || return 1
 	# $1 and bad intentionally expand in the lowered child shell.
 	# shellcheck disable=SC2016
-	/usr/bin/timeout -k 2s 30s \
+	run_bounded 30 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataScan -x /bin/sh -- -c '
 			set -o pipefail
@@ -1003,7 +1403,7 @@ uid853_tree_is_plain() {
 }
 
 uid853_read_small_file() {
-	/usr/bin/timeout -k 1s 3s \
+	run_bounded 3 1 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataRead -x /bin/dd -- if="$1" bs=4096 count=1 2>/dev/null
 }
@@ -1214,7 +1614,7 @@ migrate_runtime_data() (
 	temporary="$(mktemp -d "${new_work}/.data-migration.XXXXXX")" || return 1
 	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$temporary" &&
 		chmod 0700 "$temporary" || return 1
-	if ! /usr/bin/timeout -k 2s 120s \
+	if ! run_bounded 120 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataCopy -x /bin/cp -- -pR "${source_data}/." "$temporary/" ||
 	   ! { [ "$source_relaxed" != 1 ] || [ "$source_fd" -ef "$old_work" ]; } ||
@@ -1222,7 +1622,7 @@ migrate_runtime_data() (
 	   ! uid853_tree_is_plain "$temporary"; then
 		return 1
 	fi
-	if ! printf '%s\n' "$old_work" | /usr/bin/timeout -k 1s 3s \
+	if ! printf '%s\n' "$old_work" | run_bounded 3 1 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataMark -x /bin/dd -- \
 		of="${temporary}/.luci-app-adguardhome-migrated-from" \
@@ -1281,7 +1681,7 @@ read_official_state() {
 	OFFICIAL_ENABLED="$(normalize_bool "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")")"
 	OFFICIAL_VERBOSE="$(normalize_bool "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")")"
 	if [ -x /etc/init.d/adguardhome ]; then
-		/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+		run_bounded 5 1 /etc/init.d/adguardhome running \
 			>/dev/null 2>&1 || running_rc=$?
 		case "$running_rc" in
 			0)
@@ -1414,28 +1814,32 @@ resume_paused_official() {
 	# point onward, every failure must leave the core stopped instead of letting
 	# cleanup_all perform an unchecked lower-service restart.
 	OFFICIAL_PAUSED=0
-	if ! /usr/bin/timeout -k 2s 20s /etc/init.d/AdGuardHome tls_prepare \
+	if ! run_bounded 20 2 /etc/init.d/AdGuardHome tls_prepare \
 		>/dev/null 2>&1; then
 		echo "Unable to prepare AdGuard Home TLS access; the service remains stopped." >&2
 		return 1
 	fi
-	/usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome restart \
+	run_bounded 20 2 /etc/init.d/adguardhome restart \
 		>/dev/null 2>&1 || return 1
-	/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+	run_bounded 5 1 /etc/init.d/adguardhome running \
 		>/dev/null 2>&1 || running_rc=$?
 	[ "$running_rc" = 0 ] || return 1
+	if [ "$IS_UPGRADE" = 1 ] && [ "$UPGRADE_WAS_RUNNING" = 1 ]; then
+		run_bounded 150 5 /etc/init.d/AdGuardHome do_redirect 1 \
+			>/dev/null 2>&1 || return 1
+	fi
 }
 
 pause_official_for_normalization() {
 	local running_rc=0
 	[ "$OFFICIAL_WAS_RUNNING" = 1 ] || return 0
 	OFFICIAL_PAUSED=1
-	if ! /usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome stop \
+	if ! run_bounded 20 2 /etc/init.d/adguardhome stop \
 		>/dev/null 2>&1; then
 		echo "Unable to stop the running official AdGuard Home service before normalization." >&2
 		return 1
 	fi
-	/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+	run_bounded 5 1 /etc/init.d/adguardhome running \
 		>/dev/null 2>&1 || running_rc=$?
 	case "$running_rc" in
 		1) ;;
@@ -1451,7 +1855,7 @@ pause_official_for_normalization() {
 }
 
 initialize_upper_options() {
-	local enabled verbose redirect
+	local enabled verbose redirect run_from_memory memory_writeback_interval
 
 	if [ "$IMPORT_OFFICIAL" = 1 ]; then
 		enabled="$OFFICIAL_ENABLED"
@@ -1460,8 +1864,13 @@ initialize_upper_options() {
 		enabled="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.enabled")")"
 		verbose="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.verbose")")"
 	fi
+	run_from_memory="$(normalize_bool "$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.run_from_memory")")"
+	memory_writeback_interval="$(normalize_memory_writeback_interval \
+		"$(uci -q get "${UCI_CONFIG}.${UCI_SECTION}.memory_writeback_interval")")"
 	set_upper_option enabled "$enabled" || return 1
 	set_upper_option verbose "$verbose" || return 1
+	set_upper_option run_from_memory "$run_from_memory" || return 1
+	set_upper_option memory_writeback_interval "$memory_writeback_interval" || return 1
 	set_upper_option workdir "$TARGET_WORK_DIR" || return 1
 
 	if [ "$IMPORT_OFFICIAL" = 1 ]; then
@@ -1676,11 +2085,28 @@ refresh_luci_runtime() {
 }
 
 ensure_original_snapshot || exit 1
-discard_official_pending_delta || exit 1
+ensure_no_official_pending_delta || exit 1
 ensure_upper_section || exit 1
 read_official_state || exit 1
+load_upgrade_snapshot || {
+	echo "Unable to validate the AdGuard Home v2.1 upgrade snapshot." >&2
+	exit 1
+}
 select_migration_source || exit 1
 TARGET_CONFIG_FILE="${TARGET_WORK_DIR}/AdGuardHome.yaml"
+if [ "$IS_UPGRADE" = 1 ]; then
+	if [ "$TARGET_WORK_DIR" != "$UPGRADE_SOURCE_WORK_DIR" ] ||
+	   [ "$TARGET_CONFIG_FILE" != "$UPGRADE_SOURCE_CONFIG_FILE" ]; then
+		echo "The active workdir changed after the v2.1 upgrade snapshot was captured." >&2
+		exit 1
+	fi
+	restore_upgrade_yaml_snapshot || {
+		echo "Unable to restore the active v2.1 YAML before migration." >&2
+		exit 1
+	}
+	SOURCE_CONFIG_FILE="$TARGET_CONFIG_FILE"
+	OFFICIAL_WAS_RUNNING="$UPGRADE_WAS_RUNNING"
+fi
 pause_official_for_normalization || exit 1
 migrate_yaml "$SOURCE_CONFIG_FILE" "$TARGET_CONFIG_FILE" || exit 1
 migrate_runtime_data "$DATA_SOURCE_WORK_DIR" "$TARGET_WORK_DIR" || exit 1
@@ -1708,6 +2134,10 @@ if [ -z "$IPKG_INSTROOT" ] && [ "$DHCP_CHANGED" = 1 ]; then
 	/etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
 fi
 
+restore_upgrade_workdir_metadata || {
+	echo "Unable to restore the v2.1 workdir and YAML ownership after migration." >&2
+	exit 1
+}
 resume_paused_official || exit 1
 
 if [ "$IS_UPGRADE" = 1 ]; then
@@ -1716,6 +2146,11 @@ if [ "$IS_UPGRADE" = 1 ]; then
 	refresh_luci_runtime || exit 1
 fi
 
+create_upgrade_stopped_marker || {
+	echo "Unable to preserve the stopped AdGuard Home upgrade state." >&2
+	exit 1
+}
+INSTALL_COMMITTED=1
 cleanup_runtime_artifacts || exit 1
 trap - 0 HUP INT TERM
 

@@ -22,6 +22,16 @@ const YAML_JOB_STATE_LIMIT = 256;
 const CONFIG_NAME = 'AdGuardHome';
 const CONFIG_SECTION = 'AdGuardHome';
 const CONFIG_FILENAME = 'AdGuardHome.yaml';
+const TEMPLATE_DIRECTORY = '/usr/share/luci-app-adguardhome';
+const TEMPLATE_PATH = `${TEMPLATE_DIRECTORY}/default.yaml`;
+const TEMPLATE_WORK_DIR = '/etc/AdGuardHome';
+const TEMPLATE_FILTER_PATTERN = `${TEMPLATE_WORK_DIR}/data/userfilters/*`;
+const MEMORY_RUNTIME_DIRECTORY = '/tmp/luci-app-adguardhome-memory';
+const MEMORY_WORK_DIRECTORY = `${MEMORY_RUNTIME_DIRECTORY}/work`;
+const MEMORY_CONFIG_PATH = `${MEMORY_WORK_DIRECTORY}/${CONFIG_FILENAME}`;
+const MEMORY_STATE_PATH = `${MEMORY_RUNTIME_DIRECTORY}/state`;
+const ADGUARD_UID = 853;
+const ADGUARD_GID = 853;
 
 function valid_work_dir(value, official_work_dir, official_config_file) {
 	if (type(value) != 'string' ||
@@ -69,6 +79,99 @@ function valid_work_dir(value, official_work_dir, official_config_file) {
 	return value;
 }
 
+function encoded_device(metadata) {
+	let major = metadata?.dev?.major;
+	let minor = metadata?.dev?.minor;
+	if (type(major) != 'int' || type(minor) != 'int' || major < 0 || minor < 0)
+		return null;
+
+	// Linux gnu_dev_makedev(), expressed arithmetically to avoid 32-bit bitwise
+	// truncation in JavaScript-compatible runtimes.
+	return (minor % 256) + (major % 4096) * 256 +
+		int(minor / 256) * 1048576 + int(major / 4096) * 17592186044416;
+}
+
+function same_inode(left, right) {
+	return left?.type == 'file' && right?.type == 'file' &&
+		left.inode == right.inode &&
+		left.dev?.major == right.dev?.major &&
+		left.dev?.minor == right.dev?.minor;
+}
+
+function memory_config_path(persistent_work_dir) {
+	if (!valid_work_dir(
+		persistent_work_dir,
+		persistent_work_dir,
+		`${persistent_work_dir}/${CONFIG_FILENAME}`
+	    ))
+		return null;
+
+	let runtime = lstat(MEMORY_RUNTIME_DIRECTORY);
+	let active = lstat(MEMORY_WORK_DIRECTORY);
+	let config = lstat(MEMORY_CONFIG_PATH);
+	let data = lstat(`${MEMORY_WORK_DIRECTORY}/data`);
+	let backing = lstat(persistent_work_dir);
+	if (runtime?.type != 'directory' || runtime.uid != 0 ||
+	    runtime.gid != ADGUARD_GID || runtime.mode != 0o710 ||
+	    active?.type != 'directory' || active.uid != ADGUARD_UID ||
+	    active.gid != ADGUARD_GID || active.mode != 0o700 ||
+	    data?.type != 'directory' || data.uid != ADGUARD_UID ||
+	    data.gid != ADGUARD_GID || data.mode != 0o700 ||
+	    backing?.type != 'directory' || backing.mode != 0o700 ||
+	    !((backing.uid == 0 && (backing.gid == 0 || backing.gid == ADGUARD_GID)) ||
+	      (backing.uid == ADGUARD_UID && backing.gid == ADGUARD_GID)) ||
+	    config?.type != 'file' || config.nlink != 1 || config.size <= 0 ||
+	    config.size > MAX_CONFIG_LENGTH ||
+	    !((config.uid == ADGUARD_UID && config.gid == ADGUARD_GID &&
+	       (config.mode == 0o600 || config.mode == 0o640)) ||
+	      (config.uid == 0 && config.gid == ADGUARD_GID && config.mode == 0o640)))
+		return null;
+
+	let file = null;
+	try {
+		let before = lstat(MEMORY_STATE_PATH);
+		if (before?.type != 'file' || before.uid != 0 || before.gid != 0 ||
+		    before.mode != 0o600 || before.nlink != 1 || before.size <= 0 ||
+		    before.size > 1024)
+			return null;
+
+		file = open(MEMORY_STATE_PATH, 'r');
+		if (!file)
+			return null;
+		let descriptor = file.fileno();
+		let opened = type(descriptor) == 'int'
+			? stat(`/proc/self/fd/${descriptor}`)
+			: null;
+		let content = file.read(1025);
+		let after = lstat(MEMORY_STATE_PATH);
+		let lines = type(content) == 'string' ? split(content, '\n') : [];
+		let backing_device = encoded_device(backing);
+		let valid = same_inode(before, opened) && same_inode(before, after) &&
+			opened.uid == 0 && opened.gid == 0 && opened.mode == 0o600 &&
+			opened.nlink == 1 && after.uid == 0 && after.gid == 0 &&
+			after.mode == 0o600 && after.nlink == 1 &&
+			before.size == opened.size && before.size == after.size &&
+			length(content) == opened.size && length(lines) == 5 &&
+			lines[0] == 'version=2' &&
+			lines[1] == `persistent_work_dir=${persistent_work_dir}` &&
+			type(backing_device) == 'int' &&
+			lines[2] == `backing_device=${backing_device}` &&
+			lines[3] == `backing_inode=${backing.inode}` &&
+			lines[4] == '';
+		if (!file.close())
+			valid = false;
+		file = null;
+		return valid ? MEMORY_CONFIG_PATH : null;
+	}
+	catch (error) {
+		if (file) {
+			try { file.close(); }
+			catch (close_error) { }
+		}
+		return null;
+	}
+}
+
 function config_path() {
 	let uci = null;
 	let work_dir = null;
@@ -78,11 +181,30 @@ function config_path() {
 		let official_work_dir = uci.get('adguardhome', 'config', 'work_dir') ||
 			uci.get('adguardhome', 'config', 'workdir');
 		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
-		work_dir = valid_work_dir(
-			uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir'),
-			official_work_dir,
-			official_config_file
-		);
+		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir');
+		let memory_namespace = lstat(MEMORY_RUNTIME_DIRECTORY);
+		let active_path = memory_config_path(configured_work_dir);
+		if (active_path) {
+			// A valid root-private state record is authoritative for this boot.
+			// Lower UCI may briefly expose the backing paths while the init wrapper
+			// commits TLS or service fields; never open the stale disk YAML then.
+			work_dir = MEMORY_WORK_DIRECTORY;
+		}
+		else if (memory_namespace ||
+		         official_work_dir == MEMORY_WORK_DIRECTORY ||
+		         official_config_file == MEMORY_CONFIG_PATH) {
+			// A present but invalid RAM namespace is a corruption state, not an
+			// absent feature.  Never fall back to the stale backing YAML while the
+			// init transaction temporarily exposes persistent lower-UCI paths.
+			work_dir = null;
+		}
+		else {
+			work_dir = valid_work_dir(
+				configured_work_dir,
+				official_work_dir,
+				official_config_file
+			);
+		}
 	}
 	catch (error) {
 		work_dir = null;
@@ -124,6 +246,32 @@ function service_running() {
 	}
 
 	return service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true;
+}
+
+function service_status() {
+	let requested = false;
+	let active = config_path() == MEMORY_CONFIG_PATH;
+	let uci = null;
+
+	try {
+		uci = cursor();
+		let value = lc(`${uci.get(CONFIG_NAME, CONFIG_SECTION, 'run_from_memory') || ''}`);
+		requested = value == '1' || value == 'on' || value == 'true' ||
+			value == 'yes' || value == 'enabled';
+	}
+	catch (error) {
+		requested = false;
+	}
+	if (uci) {
+		try { uci.unload(CONFIG_NAME); }
+		catch (error) { }
+	}
+
+	return {
+		running: service_running(),
+		memory_requested: requested,
+		memory_active: active,
+	};
 }
 
 function read_yaml() {
@@ -188,6 +336,87 @@ function read_yaml() {
 		return null;
 
 	return { content, sha256: digest, path };
+}
+
+function safe_template_directory(path) {
+	let metadata = lstat(path);
+	return metadata?.type == 'directory' && metadata.uid == 0 && metadata.gid == 0 &&
+		!metadata.perm?.group_write && !metadata.perm?.other_write;
+}
+
+function read_template() {
+	let file = null;
+	let content = null;
+	let descriptor = null;
+	let before = null;
+	let opened = null;
+	let after = null;
+	let valid = false;
+
+	try {
+		for (let directory in [ '/usr', '/usr/share', TEMPLATE_DIRECTORY ])
+			if (!safe_template_directory(directory))
+				return null;
+
+		before = lstat(TEMPLATE_PATH);
+		if (before?.type != 'file' || before.uid != 0 || before.gid != 0 ||
+		    before.mode != 0o644 || before.nlink != 1 || before.size <= 0 ||
+		    before.size > MAX_CONFIG_LENGTH)
+			return null;
+
+		file = open(TEMPLATE_PATH, 'r');
+		if (!file)
+			return null;
+
+		descriptor = file.fileno();
+		opened = type(descriptor) == 'int'
+			? stat(`/proc/self/fd/${descriptor}`)
+			: null;
+		content = file.read(MAX_CONFIG_LENGTH + 1);
+		after = lstat(TEMPLATE_PATH);
+		valid = same_inode(before, opened) && same_inode(before, after) &&
+			opened.uid == 0 && opened.gid == 0 && opened.mode == 0o644 &&
+			opened.nlink == 1 && after.uid == 0 && after.gid == 0 &&
+			after.mode == 0o644 && after.nlink == 1 &&
+			before.size == opened.size && before.size == after.size &&
+			type(content) == 'string' && length(content) == opened.size &&
+			length(content) > 0 && length(content) <= MAX_CONFIG_LENGTH &&
+			index(content, "\u0000") < 0;
+		if (!file.close())
+			valid = false;
+		file = null;
+	}
+	catch (error) {
+		if (file) {
+			try { file.close(); }
+			catch (close_error) { }
+		}
+		return null;
+	}
+
+	return valid ? content : null;
+}
+
+function template_for_path(path) {
+	if (type(path) != 'string' ||
+	    !match(path, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml$/))
+		return null;
+
+	let suffix = `/${CONFIG_FILENAME}`;
+	if (substr(path, length(path) - length(suffix), length(suffix)) != suffix)
+		return null;
+
+	let work_dir = substr(path, 0, length(path) - length(suffix));
+	let content = read_template();
+	if (!content)
+		return null;
+
+	let marker = `    - ${TEMPLATE_FILTER_PATTERN}`;
+	let pieces = split(content, marker);
+	if (length(pieces) != 2)
+		return null;
+
+	return `${pieces[0]}    - ${work_dir}/data/userfilters/*${pieces[1]}`;
 }
 
 function read_config() {
@@ -310,13 +539,6 @@ function root_private_temporary_file(metadata) {
 function root_private_lock_file(metadata) {
 	return metadata?.type == 'file' && metadata.uid == 0 && metadata.gid == 0 &&
 		metadata.mode == 0o600 && metadata.nlink == 1 && metadata.size == 0;
-}
-
-function same_inode(left, right) {
-	return left?.type == 'file' && right?.type == 'file' &&
-		left.inode == right.inode &&
-		left.dev?.major == right.dev?.major &&
-		left.dev?.minor == right.dev?.minor;
 }
 
 function ensure_yaml_job_directory() {
@@ -1006,6 +1228,204 @@ function yaml_scalar(value) {
 	return trim(value);
 }
 
+function yaml_simple_scalar(value) {
+	value = trim(replace(value, /[ \t]+#.*$/, ''));
+	if (!length(value))
+		return null;
+
+	let first = substr(value, 0, 1);
+	if (first == '"' || first == "'") {
+		if (length(value) < 2 || substr(value, length(value) - 1, 1) != first)
+			return null;
+		return substr(value, 1, length(value) - 2);
+	}
+	if (match(value, /[ \t]/) || first == '|' || first == '>' ||
+	    first == '&' || first == '*' || first == '!' || first == '[' ||
+	    first == '{')
+		return null;
+
+	return value;
+}
+
+function supported_password_scalar(value) {
+	let scalar = yaml_simple_scalar(value);
+	return type(scalar) == 'string' &&
+		match(scalar, /^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$/);
+}
+
+function admin_password_record(content) {
+	if (type(content) != 'string')
+		return null;
+
+	let lines = split(content, '\n');
+	let first = -1;
+	let last = length(lines);
+	let sections = 0;
+
+	for (let i = 0; i < length(lines); i++) {
+		if (match(lines[i], /^[^ \t#]/) &&
+		    trim(replace(lines[i], /[ \t]+#.*$/, '')) == 'users:') {
+			if (first < 0)
+				first = i;
+			sections++;
+		}
+	}
+	if (sections != 1)
+		return null;
+
+	for (let i = first + 1; i < length(lines); i++) {
+		if (match(lines[i], /^[^ \t#][^:]*:/)) {
+			last = i;
+			break;
+		}
+	}
+
+	let list_indent = 0;
+	let have_entry = false;
+	let current_name = null;
+	let current_name_count = 0;
+	let current_password_count = 0;
+	let current_password_line = -1;
+	let current_password_prefix = '';
+	let admin_count = 0;
+	let password_line = -1;
+	let password_prefix = '';
+
+	for (let i = first + 1; i < last; i++) {
+		if (match(lines[i], /^[ \t]*($|#)/))
+			continue;
+
+		let sequence = match(lines[i], /^( +)-[ \t]*(.*)$/);
+		if (sequence) {
+			let indent = length(sequence[1]);
+			if (!list_indent)
+				list_indent = indent;
+			if (indent == list_indent) {
+				if (have_entry && current_name_count == 1 && current_name == 'admin') {
+					admin_count++;
+					if (current_password_count != 1 || current_password_line < 0)
+						return null;
+					password_line = current_password_line;
+					password_prefix = current_password_prefix;
+				}
+
+				have_entry = true;
+				current_name = null;
+				current_name_count = 0;
+				current_password_count = 0;
+				current_password_line = -1;
+				current_password_prefix = '';
+
+				if (length(trim(sequence[2]))) {
+					let inline_field = match(sequence[2], /^([^:]+):[ \t]*(.*)$/);
+					if (!inline_field)
+						return null;
+					let key = trim(inline_field[1]);
+					if (key == 'name') {
+						current_name_count++;
+						current_name = yaml_simple_scalar(inline_field[2]);
+						if (current_name == null)
+							return null;
+					}
+					else if (key == 'password') {
+						if (!supported_password_scalar(inline_field[2]))
+							return null;
+						current_password_count++;
+						current_password_line = i;
+						current_password_prefix = `${sequence[1]}- password: `;
+					}
+				}
+				continue;
+			}
+		}
+
+		if (!have_entry || !list_indent)
+			return null;
+		let field = match(lines[i], /^( +)([^:]+):[ \t]*(.*)$/);
+		if (!field || length(field[1]) != list_indent + 2)
+			continue;
+
+		let key = trim(field[2]);
+		if (key == 'name') {
+			current_name_count++;
+			current_name = yaml_simple_scalar(field[3]);
+			if (current_name == null)
+				return null;
+		}
+		else if (key == 'password') {
+			if (!supported_password_scalar(field[3]))
+				return null;
+			current_password_count++;
+			current_password_line = i;
+			current_password_prefix = `${field[1]}password: `;
+		}
+	}
+
+	if (have_entry && current_name_count == 1 && current_name == 'admin') {
+		admin_count++;
+		if (current_password_count != 1 || current_password_line < 0)
+			return null;
+		password_line = current_password_line;
+		password_prefix = current_password_prefix;
+	}
+
+	if (admin_count != 1 || password_line < 0)
+		return null;
+
+	return { lines, password_line, password_prefix };
+}
+
+function password_info() {
+	let yaml = read_yaml();
+	if (!yaml)
+		return { available: false, error: 'YAML configuration is unavailable' };
+
+	return admin_password_record(yaml.content)
+		? { available: true, username: 'admin', sha256: yaml.sha256 }
+		: { available: false, error: 'The YAML admin account is unavailable or ambiguous' };
+}
+
+function update_admin_password(password_hash, expected_hash) {
+	if (type(password_hash) != 'string' || length(password_hash) != 60 ||
+	    !match(password_hash, /^\$2[aby]\$10\$[./A-Za-z0-9]{53}$/))
+		return { error: 'Invalid BCrypt password hash' };
+	if (type(expected_hash) != 'string' ||
+	    !match(expected_hash, /^[0-9a-f]{64}$/))
+		return { error: 'Invalid or missing YAML revision' };
+
+	let yaml = read_yaml();
+	if (!yaml)
+		return { error: 'YAML configuration is unavailable' };
+	if (yaml.sha256 != expected_hash)
+		return { error: 'YAML changed since the password dialog was opened' };
+
+	let record = admin_password_record(yaml.content);
+	if (!record)
+		return { error: 'The YAML admin account is unavailable or ambiguous' };
+
+	record.lines[record.password_line] =
+		`${record.password_prefix}${password_hash}`;
+	return update_yaml(join('\n', record.lines), expected_hash);
+}
+
+function reset_yaml(expected_hash) {
+	if (type(expected_hash) != 'string' ||
+	    !match(expected_hash, /^[0-9a-f]{64}$/))
+		return { error: 'Invalid or missing YAML revision' };
+
+	let yaml = read_yaml();
+	if (!yaml)
+		return { error: 'YAML configuration is unavailable' };
+	if (yaml.sha256 != expected_hash)
+		return { error: 'YAML changed since the page was loaded' };
+
+	let content = template_for_path(yaml.path);
+	if (!content)
+		return { error: 'The packaged YAML template is unavailable or unsafe' };
+
+	return update_yaml(content, expected_hash);
+}
+
 function yaml_section_value(content, section, key) {
 	let lines = split(content, '\n');
 	let first = -1;
@@ -1190,7 +1610,8 @@ function config_info() {
 		true
 	);
 
-	let tls_enabled = yaml_bool(yaml_section_value(content, 'tls', 'enabled'));
+	let tls_value = yaml_section_value(content, 'tls', 'enabled');
+	let tls_enabled = tls_value == null ? false : yaml_bool(tls_value);
 	if (tls_enabled == null)
 		return result;
 
@@ -1254,7 +1675,7 @@ function core_version() {
 const methods = {
 	get_status: {
 		call: function() {
-			return { running: service_running() };
+			return service_status();
 		},
 	},
 	get_version: {
@@ -1282,6 +1703,26 @@ const methods = {
 		args: { content: '', sha256: '' },
 		call: function(request) {
 			return update_yaml(request.args.content, request.args.sha256);
+		},
+	},
+	reset_yaml: {
+		args: { sha256: '' },
+		call: function(request) {
+			return reset_yaml(request.args.sha256);
+		},
+	},
+	get_password_info: {
+		call: function() {
+			return password_info();
+		},
+	},
+	set_password: {
+		args: { password_hash: '', sha256: '' },
+		call: function(request) {
+			return update_admin_password(
+				request.args.password_hash,
+				request.args.sha256
+			);
 		},
 	},
 	get_yaml_update: {

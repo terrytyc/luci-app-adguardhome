@@ -4,13 +4,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adguardhome
-PKG_VERSION:=2.1.0
+PKG_VERSION:=2.2.0
 PKG_RELEASE:=1
-PKG_LICENSE:=Apache-2.0
+PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
 LUCI_PKGARCH:=all
-LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +ucode-mod-uloop +coreutils-timeout +flock +procd-ujail +adguardhome
+LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +ucode-mod-uloop +flock +procd-ujail +adguardhome
 LUCI_EXTRA_DEPENDS:=adguardhome (>=0.107.76-r1)
 LUCI_DESCRIPTION:=LuCI integration for the packaged AdGuard Home service
 LUCI_MAINTAINER:=terrytyc
@@ -27,6 +27,9 @@ define Build/Prepare/luci-app-adguardhome
 	chmod 0755 $(PKG_BUILD_DIR)/root/etc/hotplug.d/acme/95-AdGuardHome
 	chmod 0700 $(PKG_BUILD_DIR)/root/etc/AdGuardHome
 	chmod 0600 $(PKG_BUILD_DIR)/root/etc/AdGuardHome/AdGuardHome.yaml
+	chmod 0644 $(PKG_BUILD_DIR)/root/usr/share/luci-app-adguardhome/default.yaml
+	cmp -s $(PKG_BUILD_DIR)/root/etc/AdGuardHome/AdGuardHome.yaml \
+		$(PKG_BUILD_DIR)/root/usr/share/luci-app-adguardhome/default.yaml
 endef
 
 # Keep legacy YAML locations and the root-private original-state snapshot in
@@ -39,27 +42,142 @@ define Package/$(PKG_NAME)/conffiles
 /root/.luci-app-adguardhome/
 endef
 
-# APK maps this hook to both pre-install and pre-upgrade.  v2.1 accepts only a
-# clean install: reject upgrades before any mutation, while a first install
-# snapshots the untouched official UCI/runtime state for safe uninstall.
+# APK maps this hook to both pre-install and pre-upgrade.  A first install
+# snapshots the untouched official UCI/runtime state for safe uninstall.  The
+# only supported in-place source is the released v2.1.0-r1 package; reject any
+# other installed version before creating maintenance state or touching DNS.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$${IPKG_INSTROOT}" ] || exit 0
 
-# v2.1 is a clean-install baseline.  Reject every package-manager upgrade
-# before creating YAML maintenance state, snapshotting UCI, changing DNS, or
-# stopping either service.  APK supplies PKG_UPGRADE=1 from its pre-upgrade
-# wrapper; opkg passes "upgrade" as argv[1].  The installed manifests cover
-# callers which omit both lifecycle hints.
+# Bound lifecycle helpers with the BusyBox tools already in the base system.
+run_bounded() (
+	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0
+	shift 2
+	case "$$limit" in ""|*[!0-9]*) exit 125 ;; esac
+	case "$$grace" in ""|*[!0-9]*) exit 125 ;; esac
+	[ "$$#" -gt 0 ] || exit 125
+	[ -x /usr/bin/setsid ] || exit 125
+	marker="$$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
+	chmod 0600 "$$marker" || {
+		rm -f "$$marker"
+		exit 125
+	}
+	printf '0\n' >"$$marker" || {
+		rm -f "$$marker"
+		exit 125
+	}
+	bounded_signal_session() {
+		/bin/kill "-$$1" -- "-$$child" 2>/dev/null ||
+			/bin/kill "-$$1" "$$child" 2>/dev/null || true
+	}
+	bounded_abort() {
+		trap - HUP INT QUIT TERM
+		[ -z "$$watchdog" ] || /bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		[ -z "$$watchdog" ] || wait "$$watchdog" 2>/dev/null || true
+		if [ -n "$$child" ]; then
+			bounded_signal_session TERM
+			sleep "$$grace" 2>/dev/null || true
+			bounded_signal_session KILL
+			wait "$$child" 2>/dev/null || true
+		fi
+		rm -f "$$marker"
+		exit 125
+	}
+	trap bounded_abort HUP INT QUIT TERM
+	[ ! -e /proc/self/fd/187 ] || bounded_abort
+	exec 187<&0 || bounded_abort
+	/usr/bin/setsid "$$@" <&187 187<&- &
+	child=$$!
+	exec 187<&-
+	(
+		bounded_sleeper=""
+		bounded_watchdog_abort() {
+			trap - HUP INT QUIT TERM
+			[ -z "$$bounded_sleeper" ] || /bin/kill -TERM "$$bounded_sleeper" 2>/dev/null || true
+			[ -z "$$bounded_sleeper" ] || wait "$$bounded_sleeper" 2>/dev/null || true
+			exit 1
+		}
+		bounded_watchdog_sleep() {
+			sleep "$$1" &
+			bounded_sleeper=$$!
+			wait "$$bounded_sleeper"
+			bounded_sleep_rc=$$?
+			bounded_sleeper=""
+			return "$$bounded_sleep_rc"
+		}
+		trap bounded_watchdog_abort HUP INT QUIT TERM
+		bounded_watchdog_sleep "$$limit" || exit 1
+		/bin/kill -0 -- "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
+		printf '1\n' >"$$marker" || exit 1
+		bounded_signal_session TERM
+		bounded_watchdog_sleep "$$grace" || exit 0
+		bounded_signal_session KILL
+	) &
+	watchdog=$$!
+	wait "$$child" 2>/dev/null || rc=$$?
+	read -r expired <"$$marker" 2>/dev/null || expired=0
+	if [ "$$expired" = 1 ]; then
+		wait "$$watchdog" 2>/dev/null || true
+	else
+		/bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		wait "$$watchdog" 2>/dev/null || true
+	fi
+	trap - HUP INT QUIT TERM
+	rm -f "$$marker"
+	[ "$$expired" = 1 ] && exit 124
+	exit "$$rc"
+)
+
+# APK supplies PKG_UPGRADE=1 from its pre-upgrade wrapper; opkg passes
+# "upgrade" as argv[1].  Installed manifests cover callers which omit both
+# lifecycle hints.  Version discovery is deliberately read-only and happens
+# before legacy-marker cleanup, YAML quiescing, or snapshot creation.
 is_upgrade=0
 case "$${PKG_UPGRADE}:$${1}" in
 	1:*|*:upgrade) is_upgrade=1 ;;
 esac
 [ -f /usr/lib/opkg/info/luci-app-adguardhome.list ] && is_upgrade=1
 [ -f /lib/apk/packages/luci-app-adguardhome.list ] && is_upgrade=1
+
+installed_source_version() {
+	local apk_record opkg_record
+	if [ -f /lib/apk/packages/luci-app-adguardhome.list ]; then
+		[ ! -f /usr/lib/opkg/info/luci-app-adguardhome.list ] || return 1
+		command -v apk >/dev/null 2>&1 || return 1
+		apk_record="$$(apk list --installed luci-app-adguardhome 2>/dev/null | awk '
+			$$1 ~ /^luci-app-adguardhome-/ { matches++; record=$$1 }
+			END { if (matches == 1) print record; else exit 1 }
+		')" || return 1
+		case "$$apk_record" in
+			luci-app-adguardhome-*) ;;
+			*) return 1 ;;
+		esac
+		printf '%s\n' "$${apk_record#luci-app-adguardhome-}"
+		return
+	fi
+	if [ -f /usr/lib/opkg/info/luci-app-adguardhome.list ]; then
+		command -v opkg >/dev/null 2>&1 || return 1
+		opkg_record="$$(opkg status luci-app-adguardhome 2>/dev/null)" || return 1
+		printf '%s\n' "$$opkg_record" | awk '
+			$$1 == "Package:" && $$2 == "luci-app-adguardhome" { packages++; next }
+			$$1 == "Version:" && NF == 2 { versions++; version=$$2 }
+			END { if (packages == 1 && versions == 1) print version; else exit 1 }
+		'
+		return
+	fi
+	return 1
+}
+
 if [ "$$is_upgrade" = 1 ]; then
-	echo "In-place luci-app-adguardhome upgrades are unsupported; uninstall the old LuCI plugin, then install v2.1. Keep the official adguardhome core package installed." >&2
-	exit 1
+	installed_version="$$(installed_source_version)" || {
+		echo "Unable to determine the installed luci-app-adguardhome version; upgrade aborted before any state change." >&2
+		exit 1
+	}
+	if [ "$$installed_version" != 2.1.0-r1 ]; then
+		echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1; found '$$installed_version'." >&2
+		exit 1
+	fi
 fi
 
 snapshot_dir=/root/.luci-app-adguardhome
@@ -70,12 +188,17 @@ snapshot_version="$${snapshot_dir}/snapshot-version"
 runtime_dir=/var/run/luci-app-adguardhome
 upgrade_marker="$${runtime_dir}/upgrade"
 init_enabled_marker="$${runtime_dir}/init-enabled"
+upgrade_yaml_snapshot="$${runtime_dir}/upgrade-active.yaml"
+upgrade_workdir_metadata="$${runtime_dir}/upgrade-workdir.meta"
 yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
 yaml_update_lock="$${yaml_runtime_dir}/update.lock"
 yaml_maintenance_marker="$${yaml_runtime_dir}/removing"
 yaml_maintenance_created=0
 yaml_maintenance_committed=0
 snapshot_stage=""
+upgrade_restore_required=0
+upgrade_was_running=0
+upgrade_workdir=""
 
 # Historical versions trusted these world-writable marker paths.  Never read
 # them; remove only the two exact legacy objects before doing any work.
@@ -130,6 +253,153 @@ root_private_empty_file() {
 		[ "$$owner" = 0 ] && [ "$$group" = 0 ] || return 1
 	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
 	[ "$$size" = 0 ]
+}
+
+root_private_single_file() {
+	local metadata mode links owner group
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+root_owned_directory_allow_writable() {
+	local metadata owner group
+	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r _mode _links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+root_owned_regular_file() {
+	local metadata mode owner group
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode _links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	case "$$mode" in -?????????) ;; *) return 1 ;; esac
+	[ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+path_contains_symlink() {
+	local remaining="$${1#/}" component current=""
+	while [ -n "$$remaining" ]; do
+		component="$${remaining%%/*}"
+		current="$${current}/$${component}"
+		[ ! -L "$$current" ] || return 0
+		[ "$$remaining" = "$$component" ] && break
+		remaining="$${remaining#*/}"
+	done
+	return 1
+}
+
+trusted_mnt_ancestors() {
+	local value="$${1%/}" parent remaining component current
+	case "$$value" in /mnt/*/*) ;; *) return 1 ;; esac
+	parent="$${value%/*}"
+	[ "$$parent" != /mnt ] || return 1
+	current=/mnt
+	root_owned_safe_directory "$$current" || return 1
+	remaining="$${parent#/mnt/}"
+	while [ -n "$$remaining" ]; do
+		component="$${remaining%%/*}"
+		current="$${current}/$${component}"
+		root_owned_safe_directory "$$current" || return 1
+		[ "$$remaining" = "$$component" ] && break
+		remaining="$${remaining#*/}"
+	done
+}
+
+valid_upgrade_workdir_path() {
+	local value="$$1" parent leaf
+	case "$$value" in
+		""|/|//*|*//*|*/) return 1 ;;
+		/*) ;;
+		*) return 1 ;;
+	esac
+	case "$$value" in *[!A-Za-z0-9_./+@%:,=-]*) return 1 ;; esac
+	case "$${value}/" in */./*|*/../*) return 1 ;; esac
+	parent="$${value%/*}"
+	leaf="$${value##*/}"
+	case "$$leaf" in AdGuardHome|AdGuardHome-?*) ;; *) return 1 ;; esac
+	case "$$parent" in
+		/etc) root_owned_directory_allow_writable /etc || return 1 ;;
+		/mnt/*) trusted_mnt_ancestors "$$value" || return 1 ;;
+		*) return 1 ;;
+	esac
+	[ -d "$$value" ] && [ ! -L "$$value" ] || return 1
+	! path_contains_symlink "$$value"
+}
+
+upgrade_workdir_metadata() {
+	local metadata mode owner group
+	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode _links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	case "$$owner:$$group:$$mode" in
+		0:0:drwx------|0:853:drwx------|853:853:drwx------) ;;
+		*) return 1 ;;
+	esac
+}
+
+upgrade_yaml_metadata() {
+	local metadata mode links owner group size
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group size _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$links" = 1 ] || return 1
+	case "$$owner:$$group:$$mode" in
+		0:0:-rw-------|0:853:-rw-r-----|853:853:-rw-------|853:853:-rw-r-----) ;;
+		*) return 1 ;;
+	esac
+	case "$$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$$size" -gt 0 ] && [ "$$size" -le 524288 ]
+}
+
+upgrade_source_anchors_match() {
+	local value="$$1" upper_work lower_work lower_config
+	upper_work="$$(uci -q get AdGuardHome.AdGuardHome.workdir)" || return 1
+	lower_work="$$(uci -q get adguardhome.config.work_dir)" || return 1
+	lower_config="$$(uci -q get adguardhome.config.config_file)" || return 1
+	[ "$$upper_work" = "$$value" ] && [ "$$lower_work" = "$$value" ] &&
+		[ "$$lower_config" = "$${value}/AdGuardHome.yaml" ]
+}
+
+prepare_upgrade_snapshot_source() {
+	local upper_enabled running_rc=0
+	[ -x /etc/init.d/AdGuardHome ] && [ -f /etc/init.d/AdGuardHome ] &&
+		[ ! -L /etc/init.d/AdGuardHome ] &&
+		root_owned_regular_file /etc/init.d/AdGuardHome || return 1
+	[ -x /etc/init.d/adguardhome ] && [ -f /etc/init.d/adguardhome ] &&
+		[ ! -L /etc/init.d/adguardhome ] &&
+		root_owned_regular_file /etc/init.d/adguardhome || return 1
+	upgrade_workdir="$$(uci -q get AdGuardHome.AdGuardHome.workdir)" || return 1
+	valid_upgrade_workdir_path "$$upgrade_workdir" || return 1
+	upgrade_source_anchors_match "$$upgrade_workdir" || return 1
+	upgrade_workdir_metadata "$$upgrade_workdir" || return 1
+	upgrade_yaml_metadata "$${upgrade_workdir}/AdGuardHome.yaml" || return 1
+	upper_enabled="$$(uci -q get AdGuardHome.AdGuardHome.enabled)" || return 1
+	case "$$upper_enabled" in 0|1) ;; *) return 1 ;; esac
+	run_bounded 5 1 /etc/init.d/adguardhome running \
+		>/dev/null 2>&1 || running_rc=$$?
+	case "$$running_rc" in
+		0)
+			[ "$$upper_enabled" = 1 ] || return 1
+			upgrade_was_running=1
+			;;
+		1) upgrade_was_running=0 ;;
+		*) return 1 ;;
+	esac
 }
 
 quiesce_yaml_updates() {
@@ -188,7 +458,7 @@ capture_official_config() (
 	case "$$fd_mode" in -?????????) ;; *) exit 1 ;; esac
 	[ "$$fd_owner" = 0 ] && [ "$$fd_group" = 0 ] || exit 1
 	[ "$$fd_path" -ef /etc/config/adguardhome ] || exit 1
-	/usr/bin/timeout -k 1s 5s /bin/dd if="$$fd_path" \
+	run_bounded 5 1 /bin/dd if="$$fd_path" \
 		bs=4096 count=129 of="$$target" 2>/dev/null || exit 1
 	[ ! -L /etc/config/adguardhome ] &&
 		[ "$$fd_path" -ef /etc/config/adguardhome ]
@@ -223,14 +493,15 @@ validate_original_snapshot() {
 	grep -Eq '^package[[:space:]]+adguardhome$$' "$$snapshot_uci"
 }
 
-discard_official_pending_delta() {
+ensure_no_official_pending_delta() {
 	local delta_dir=/tmp/.uci delta_file=/tmp/.uci/adguardhome
 	if [ ! -e "$$delta_dir" ] && [ ! -L "$$delta_dir" ]; then
 		return 0
 	fi
 	root_private_directory "$$delta_dir" || return 1
 	if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
-		rm -f "$$delta_file" || return 1
+		echo "Pending official adguardhome UCI changes must be committed or reverted before installing this plugin." >&2
+		return 1
 	fi
 	[ ! -e "$$delta_file" ] && [ ! -L "$$delta_file" ]
 }
@@ -258,10 +529,6 @@ ensure_original_snapshot() {
 		return 0
 	fi
 	root_owned_safe_directory /root || return 1
-	[ -x /usr/bin/timeout ] || {
-		echo "The required coreutils timeout helper is missing." >&2
-		return 1
-	}
 	stage="$$(mktemp -d /root/.luci-app-adguardhome.XXXXXX)" || return 1
 	snapshot_stage="$$stage"
 	if ! chown 0:0 "$$stage" || ! chmod 0700 "$$stage"; then
@@ -284,7 +551,7 @@ ensure_original_snapshot() {
 		echo "Unable to capture the original official adguardhome config file." >&2
 		return 1
 	fi
-	if ! /usr/bin/timeout -k 1s 5s uci -q -c "$$stage" \
+	if ! run_bounded 5 1 uci -q -c "$$stage" \
 		export "$$snapshot_package" >"$$raw_export" ||
 	   ! chown 0:0 "$$raw_export" || ! chmod 0600 "$$raw_export" ||
 	   ! bounded_private_file "$$raw_export" ||
@@ -306,7 +573,7 @@ ensure_original_snapshot() {
 		return 1
 	}
 	if [ -x /etc/init.d/adguardhome ]; then
-		/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+		run_bounded 5 1 /etc/init.d/adguardhome running \
 			>/dev/null 2>&1 || running_rc=$$?
 		case "$$running_rc" in
 			0) was_running=1 ;;
@@ -383,6 +650,34 @@ ensure_runtime_dir() {
 	validate_runtime_dir
 }
 
+private_single_file_at_most() {
+	local size
+	root_private_single_file "$$1" || return 1
+	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+	case "$$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$$size" -le "$$2" ]
+}
+
+private_single_file_between() {
+	local size
+	private_single_file_at_most "$$1" "$$3" || return 1
+	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+	[ "$$size" -ge "$$2" ]
+}
+
+valid_runtime_temp_name() {
+	local entry="$$1" suffix
+	case "$$entry" in
+		"$$runtime_dir"/.upgrade-active.yaml.??????|\
+		"$$runtime_dir"/.upgrade-verify.yaml.??????|\
+		"$$runtime_dir"/.upgrade-workdir.meta.??????) ;;
+		*) return 1 ;;
+	esac
+	suffix="$${entry##*.}"
+	case "$$suffix" in ??????) ;; *) return 1 ;; esac
+	case "$$suffix" in *[!A-Za-z0-9]*) return 1 ;; esac
+}
+
 validate_initial_runtime_contents() {
 	local entry
 	validate_runtime_dir || return 1
@@ -392,11 +687,269 @@ validate_initial_runtime_contents() {
 		"$$runtime_dir"/..?*; do
 		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
 		case "$$entry" in
-			"$$upgrade_marker"|"$$init_enabled_marker") ;;
+			"$$upgrade_marker"|"$$init_enabled_marker")
+				private_single_file_between "$$entry" 1 64 || return 1
+				;;
+			"$$upgrade_yaml_snapshot")
+				private_single_file_between "$$entry" 1 524288 || return 1
+				;;
+			"$$upgrade_workdir_metadata")
+				private_single_file_between "$$entry" 1 4096 || return 1
+				;;
+			"$$runtime_dir"/.upgrade-active.yaml.??????|\
+			"$$runtime_dir"/.upgrade-verify.yaml.??????)
+				valid_runtime_temp_name "$$entry" &&
+					private_single_file_at_most "$$entry" 524288 || return 1
+				;;
+			"$$runtime_dir"/.upgrade-workdir.meta.??????)
+				valid_runtime_temp_name "$$entry" &&
+					private_single_file_at_most "$$entry" 4096 || return 1
+				;;
 			*) return 1 ;;
 		esac
 	done
 }
+
+clear_upgrade_snapshot_artifacts() {
+	local entry
+	validate_runtime_dir || return 1
+	rm -f "$$upgrade_yaml_snapshot" "$$upgrade_workdir_metadata" \
+		"$$runtime_dir"/.upgrade-active.yaml.?????? \
+		"$$runtime_dir"/.upgrade-verify.yaml.?????? \
+		"$$runtime_dir"/.upgrade-workdir.meta.?????? || return 1
+	for entry in \
+		"$$upgrade_yaml_snapshot" \
+		"$$upgrade_workdir_metadata" \
+		"$$runtime_dir"/.upgrade-active.yaml.?????? \
+		"$$runtime_dir"/.upgrade-verify.yaml.?????? \
+		"$$runtime_dir"/.upgrade-workdir.meta.??????; do
+		[ ! -e "$$entry" ] && [ ! -L "$$entry" ] || return 1
+	done
+}
+
+fd_directory_metadata_matches() {
+	local metadata mode owner group
+	metadata="$$(LC_ALL=C ls -ldnL "$$1" 2>/dev/null)" || return 1
+	read -r mode _links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "$$2" ] && [ "$$owner" = "$$3" ] && [ "$$group" = "$$4" ]
+}
+
+adguard_uid_process_exists() {
+	local status uids
+	for status in /proc/[0-9]*/task/[0-9]*/status; do
+		if [ ! -r "$$status" ]; then
+			[ ! -e "$$status" ] && continue
+			return 0
+		fi
+		uids="$$(awk '$$1 == "Uid:" {
+			if (NF != 5) exit 2
+			for (i=2; i<=5; i++) if ($$i !~ /^[0-9]+$$/) exit 2
+			print $$2, $$3, $$4, $$5; found=1; exit }
+			END { if (!found) exit 1 }' "$$status" 2>/dev/null)" || {
+			[ ! -e "$$status" ] && continue
+			return 0
+		}
+		case " $$uids " in *" 853 "*) return 0 ;; esac
+	done
+	return 1
+}
+
+snapshot_sha256() {
+	local digest
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	digest="$$(sha256sum "$$1" 2>/dev/null)" || return 1
+	digest="$${digest%% *}"
+	[ "$${#digest}" -eq 64 ] || return 1
+	case "$$digest" in *[!0-9a-f]*) return 1 ;; esac
+	printf '%s\n' "$$digest"
+}
+
+# The old v2.1 core is stopped before this transaction.  Hold the exact
+# persistent workdir inode and capture the active YAML twice without changing
+# its metadata.  A service-owned namespace is read only by uid 853 through the
+# inherited directory descriptor, so root never opens a replaceable pathname.
+# No data subtree is traversed or copied here.
+cold_snapshot_upgrade_yaml() (
+	snapshot_workdir="$$1"
+	snapshot_config="$${snapshot_workdir}/AdGuardHome.yaml"
+	snapshot_workdir_fd=""
+	snapshot_config_fd=""
+	snapshot_original_owner=""
+	snapshot_original_group=""
+	snapshot_committed=0
+	snapshot_yaml_tmp=""
+	snapshot_verify_tmp=""
+	snapshot_meta_tmp=""
+
+	cleanup_cold_upgrade_snapshot() {
+		snapshot_primary_rc="$$1"
+		snapshot_cleanup_rc=0
+		for snapshot_temporary in \
+			"$$snapshot_yaml_tmp" "$$snapshot_verify_tmp" "$$snapshot_meta_tmp"; do
+			[ -n "$$snapshot_temporary" ] || continue
+			case "$$snapshot_temporary" in
+				"$$runtime_dir"/.upgrade-active.yaml.??????|\
+				"$$runtime_dir"/.upgrade-verify.yaml.??????|\
+				"$$runtime_dir"/.upgrade-workdir.meta.??????)
+					rm -f "$$snapshot_temporary" || snapshot_cleanup_rc=1
+					;;
+				*) snapshot_cleanup_rc=1 ;;
+			esac
+		done
+		if [ "$$snapshot_primary_rc" -ne 0 ] ||
+		   [ "$$snapshot_cleanup_rc" -ne 0 ] ||
+		   [ "$$snapshot_committed" != 1 ]; then
+			rm -f "$$upgrade_yaml_snapshot" "$$upgrade_workdir_metadata" ||
+				snapshot_cleanup_rc=1
+		fi
+		if [ "$$snapshot_primary_rc" -ne 0 ]; then
+			return "$$snapshot_primary_rc"
+		fi
+		return "$$snapshot_cleanup_rc"
+	}
+
+	cold_upgrade_snapshot_on_exit() {
+		snapshot_exit_rc=$$?
+		trap '' 0 HUP INT TERM
+		snapshot_exit_final_rc=0
+		cleanup_cold_upgrade_snapshot "$$snapshot_exit_rc" ||
+			snapshot_exit_final_rc=$$?
+		exit "$$snapshot_exit_final_rc"
+	}
+
+	trap cold_upgrade_snapshot_on_exit 0
+	trap 'exit 1' HUP INT TERM
+	validate_runtime_dir || exit 1
+	[ ! -e "$$upgrade_yaml_snapshot" ] && [ ! -L "$$upgrade_yaml_snapshot" ] || exit 1
+	[ ! -e "$$upgrade_workdir_metadata" ] && [ ! -L "$$upgrade_workdir_metadata" ] || exit 1
+	valid_upgrade_workdir_path "$$snapshot_workdir" || exit 1
+	upgrade_source_anchors_match "$$snapshot_workdir" || exit 1
+	upgrade_workdir_metadata "$$snapshot_workdir" || exit 1
+
+	exec 7<"$$snapshot_workdir" || exit 1
+	snapshot_workdir_fd=/proc/self/fd/7
+	[ -d "$$snapshot_workdir_fd" ] &&
+		[ "$$snapshot_workdir_fd" -ef "$$snapshot_workdir" ] || exit 1
+	snapshot_directory_metadata="$$(LC_ALL=C ls -ldnL \
+		"$$snapshot_workdir_fd" 2>/dev/null)" || exit 1
+	read -r snapshot_directory_mode _snapshot_directory_links \
+		snapshot_original_owner snapshot_original_group \
+		_snapshot_directory_remainder <<-EOF
+	$$snapshot_directory_metadata
+	EOF
+	case "$$snapshot_original_owner:$$snapshot_original_group:$$snapshot_directory_mode" in
+		0:0:drwx------|0:853:drwx------|853:853:drwx------) ;;
+		*) exit 1 ;;
+	esac
+	adguard_uid_process_exists && exit 1
+	[ "$$snapshot_workdir_fd" -ef "$$snapshot_workdir" ] &&
+		fd_directory_metadata_matches "$$snapshot_workdir_fd" drwx------ \
+			"$$snapshot_original_owner" "$$snapshot_original_group" || exit 1
+
+	upgrade_yaml_metadata "$$snapshot_config" || exit 1
+	snapshot_config_metadata="$$(LC_ALL=C ls -ldn \
+		"$$snapshot_config" 2>/dev/null)" || exit 1
+	read -r snapshot_config_mode snapshot_config_links snapshot_config_owner \
+		snapshot_config_group snapshot_config_size _snapshot_config_remainder <<-EOF
+	$$snapshot_config_metadata
+	EOF
+	[ "$$snapshot_config_links" = 1 ] || exit 1
+	case "$$snapshot_config_owner:$$snapshot_config_group:$$snapshot_config_mode" in
+		0:0:-rw-------|0:853:-rw-r-----|853:853:-rw-------|853:853:-rw-r-----) ;;
+		*) exit 1 ;;
+	esac
+	case "$$snapshot_config_size" in ""|*[!0-9]*) exit 1 ;; esac
+	[ "$$snapshot_config_size" -gt 0 ] &&
+		[ "$$snapshot_config_size" -le 524288 ] || exit 1
+
+	umask 077
+	snapshot_yaml_tmp="$$(mktemp \
+		"$$runtime_dir/.upgrade-active.yaml.XXXXXX")" || exit 1
+	snapshot_verify_tmp="$$(mktemp \
+		"$$runtime_dir/.upgrade-verify.yaml.XXXXXX")" || exit 1
+	snapshot_meta_tmp="$$(mktemp \
+		"$$runtime_dir/.upgrade-workdir.meta.XXXXXX")" || exit 1
+	valid_runtime_temp_name "$$snapshot_yaml_tmp" &&
+		valid_runtime_temp_name "$$snapshot_verify_tmp" &&
+		valid_runtime_temp_name "$$snapshot_meta_tmp" || exit 1
+	chown 0:0 "$$snapshot_yaml_tmp" "$$snapshot_verify_tmp" "$$snapshot_meta_tmp" &&
+		chmod 0600 "$$snapshot_yaml_tmp" "$$snapshot_verify_tmp" \
+			"$$snapshot_meta_tmp" || exit 1
+
+	case "$$snapshot_original_owner" in
+		853)
+			run_bounded 5 1 \
+				/sbin/start-stop-daemon -S -c 853:853 -n AGHUpgradeRead \
+				-x /bin/dd -- if="$$snapshot_workdir_fd/AdGuardHome.yaml" \
+				bs=4096 count=129 >"$$snapshot_yaml_tmp" 2>/dev/null || exit 1
+			run_bounded 5 1 \
+				/sbin/start-stop-daemon -S -c 853:853 -n AGHUpgradeRead \
+				-x /bin/dd -- if="$$snapshot_workdir_fd/AdGuardHome.yaml" \
+				bs=4096 count=129 >"$$snapshot_verify_tmp" 2>/dev/null || exit 1
+			;;
+		0)
+			exec 8<"$$snapshot_config" || exit 1
+			snapshot_config_fd=/proc/self/fd/8
+			[ -f "$$snapshot_config_fd" ] &&
+				[ "$$snapshot_config_fd" -ef "$$snapshot_config" ] || exit 1
+			run_bounded 5 1 /bin/dd if="$$snapshot_config_fd" \
+				bs=4096 count=129 of="$$snapshot_yaml_tmp" 2>/dev/null || exit 1
+			run_bounded 5 1 /bin/dd if="$$snapshot_config_fd" \
+				bs=4096 count=129 of="$$snapshot_verify_tmp" 2>/dev/null || exit 1
+			[ "$$snapshot_config_fd" -ef "$$snapshot_config" ] || exit 1
+			;;
+		*) exit 1 ;;
+	esac
+	[ "$$snapshot_workdir_fd" -ef "$$snapshot_workdir" ] || exit 1
+	fd_directory_metadata_matches "$$snapshot_workdir_fd" drwx------ \
+		"$$snapshot_original_owner" "$$snapshot_original_group" || exit 1
+	upgrade_yaml_metadata "$$snapshot_config" || exit 1
+	[ "$$(LC_ALL=C ls -ldn "$$snapshot_config" 2>/dev/null)" = \
+		"$$snapshot_config_metadata" ] || exit 1
+	private_single_file_between "$$snapshot_yaml_tmp" 1 524288 &&
+		private_single_file_between "$$snapshot_verify_tmp" 1 524288 || exit 1
+	cmp -s "$$snapshot_yaml_tmp" "$$snapshot_verify_tmp" || exit 1
+	snapshot_yaml_size="$$(wc -c <"$$snapshot_yaml_tmp" 2>/dev/null)" || exit 1
+	[ "$$snapshot_yaml_size" = "$$snapshot_config_size" ] || exit 1
+	snapshot_yaml_hash="$$(snapshot_sha256 "$$snapshot_yaml_tmp")" || exit 1
+	[ "$$(snapshot_sha256 "$$snapshot_verify_tmp")" = "$$snapshot_yaml_hash" ] || exit 1
+
+	{
+		printf 'format=1\n'
+		printf 'source_version=2.1.0-r1\n'
+		printf 'workdir=%s\n' "$$snapshot_workdir"
+		printf 'uid=%s\n' "$$snapshot_original_owner"
+		printf 'gid=%s\n' "$$snapshot_original_group"
+		printf 'mode=0700\n'
+		printf 'config_file=%s\n' "$$snapshot_config"
+		printf 'yaml_sha256=%s\n' "$$snapshot_yaml_hash"
+		printf 'yaml_size=%s\n' "$$snapshot_yaml_size"
+		printf 'was_running=%s\n' "$$upgrade_was_running"
+	} >"$$snapshot_meta_tmp" || exit 1
+	chown 0:0 "$$snapshot_meta_tmp" && chmod 0600 "$$snapshot_meta_tmp" || exit 1
+	private_single_file_between "$$snapshot_meta_tmp" 1 4096 || exit 1
+	[ "$$(wc -l <"$$snapshot_meta_tmp" 2>/dev/null)" = 10 ] || exit 1
+
+	rm -f "$$snapshot_verify_tmp" || exit 1
+	snapshot_verify_tmp=""
+	mv "$$snapshot_yaml_tmp" "$$upgrade_yaml_snapshot" || exit 1
+	snapshot_yaml_tmp=""
+	mv "$$snapshot_meta_tmp" "$$upgrade_workdir_metadata" || exit 1
+	snapshot_meta_tmp=""
+	private_single_file_between "$$upgrade_yaml_snapshot" 1 524288 &&
+		private_single_file_between "$$upgrade_workdir_metadata" 1 4096 || exit 1
+	[ "$$(snapshot_sha256 "$$upgrade_yaml_snapshot")" = "$$snapshot_yaml_hash" ] || exit 1
+	[ "$$(wc -c <"$$upgrade_yaml_snapshot" 2>/dev/null)" = \
+		"$$snapshot_yaml_size" ] || exit 1
+	snapshot_committed=1
+
+	trap '' 0 HUP INT TERM
+	snapshot_final_rc=0
+	cleanup_cold_upgrade_snapshot 0 || snapshot_final_rc=$$?
+	exit "$$snapshot_final_rc"
+)
 
 write_runtime_marker() {
 	local marker="$$1"
@@ -408,17 +961,49 @@ write_runtime_marker() {
 		[ "$$(wc -c <"$$marker" 2>/dev/null)" = 2 ] && grep -qx '1' "$$marker"
 }
 
+restore_failed_upgrade() {
+	local running_rc=0
+	[ "$$upgrade_restore_required" = 1 ] || return 0
+	[ "$$upgrade_was_running" = 1 ] || return 0
+	run_bounded 150 5 /etc/init.d/AdGuardHome start \
+		>/dev/null 2>&1 || return 1
+	run_bounded 5 1 /etc/init.d/adguardhome running \
+		>/dev/null 2>&1 || running_rc=$$?
+	[ "$$running_rc" = 0 ] || return 1
+	run_bounded 150 5 /etc/init.d/AdGuardHome do_redirect 1 \
+		>/dev/null 2>&1
+}
+
 cleanup_upgrade_markers() {
+	local cleanup_rc=0
+	if ! restore_failed_upgrade; then
+		echo "Unable to restore the running AdGuard Home v2.1 service after the failed upgrade." >&2
+		cleanup_rc=1
+	fi
 	cleanup_yaml_maintenance
 	cleanup_snapshot_stage "$$snapshot_stage"
 	if validate_runtime_dir; then
-		rm -f "$$upgrade_marker" "$$init_enabled_marker"
+		clear_upgrade_snapshot_artifacts || cleanup_rc=1
+		rm -f "$$upgrade_marker" "$$init_enabled_marker" || cleanup_rc=1
 		rmdir "$$runtime_dir" 2>/dev/null || true
+	elif [ "$$is_upgrade" = 1 ] &&
+	     { [ -e "$$runtime_dir" ] || [ -L "$$runtime_dir" ]; }; then
+		cleanup_rc=1
 	fi
+	return "$$cleanup_rc"
 }
 
-trap cleanup_upgrade_markers 0
+preinst_exit() {
+	local primary_rc=$$? cleanup_rc=0
+	trap '' 0 HUP INT TERM
+	cleanup_upgrade_markers || cleanup_rc=$$?
+	[ "$$primary_rc" -ne 0 ] && exit "$$primary_rc"
+	exit "$$cleanup_rc"
+}
+
+trap preinst_exit 0
 trap 'exit 1' HUP INT TERM
+ensure_no_official_pending_delta || exit 1
 quiesce_yaml_updates || {
 	echo "Unable to quiesce LuCI YAML updates; installation aborted." >&2
 	exit 1
@@ -432,8 +1017,8 @@ esac
 [ -f /lib/apk/packages/luci-app-adguardhome.list ] && is_upgrade=1
 [ "$$is_upgrade" = 1 ] || {
 	yaml_maintenance_committed=1
-	cleanup_upgrade_markers
-	trap - 0 HUP INT TERM
+	trap '' 0 HUP INT TERM
+	cleanup_upgrade_markers || exit 1
 	exit 0
 }
 ensure_runtime_dir || {
@@ -442,6 +1027,10 @@ ensure_runtime_dir || {
 }
 validate_initial_runtime_contents || {
 	echo "Unexpected AdGuard Home lifecycle runtime entry; upgrade aborted." >&2
+	exit 1
+}
+clear_upgrade_snapshot_artifacts || {
+	echo "Unable to clear stale AdGuard Home upgrade snapshots; upgrade aborted." >&2
 	exit 1
 }
 write_runtime_marker "$$upgrade_marker" || {
@@ -462,6 +1051,16 @@ for init_link in /etc/rc.d/S??AdGuardHome /etc/rc.d/K??AdGuardHome; do
 	}
 	break
 done
+
+prepare_upgrade_snapshot_source || {
+	echo "The active AdGuard Home v2.1 workdir or service state is not trustworthy; upgrade aborted before DNS or service changes." >&2
+	exit 1
+}
+
+# Every path below may change resolver or runtime state.  An EXIT cleanup will
+# restart a previously running v2.1 installation unless preinst commits the
+# cold upgrade snapshot successfully.
+upgrade_restore_required=1
 
 ensure_dnsmasq_generic_upstream() {
 	local rollback_port="$$1" servers server has_generic=0 resolvfile
@@ -645,13 +1244,13 @@ else
 fi
 
 if [ -x /etc/init.d/adguardhome ]; then
-	/usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome stop \
+	run_bounded 20 2 /etc/init.d/adguardhome stop \
 		>/dev/null 2>&1 || {
 		echo "Unable to stop the packaged AdGuard Home service; upgrade aborted." >&2
 		exit 1
 	}
 	lower_running_rc=0
-	/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+	run_bounded 5 1 /etc/init.d/adguardhome running \
 		>/dev/null 2>&1 || lower_running_rc=$$?
 	case "$$lower_running_rc" in
 		1) ;;
@@ -666,8 +1265,14 @@ if [ -x /etc/init.d/adguardhome ]; then
 	esac
 fi
 
+cold_snapshot_upgrade_yaml "$$upgrade_workdir" || {
+	echo "Unable to capture a stable private snapshot of the active AdGuard Home v2.1 YAML; upgrade aborted." >&2
+	exit 1
+}
+
+upgrade_restore_required=0
 yaml_maintenance_committed=1
-trap - 0 HUP INT TERM
+trap '' 0 HUP INT TERM
 exit 0
 endef
 
@@ -774,6 +1379,85 @@ define Package/$(PKG_NAME)/prerm
 case "$${PKG_UPGRADE}:$$1" in
 	1:*|*:upgrade) exit 0 ;;
 esac
+
+# Keep uninstall cleanup bounded without a target timeout package.
+run_bounded() (
+	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0
+	shift 2
+	case "$$limit" in ""|*[!0-9]*) exit 125 ;; esac
+	case "$$grace" in ""|*[!0-9]*) exit 125 ;; esac
+	[ "$$#" -gt 0 ] || exit 125
+	[ -x /usr/bin/setsid ] || exit 125
+	marker="$$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
+	chmod 0600 "$$marker" || {
+		rm -f "$$marker"
+		exit 125
+	}
+	printf '0\n' >"$$marker" || {
+		rm -f "$$marker"
+		exit 125
+	}
+	bounded_signal_session() {
+		/bin/kill "-$$1" -- "-$$child" 2>/dev/null ||
+			/bin/kill "-$$1" "$$child" 2>/dev/null || true
+	}
+	bounded_abort() {
+		trap - HUP INT QUIT TERM
+		[ -z "$$watchdog" ] || /bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		[ -z "$$watchdog" ] || wait "$$watchdog" 2>/dev/null || true
+		if [ -n "$$child" ]; then
+			bounded_signal_session TERM
+			sleep "$$grace" 2>/dev/null || true
+			bounded_signal_session KILL
+			wait "$$child" 2>/dev/null || true
+		fi
+		rm -f "$$marker"
+		exit 125
+	}
+	trap bounded_abort HUP INT QUIT TERM
+	[ ! -e /proc/self/fd/187 ] || bounded_abort
+	exec 187<&0 || bounded_abort
+	/usr/bin/setsid "$$@" <&187 187<&- &
+	child=$$!
+	exec 187<&-
+	(
+		bounded_sleeper=""
+		bounded_watchdog_abort() {
+			trap - HUP INT QUIT TERM
+			[ -z "$$bounded_sleeper" ] || /bin/kill -TERM "$$bounded_sleeper" 2>/dev/null || true
+			[ -z "$$bounded_sleeper" ] || wait "$$bounded_sleeper" 2>/dev/null || true
+			exit 1
+		}
+		bounded_watchdog_sleep() {
+			sleep "$$1" &
+			bounded_sleeper=$$!
+			wait "$$bounded_sleeper"
+			bounded_sleep_rc=$$?
+			bounded_sleeper=""
+			return "$$bounded_sleep_rc"
+		}
+		trap bounded_watchdog_abort HUP INT QUIT TERM
+		bounded_watchdog_sleep "$$limit" || exit 1
+		/bin/kill -0 -- "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
+		printf '1\n' >"$$marker" || exit 1
+		bounded_signal_session TERM
+		bounded_watchdog_sleep "$$grace" || exit 0
+		bounded_signal_session KILL
+	) &
+	watchdog=$$!
+	wait "$$child" 2>/dev/null || rc=$$?
+	read -r expired <"$$marker" 2>/dev/null || expired=0
+	if [ "$$expired" = 1 ]; then
+		wait "$$watchdog" 2>/dev/null || true
+	else
+		/bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		wait "$$watchdog" 2>/dev/null || true
+	fi
+	trap - HUP INT QUIT TERM
+	rm -f "$$marker"
+	[ "$$expired" = 1 ] && exit 124
+	exit "$$rc"
+)
 
 snapshot_dir=/root/.luci-app-adguardhome
 snapshot_uci="$${snapshot_dir}/official-adguardhome.uci"
@@ -883,14 +1567,28 @@ bounded_private_file() {
 	[ "$$size" -gt 0 ] && [ "$$size" -le 524288 ]
 }
 
-discard_official_pending_delta() {
+clear_owned_memory_delta_or_refuse() {
 	local delta_dir=/tmp/.uci delta_file=/tmp/.uci/adguardhome
+	local effective_config effective_work memory_status
 	if [ ! -e "$$delta_dir" ] && [ ! -L "$$delta_dir" ]; then
 		return 0
 	fi
 	root_private_directory "$$delta_dir" || return 1
 	if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
-		rm -f "$$delta_file" || return 1
+		effective_config="$$(uci -q get adguardhome.config.config_file)"
+		effective_work="$$(uci -q get adguardhome.config.work_dir)"
+		if [ "$$effective_config" = /tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml ] &&
+		   [ "$$effective_work" = /tmp/luci-app-adguardhome-memory/work ] &&
+		   [ -x /etc/init.d/AdGuardHome ]; then
+			memory_status="$$(/etc/init.d/AdGuardHome memory_status 2>/dev/null)" || return 1
+			printf '%s\n' "$$memory_status" | grep -qx 'active=1' || return 1
+			uci -q revert adguardhome.config.config_file || return 1
+			uci -q revert adguardhome.config.work_dir || return 1
+		fi
+		if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
+			echo "Pending official adguardhome UCI changes must be committed or reverted before uninstalling this plugin." >&2
+			return 1
+		fi
 	fi
 	[ ! -e "$$delta_file" ] && [ ! -L "$$delta_file" ]
 }
@@ -916,7 +1614,7 @@ atomic_restore_official_config() (
 	target_fd=/proc/self/fd/9
 	[ "$$source_fd" -ef "$$snapshot_config" ] || exit 1
 	[ ! -L "$$temporary" ] && [ "$$target_fd" -ef "$$temporary" ] || exit 1
-	/usr/bin/timeout -k 1s 5s /bin/dd if="$$source_fd" of="$$target_fd" \
+	run_bounded 5 1 /bin/dd if="$$source_fd" of="$$target_fd" \
 		bs=4096 count=129 2>/dev/null || exit 1
 	chown 0:0 "$$target_fd" && chmod 0600 "$$target_fd" || exit 1
 	metadata="$$(LC_ALL=C ls -ldnL "$$target_fd" 2>/dev/null)" || exit 1
@@ -1013,13 +1711,13 @@ restore_official_state() {
 	case "$$verify_suffix" in *[!A-Za-z0-9]*) return 1 ;; esac
 	verify_package="luci_agh_restore_$${verify_suffix}"
 	raw_export="$${verify_config_dir}/.semantic-export"
-	if ! /usr/bin/timeout -k 1s 5s /bin/dd if="$$snapshot_config" \
+	if ! run_bounded 5 1 /bin/dd if="$$snapshot_config" \
 		of="$${verify_config_dir}/$${verify_package}" bs=4096 count=129 2>/dev/null ||
 	   ! chown 0:0 "$${verify_config_dir}/$${verify_package}" ||
 	   ! chmod 0600 "$${verify_config_dir}/$${verify_package}" ||
 	   ! bounded_private_file "$${verify_config_dir}/$${verify_package}" ||
 	   ! cmp -s "$$snapshot_config" "$${verify_config_dir}/$${verify_package}" ||
-	   ! /usr/bin/timeout -k 1s 5s uci -q -c "$$verify_config_dir" \
+	   ! run_bounded 5 1 uci -q -c "$$verify_config_dir" \
 		export "$$verify_package" >"$$raw_export" ||
 	   ! chown 0:0 "$$raw_export" || ! chmod 0600 "$$raw_export" ||
 	   ! bounded_private_file "$$raw_export" ||
@@ -1041,19 +1739,19 @@ restore_official_state() {
 	was_running="$$(sed -n 's/^was_running=//p' "$$snapshot_state")"
 	case "$$was_running" in
 		1)
-			/usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome start \
+			run_bounded 20 2 /etc/init.d/adguardhome start \
 				>/dev/null 2>&1 || {
 				echo "Unable to restart the originally running official adguardhome service." >&2
 				return 1
 			}
-			/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+			run_bounded 5 1 /etc/init.d/adguardhome running \
 				>/dev/null 2>&1 || {
 				echo "The restored official adguardhome service is not running." >&2
 				return 1
 			}
 			;;
 		0)
-			/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+			run_bounded 5 1 /etc/init.d/adguardhome running \
 				>/dev/null 2>&1 || running_rc=$$?
 			case "$$running_rc" in
 				1) ;;
@@ -1079,7 +1777,7 @@ validate_original_snapshot || {
 	exit 1
 }
 ensure_runtime_dir || exit 1
-discard_official_pending_delta || {
+clear_owned_memory_delta_or_refuse || {
 	echo "Unsafe official adguardhome UCI delta; uninstall aborted." >&2
 	exit 1
 }
@@ -1104,13 +1802,13 @@ if [ -x /etc/init.d/AdGuardHome ]; then
 fi
 
 if [ -x /etc/init.d/adguardhome ]; then
-	/usr/bin/timeout -k 2s 20s /etc/init.d/adguardhome stop \
+	run_bounded 20 2 /etc/init.d/adguardhome stop \
 		>/dev/null 2>&1 || {
 		echo "Unable to stop the packaged AdGuard Home service; uninstall aborted." >&2
 		exit 1
 	}
 	lower_running_rc=0
-	/usr/bin/timeout -k 1s 5s /etc/init.d/adguardhome running \
+	run_bounded 5 1 /etc/init.d/adguardhome running \
 		>/dev/null 2>&1 || lower_running_rc=$$?
 	case "$$lower_running_rc" in
 		1) ;;
@@ -1123,6 +1821,14 @@ if [ -x /etc/init.d/adguardhome ]; then
 			exit 1
 			;;
 	esac
+fi
+
+if [ -x /etc/init.d/AdGuardHome ]; then
+	run_bounded 180 5 /etc/init.d/AdGuardHome memory_cleanup \
+		>/dev/null 2>&1 || {
+		echo "Unable to checkpoint and remove the AdGuard Home memory workdir; uninstall aborted." >&2
+		exit 1
+	}
 fi
 
 restore_official_state || exit 1

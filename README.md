@@ -1,6 +1,6 @@
 # luci-app-adguardhome
 
-luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
+luci-app-adguardhome v2.2.0 for ImmortalWrt 25.12.1
 
 去 Lua、去 CBI、纯 LuCI JS + ucode RPC。自用修改版，支持 fw4 和 HTTP/HTTPS 管理入口自适应，不支持旧版 Lua LuCI。
 
@@ -10,7 +10,7 @@ luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
 - 使用现代 LuCI JavaScript 页面和专用 ucode RPC 后端，不依赖 Lua、CBI 或 `luci-compat`
 - 通过官方 `/etc/init.d/adguardhome` 管理核心进程
 - 使用独立的 `AdGuardHome` UCI 配置和 `none`、`redirect`、`dnsmasq-upstream` 三种 DNS 集成模式
-- 默认 YAML 的 Web 管理端口为 `3000`，默认用户名和密码均为 `admin`
+- 默认/重置 YAML 仅启用 HTTP，Web 管理端口为 `3000`，默认用户名和密码均为 `admin`
 - 默认 YAML 的 DNS 监听端口为 `53335`；运行时会动态读取实际的 `dns.port`
 - 只需配置工作目录；配置文件固定为 `<工作目录>/AdGuardHome.yaml`
 - 默认工作目录为 `/etc/AdGuardHome`
@@ -19,9 +19,15 @@ luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
 - 核心由官方服务使用 `adguardhome` 系统用户和组运行（ImmortalWrt 默认 UID/GID 853）
 - LuCI 前端分为“设置”、“运行日志”和“YAML 配置”三个页签；状态概览与启停、详细日志、DNS 模式、工作目录在“设置”页扁平显示
 - “运行日志”页可直接查看插件与 AdGuard Home 的运行日志
+- “设置”页可修改 `admin` 管理密码：浏览器内使用 cost 10 的 BCrypt 生成哈希，路由器不会接收密码明文
+- 可选“从内存运行”：启动时把持久化工作目录中的 `data` 复制到 RAM 挂载路径，并让官方核心在该副本中运行；正常停止或重启时会把一致性检查点回写到持久化工作目录
+- 内存模式默认每 60 分钟周期回写一次，可在设置页自定义为 1–10080 分钟，设为 `0` 可停用周期回写；为保证检查点一致，周期回写会短暂停止并重启官方核心及其 DNS 服务，期间会产生持久化写入，建议闪存设备使用 60 分钟或更长周期
+- 意外断电可能丢失内存模式自上次成功检查点之后的运行数据；停用周期回写不影响正常停止或重启时的回写
+- 内存模式仅使用系统已有的 tmpfs、服务监控与 BusyBox 基础工具，不新增 `rsync`、cron、`coreutils-stat` 或 `coreutils-timeout` 等依赖；可能阻塞的服务、复制和配置操作由插件内置的 shell 超时保护负责终止
 - “YAML 配置”页提供事务式编辑：新配置通过校验并安全落盘后才会生效，失败时不会留下半写入的活动配置
+- “YAML 配置”页可重置为软件包内置模板；重置会恢复 `admin/admin`、DNS 53335 和 HTTP 3000，但保留持久化工作目录、`data`、启用状态与 DNS 集成模式
 - LuCI 入口统一为小写 `/admin/services/adguardhome`，三个子页分别为 `/settings`、`/log` 和 `/yaml`
-- v2.1 是新的洁净安装基线，安装器会拒绝从任何旧版 `luci-app-adguardhome` 原位升级
+- 支持从正式版 `2.1.0-r1` 原位升级到 `2.2.0-r1`；升级会保留当前 UCI、工作目录、YAML、HTTPS 配置与运行数据
 - 更换工作目录时会安全复制现有 `data` 运行数据并保留原目录作为回退
 - 导入官方默认的易失 `/var/lib/adguardhome` 时，会把 YAML 与现有 `data` 迁移到持久目录；新的工作目录不允许位于 `/tmp` 或 `/var`
 - Web 跳转按钮从 YAML 读取管理端点：HTTP 沿用当前 LuCI 的 IP/域名并使用 `http.address` 的端口，HTTPS 使用 `tls.server_name` 和 `tls.port_https`
@@ -30,7 +36,7 @@ luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
 
 AdGuard Home 的 HTTPS 文件证书应在 YAML 中使用 `tls.certificate_path` 和 `tls.private_key_path`。`tls.certificate_chain` 与 `tls.private_key` 仅用于直接内嵌 PEM 内容，不能填写文件路径。
 
-官方核心运行在 UID/GID 853 的沙箱中，证书及其父目录必须对该沙箱可读。每次通过插件的 `/etc/init.d/AdGuardHome` 启动或重启核心，以及安装过程中恢复官方服务之前，v2.1 都会重新读取当前工作目录下的 YAML，并把 `/etc/ssl/certs`、`/etc/ssl/acme` 到 `/etc/acme` 的受控外部证书文件修复为 `root:853`、`0640`，再实际验证 UID 853 可读；不要通过放宽整个证书目录权限来绕过沙箱。
+官方核心运行在 UID/GID 853 的沙箱中，证书及其父目录必须对该沙箱可读。每次通过插件的 `/etc/init.d/AdGuardHome` 启动或重启核心，以及安装过程中恢复官方服务之前，v2.2 都会重新读取当前工作目录下的 YAML，并把 `/etc/ssl/certs`、`/etc/ssl/acme` 到 `/etc/acme` 的受控外部证书文件修复为 `root:853`、`0640`，再实际验证 UID 853 可读；不要通过放宽整个证书目录权限来绕过沙箱。
 
 插件不会在后台轮询证书路径。官方小写 `/etc/init.d/adguardhome` 保持原样；直接绕过插件调用该服务，不会执行上述启动前准备。
 
@@ -42,7 +48,7 @@ AdGuard Home 的 HTTPS 文件证书应在 YAML 中使用 `tls.certificate_path` 
 官方 `adguardhome` APK 的文件、服务名、UCI 配置名和 `/usr/bin/AdGuardHome` 二进制名称保持原样；本插件仅通过官方服务与 UCI 接口集成，不覆盖官方包载荷。
 旧版核心更新器、UPX 和 GFW 列表功能已经移除。
 
-若路由器已安装任意旧版（包括 1.x 或 2.0.x），必须先使用包管理器完整卸载（APK 系统建议使用 `apk del --purge`）旧的 LuCI 插件，再安装 v2.1；不承诺保留旧插件的 UCI、YAML 或运行数据。官方 `adguardhome` 核心包无需卸载，洁净安装时会按当前安全生命周期接管，并在卸载 v2.1 时恢复安装前保存的官方状态。
+从 `2.1.0-r1` 可直接通过 APK 包管理器升级到 `2.2.0-r1`。从 1.x、2.0.x 或未知开发版升级不受支持，应先使用包管理器完整卸载（APK 系统建议使用 `apk del --purge`）旧 LuCI 插件再安装 2.2；官方 `adguardhome` 核心包无需卸载。卸载 2.2 时仍会恢复首次安装 2.1 前保存的官方状态。
 
 `dnsmasq-upstream` 模式要求系统只有一个 dnsmasq UCI 实例；检测到多个实例时会拒绝接管，避免误改非 LAN 实例。此类系统可选择 `redirect` 或 `none` 模式。
 
