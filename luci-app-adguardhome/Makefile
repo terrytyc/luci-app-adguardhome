@@ -39,13 +39,29 @@ define Package/$(PKG_NAME)/conffiles
 /root/.luci-app-adguardhome/
 endef
 
-# APK maps this hook to both pre-install and pre-upgrade; its generated upgrade
-# wrapper supplies PKG_UPGRADE=1, while opkg passes "upgrade" as argv[1].
-# Snapshot the untouched official UCI/runtime state on the first install, then
-# stop the legacy mixed-case supervisor before an upgrade replaces it.
+# APK maps this hook to both pre-install and pre-upgrade.  v2.1 accepts only a
+# clean install: reject upgrades before any mutation, while a first install
+# snapshots the untouched official UCI/runtime state for safe uninstall.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$${IPKG_INSTROOT}" ] || exit 0
+
+# v2.1 is a clean-install baseline.  Reject every package-manager upgrade
+# before creating YAML maintenance state, snapshotting UCI, changing DNS, or
+# stopping either service.  APK supplies PKG_UPGRADE=1 from its pre-upgrade
+# wrapper; opkg passes "upgrade" as argv[1].  The installed manifests cover
+# callers which omit both lifecycle hints.
+is_upgrade=0
+case "$${PKG_UPGRADE}:$${1}" in
+	1:*|*:upgrade) is_upgrade=1 ;;
+esac
+[ -f /usr/lib/opkg/info/luci-app-adguardhome.list ] && is_upgrade=1
+[ -f /lib/apk/packages/luci-app-adguardhome.list ] && is_upgrade=1
+if [ "$$is_upgrade" = 1 ]; then
+	echo "In-place luci-app-adguardhome upgrades are unsupported; uninstall the old LuCI plugin, then install v2.1. Keep the official adguardhome core package installed." >&2
+	exit 1
+fi
+
 snapshot_dir=/root/.luci-app-adguardhome
 snapshot_uci="$${snapshot_dir}/official-adguardhome.uci"
 snapshot_config="$${snapshot_dir}/official-adguardhome.config"

@@ -1008,33 +1008,149 @@ uid853_read_small_file() {
 		-n AGHDataRead -x /bin/dd -- if="$1" bs=4096 count=1 2>/dev/null
 }
 
+restore_migration_directory_owner() {
+	chown "$1" "$2"
+}
+
+restore_migration_directory_mode() {
+	chmod "$1" "$2"
+}
+
 # Preserve runtime history, filters, and query data when a volatile official or
 # legacy workdir must be moved.  The source is retained for rollback; a
 # root-owned 0710 target parent grants uid 853 traversal into only its private
 # staging child, never rename/write authority over sibling paths.
 migrate_runtime_data() (
-	local old_work="${1%/}" new_work="${2%/}" source_data target_data marker
-	local temporary="" parent_relaxed=0 marker_value="" source_relaxed=0
-	local source_fd="" source_metadata source_mode source_owner source_group
+	# BusyBox ash restores function-local variables before running an EXIT trap.
+	# This function already runs in a subshell, so keep trap state at subshell
+	# scope to make it available throughout cleanup without leaking to the caller.
+	old_work="${1%/}"
+	new_work="${2%/}"
+	source_data=""
+	target_data=""
+	marker=""
+	temporary=""
+	temporary_leaf=""
+	target_relaxed=0
+	marker_value=""
+	source_relaxed=0
+	source_fd=""
+	source_metadata=""
+	source_mode=""
+	source_owner=""
+	source_group=""
+	target_fd=""
+	target_metadata=""
+	target_mode=""
+	target_owner=""
+	target_group=""
+	data_migration_copied=0
+	fd_directory_metadata_matches() {
+		local metadata mode owner group
+		[ -d "$1" ] || return 1
+		metadata="$(LC_ALL=C ls -ldnL "$1" 2>/dev/null)" || return 1
+		read -r mode _fd_links owner group _fd_remainder <<-EOF
+		$metadata
+		EOF
+		[ "$mode" = "$2" ] && [ "$owner" = "$3" ] && [ "$group" = "$4" ]
+	}
 	cleanup_data_migration() {
+		data_migration_rc="$1"
+		data_migration_cleanup_rc=0
 		if [ -n "$temporary" ]; then
-			case "$temporary" in "${new_work}/.data-migration."*) rm -rf "$temporary" ;; esac
+			data_migration_temporary_safe=1
+			temporary_leaf="${temporary##*/}"
+			case "$temporary_leaf" in
+				.data-migration.??????) ;;
+				*)
+					data_migration_temporary_safe=0
+					data_migration_cleanup_rc=1
+					;;
+			esac
+			case "$temporary_leaf" in
+				*[!A-Za-z0-9._-]*)
+					data_migration_temporary_safe=0
+					data_migration_cleanup_rc=1
+					;;
+			esac
+			if [ "$data_migration_temporary_safe" = 1 ] &&
+			   [ "$temporary" = "${new_work}/${temporary_leaf}" ] &&
+			   [ -n "$target_fd" ] && [ -d "$target_fd" ]; then
+				rm -rf "${target_fd:?}/${temporary_leaf:?}" || data_migration_cleanup_rc=1
+				if [ -e "${target_fd}/${temporary_leaf}" ] ||
+				   [ -L "${target_fd}/${temporary_leaf}" ]; then
+					data_migration_cleanup_rc=1
+				fi
+			else
+				data_migration_cleanup_rc=1
+			fi
 		fi
 		if [ "$source_relaxed" = 1 ] && [ -n "$source_fd" ] && [ -d "$source_fd" ]; then
-			chown "${source_owner}:${source_group}" "$source_fd" >/dev/null 2>&1 || true
-			chmod 0700 "$source_fd" >/dev/null 2>&1 || true
+			restore_migration_directory_owner \
+				"${source_owner}:${source_group}" "$source_fd" >/dev/null 2>&1 ||
+				data_migration_cleanup_rc=1
+			restore_migration_directory_mode 0700 "$source_fd" >/dev/null 2>&1 ||
+				data_migration_cleanup_rc=1
+		elif [ "$source_relaxed" = 1 ]; then
+			data_migration_cleanup_rc=1
 		fi
-		if [ "$parent_relaxed" = 1 ]; then
-			chown 0:0 "$new_work" >/dev/null 2>&1 || true
-			chmod 0700 "$new_work" >/dev/null 2>&1 || true
+		if [ -n "$source_fd" ]; then
+			[ "$source_fd" -ef "$old_work" ] &&
+				fd_directory_metadata_matches "$source_fd" "$source_mode" \
+					"$source_owner" "$source_group" || data_migration_cleanup_rc=1
 		fi
+		if [ "$target_relaxed" = 1 ] && [ -n "$target_fd" ] && [ -d "$target_fd" ]; then
+			restore_migration_directory_owner \
+				"${target_owner}:${target_group}" "$target_fd" >/dev/null 2>&1 ||
+				data_migration_cleanup_rc=1
+			restore_migration_directory_mode 0700 "$target_fd" >/dev/null 2>&1 ||
+				data_migration_cleanup_rc=1
+		elif [ "$target_relaxed" = 1 ]; then
+			data_migration_cleanup_rc=1
+		fi
+		if [ -n "$target_fd" ]; then
+			[ "$target_fd" -ef "$new_work" ] &&
+				fd_directory_metadata_matches "$target_fd" "$target_mode" \
+					"$target_owner" "$target_group" || data_migration_cleanup_rc=1
+		fi
+		if [ "$data_migration_cleanup_rc" -ne 0 ]; then
+			echo "Unable to restore AdGuard Home migration directory metadata." >&2
+		fi
+		if [ "$data_migration_rc" -ne 0 ]; then
+			return "$data_migration_rc"
+		fi
+		return "$data_migration_cleanup_rc"
 	}
-	trap cleanup_data_migration 0
+	cleanup_data_migration_on_exit() {
+		data_migration_exit_rc=$?
+		# Disable the EXIT action and ignore terminating signals in one trap
+		# operation, so cleanup cannot recurse or be interrupted halfway through
+		# restoring a directory inode.
+		trap '' 0 HUP INT TERM
+		data_migration_exit_final_rc=0
+		cleanup_data_migration "$data_migration_exit_rc" ||
+			data_migration_exit_final_rc=$?
+		exit "$data_migration_exit_final_rc"
+	}
+	trap cleanup_data_migration_on_exit 0
 	trap 'exit 1' HUP INT TERM
+	perform_data_migration() {
 	[ -n "$old_work" ] || return 0
 	[ "$old_work" != "$new_work" ] || return 0
 	is_allowed_data_source_work_dir "$old_work" || return 1
 	is_managed_work_dir "$new_work" || return 1
+	case "${old_work}/" in
+		"${new_work}/"*)
+			echo "Nested AdGuard Home migration source '$old_work' is unsafe." >&2
+			return 1
+			;;
+	esac
+	case "${new_work}/" in
+		"${old_work}/"*)
+			echo "Nested AdGuard Home migration target '$new_work' is unsafe." >&2
+			return 1
+			;;
+	esac
 	source_data="${old_work}/data"
 	target_data="${new_work}/data"
 	marker="${target_data}/.luci-app-adguardhome-migrated-from"
@@ -1043,17 +1159,18 @@ migrate_runtime_data() (
 		echo "Unsafe AdGuard Home runtime-data source '$source_data'." >&2
 		return 1
 	fi
+	exec 7<"$old_work" || return 1
+	source_fd=/proc/self/fd/7
+	[ -d "$source_fd" ] && [ "$source_fd" -ef "$old_work" ] || return 1
+	source_metadata="$(LC_ALL=C ls -ldnL "$source_fd" 2>/dev/null)" || return 1
+	read -r source_mode _source_links source_owner source_group _source_remainder <<-EOF
+	$source_metadata
+	EOF
+	case "$source_mode" in d?????????) ;; *) return 1 ;; esac
 	if ! uid853_tree_is_plain "$source_data"; then
 		# A stopped legacy instance may leave its managed workdir root-private.
 		# Hold that directory inode while granting uid 853 traverse-only access,
 		# and restore the original inode through the descriptor on every exit.
-		exec 7<"$old_work" || return 1
-		source_fd=/proc/self/fd/7
-		[ -d "$source_fd" ] && [ "$source_fd" -ef "$old_work" ] || return 1
-		source_metadata="$(LC_ALL=C ls -ldnL "$source_fd" 2>/dev/null)" || return 1
-		read -r source_mode _source_links source_owner source_group _source_remainder <<-EOF
-		$source_metadata
-		EOF
 		case "${source_owner}:${source_group}:${source_mode}" in
 			0:0:drwx------|0:"$ADGUARD_GID":drwx------) ;;
 			*) return 1 ;;
@@ -1061,11 +1178,26 @@ migrate_runtime_data() (
 		source_relaxed=1
 		chown "0:${ADGUARD_GID}" "$source_fd" && chmod 0710 "$source_fd" || return 1
 		[ "$source_fd" -ef "$old_work" ] &&
+			fd_directory_metadata_matches "$source_fd" drwx--x--- 0 "$ADGUARD_GID" &&
 			uid853_tree_is_plain "$source_data" || return 1
+	else
+		[ "$source_fd" -ef "$old_work" ] || return 1
 	fi
 	secure_target_work_dir "$new_work" || return 1
-	parent_relaxed=1
-	chown "0:${ADGUARD_GID}" "$new_work" && chmod 0710 "$new_work" || return 1
+	exec 8<"$new_work" || return 1
+	target_fd=/proc/self/fd/8
+	[ -d "$target_fd" ] && [ "$target_fd" -ef "$new_work" ] || return 1
+	target_metadata="$(LC_ALL=C ls -ldnL "$target_fd" 2>/dev/null)" || return 1
+	read -r target_mode _target_links target_owner target_group _target_remainder <<-EOF
+	$target_metadata
+	EOF
+	[ "$target_mode" = drwx------ ] && [ "$target_owner" = 0 ] &&
+		[ "$target_group" = 0 ] || return 1
+	target_relaxed=1
+	chown "0:${ADGUARD_GID}" "$target_fd" && chmod 0710 "$target_fd" || return 1
+	[ "$target_fd" -ef "$new_work" ] &&
+		fd_directory_metadata_matches "$target_fd" drwx--x--- 0 "$ADGUARD_GID" ||
+		return 1
 	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
 		marker_value=""
 		if [ -f "$marker" ] && [ ! -L "$marker" ] &&
@@ -1111,7 +1243,20 @@ migrate_runtime_data() (
 	}
 	temporary=""
 	chmod 0700 "$target_data" || return 1
-	echo "Copied AdGuard Home runtime data from '$source_data' to '$target_data'; source retained."
+	data_migration_copied=1
+	}
+	data_migration_rc=0
+	perform_data_migration || data_migration_rc=$?
+	# Normal completion performs cleanup explicitly so BusyBox ash can propagate
+	# its status.  Ignore terminating signals for the whole critical section and
+	# disable the EXIT action atomically before restoring either inode.
+	trap '' 0 HUP INT TERM
+	data_migration_final_rc=0
+	cleanup_data_migration "$data_migration_rc" || data_migration_final_rc=$?
+	if [ "$data_migration_final_rc" -eq 0 ] && [ "$data_migration_copied" = 1 ]; then
+		echo "Copied AdGuard Home runtime data from '$source_data' to '$target_data'; source retained."
+	fi
+	exit "$data_migration_final_rc"
 )
 
 read_official_state() {
