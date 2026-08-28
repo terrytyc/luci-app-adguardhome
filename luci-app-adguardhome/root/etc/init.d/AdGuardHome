@@ -50,7 +50,7 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update yaml_update_job tls_refresh"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update yaml_update_job tls_prepare tls_refresh"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
@@ -59,6 +59,7 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
 \tyaml_update_job <old-hash> <new-hash> <stage> <stage-fd> <lock-fd> <token>\tRun an asynchronous LuCI YAML edit
+\ttls_prepare\t\tPrepare current YAML TLS access before core start
 \ttls_refresh\t\tRecheck ACME material after renewal"
 
 log_error() {
@@ -3008,6 +3009,16 @@ tls_refresh_locked() {
 tls_refresh() {
 	case "${ACTION:-renewed}" in issued|renewed) ;; *) return 0 ;; esac
 	run_locked tls_refresh_locked
+}
+
+tls_prepare_locked() {
+	official_running && return 1
+	load_legacy_settings || return 1
+	sync_official_uci
+}
+
+tls_prepare() {
+	run_locked tls_prepare_locked
 }
 
 fail_safe_locked() {

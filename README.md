@@ -30,7 +30,9 @@ luci-app-adguardhome v2.1.0 for ImmortalWrt 25.12.1
 
 AdGuard Home 的 HTTPS 文件证书应在 YAML 中使用 `tls.certificate_path` 和 `tls.private_key_path`。`tls.certificate_chain` 与 `tls.private_key` 仅用于直接内嵌 PEM 内容，不能填写文件路径。
 
-官方核心运行在 UID/GID 853 的沙箱中，证书及其父目录必须对该沙箱可读。v2.1 会自动处理工作目录、`/etc/ssl/certs`，以及从 `/etc/ssl/acme` 到 `/etc/acme` 的受控证书可读路径；不要通过放宽整个证书目录权限来绕过沙箱。
+官方核心运行在 UID/GID 853 的沙箱中，证书及其父目录必须对该沙箱可读。每次通过插件的 `/etc/init.d/AdGuardHome` 启动或重启核心，以及安装过程中恢复官方服务之前，v2.1 都会重新读取当前工作目录下的 YAML，并把 `/etc/ssl/certs`、`/etc/ssl/acme` 到 `/etc/acme` 的受控外部证书文件修复为 `root:853`、`0640`，再实际验证 UID 853 可读；不要通过放宽整个证书目录权限来绕过沙箱。
+
+插件不会在后台轮询证书路径。官方小写 `/etc/init.d/adguardhome` 保持原样；直接绕过插件调用该服务，不会执行上述启动前准备。
 
 已支持 ACME 自动续期：ACME 的 `issued`/`renewed` 事件会触发安全重载，使续期证书生效，无需手工重启路由器。
 
