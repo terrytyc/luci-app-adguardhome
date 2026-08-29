@@ -4849,17 +4849,19 @@ prepare_yaml_job_runtime() {
 	if [ -e "$YAML_JOB_RUNTIME_DIR" ] || [ -L "$YAML_JOB_RUNTIME_DIR" ]; then
 		yaml_job_runtime_is_private || return 1
 	else
-		(umask 077; mkdir "$YAML_JOB_RUNTIME_DIR") || return 1
-		chown 0:0 "$YAML_JOB_RUNTIME_DIR" &&
-			chmod 0700 "$YAML_JOB_RUNTIME_DIR" || return 1
+		if (umask 077; mkdir "$YAML_JOB_RUNTIME_DIR"); then
+			chown 0:0 "$YAML_JOB_RUNTIME_DIR" &&
+				chmod 0700 "$YAML_JOB_RUNTIME_DIR" || return 1
+		fi
 		yaml_job_runtime_is_private || return 1
 	fi
 
 	if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
 		yaml_job_lock_file_is_private || return 1
 	else
-		(umask 077; : >"$lock_path") || return 1
-		chown 0:0 "$lock_path" && chmod 0600 "$lock_path" || return 1
+		if (umask 077; set -C; : >"$lock_path") 2>/dev/null; then
+			chown 0:0 "$lock_path" && chmod 0600 "$lock_path" || return 1
+		fi
 		yaml_job_lock_file_is_private || return 1
 	fi
 }
