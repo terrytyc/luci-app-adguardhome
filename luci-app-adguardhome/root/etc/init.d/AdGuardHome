@@ -4844,6 +4844,26 @@ yaml_job_lock_file_is_private() {
 	[ "$size" = 0 ]
 }
 
+prepare_yaml_job_runtime() {
+	local lock_path="${YAML_JOB_RUNTIME_DIR}/update.lock"
+	if [ -e "$YAML_JOB_RUNTIME_DIR" ] || [ -L "$YAML_JOB_RUNTIME_DIR" ]; then
+		yaml_job_runtime_is_private || return 1
+	else
+		(umask 077; mkdir "$YAML_JOB_RUNTIME_DIR") || return 1
+		chown 0:0 "$YAML_JOB_RUNTIME_DIR" &&
+			chmod 0700 "$YAML_JOB_RUNTIME_DIR" || return 1
+		yaml_job_runtime_is_private || return 1
+	fi
+
+	if [ -e "$lock_path" ] || [ -L "$lock_path" ]; then
+		yaml_job_lock_file_is_private || return 1
+	else
+		(umask 077; : >"$lock_path") || return 1
+		chown 0:0 "$lock_path" && chmod 0600 "$lock_path" || return 1
+		yaml_job_lock_file_is_private || return 1
+	fi
+}
+
 yaml_job_lock_fd_valid() {
 	local stage_fd="$1" lock_fd="$2" lock_path fd_path
 	case "$lock_fd" in ""|*[!0-9]*) return 1 ;; esac
@@ -5569,6 +5589,10 @@ start_service() {
 	if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	   [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
 		log_error "Configuration migration is incomplete; refusing to start the coordinator"
+		return 1
+	fi
+	if ! prepare_yaml_job_runtime; then
+		log_error "Unsafe YAML job runtime; refusing to start the coordinator"
 		return 1
 	fi
 	START_PREPARED=0
