@@ -1591,8 +1591,13 @@ clear_owned_memory_delta_or_refuse() {
 		fi
 		if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
 			# Both UCI commit and reverting the plugin-owned RAM overrides may
-			# leave an empty saved-delta inode.  It contains no pending state.
-			root_private_empty_file "$$delta_file" && return 0
+			# leave an empty saved-delta inode.  It contains no pending state,
+			# so remove only that exact validated object before restoration.
+			if root_private_empty_file "$$delta_file"; then
+				rm -f "$$delta_file" || return 1
+				[ ! -e "$$delta_file" ] && [ ! -L "$$delta_file" ] || return 1
+				return 0
+			fi
 			echo "Pending official adguardhome UCI changes must be committed or reverted before uninstalling this plugin." >&2
 			return 1
 		fi
@@ -1838,6 +1843,10 @@ if [ -x /etc/init.d/AdGuardHome ]; then
 	}
 fi
 
+clear_owned_memory_delta_or_refuse || {
+	echo "Unsafe official adguardhome UCI delta after memory cleanup; uninstall aborted." >&2
+	exit 1
+}
 restore_official_state || exit 1
 yaml_removal_committed=1
 cleanup_restore_files
