@@ -27,7 +27,7 @@ luci-app-adguardhome v2.2.0 for ImmortalWrt 25.12.1
 - “YAML 配置”页提供事务式编辑：新配置通过校验并安全落盘后才会生效，失败时不会留下半写入的活动配置
 - “YAML 配置”页可重置为软件包内置模板；重置会恢复 `admin/admin`、DNS 53335 和 HTTP 3000，但保留持久化工作目录、`data`、启用状态与 DNS 集成模式
 - LuCI 入口统一为小写 `/admin/services/adguardhome`，三个子页分别为 `/settings`、`/log` 和 `/yaml`
-- 支持从正式版 `2.1.0-r1` 原位升级到 `2.2.0-r1`；升级会保留当前 UCI、工作目录、YAML、HTTPS 配置与运行数据
+- 支持从正式版 `2.1.0-r1` 或 `2.2.0-r1` 原位升级到 `2.2.0-r2`；升级会保留当前 UCI、工作目录、YAML、HTTPS 配置与运行数据
 - 更换工作目录时会安全复制现有 `data` 运行数据并保留原目录作为回退
 - 导入官方默认的易失 `/var/lib/adguardhome` 时，会把 YAML 与现有 `data` 迁移到持久目录；新的工作目录不允许位于 `/tmp` 或 `/var`
 - Web 跳转按钮从 YAML 读取管理端点：HTTP 沿用当前 LuCI 的 IP/域名并使用 `http.address` 的端口，HTTPS 使用 `tls.server_name` 和 `tls.port_https`
@@ -48,7 +48,7 @@ AdGuard Home 的 HTTPS 文件证书应在 YAML 中使用 `tls.certificate_path` 
 官方 `adguardhome` APK 的文件、服务名、UCI 配置名和 `/usr/bin/AdGuardHome` 二进制名称保持原样；本插件仅通过官方服务与 UCI 接口集成，不覆盖官方包载荷。
 旧版核心更新器、UPX 和 GFW 列表功能已经移除。
 
-从 `2.1.0-r1` 可直接通过 APK 包管理器升级到 `2.2.0-r1`。从 1.x、2.0.x 或未知开发版升级不受支持，应先使用包管理器完整卸载（APK 系统建议使用 `apk del --purge`）旧 LuCI 插件再安装 2.2；官方 `adguardhome` 核心包无需卸载。卸载 2.2 时仍会恢复首次安装 2.1 前保存的官方状态。
+从 `2.1.0-r1` 或 `2.2.0-r1` 可直接通过 APK 包管理器升级到 `2.2.0-r2`。其中 r1 到 r2 是轻量维护升级，只刷新插件文件和 LuCI/rpcd 缓存，不迁移 YAML、UCI、DNS、运行数据或内存工作目录。从 1.x、2.0.x 或未知开发版升级不受支持，应先使用包管理器完整卸载（APK 系统建议使用 `apk del --purge`）旧 LuCI 插件再安装 2.2；官方 `adguardhome` 核心包无需卸载。卸载 2.2 时仍会恢复首次安装 2.1 前保存的官方状态。
 
 `dnsmasq-upstream` 模式要求系统只有一个 dnsmasq UCI 实例；检测到多个实例时会拒绝接管，避免误改非 LAN 实例。此类系统可选择 `redirect` 或 `none` 模式。
 

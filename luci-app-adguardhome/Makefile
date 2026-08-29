@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.2.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -44,8 +44,9 @@ endef
 
 # APK maps this hook to both pre-install and pre-upgrade.  A first install
 # snapshots the untouched official UCI/runtime state for safe uninstall.  The
-# only supported in-place source is the released v2.1.0-r1 package; reject any
-# other installed version before creating maintenance state or touching DNS.
+# supported in-place sources are the released v2.1.0-r1 and v2.2.0-r1
+# packages; reject any other installed version before creating maintenance
+# state or touching DNS.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$${IPKG_INSTROOT}" ] || exit 0
@@ -174,10 +175,14 @@ if [ "$$is_upgrade" = 1 ]; then
 		echo "Unable to determine the installed luci-app-adguardhome version; upgrade aborted before any state change." >&2
 		exit 1
 	}
-	if [ "$$installed_version" != 2.1.0-r1 ]; then
-		echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1; found '$$installed_version'." >&2
-		exit 1
-	fi
+	case "$$installed_version" in
+		2.1.0-r1) maintenance_upgrade=0 ;;
+		2.2.0-r1) maintenance_upgrade=1 ;;
+		*)
+			echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1 or 2.2.0-r1; found '$$installed_version'." >&2
+			exit 1
+			;;
+	esac
 fi
 
 snapshot_dir=/root/.luci-app-adguardhome
@@ -188,6 +193,9 @@ snapshot_version="$${snapshot_dir}/snapshot-version"
 runtime_dir=/var/run/luci-app-adguardhome
 upgrade_marker="$${runtime_dir}/upgrade"
 init_enabled_marker="$${runtime_dir}/init-enabled"
+maintenance_upgrade_marker="$${runtime_dir}/maintenance-upgrade"
+maintenance_config_snapshot="$${runtime_dir}/maintenance-adguardhome.config"
+maintenance_delta_snapshot="$${runtime_dir}/maintenance-adguardhome.delta"
 upgrade_yaml_snapshot="$${runtime_dir}/upgrade-active.yaml"
 upgrade_workdir_metadata="$${runtime_dir}/upgrade-workdir.meta"
 yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
@@ -199,6 +207,11 @@ snapshot_stage=""
 upgrade_restore_required=0
 upgrade_was_running=0
 upgrade_workdir=""
+maintenance_upgrade="$${maintenance_upgrade:-0}"
+maintenance_marker_created=0
+maintenance_config_created=0
+maintenance_delta_created=0
+maintenance_upgrade_committed=0
 
 # Historical versions trusted these world-writable marker paths.  Never read
 # them; remove only the two exact legacy objects before doing any work.
@@ -965,6 +978,147 @@ write_runtime_marker() {
 		[ "$$(wc -c <"$$marker" 2>/dev/null)" = 2 ] && grep -qx '1' "$$marker"
 }
 
+runtime_dir_is_empty() {
+	local entry
+	validate_runtime_dir || return 1
+	for entry in \
+		"$$runtime_dir"/* \
+		"$$runtime_dir"/.[!.]* \
+		"$$runtime_dir"/..?*; do
+		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
+		return 1
+	done
+}
+
+capture_maintenance_delta() (
+	local source=/tmp/.uci/adguardhome target="$$1" source_fd=/proc/self/fd/8
+	root_private_directory /tmp/.uci || exit 1
+	root_private_single_file "$$source" || exit 1
+	exec 8<"$$source" || exit 1
+	[ -f "$$source_fd" ] && [ "$$source_fd" -ef "$$source" ] || exit 1
+	run_bounded 5 1 /bin/dd if="$$source_fd" of="$$target" \
+		bs=4096 count=129 2>/dev/null || exit 1
+	chown 0:0 "$$target" && chmod 0600 "$$target" || exit 1
+	root_private_single_file "$$target" || exit 1
+	[ "$$(wc -c <"$$target" 2>/dev/null)" -le 524288 ] 2>/dev/null || exit 1
+	[ "$$source_fd" -ef "$$source" ] && cmp -s "$$source_fd" "$$target"
+)
+
+maintenance_upgrade_bundle_valid() {
+	local line1 line2 line3 line4 line5 line6 line7 line8 extra entry
+	local wrapper_running delta_present config_hash config_size delta_hash delta_size
+	root_private_single_file "$$maintenance_upgrade_marker" || return 1
+	private_single_file_between "$$maintenance_upgrade_marker" 1 4096 || return 1
+	{
+		IFS= read -r line1 && IFS= read -r line2 &&
+		IFS= read -r line3 && IFS= read -r line4 &&
+		IFS= read -r line5 && IFS= read -r line6 &&
+		IFS= read -r line7 && IFS= read -r line8 &&
+		! IFS= read -r extra
+	} <"$$maintenance_upgrade_marker" || return 1
+	[ "$$line1" = format=1 ] && [ "$$line2" = source_version=2.2.0-r1 ] || return 1
+	case "$$line3" in wrapper_running=0|wrapper_running=1)
+		wrapper_running="$${line3#*=}" ;; *) return 1 ;; esac
+	case "$$line4" in delta_present=0|delta_present=1)
+		delta_present="$${line4#*=}" ;; *) return 1 ;; esac
+	case "$$line5" in config_sha256=*) config_hash="$${line5#*=}" ;; *) return 1 ;; esac
+	case "$$line6" in config_size=*) config_size="$${line6#*=}" ;; *) return 1 ;; esac
+	case "$$line7" in delta_sha256=*) delta_hash="$${line7#*=}" ;; *) return 1 ;; esac
+	case "$$line8" in delta_size=*) delta_size="$${line8#*=}" ;; *) return 1 ;; esac
+	case "$$config_hash" in *[!0-9a-f]*|'') return 1 ;; esac
+	[ "$${#config_hash}" = 64 ] || return 1
+	case "$$config_size" in ''|*[!0-9]*) return 1 ;; esac
+	private_single_file_between "$$maintenance_config_snapshot" 1 524288 || return 1
+	[ "$$(wc -c <"$$maintenance_config_snapshot")" = "$$config_size" ] &&
+		[ "$$(snapshot_sha256 "$$maintenance_config_snapshot")" = "$$config_hash" ] || return 1
+	case "$$delta_present" in
+		0)
+			[ "$$delta_hash" = none ] && [ "$$delta_size" = 0 ] &&
+				[ ! -e "$$maintenance_delta_snapshot" ] &&
+				[ ! -L "$$maintenance_delta_snapshot" ] || return 1
+			;;
+		1)
+			case "$$delta_hash" in *[!0-9a-f]*|'') return 1 ;; esac
+			[ "$${#delta_hash}" = 64 ] || return 1
+			case "$$delta_size" in ''|*[!0-9]*) return 1 ;; esac
+			private_single_file_at_most "$$maintenance_delta_snapshot" 524288 || return 1
+			[ "$$(wc -c <"$$maintenance_delta_snapshot")" = "$$delta_size" ] &&
+				[ "$$(snapshot_sha256 "$$maintenance_delta_snapshot")" = "$$delta_hash" ] || return 1
+			;;
+	esac
+	for entry in \
+		"$$runtime_dir"/* \
+		"$$runtime_dir"/.[!.]* \
+		"$$runtime_dir"/..?*; do
+		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
+		case "$$entry" in
+			"$$maintenance_upgrade_marker"|"$$maintenance_config_snapshot") ;;
+			"$$maintenance_delta_snapshot")
+				[ "$$delta_present" = 1 ] || return 1 ;;
+			*) return 1 ;;
+		esac
+	done
+	MAINTENANCE_WRAPPER_RUNNING="$$wrapper_running"
+	MAINTENANCE_DELTA_PRESENT="$$delta_present"
+}
+
+write_maintenance_upgrade_marker() {
+	local wrapper_running="$$1" delta_present="$$2" config_hash config_size
+	local delta_hash=none delta_size=0
+	case "$$wrapper_running:$$delta_present" in [01]:[01]) ;; *) return 1 ;; esac
+	config_hash="$$(snapshot_sha256 "$$maintenance_config_snapshot")" || return 1
+	config_size="$$(wc -c <"$$maintenance_config_snapshot")" || return 1
+	if [ "$$delta_present" = 1 ]; then
+		delta_hash="$$(snapshot_sha256 "$$maintenance_delta_snapshot")" || return 1
+		delta_size="$$(wc -c <"$$maintenance_delta_snapshot")" || return 1
+	fi
+	[ ! -e "$$maintenance_upgrade_marker" ] &&
+		[ ! -L "$$maintenance_upgrade_marker" ] || return 1
+	{
+		printf 'format=1\n'
+		printf 'source_version=2.2.0-r1\n'
+		printf 'wrapper_running=%s\n' "$$wrapper_running"
+		printf 'delta_present=%s\n' "$$delta_present"
+		printf 'config_sha256=%s\n' "$$config_hash"
+		printf 'config_size=%s\n' "$$config_size"
+		printf 'delta_sha256=%s\n' "$$delta_hash"
+		printf 'delta_size=%s\n' "$$delta_size"
+	} >"$$maintenance_upgrade_marker" || return 1
+	maintenance_marker_created=1
+	chown 0:0 "$$maintenance_upgrade_marker" &&
+		chmod 0600 "$$maintenance_upgrade_marker" || return 1
+	maintenance_upgrade_bundle_valid
+}
+
+cleanup_maintenance_upgrade() {
+	local cleanup_rc=0
+	[ "$$maintenance_upgrade_committed" != 1 ] || return 0
+	cleanup_yaml_maintenance
+	if validate_runtime_dir; then
+		if [ "$$maintenance_marker_created" = 1 ]; then
+			rm -f "$$maintenance_upgrade_marker" || cleanup_rc=1
+		fi
+		if [ "$$maintenance_delta_created" = 1 ]; then
+			rm -f "$$maintenance_delta_snapshot" || cleanup_rc=1
+		fi
+		if [ "$$maintenance_config_created" = 1 ]; then
+			rm -f "$$maintenance_config_snapshot" || cleanup_rc=1
+		fi
+		rmdir "$$runtime_dir" 2>/dev/null || cleanup_rc=1
+	elif [ -e "$$runtime_dir" ] || [ -L "$$runtime_dir" ]; then
+		cleanup_rc=1
+	fi
+	return "$$cleanup_rc"
+}
+
+maintenance_preinst_exit() {
+	local primary_rc=$$? cleanup_rc=0
+	trap '' 0 HUP INT TERM
+	cleanup_maintenance_upgrade || cleanup_rc=$$?
+	[ "$$primary_rc" -ne 0 ] && exit "$$primary_rc"
+	exit "$$cleanup_rc"
+}
+
 restore_failed_upgrade() {
 	local running_rc=0
 	[ "$$upgrade_restore_required" = 1 ] || return 0
@@ -981,7 +1135,7 @@ restore_failed_upgrade() {
 cleanup_upgrade_markers() {
 	local cleanup_rc=0
 	if ! restore_failed_upgrade; then
-		echo "Unable to restore the running AdGuard Home v2.1 service after the failed upgrade." >&2
+		echo "Unable to restore the previously running AdGuard Home service after the failed upgrade." >&2
 		cleanup_rc=1
 	fi
 	cleanup_yaml_maintenance
@@ -1004,6 +1158,79 @@ preinst_exit() {
 	[ "$$primary_rc" -ne 0 ] && exit "$$primary_rc"
 	exit "$$cleanup_rc"
 }
+
+if [ "$$maintenance_upgrade" = 1 ]; then
+	trap maintenance_preinst_exit 0
+	trap 'exit 1' HUP INT TERM
+	quiesce_yaml_updates || {
+		echo "Unable to quiesce LuCI YAML updates; maintenance upgrade aborted." >&2
+		exit 1
+	}
+	ensure_runtime_dir || {
+		echo "Unable to create the private AdGuard Home lifecycle directory." >&2
+		exit 1
+	}
+	if [ -e /tmp/.uci ] || [ -L /tmp/.uci ]; then
+		root_private_directory /tmp/.uci || {
+			echo "Unsafe UCI delta directory; maintenance upgrade aborted." >&2
+			exit 1
+		}
+	else
+		(umask 077; mkdir /tmp/.uci) || exit 1
+		chown 0:0 /tmp/.uci && chmod 0700 /tmp/.uci || exit 1
+		root_private_directory /tmp/.uci || exit 1
+	fi
+	if ! runtime_dir_is_empty; then
+		maintenance_upgrade_bundle_valid || {
+			echo "Unexpected AdGuard Home lifecycle state; maintenance upgrade aborted." >&2
+			exit 1
+		}
+		maintenance_upgrade_committed=1
+		yaml_maintenance_committed=1
+		trap '' 0 HUP INT TERM
+		exit 0
+	fi
+	wrapper_running_rc=0
+	run_bounded 5 1 /etc/init.d/AdGuardHome running \
+		>/dev/null 2>&1 || wrapper_running_rc=$$?
+	case "$$wrapper_running_rc" in
+		0) maintenance_wrapper_running=1 ;;
+		1) maintenance_wrapper_running=0 ;;
+		*)
+			echo "Unable to determine the AdGuard Home coordinator state." >&2
+			exit 1
+			;;
+	esac
+	(umask 077; : >"$$maintenance_config_snapshot") || exit 1
+	maintenance_config_created=1
+	chown 0:0 "$$maintenance_config_snapshot" &&
+		chmod 0600 "$$maintenance_config_snapshot" || exit 1
+	capture_official_config "$$maintenance_config_snapshot" || {
+		echo "Unable to snapshot the official AdGuard Home UCI file." >&2
+		exit 1
+	}
+	maintenance_delta_present=0
+	if [ -e /tmp/.uci/adguardhome ] || [ -L /tmp/.uci/adguardhome ]; then
+		(umask 077; : >"$$maintenance_delta_snapshot") || exit 1
+		maintenance_delta_created=1
+		chown 0:0 "$$maintenance_delta_snapshot" &&
+			chmod 0600 "$$maintenance_delta_snapshot" || exit 1
+		capture_maintenance_delta "$$maintenance_delta_snapshot" || {
+			echo "Unable to snapshot the active AdGuard Home UCI delta." >&2
+			exit 1
+		}
+		maintenance_delta_present=1
+	fi
+	write_maintenance_upgrade_marker "$$maintenance_wrapper_running" \
+		"$$maintenance_delta_present" || {
+		echo "Unable to mark the AdGuard Home r1 maintenance upgrade." >&2
+		exit 1
+	}
+	maintenance_upgrade_committed=1
+	yaml_maintenance_committed=1
+	trap '' 0 HUP INT TERM
+	exit 0
+fi
 
 trap preinst_exit 0
 trap 'exit 1' HUP INT TERM
@@ -1297,6 +1524,7 @@ fi
 entry_metadata() {
 	LC_ALL=C ls -ldn "$$1" 2>/dev/null
 }
+
 root_private_directory() {
 	local metadata
 	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
@@ -1306,6 +1534,17 @@ root_private_directory() {
 	EOF
 	[ "$$mode" = "drwx------" ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
 }
+
+root_owned_directory_allow_writable() {
+	local metadata owner group
+	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r _mode _links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
 root_private_empty_file() {
 	local metadata mode links owner group size
 	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
@@ -1318,9 +1557,229 @@ root_private_empty_file() {
 	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
 	[ "$$size" = 0 ]
 }
+
+root_private_single_file() {
+	local metadata mode links owner group
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+root_owned_single_file() {
+	local metadata mode links owner group
+	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
+	metadata="$$(entry_metadata "$$1")" || return 1
+	read -r mode links owner group _remainder <<-EOF
+	$$metadata
+	EOF
+	case "$$mode" in -?????????) ;; *) return 1 ;; esac
+	[ "$$links" = 1 ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
+}
+
+snapshot_sha256() {
+	local digest
+	command -v sha256sum >/dev/null 2>&1 || return 1
+	digest="$$(sha256sum "$$1" 2>/dev/null)" || return 1
+	printf '%s\n' "$${digest%% *}"
+}
+
+maintenance_upgrade_bundle_valid() {
+	local line1 line2 line3 line4 line5 line6 line7 line8 extra entry
+	local config_hash config_size delta_hash delta_size
+	root_private_directory "$$runtime_dir" || return 1
+	root_private_single_file "$$maintenance_upgrade_marker" || return 1
+	[ "$$(wc -c <"$$maintenance_upgrade_marker" 2>/dev/null)" -le 4096 ] \
+		2>/dev/null || return 1
+	{
+		IFS= read -r line1 && IFS= read -r line2 &&
+		IFS= read -r line3 && IFS= read -r line4 &&
+		IFS= read -r line5 && IFS= read -r line6 &&
+		IFS= read -r line7 && IFS= read -r line8 &&
+		! IFS= read -r extra
+	} <"$$maintenance_upgrade_marker" || return 1
+	[ "$$line1" = format=1 ] && [ "$$line2" = source_version=2.2.0-r1 ] || return 1
+	case "$$line3" in wrapper_running=0|wrapper_running=1)
+		maintenance_wrapper_running="$${line3#*=}" ;; *) return 1 ;; esac
+	case "$$line4" in delta_present=0|delta_present=1)
+		maintenance_delta_present="$${line4#*=}" ;; *) return 1 ;; esac
+	case "$$line5" in config_sha256=*) config_hash="$${line5#*=}" ;; *) return 1 ;; esac
+	case "$$line6" in config_size=*) config_size="$${line6#*=}" ;; *) return 1 ;; esac
+	case "$$line7" in delta_sha256=*) delta_hash="$${line7#*=}" ;; *) return 1 ;; esac
+	case "$$line8" in delta_size=*) delta_size="$${line8#*=}" ;; *) return 1 ;; esac
+	case "$$config_hash" in ''|*[!0-9a-f]*) return 1 ;; esac
+	[ "$${#config_hash}" = 64 ] || return 1
+	case "$$config_size" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$$config_size" -ge 1 ] 2>/dev/null &&
+		[ "$$config_size" -le 524288 ] 2>/dev/null || return 1
+	root_private_single_file "$$maintenance_config_snapshot" || return 1
+	[ "$$(wc -c <"$$maintenance_config_snapshot" 2>/dev/null)" = "$$config_size" ] &&
+		[ "$$(snapshot_sha256 "$$maintenance_config_snapshot")" = "$$config_hash" ] || return 1
+	case "$$maintenance_delta_present" in
+		0)
+			[ "$$delta_hash" = none ] && [ "$$delta_size" = 0 ] &&
+				[ ! -e "$$maintenance_delta_snapshot" ] &&
+				[ ! -L "$$maintenance_delta_snapshot" ] || return 1
+			;;
+		1)
+			case "$$delta_hash" in ''|*[!0-9a-f]*) return 1 ;; esac
+			[ "$${#delta_hash}" = 64 ] || return 1
+			case "$$delta_size" in ''|*[!0-9]*) return 1 ;; esac
+			[ "$$delta_size" -le 524288 ] 2>/dev/null || return 1
+			root_private_single_file "$$maintenance_delta_snapshot" || return 1
+			[ "$$(wc -c <"$$maintenance_delta_snapshot" 2>/dev/null)" = "$$delta_size" ] &&
+				[ "$$(snapshot_sha256 "$$maintenance_delta_snapshot")" = "$$delta_hash" ] || return 1
+			;;
+	esac
+	for entry in \
+		"$$runtime_dir"/* \
+		"$$runtime_dir"/.[!.]* \
+		"$$runtime_dir"/..?*; do
+		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
+		case "$$entry" in
+			"$$maintenance_upgrade_marker"|"$$maintenance_config_snapshot") ;;
+			"$$maintenance_delta_snapshot")
+				[ "$$maintenance_delta_present" = 1 ] || return 1 ;;
+			*) return 1 ;;
+		esac
+	done
+}
+
+ensure_root_private_directory() {
+	if [ -e "$$1" ] || [ -L "$$1" ]; then
+		root_private_directory "$$1"
+		return
+	fi
+	mkdir -m 0700 "$$1" || return 1
+	chown 0:0 "$$1" && chmod 0700 "$$1" || return 1
+	root_private_directory "$$1"
+}
+
+# Restore through file descriptors held across a same-directory rename.  This
+# preserves the exact persistent and saved-delta bytes while refusing a
+# replaced source, staging path, or destination object.
+atomic_restore_maintenance_file() (
+	local source="$$1" target="$$2" directory="$$3" prefix="$$4" minimum="$$5"
+	local temporary="" source_fd=/proc/self/fd/8 target_fd=/proc/self/fd/9
+	local metadata mode links owner group size
+	cleanup_atomic_restore() {
+		[ -z "$$temporary" ] || rm -f "$$temporary"
+	}
+	trap cleanup_atomic_restore 0
+	trap 'exit 1' HUP INT TERM
+	case "$$target" in "$$directory"/*) ;; *) exit 1 ;; esac
+	case "$$minimum" in 0|1) ;; *) exit 1 ;; esac
+	root_private_single_file "$$source" || exit 1
+	case "$$directory" in
+		/etc/config) root_owned_directory_allow_writable "$$directory" || exit 1 ;;
+		/tmp/.uci) root_private_directory "$$directory" || exit 1 ;;
+		*) exit 1 ;;
+	esac
+	if [ -e "$$target" ] || [ -L "$$target" ]; then
+		root_owned_single_file "$$target" || exit 1
+	fi
+	temporary="$$(mktemp "$${directory}/$${prefix}.XXXXXX")" || exit 1
+	chown 0:0 "$$temporary" && chmod 0600 "$$temporary" || exit 1
+	exec 8<"$$source" || exit 1
+	exec 9<>"$$temporary" || exit 1
+	[ "$$source_fd" -ef "$$source" ] &&
+		[ ! -L "$$temporary" ] && [ "$$target_fd" -ef "$$temporary" ] || exit 1
+	/bin/dd if="$$source_fd" of="$$target_fd" bs=4096 count=129 2>/dev/null || exit 1
+	chown 0:0 "$$target_fd" && chmod 0600 "$$target_fd" || exit 1
+	metadata="$$(LC_ALL=C ls -ldnL "$$target_fd" 2>/dev/null)" || exit 1
+	read -r mode links owner group size _remainder <<-EOF
+	$$metadata
+	EOF
+	[ "$$mode" = "-rw-------" ] && [ "$$links" = 1 ] &&
+		[ "$$owner" = 0 ] && [ "$$group" = 0 ] || exit 1
+	case "$$size" in ''|*[!0-9]*) exit 1 ;; esac
+	[ "$$size" -ge "$$minimum" ] 2>/dev/null &&
+		[ "$$size" -le 524288 ] 2>/dev/null || exit 1
+	cmp -s "$$source_fd" "$$target_fd" || exit 1
+	[ "$$source_fd" -ef "$$source" ] &&
+		[ ! -L "$$temporary" ] && [ "$$target_fd" -ef "$$temporary" ] || exit 1
+	if [ -e "$$target" ] || [ -L "$$target" ]; then
+		root_owned_single_file "$$target" || exit 1
+	fi
+	mv -f "$$temporary" "$$target" || exit 1
+	temporary=""
+	[ "$$target_fd" -ef "$$target" ] || exit 1
+	root_private_single_file "$$target" || exit 1
+	cmp -s "$$source_fd" "$$target_fd" && cmp -s "$$source" "$$target"
+)
+
+restore_maintenance_layers() {
+	atomic_restore_maintenance_file "$$maintenance_config_snapshot" \
+		/etc/config/adguardhome /etc/config .adguardhome.luci-maintenance 1 || return 1
+	case "$$maintenance_delta_present" in
+		0)
+			if [ -e /tmp/.uci ] || [ -L /tmp/.uci ]; then
+				root_private_directory /tmp/.uci || return 1
+			fi
+			if [ -e /tmp/.uci/adguardhome ] || [ -L /tmp/.uci/adguardhome ]; then
+				root_private_empty_file /tmp/.uci/adguardhome || return 1
+				rm -f /tmp/.uci/adguardhome || return 1
+			fi
+			[ ! -e /tmp/.uci/adguardhome ] && [ ! -L /tmp/.uci/adguardhome ]
+			;;
+		1)
+			ensure_root_private_directory /tmp/.uci || return 1
+			atomic_restore_maintenance_file "$$maintenance_delta_snapshot" \
+				/tmp/.uci/adguardhome /tmp/.uci .adguardhome.luci-maintenance 0
+			;;
+		*) return 1 ;;
+	esac
+}
+
+verify_maintenance_layers() {
+	root_private_single_file /etc/config/adguardhome &&
+		cmp -s "$$maintenance_config_snapshot" /etc/config/adguardhome || return 1
+	case "$$maintenance_delta_present" in
+		0) [ ! -e /tmp/.uci/adguardhome ] && [ ! -L /tmp/.uci/adguardhome ] ;;
+		1)
+			root_private_directory /tmp/.uci &&
+				root_private_single_file /tmp/.uci/adguardhome &&
+				cmp -s "$$maintenance_delta_snapshot" /tmp/.uci/adguardhome
+			;;
+		*) return 1 ;;
+	esac
+}
+
+verify_maintenance_wrapper_state() {
+	local running_rc=0
+	/etc/init.d/AdGuardHome running >/dev/null 2>&1 || running_rc=$$?
+	case "$$maintenance_wrapper_running:$$running_rc" in
+		1:0|0:1) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+runtime_dir=/var/run/luci-app-adguardhome
+maintenance_upgrade_marker="$${runtime_dir}/maintenance-upgrade"
+maintenance_config_snapshot="$${runtime_dir}/maintenance-adguardhome.config"
+maintenance_delta_snapshot="$${runtime_dir}/maintenance-adguardhome.delta"
+maintenance_upgrade=0
 yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
 yaml_update_lock="$${yaml_runtime_dir}/update.lock"
 yaml_maintenance_marker="$${yaml_runtime_dir}/removing"
+integration_lock=/var/lock/AdGuardHome-integration.lock
+
+if [ -e "$$maintenance_upgrade_marker" ] ||
+   [ -L "$$maintenance_upgrade_marker" ]; then
+	maintenance_upgrade_bundle_valid || {
+		echo "Unsafe AdGuard Home maintenance-upgrade bundle; installation aborted." >&2
+		exit 1
+	}
+	maintenance_upgrade=1
+elif [ -e "$$maintenance_config_snapshot" ] ||
+     [ -L "$$maintenance_config_snapshot" ] ||
+     [ -e "$$maintenance_delta_snapshot" ] ||
+     [ -L "$$maintenance_delta_snapshot" ]; then
+	echo "Incomplete AdGuard Home maintenance-upgrade bundle; installation aborted." >&2
+	exit 1
+fi
 
 # Defensively establish or repair the stable YAML lock again in postinst.  The
 # pre-install/pre-upgrade hook normally creates it, but postinst must not expose
@@ -1347,10 +1806,35 @@ exec 191>>"$$yaml_update_lock" || exit 1
 if [ -e "$$yaml_maintenance_marker" ] || [ -L "$$yaml_maintenance_marker" ]; then
 	root_private_empty_file "$$yaml_maintenance_marker" || exit 1
 else
+	if [ "$$maintenance_upgrade" = 1 ]; then
+		echo "The AdGuard Home maintenance guard disappeared during upgrade." >&2
+		exit 1
+	fi
 	(umask 077; : >"$$yaml_maintenance_marker") || exit 1
 	chown 0:0 "$$yaml_maintenance_marker" &&
 		chmod 0600 "$$yaml_maintenance_marker" || exit 1
 	root_private_empty_file "$$yaml_maintenance_marker" || exit 1
+fi
+
+if [ "$$maintenance_upgrade" = 1 ]; then
+	maintenance_upgrade_bundle_valid || exit 1
+	mkdir -p "$${integration_lock%/*}" || exit 1
+	[ ! -e /proc/self/fd/190 ] || exit 1
+	exec 190>>"$$integration_lock" || exit 1
+	/usr/bin/flock -x 190 || exit 1
+	maintenance_upgrade_bundle_valid || exit 1
+	restore_maintenance_layers || {
+		echo "Unable to restore the AdGuard Home UCI layers after upgrade." >&2
+		exit 1
+	}
+	verify_maintenance_layers || {
+		echo "Unable to verify the restored AdGuard Home UCI layers." >&2
+		exit 1
+	}
+	verify_maintenance_wrapper_state || {
+		echo "The AdGuard Home coordinator state changed during upgrade." >&2
+		exit 1
+	}
 fi
 
 rm -f /tmp/luci-indexcache.* || exit 1
@@ -1365,6 +1849,23 @@ if [ ! -x /etc/init.d/rpcd ] ||
 	exit 1
 fi
 
+if [ "$$maintenance_upgrade" = 1 ]; then
+	maintenance_upgrade_bundle_valid &&
+		verify_maintenance_layers &&
+		verify_maintenance_wrapper_state || exit 1
+	if [ "$$maintenance_delta_present" = 1 ]; then
+		rm -f "$$maintenance_delta_snapshot" || exit 1
+		[ ! -e "$$maintenance_delta_snapshot" ] &&
+			[ ! -L "$$maintenance_delta_snapshot" ] || exit 1
+	fi
+	rm -f "$$maintenance_config_snapshot" || exit 1
+	[ ! -e "$$maintenance_config_snapshot" ] &&
+		[ ! -L "$$maintenance_config_snapshot" ] || exit 1
+	rm -f "$$maintenance_upgrade_marker" || exit 1
+	[ ! -e "$$maintenance_upgrade_marker" ] &&
+		[ ! -L "$$maintenance_upgrade_marker" ] || exit 1
+	rmdir "$$runtime_dir" || exit 1
+fi
 [ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || exit 1
 root_private_directory "$$yaml_runtime_dir" &&
 	root_private_empty_file "$$yaml_update_lock" &&

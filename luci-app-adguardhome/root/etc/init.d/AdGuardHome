@@ -48,8 +48,12 @@ MEMORY_LIVE_MARKER="${MEMORY_LIVE_RUNTIME_DIR}/active"
 INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
 NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
 NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
+MAINTENANCE_UPGRADE_MARKER="${NORMALIZER_RUNTIME_DIR}/maintenance-upgrade"
+MAINTENANCE_CONFIG_SNAPSHOT="${NORMALIZER_RUNTIME_DIR}/maintenance-adguardhome.config"
+MAINTENANCE_DELTA_SNAPSHOT="${NORMALIZER_RUNTIME_DIR}/maintenance-adguardhome.delta"
 UPGRADE_STOPPED_MARKER="${NORMALIZER_RUNTIME_DIR}/upgrade-was-stopped"
 YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
+YAML_MAINTENANCE_MARKER="${YAML_JOB_RUNTIME_DIR}/removing"
 MONITOR_INTERVAL=2
 # First boot can download and compile the packaged default filters before the
 # DNS sockets appear, especially on slower routers.  Keep takeover disabled
@@ -2534,6 +2538,81 @@ normalizer_lock_directory_is_private() {
 	[ "$owner:$group:$mode" = "0:0:drwx------" ]
 }
 
+maintenance_upgrade_private_file() {
+	local target="$1" minimum="$2" metadata mode links owner group size remainder
+	[ -f "$target" ] && [ ! -L "$target" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
+	read -r mode links owner group size remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
+		[ "$owner" = 0 ] && [ "$group" = 0 ] || return 1
+	case "$size" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$size" -ge "$minimum" ] 2>/dev/null && [ "$size" -le 524288 ] 2>/dev/null
+}
+
+maintenance_upgrade_marker_is_valid() {
+	local line1 line2 line3 line4 line5 line6 line7 line8 extra entry
+	local config_hash config_size delta_hash delta_size digest
+	[ -e "$MAINTENANCE_UPGRADE_MARKER" ] ||
+		[ -L "$MAINTENANCE_UPGRADE_MARKER" ] || return 1
+	normalizer_lock_directory_is_private || return 1
+	maintenance_upgrade_private_file "$MAINTENANCE_UPGRADE_MARKER" 1 || return 1
+	[ "$(wc -c <"$MAINTENANCE_UPGRADE_MARKER")" -le 4096 ] 2>/dev/null || return 1
+	exec 8<"$MAINTENANCE_UPGRADE_MARKER" || return 1
+	[ -f /proc/self/fd/8 ] &&
+		[ /proc/self/fd/8 -ef "$MAINTENANCE_UPGRADE_MARKER" ] || return 1
+	{
+		IFS= read -r line1 && IFS= read -r line2 &&
+		IFS= read -r line3 && IFS= read -r line4 &&
+		IFS= read -r line5 && IFS= read -r line6 &&
+		IFS= read -r line7 && IFS= read -r line8 &&
+		! IFS= read -r extra
+	} </proc/self/fd/8 || return 1
+	[ "$line1" = format=1 ] && [ "$line2" = source_version=2.2.0-r1 ] || return 1
+	case "$line3" in wrapper_running=0|wrapper_running=1)
+		MAINTENANCE_WRAPPER_RUNNING="${line3#*=}" ;; *) return 1 ;; esac
+	case "$line4" in delta_present=0|delta_present=1)
+		MAINTENANCE_DELTA_PRESENT="${line4#*=}" ;; *) return 1 ;; esac
+	case "$line5" in config_sha256=*) config_hash="${line5#*=}" ;; *) return 1 ;; esac
+	case "$line6" in config_size=*) config_size="${line6#*=}" ;; *) return 1 ;; esac
+	case "$line7" in delta_sha256=*) delta_hash="${line7#*=}" ;; *) return 1 ;; esac
+	case "$line8" in delta_size=*) delta_size="${line8#*=}" ;; *) return 1 ;; esac
+	case "$config_hash:$config_size" in *[!0-9a-f:]*|:*) return 1 ;; esac
+	[ "${#config_hash}" = 64 ] || return 1
+	maintenance_upgrade_private_file "$MAINTENANCE_CONFIG_SNAPSHOT" 1 || return 1
+	[ "$(wc -c <"$MAINTENANCE_CONFIG_SNAPSHOT")" = "$config_size" ] || return 1
+	digest="$(sha256sum "$MAINTENANCE_CONFIG_SNAPSHOT" 2>/dev/null)" || return 1
+	[ "${digest%% *}" = "$config_hash" ] || return 1
+	case "$MAINTENANCE_DELTA_PRESENT" in
+		0)
+			[ "$delta_hash" = none ] && [ "$delta_size" = 0 ] &&
+				[ ! -e "$MAINTENANCE_DELTA_SNAPSHOT" ] &&
+				[ ! -L "$MAINTENANCE_DELTA_SNAPSHOT" ] || return 1
+			;;
+		1)
+			case "$delta_hash:$delta_size" in *[!0-9a-f:]*|:*) return 1 ;; esac
+			[ "${#delta_hash}" = 64 ] || return 1
+			maintenance_upgrade_private_file "$MAINTENANCE_DELTA_SNAPSHOT" 0 || return 1
+			[ "$(wc -c <"$MAINTENANCE_DELTA_SNAPSHOT")" = "$delta_size" ] || return 1
+			digest="$(sha256sum "$MAINTENANCE_DELTA_SNAPSHOT" 2>/dev/null)" || return 1
+			[ "${digest%% *}" = "$delta_hash" ] || return 1
+			;;
+	esac
+	for entry in \
+		"$NORMALIZER_RUNTIME_DIR"/* \
+		"$NORMALIZER_RUNTIME_DIR"/.[!.]* \
+		"$NORMALIZER_RUNTIME_DIR"/..?*; do
+		[ -e "$entry" ] || [ -L "$entry" ] || continue
+		case "$entry" in
+			"$MAINTENANCE_UPGRADE_MARKER"|"$MAINTENANCE_CONFIG_SNAPSHOT") ;;
+			"$MAINTENANCE_DELTA_SNAPSHOT")
+				[ "$MAINTENANCE_DELTA_PRESENT" = 1 ] || return 1 ;;
+			*) return 1 ;;
+		esac
+	done
+}
+
 # ImmortalWrt's default package post-install helper invokes every packaged init
 # script once even during an upgrade.  Consume the root-private marker left by
 # a successful stopped v2.1 migration so that one automatic invocation is a
@@ -4844,6 +4923,19 @@ yaml_job_lock_file_is_private() {
 	[ "$size" = 0 ]
 }
 
+yaml_maintenance_marker_is_private() {
+	local metadata mode links owner group remainder size
+	[ -f "$YAML_MAINTENANCE_MARKER" ] &&
+		[ ! -L "$YAML_MAINTENANCE_MARKER" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$YAML_MAINTENANCE_MARKER" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || return 1
+	size="$(wc -c <"$YAML_MAINTENANCE_MARKER" 2>/dev/null)" || return 1
+	[ "$size" = 0 ]
+}
+
 prepare_yaml_job_runtime() {
 	local lock_path="${YAML_JOB_RUNTIME_DIR}/update.lock"
 	if [ -e "$YAML_JOB_RUNTIME_DIR" ] || [ -L "$YAML_JOB_RUNTIME_DIR" ]; then
@@ -5599,7 +5691,39 @@ start_service() {
 	fi
 	START_PREPARED=0
 	START_DISABLED=0
-	if [ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ]; then
+	START_MAINTENANCE_UPGRADE=0
+	if [ -e "$MAINTENANCE_UPGRADE_MARKER" ] ||
+	   [ -L "$MAINTENANCE_UPGRADE_MARKER" ]; then
+		if [ "${PKG_UPGRADE:-0}" != 1 ] ||
+		   ! maintenance_upgrade_marker_is_valid; then
+			log_error "Unsafe maintenance-upgrade marker; refusing to start the coordinator"
+			return 1
+		fi
+		[ -e "$YAML_MAINTENANCE_MARKER" ] ||
+			[ -L "$YAML_MAINTENANCE_MARKER" ] || {
+			log_error "Missing YAML maintenance marker; refusing to start the coordinator"
+			return 1
+		}
+		yaml_maintenance_marker_is_private || {
+			log_error "Unsafe YAML maintenance marker; refusing to start the coordinator"
+			return 1
+		}
+		log_error "Preserving the maintenance bundle for package post-install verification"
+		START_PREPARED=1
+		START_MAINTENANCE_UPGRADE=1
+		case "$MAINTENANCE_WRAPPER_RUNNING" in
+			0)
+				START_DISABLED=1
+				log_error "Preserved the stopped AdGuard Home state across the maintenance upgrade"
+				return 0
+				;;
+			1) ;;
+			*)
+				log_error "Invalid maintenance-upgrade service state"
+				return 1
+				;;
+		esac
+	elif [ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ]; then
 		marker_rc=0
 		consume_upgrade_stopped_marker || marker_rc=$?
 		case "$marker_rc" in
@@ -5607,7 +5731,7 @@ start_service() {
 				if [ "${PKG_UPGRADE:-0}" = 1 ]; then
 					START_PREPARED=1
 					START_DISABLED=1
-					log_error "Preserved the stopped AdGuard Home state across the v2.1 upgrade"
+					log_error "Preserved the stopped AdGuard Home state across the package upgrade"
 					return 0
 				fi
 				log_error "Discarded a stale stopped-upgrade marker before a normal start"
@@ -5617,16 +5741,17 @@ start_service() {
 				return 1
 				;;
 		esac
+	else
+		run_locked prepare_wrapper_locked || prepare_rc=$?
+		case "$prepare_rc" in
+			0) START_PREPARED=1 ;;
+			2)
+				START_PREPARED=1
+				START_DISABLED=1
+				return 0
+				;;
+		esac
 	fi
-	run_locked prepare_wrapper_locked || prepare_rc=$?
-	case "$prepare_rc" in
-		0) START_PREPARED=1 ;;
-		2)
-			START_PREPARED=1
-			START_DISABLED=1
-			return 0
-			;;
-	esac
 	[ "$START_PREPARED" = 1 ] || return 0
 	procd_open_instance monitor
 	procd_set_param command "$initscript" monitor
@@ -5644,6 +5769,7 @@ service_started() {
 		return 1
 	fi
 	[ "$START_DISABLED" != 1 ] || return 0
+	[ "$START_MAINTENANCE_UPGRADE" != 1 ] || return 0
 	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
 		RELOAD_SERVICES=0 run_locked reconcile_core_locked
 	else

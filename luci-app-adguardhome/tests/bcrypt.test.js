@@ -12,7 +12,35 @@ const modulePath = path.resolve(
 );
 const moduleSource = fs.readFileSync(modulePath, 'utf8');
 
+function createLuCIClass() {
+	function LuCIClass() {}
+
+	LuCIClass.extend = function(definition) {
+		function DerivedClass() {}
+
+		DerivedClass.prototype = Object.create(this.prototype);
+		Object.assign(DerivedClass.prototype, definition);
+		Object.defineProperty(DerivedClass.prototype, 'constructor', {
+			value: DerivedClass,
+			writable: true,
+			configurable: true
+		});
+		DerivedClass.extend = this.extend;
+		return DerivedClass;
+	};
+
+	LuCIClass.isSubclass = function(candidate) {
+		return typeof candidate === 'function' &&
+			candidate.prototype instanceof LuCIClass;
+	};
+	assert.equal(LuCIClass.isSubclass({}), false,
+		'plain-object factories must be rejected like the real LuCI loader');
+
+	return LuCIClass;
+}
+
 function loadModule(cryptoImplementation) {
+	const LuCIClass = createLuCIClass();
 	const sandbox = {
 		crypto: cryptoImplementation,
 		setImmediate: setImmediate,
@@ -21,17 +49,27 @@ function loadModule(cryptoImplementation) {
 
 	vm.createContext(sandbox);
 
-	return vm.runInContext(
-		'(function() {\n' + moduleSource + '\n}).call(globalThis)',
-		sandbox,
+	const ModuleClass = vm.runInContext(
+		'(function(window, document, L, baseclass) {\n' + moduleSource +
+			'\n}).call(globalThis, globalThis, null, {}, LuCIClass)',
+		Object.assign(sandbox, { LuCIClass: LuCIClass }),
 		{ filename: modulePath }
 	);
+
+	assert.equal(
+		LuCIClass.isSubclass(ModuleClass),
+		true,
+		'LuCI resource factory must yield an L.Class constructor'
+	);
+
+	return new ModuleClass();
 }
 
 async function main() {
 	assert.doesNotMatch(moduleSource, /\beval\s*\(/);
 	assert.doesNotMatch(moduleSource, /\bnew\s+Function\b/);
 	assert.doesNotMatch(moduleSource, /Math\.random/);
+	assert.match(moduleSource, /^'use strict';\s*'require baseclass';/);
 
 	let randomCalls = 0;
 	const trackedCrypto = {
@@ -41,13 +79,11 @@ async function main() {
 		}
 	};
 	const bcrypt = loadModule(trackedCrypto);
-	assert.deepEqual(
-		Array.from(Object.keys(bcrypt)).sort(),
-		['COST', 'MAX_PASSWORD_BYTES', 'compare', 'hash', 'truncates']
-	);
-	assert.equal(Object.isFrozen(bcrypt), true);
 	assert.equal(bcrypt.COST, 10);
 	assert.equal(bcrypt.MAX_PASSWORD_BYTES, 72);
+	assert.equal(typeof bcrypt.hash, 'function');
+	assert.equal(typeof bcrypt.compare, 'function');
+	assert.equal(typeof bcrypt.truncates, 'function');
 
 	assert.equal(bcrypt.truncates('x'.repeat(72)), false);
 	assert.equal(bcrypt.truncates('x'.repeat(73)), true);

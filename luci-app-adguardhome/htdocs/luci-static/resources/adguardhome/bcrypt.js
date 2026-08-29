@@ -1,4 +1,5 @@
 'use strict';
+'require baseclass';
 
 /*
  * Browser-only asynchronous bcrypt support for LuCI.
@@ -1258,7 +1259,7 @@ function truncates(password) {
 	return upstreamBcrypt.truncates(password);
 }
 
-return Object.freeze({
+return baseclass.extend({
 	COST: COST,
 	MAX_PASSWORD_BYTES: MAX_PASSWORD_BYTES,
 	hash: hash,
