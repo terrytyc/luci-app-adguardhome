@@ -101,8 +101,8 @@ assert.match(rpcSource, /args: \{ source: 'core', lines: 100 \}/,
 	'get_log must declare the bounded source and line arguments');
 
 assert.match(viewSource, /params: \[ 'source', 'lines' \]/);
-assert.match(viewSource, /fetchLog\('core', DEFAULT_LINES\)/);
-assert.match(viewSource, /fetchLog\('plugin', DEFAULT_LINES\)/);
+assert.match(viewSource, /fetchLog\('core', DEFAULT_LINES, pageScope\)/);
+assert.match(viewSource, /fetchLog\('plugin', DEFAULT_LINES, pageScope\)/);
 assert.match(viewSource, /Promise\.all\(\[/,
 	'the two independent sources should load together');
 assert.match(viewSource, /AdGuard Home Core Log/);

@@ -74,17 +74,24 @@ function delay(milliseconds) {
 	return new Promise(resolve => window.setTimeout(resolve, milliseconds));
 }
 
-async function waitForYamlUpdate(token) {
+async function waitForYamlUpdate(token, scope) {
 	let consecutiveErrors = 0;
 	let lastError = null;
 
 	for (let attempt = 0; attempt < YAML_POLL_LIMIT; attempt++) {
+		if (!operation.isPageActive(scope))
+			throw operation.pageInactiveError();
+
 		let result = null;
 		try {
 			result = await callGetYamlUpdate(token, false);
+			if (!operation.isPageActive(scope))
+				throw operation.pageInactiveError();
 			consecutiveErrors = 0;
 			lastError = null;
 		} catch (error) {
+			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+				throw operation.pageInactiveError();
 			lastError = error;
 			consecutiveErrors++;
 			if (consecutiveErrors >= 10)
@@ -111,25 +118,29 @@ async function waitForYamlUpdate(token) {
 		: _('The credential update is still running. Do not submit it again; reload this page later.'));
 }
 
-async function getServiceStatus() {
+async function getServiceStatus(scope) {
 	try {
-		const result = await callGetServiceStatus();
+		const result = await operation.requestDuringApply(callGetServiceStatus, scope);
 		return {
 			running: result?.running === true,
 			memoryRequested: result?.memory_requested === true,
 			memoryActive: result?.memory_active === true,
 		};
 	} catch (error) {
+		if (operation.isPageInactiveError(error))
+			throw error;
 		console.error('Unable to query AdGuard Home service status:', error);
 		return { running: false, memoryRequested: false, memoryActive: false };
 	}
 }
 
-async function getCoreVersion() {
+async function getCoreVersion(scope) {
 	try {
-		const result = await callGetCoreVersion();
+		const result = await operation.requestDuringApply(callGetCoreVersion, scope);
 		return String(result?.version ?? '').trim() || _('Unknown');
 	} catch (error) {
+		if (operation.isPageInactiveError(error))
+			throw error;
 		console.error('Unable to query AdGuard Home version:', error);
 		return _('Unknown');
 	}
@@ -159,10 +170,12 @@ function normalizeConfigInfo(result) {
 	return { dnsPort, web };
 }
 
-async function getConfigInfo() {
+async function getConfigInfo(scope) {
 	try {
-		return normalizeConfigInfo(await callGetConfigInfo());
+		return normalizeConfigInfo(await operation.requestDuringApply(callGetConfigInfo, scope));
 	} catch (error) {
+		if (operation.isPageInactiveError(error))
+			throw error;
 		console.error('Unable to query the AdGuard Home YAML configuration:', error);
 		return { dnsPort: null, web: null };
 	}
@@ -313,16 +326,26 @@ function validateMemoryWritebackInterval(_sectionId, value) {
 }
 
 return view.extend({
-	load() {
-		return Promise.all([
-			uci.load(CONFIG_NAME),
-			getServiceStatus(),
-			getCoreVersion(),
-			getConfigInfo(),
-		]);
+	async load() {
+		const pageScope = operation.createPageScope();
+		this.pageScope = pageScope;
+		try {
+			const result = await Promise.all([
+				operation.requestDuringApply(() => uci.load(CONFIG_NAME), pageScope),
+				getServiceStatus(pageScope),
+				getCoreVersion(pageScope),
+				getConfigInfo(pageScope),
+			]);
+			return [ ...result, pageScope ];
+		} catch (error) {
+			return operation.abandonInactiveLoad(error);
+		}
 	},
 
-	async render([_config, serviceStatus, version, configInfo]) {
+	async render([_config, serviceStatus, version, configInfo, pageScope]) {
+		if (!operation.isPageActive(pageScope))
+			return operation.abandonInactiveLoad(operation.pageInactiveError());
+
 		let running = serviceStatus.running;
 		const map = new form.Map(
 			CONFIG_NAME,
@@ -448,12 +471,28 @@ return view.extend({
 		}, _('Change Username and Password'));
 
 		const rendered = await map.render();
+		if (!operation.isPageActive(pageScope))
+			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
 		poll.add(async () => {
-			const [currentStatus, currentConfigInfo] = await Promise.all([
-				getServiceStatus(),
-				getConfigInfo(),
-			]);
+			if (!operation.isPageActive(pageScope))
+				return;
+
+			let currentStatus = null;
+			let currentConfigInfo = null;
+			try {
+				[currentStatus, currentConfigInfo] = await Promise.all([
+					getServiceStatus(pageScope),
+					getConfigInfo(pageScope),
+				]);
+			} catch (error) {
+				if (operation.isPageInactiveError(error))
+					return;
+				throw error;
+			}
+			if (!operation.isPageActive(pageScope))
+				return;
+
 			dom.content(statusContainer, renderServiceStatus(currentStatus.running));
 			dom.content(storageContainer, renderStorageStatus(currentStatus));
 			dom.content(
@@ -463,13 +502,14 @@ return view.extend({
 			dom.content(managementContainer, renderManagementLink(currentConfigInfo.web, currentStatus.running));
 		}, POLL_INTERVAL);
 
-		return rendered;
+		return pageScope.attach(E('div', {}, rendered));
 	},
 
 	async openCredentialsDialog() {
+		const scope = this.pageScope;
 		let info = null;
 		try {
-			info = await callGetCredentials();
+			info = await operation.requestDuringApply(callGetCredentials, scope);
 			if (typeof info?.error === 'string' && info.error)
 				throw new Error(info.error);
 			if (info?.available !== true || typeof info.username !== 'string' ||
@@ -477,6 +517,8 @@ return view.extend({
 			    typeof info.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(info.sha256))
 				throw new Error(_('The YAML user account is unavailable or ambiguous. Use the YAML editor to review the users section.'));
 		} catch (error) {
+			if (operation.isPageInactiveError(error))
+				return;
 			operation.failure(
 				_('Unable to prepare the username or password change: %s').format(errorMessage(error)),
 			);
@@ -561,6 +603,7 @@ return view.extend({
 	},
 
 	async changeCredentials(info, usernameInput, passwordInput, confirmationInput, status, submitButton, cancelButton) {
+		const scope = this.pageScope;
 		let username = String(usernameInput.value ?? '');
 		let password = String(passwordInput.value ?? '');
 		let confirmation = String(confirmationInput.value ?? '');
@@ -598,9 +641,11 @@ return view.extend({
 
 		submitButton.disabled = true;
 		cancelButton.disabled = true;
-		operation.start();
+		const operationTicket = operation.start();
 		try {
 			const passwordHash = password ? await bcrypt.hash(password) : '';
+			if (!operation.isPageActive(scope))
+				return;
 			password = null;
 			usernameInput.value = '';
 			passwordInput.value = '';
@@ -612,26 +657,40 @@ return view.extend({
 			    !/^[0-9a-f]{32}$/.test(response.token))
 				throw new Error(_('The server did not accept the credential update job.'));
 
-			const result = await waitForYamlUpdate(response.token);
+			const result = await waitForYamlUpdate(response.token, scope);
 			if (result?.ok !== true)
 				throw new Error(typeof result?.error === 'string' && result.error
 					? result.error
 					: _('The server rejected the credential update.'));
 
-			operation.success();
+			operation.success(undefined, operationTicket);
 		} catch (error) {
+			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+				return;
 			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
 			operation.failure(
 				_('Unable to change the username or password: %s').format(errorMessage(error)),
+				operationTicket,
 			);
 		} finally {
 			username = null;
 			password = null;
 			confirmation = null;
-			submitButton.disabled = false;
-			cancelButton.disabled = false;
+			if (operation.isPageActive(scope)) {
+				submitButton.disabled = false;
+				cancelButton.disabled = false;
+			}
 		}
+	},
+
+	handleSaveApply(ev, mode) {
+		return this.handleSave(ev).then(() => {
+			if (!operation.isPageActive(this.pageScope))
+				return;
+			operation.markApplyPending();
+			return ui.changes.apply(mode == '0');
+		});
 	},
 });

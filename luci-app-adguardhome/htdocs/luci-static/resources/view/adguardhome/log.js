@@ -44,13 +44,18 @@ function sourceErrorMessage(source, error) {
 		: _('Unable to read the AdGuard Home core log: %s').format(errorMessage(error));
 }
 
-async function fetchLog(source, lines) {
+async function fetchLog(source, lines, scope) {
 	try {
-		const result = normalizeLog(await callGetLog(source, lines));
+		const result = normalizeLog(await operation.requestDuringApply(
+			() => callGetLog(source, lines),
+			scope,
+		));
 		if (result.source !== source)
 			throw new Error(_('The log source response was invalid.'));
 		return result;
 	} catch (error) {
+		if (operation.isPageInactiveError(error))
+			throw error;
 		return { log: '', lines: 0, source, error };
 	}
 }
@@ -73,14 +78,24 @@ function logSummary(lines, result) {
 
 return view.extend({
 	async load() {
-		const [ core, plugin ] = await Promise.all([
-			fetchLog('core', DEFAULT_LINES),
-			fetchLog('plugin', DEFAULT_LINES),
-		]);
-		return { core, plugin };
+		const pageScope = operation.createPageScope();
+		this.pageScope = pageScope;
+		try {
+			const [ core, plugin ] = await Promise.all([
+				fetchLog('core', DEFAULT_LINES, pageScope),
+				fetchLog('plugin', DEFAULT_LINES, pageScope),
+			]);
+			return { core, plugin, pageScope };
+		} catch (error) {
+			return operation.abandonInactiveLoad(error);
+		}
 	},
 
 	render(result) {
+		const pageScope = result.pageScope;
+		if (!operation.isPageActive(pageScope))
+			return operation.abandonInactiveLoad(operation.pageInactiveError());
+
 		this.logLines = DEFAULT_LINES;
 		this.logOutputs = {
 			core: logOutput(result.core),
@@ -105,12 +120,17 @@ return view.extend({
 			click: ui.createHandlerFn(this, 'handleRefresh'),
 		}, _('Refresh'));
 
-		for (const source of LOG_SOURCES)
-			if (result[source].error)
-				ui.addNotification(null, E('p', {},
-					sourceErrorMessage(source, result[source].error)), 'error');
+		for (const source of LOG_SOURCES) {
+			if (!result[source].error ||
+			    operation.isPageInactiveError(result[source].error) ||
+			    !operation.isPageActive(pageScope))
+				continue;
 
-		return E('div', {}, [
+			ui.addNotification(null, E('p', {},
+				sourceErrorMessage(source, result[source].error)), 'error');
+		}
+
+		const root = E('div', {}, [
 			E('h2', {}, _('AdGuard Home')),
 			E('div', { class: 'cbi-map-descr' },
 				_('View recent core and plugin messages from the system log. The newest entries are shown first, and this page is read-only.')),
@@ -133,19 +153,27 @@ return view.extend({
 				this.logOutputs.plugin,
 			]),
 		]);
+		return pageScope.attach(root);
 	},
 
 	async handleRefresh() {
+		const scope = this.pageScope;
+		if (!operation.isPageActive(scope))
+			return;
+
 		const lines = normalizeLineCount(this.lineSelect?.value ?? this.logLines);
 		this.logLines = lines;
 		this.refreshButton.disabled = true;
-		operation.start();
+		const operationTicket = operation.start();
 
 		try {
 			const [ core, plugin ] = await Promise.all([
-				fetchLog('core', lines),
-				fetchLog('plugin', lines),
+				fetchLog('core', lines, scope),
+				fetchLog('plugin', lines, scope),
 			]);
+			if (!operation.isPageActive(scope))
+				return;
+
 			const results = { core, plugin };
 			const failures = [];
 
@@ -163,13 +191,16 @@ return view.extend({
 			}
 
 			if (failures.length)
-				operation.failure(failures.join(' '));
+				operation.failure(failures.join(' '), operationTicket);
 			else
-				operation.success(_('Logs refreshed.'));
+				operation.success(_('Logs refreshed.'), operationTicket);
 		} catch (error) {
-			operation.failure(errorMessage(error));
+			if (operation.isPageInactiveError(error))
+				return;
+			operation.failure(errorMessage(error), operationTicket);
 		} finally {
-			this.refreshButton.disabled = false;
+			if (operation.isPageActive(scope))
+				this.refreshButton.disabled = false;
 		}
 	},
 

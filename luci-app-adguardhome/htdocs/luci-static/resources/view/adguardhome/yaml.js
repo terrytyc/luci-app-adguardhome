@@ -66,15 +66,28 @@ function delay(milliseconds) {
 
 return view.extend({
 	async load() {
+		const pageScope = operation.createPageScope();
+		this.pageScope = pageScope;
 		try {
-			const result = normalizeYaml(await callGetYaml());
-			return result.error ? { ...result, error: new Error(result.error) } : result;
+			const result = normalizeYaml(await operation.requestDuringApply(
+				callGetYaml,
+				pageScope,
+			));
+			return result.error
+				? { ...result, error: new Error(result.error), pageScope }
+				: { ...result, pageScope };
 		} catch (error) {
-			return { content: '', sha256: '', path: '', error };
+			if (operation.isPageInactiveError(error))
+				return operation.abandonInactiveLoad(error);
+			return { content: '', sha256: '', path: '', error, pageScope };
 		}
 	},
 
 	render(result) {
+		const pageScope = result.pageScope;
+		if (!operation.isPageActive(pageScope))
+			return operation.abandonInactiveLoad(operation.pageInactiveError());
+
 		this.yamlHash = result.sha256;
 		this.yamlPath = result.path;
 		this.yamlEditor = E('textarea', {
@@ -104,12 +117,12 @@ return view.extend({
 			click: ui.createHandlerFn(this, 'handleReload'),
 		}, _('Reload from disk'));
 
-		if (result.error) {
+		if (result.error && operation.isPageActive(pageScope)) {
 			ui.addNotification(null, E('p', {},
 				_('Unable to read the YAML configuration: %s').format(errorMessage(result.error))), 'error');
 		}
 
-		return E('div', {}, [
+		const root = E('div', {}, [
 			E('h2', {}, _('AdGuard Home')),
 			E('div', { class: 'cbi-map-descr' }, [
 				_('Edit the active AdGuard Home configuration file directly.'),
@@ -131,29 +144,38 @@ return view.extend({
 				]),
 			]),
 		]);
+		return pageScope.attach(root);
 	},
 
 	async handleReload() {
-		if (this.operationBusy)
+		const scope = this.pageScope;
+		if (this.operationBusy || !operation.isPageActive(scope))
 			return;
 		this.setBusy(true);
-		operation.start();
+		const operationTicket = operation.start();
 
 		try {
 			await this.reloadYaml();
-			operation.success();
+			operation.success(undefined, operationTicket);
 		} catch (error) {
+			if (operation.isPageInactiveError(error))
+				return;
 			this.invalidateYamlEditor();
 			operation.failure(
 				_('Unable to read the YAML configuration: %s').format(errorMessage(error)),
+				operationTicket,
 			);
 		} finally {
-			this.setBusy(false);
+			if (operation.isPageActive(scope))
+				this.setBusy(false);
 		}
 	},
 
 	async reloadYaml() {
-		const result = normalizeYaml(await callGetYaml());
+		const result = normalizeYaml(await operation.requestDuringApply(
+			callGetYaml,
+			this.pageScope,
+		));
 		if (result.error)
 			throw new Error(result.error);
 		if (!result.sha256)
@@ -202,12 +224,13 @@ return view.extend({
 	},
 
 	async saveYaml() {
-		if (!this.yamlHash || this.operationBusy)
+		const scope = this.pageScope;
+		if (!this.yamlHash || this.operationBusy || !operation.isPageActive(scope))
 			return;
 
 		this.setBusy(true);
 		const content = String(this.yamlEditor.value ?? '').replace(/\r\n?/g, '\n');
-		operation.start();
+		const operationTicket = operation.start();
 
 		try {
 			const accepted = await callSetYaml(content, this.yamlHash);
@@ -218,7 +241,7 @@ return view.extend({
 			    !/^[0-9a-f]{32}$/.test(accepted.token))
 				throw new Error(_('The server did not accept the YAML update job.'));
 
-			const result = await this.waitForYamlUpdate(accepted.token);
+			const result = await this.waitForYamlUpdate(accepted.token, scope);
 			if (result?.indeterminate === true)
 				throw uncertainYamlUpdateError(typeof result?.error === 'string' && result.error
 					? result.error
@@ -237,18 +260,23 @@ return view.extend({
 			} catch (error) {
 				operation.success(
 					_('The YAML configuration was saved and applied, but the editor could not reload it: %s. Refresh this page before editing again.').format(errorMessage(error)),
+					operationTicket,
 				);
 				return;
 			}
-			operation.success();
+			operation.success(undefined, operationTicket);
 		} catch (error) {
+			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+				return;
 			if (error?.yamlUpdateUncertain === true)
 				this.invalidateYamlEditor();
 			operation.failure(
 				_('Unable to save the YAML configuration: %s').format(errorMessage(error)),
+				operationTicket,
 			);
 		} finally {
-			this.setBusy(false);
+			if (operation.isPageActive(scope))
+				this.setBusy(false);
 		}
 	},
 
@@ -278,12 +306,15 @@ return view.extend({
 	},
 
 	async resetYaml() {
-		if (!this.yamlHash || this.operationBusy)
+		const scope = this.pageScope;
+		if (!this.yamlHash || this.operationBusy || !operation.isPageActive(scope))
 			return;
 
 		this.setBusy(true);
 		try {
 			const template = await callResetYaml(this.yamlHash);
+			if (!operation.isPageActive(scope))
+				return;
 			if (typeof template?.error === 'string' && template.error)
 				throw new Error(template.error);
 			if (typeof template?.content !== 'string' || !template.content ||
@@ -295,25 +326,35 @@ return view.extend({
 			// that set_yaml must compare when the user later saves this editor text.
 			this.yamlEditor.value = template.content;
 		} catch (error) {
+			if (!operation.isPageActive(scope))
+				return;
 			operation.failure(
 				_('Unable to restore the YAML template: %s').format(errorMessage(error)),
 			);
 		} finally {
-			this.setBusy(false);
+			if (operation.isPageActive(scope))
+				this.setBusy(false);
 		}
 	},
 
-	async waitForYamlUpdate(token) {
+	async waitForYamlUpdate(token, scope) {
 		let consecutiveErrors = 0;
 		let lastError = null;
 
 		for (let attempt = 0; attempt < YAML_POLL_LIMIT; attempt++) {
+			if (!operation.isPageActive(scope))
+				throw operation.pageInactiveError();
+
 			let result = null;
 			try {
 				result = await callGetYamlUpdate(token, false);
+				if (!operation.isPageActive(scope))
+					throw operation.pageInactiveError();
 				consecutiveErrors = 0;
 				lastError = null;
 			} catch (error) {
+				if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+					throw operation.pageInactiveError();
 				lastError = error;
 				consecutiveErrors++;
 				if (consecutiveErrors >= 10)
