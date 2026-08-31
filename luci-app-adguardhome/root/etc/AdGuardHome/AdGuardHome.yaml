@@ -82,9 +82,9 @@ dns:
 tls:
   enabled: false
   force_https: false
-  port_https: 1029
+  port_https: 443
   port_dns_over_tls: 853
-  port_dns_over_quic: 853
+  port_dns_over_quic: 854
   port_dnscrypt: 0
   dnscrypt_config_file: ""
   certificate_chain: ""
