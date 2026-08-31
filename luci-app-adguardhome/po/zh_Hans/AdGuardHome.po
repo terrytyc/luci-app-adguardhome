@@ -114,8 +114,8 @@ msgstr "详细日志"
 msgid "Run from memory"
 msgstr "从内存运行"
 
-msgid "At startup, copies the persistent data directory into RAM and runs the official core there. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back."
-msgstr "启动时把持久化 data 目录复制到内存，并让官方核心在内存副本中运行。手动及周期回写会直接把实时内存 data 复制到持久化存储，不重启核心或 DNS 服务，也不保证并发变更或极端断电情况下的一致性。正常停止或重启时仍会执行完整回写。"
+msgid "At startup, copies only the persistent data directory into RAM and runs the official core there. AdGuardHome.yaml always remains in and is read from the persistent work directory. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back."
+msgstr "启动时只把持久化 data 目录复制到内存，并让官方核心在内存副本中运行；AdGuardHome.yaml 始终保留在持久化工作目录并从该处读取。手动及周期回写会直接把实时内存 data 复制到持久化存储，不重启核心或 DNS 服务，也不保证并发变更或极端断电情况下的一致性。正常停止或重启时仍会执行完整回写。"
 
 msgid "Memory write-back interval (minutes)"
 msgstr "内存数据回写周期（分钟）"
@@ -222,8 +222,8 @@ msgstr "请使用 /etc/AdGuardHome、/etc/AdGuardHome-*，或 /mnt 下以 AdGuar
 msgid "Runtime Log"
 msgstr "运行日志"
 
-msgid "View recent service messages from the system log. This page is read-only."
-msgstr "查看系统日志中的近期服务消息；此页面为只读。"
+msgid "View recent core and plugin messages from the system log. The newest entries are shown first, and this page is read-only."
+msgstr "查看系统日志中的近期核心和插件消息；最新记录显示在最上方，此页面为只读。"
 
 msgid "Lines:"
 msgstr "行数："
@@ -240,8 +240,23 @@ msgstr "暂无日志输出。"
 msgid "Showing up to %d lines (%d returned)."
 msgstr "最多显示 %d 行（实际返回 %d 行）。"
 
-msgid "Unable to read the runtime log: %s"
-msgstr "无法读取运行日志：%s"
+msgid "AdGuard Home Core Log"
+msgstr "AdGuard Home 核心日志"
+
+msgid "Plugin Runtime Log"
+msgstr "插件运行日志"
+
+msgid "Unable to read the AdGuard Home core log: %s"
+msgstr "无法读取 AdGuard Home 核心日志：%s"
+
+msgid "Unable to read the plugin runtime log: %s"
+msgstr "无法读取插件运行日志：%s"
+
+msgid "The log source response was invalid."
+msgstr "日志来源响应无效。"
+
+msgid "Logs refreshed."
+msgstr "日志已刷新。"
 
 msgid "Unknown error"
 msgstr "未知错误"

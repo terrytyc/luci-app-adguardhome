@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.3.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -44,9 +44,11 @@ endef
 
 # APK maps this hook to both pre-install and pre-upgrade.  A first install
 # snapshots the untouched official UCI/runtime state for safe uninstall.  The
-# supported in-place sources are the released v2.1.0-r1, v2.2.0-r1 and
-# v2.2.0-r2 packages; reject any other installed version before creating maintenance
-# state or touching DNS.
+# supported in-place sources are the released v2.1.0-r1, v2.2.0-r1,
+# v2.2.0-r2 and v2.3.0-r1 packages; reject any other installed version before
+# creating maintenance state or touching DNS.  The v2.3.0-r1 source and any
+# v2.2 source that requests or actively uses its old RAM-YAML mode use the cold
+# path because r2 deliberately no longer creates a YAML copy in RAM.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$${IPKG_INSTROOT}" ] || exit 0
@@ -176,13 +178,16 @@ if [ "$$is_upgrade" = 1 ]; then
 		exit 1
 	}
 	case "$$installed_version" in
-		2.1.0-r1) maintenance_upgrade=0 ;;
+		2.1.0-r1|2.3.0-r1)
+			maintenance_upgrade=0
+			upgrade_source_version="$$installed_version"
+			;;
 		2.2.0-r1|2.2.0-r2)
 			maintenance_upgrade=1
 			maintenance_source_version="$$installed_version"
 			;;
 		*)
-			echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1, 2.2.0-r1 or 2.2.0-r2; found '$$installed_version'." >&2
+			echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1, 2.2.0-r1, 2.2.0-r2 or 2.3.0-r1; found '$$installed_version'." >&2
 			exit 1
 			;;
 	esac
@@ -210,6 +215,7 @@ snapshot_stage=""
 upgrade_restore_required=0
 upgrade_was_running=0
 upgrade_workdir=""
+upgrade_source_version="$${upgrade_source_version:-}"
 maintenance_upgrade="$${maintenance_upgrade:-0}"
 maintenance_source_version="$${maintenance_source_version:-}"
 maintenance_marker_created=0
@@ -392,6 +398,91 @@ upgrade_source_anchors_match() {
 		[ "$$lower_config" = "$${value}/AdGuardHome.yaml" ]
 }
 
+legacy_memory_source_deltas_safe() {
+	local changes line package count=0 seen_config=0 seen_work=0
+	local effective_config effective_work memory_status
+	for package in AdGuardHome dhcp firewall; do
+		[ -z "$$(uci -q changes "$$package" 2>/dev/null)" ] || return 1
+	done
+	changes="$$(uci -q changes adguardhome 2>/dev/null)" || return 1
+	while IFS= read -r line; do
+		[ -n "$$line" ] || continue
+		count=$$((count + 1))
+		case "$$line" in
+			"adguardhome.config.config_file='/tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml'")
+				[ "$$seen_config" = 0 ] || return 1
+				seen_config=1
+				;;
+			"adguardhome.config.work_dir='/tmp/luci-app-adguardhome-memory/work'")
+				[ "$$seen_work" = 0 ] || return 1
+				seen_work=1
+				;;
+			*) return 1 ;;
+		esac
+	done <<-EOF
+	$$changes
+	EOF
+	[ "$$count" -le 2 ] 2>/dev/null || return 1
+	effective_config="$$(uci -q get adguardhome.config.config_file)"
+	effective_work="$$(uci -q get adguardhome.config.work_dir)"
+	if [ "$$effective_config" = /tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml ] ||
+	   [ "$$effective_work" = /tmp/luci-app-adguardhome-memory/work ]; then
+		[ "$$effective_config" = /tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml ] &&
+			[ "$$effective_work" = /tmp/luci-app-adguardhome-memory/work ] || return 1
+		memory_status="$$(/etc/init.d/AdGuardHome memory_status 2>/dev/null)" || return 1
+		printf '%s\n' "$$memory_status" | grep -qx 'active=1' &&
+			printf '%s\n' "$$memory_status" | grep -qx \
+			'active_config_file=/tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml'
+		return
+	fi
+	[ "$$count" = 0 ]
+}
+
+stop_memory_source_for_cold_upgrade() {
+	local upper_enabled wrapper_rc=0 running_rc=0
+	case "$$upgrade_source_version" in
+		2.2.0-r1|2.2.0-r2|2.3.0-r1) ;;
+		*) return 1 ;;
+	esac
+	[ -x /etc/init.d/AdGuardHome ] && [ -f /etc/init.d/AdGuardHome ] &&
+		[ ! -L /etc/init.d/AdGuardHome ] &&
+		root_owned_regular_file /etc/init.d/AdGuardHome || return 1
+	[ -x /etc/init.d/adguardhome ] && [ -f /etc/init.d/adguardhome ] &&
+		[ ! -L /etc/init.d/adguardhome ] &&
+		root_owned_regular_file /etc/init.d/adguardhome || return 1
+	legacy_memory_source_deltas_safe || return 1
+	upper_enabled="$$(uci -q get AdGuardHome.AdGuardHome.enabled)" || return 1
+	case "$$upper_enabled" in 0|1) ;; *) return 1 ;; esac
+	# The registered coordinator is the durable running-state authority.  Its
+	# monitor remains registered while the lower procd instance is between
+	# respawns, so sampling only the core PID would incorrectly preserve that
+	# installation as stopped.
+	maintenance_wrapper_registered || wrapper_rc=$$?
+	case "$$wrapper_rc" in
+		0)
+			[ "$$upper_enabled" = 1 ] || return 1
+			upgrade_was_running=1
+			;;
+		1) upgrade_was_running=0 ;;
+		*) return 1 ;;
+	esac
+	run_bounded 5 1 /etc/init.d/adguardhome running \
+		>/dev/null 2>&1 || running_rc=$$?
+	case "$$wrapper_rc:$$running_rc" in
+		0:0|0:1) ;;
+		1:1) ;;
+		*) return 1 ;;
+	esac
+	# The installed wrapper owns the only safe conversion from its optional
+	# RAM YAML generation to a persistent YAML plus durable data checkpoint.
+	run_bounded 180 5 /etc/init.d/AdGuardHome stop \
+		>/dev/null 2>&1 || return 1
+	running_rc=0
+	run_bounded 5 1 /etc/init.d/adguardhome running \
+		>/dev/null 2>&1 || running_rc=$$?
+	[ "$$running_rc" = 1 ]
+}
+
 prepare_upgrade_snapshot_source() {
 	local upper_enabled running_rc=0
 	[ -x /etc/init.d/AdGuardHome ] && [ -f /etc/init.d/AdGuardHome ] &&
@@ -402,21 +493,33 @@ prepare_upgrade_snapshot_source() {
 		root_owned_regular_file /etc/init.d/adguardhome || return 1
 	upgrade_workdir="$$(uci -q get AdGuardHome.AdGuardHome.workdir)" || return 1
 	valid_upgrade_workdir_path "$$upgrade_workdir" || return 1
+	upper_enabled="$$(uci -q get AdGuardHome.AdGuardHome.enabled)" || return 1
+	case "$$upper_enabled" in 0|1) ;; *) return 1 ;; esac
+	case "$$upgrade_source_version" in
+		2.1.0-r1)
+			run_bounded 5 1 /etc/init.d/adguardhome running \
+				>/dev/null 2>&1 || running_rc=$$?
+			case "$$running_rc" in
+				0)
+					[ "$$upper_enabled" = 1 ] || return 1
+					upgrade_was_running=1
+					;;
+				1) upgrade_was_running=0 ;;
+				*) return 1 ;;
+			esac
+			;;
+		2.2.0-r1|2.2.0-r2|2.3.0-r1)
+			case "$$upgrade_was_running" in 0|1) ;; *) return 1 ;; esac
+			running_rc=0
+			run_bounded 5 1 /etc/init.d/adguardhome running \
+				>/dev/null 2>&1 || running_rc=$$?
+			[ "$$running_rc" = 1 ] || return 1
+			;;
+		*) return 1 ;;
+	esac
 	upgrade_source_anchors_match "$$upgrade_workdir" || return 1
 	upgrade_workdir_metadata "$$upgrade_workdir" || return 1
 	upgrade_yaml_metadata "$${upgrade_workdir}/AdGuardHome.yaml" || return 1
-	upper_enabled="$$(uci -q get AdGuardHome.AdGuardHome.enabled)" || return 1
-	case "$$upper_enabled" in 0|1) ;; *) return 1 ;; esac
-	run_bounded 5 1 /etc/init.d/adguardhome running \
-		>/dev/null 2>&1 || running_rc=$$?
-	case "$$running_rc" in
-		0)
-			[ "$$upper_enabled" = 1 ] || return 1
-			upgrade_was_running=1
-			;;
-		1) upgrade_was_running=0 ;;
-		*) return 1 ;;
-	esac
 }
 
 quiesce_yaml_updates() {
@@ -787,7 +890,7 @@ snapshot_sha256() {
 	printf '%s\n' "$$digest"
 }
 
-# The old v2.1 core is stopped before this transaction.  Hold the exact
+# The supported cold-upgrade core is stopped before this transaction.  Hold the exact
 # persistent workdir inode and capture the active YAML twice without changing
 # its metadata.  A service-owned namespace is read only by uid 853 through the
 # inherited directory descriptor, so root never opens a replaceable pathname.
@@ -845,6 +948,10 @@ cold_snapshot_upgrade_yaml() (
 	validate_runtime_dir || exit 1
 	[ ! -e "$$upgrade_yaml_snapshot" ] && [ ! -L "$$upgrade_yaml_snapshot" ] || exit 1
 	[ ! -e "$$upgrade_workdir_metadata" ] && [ ! -L "$$upgrade_workdir_metadata" ] || exit 1
+	case "$$upgrade_source_version" in
+		2.1.0-r1|2.2.0-r1|2.2.0-r2|2.3.0-r1) ;;
+		*) exit 1 ;;
+	esac
 	valid_upgrade_workdir_path "$$snapshot_workdir" || exit 1
 	upgrade_source_anchors_match "$$snapshot_workdir" || exit 1
 	upgrade_workdir_metadata "$$snapshot_workdir" || exit 1
@@ -939,7 +1046,7 @@ cold_snapshot_upgrade_yaml() (
 
 	{
 		printf 'format=1\n'
-		printf 'source_version=2.1.0-r1\n'
+		printf 'source_version=%s\n' "$$upgrade_source_version"
 		printf 'workdir=%s\n' "$$snapshot_workdir"
 		printf 'uid=%s\n' "$$snapshot_original_owner"
 		printf 'gid=%s\n' "$$snapshot_original_group"
@@ -1197,6 +1304,35 @@ preinst_exit() {
 	exit "$$cleanup_rc"
 }
 
+select_v22_upgrade_path() {
+	local status requested active
+	[ "$$maintenance_upgrade" = 1 ] || return 0
+	case "$$maintenance_source_version" in 2.2.0-r1|2.2.0-r2) ;; *) return 1 ;; esac
+	[ -x /etc/init.d/AdGuardHome ] && [ -f /etc/init.d/AdGuardHome ] &&
+		[ ! -L /etc/init.d/AdGuardHome ] &&
+		root_owned_regular_file /etc/init.d/AdGuardHome || return 1
+	status="$$(run_bounded 180 5 /etc/init.d/AdGuardHome memory_status)" || return 1
+	[ "$$(printf '%s\n' "$$status" | grep -c '^requested=')" = 1 ] || return 1
+	[ "$$(printf '%s\n' "$$status" | grep -c '^active=')" = 1 ] || return 1
+	requested="$$(printf '%s\n' "$$status" | sed -n 's/^requested=//p')"
+	active="$$(printf '%s\n' "$$status" | sed -n 's/^active=//p')"
+	case "$$requested:$$active" in
+		0:0) return 0 ;;
+		0:1|1:0|1:1)
+			upgrade_source_version="$$maintenance_source_version"
+			maintenance_source_version=""
+			maintenance_upgrade=0
+			return 0
+			;;
+		*) return 1 ;;
+	esac
+}
+
+select_v22_upgrade_path || {
+	echo "Unable to determine the installed AdGuard Home memory layout; upgrade aborted." >&2
+	exit 1
+}
+
 if [ "$$maintenance_upgrade" = 1 ]; then
 	trap maintenance_preinst_exit 0
 	trap 'exit 1' HUP INT TERM
@@ -1271,11 +1407,24 @@ fi
 
 trap preinst_exit 0
 trap 'exit 1' HUP INT TERM
-ensure_no_official_pending_delta || exit 1
 quiesce_yaml_updates || {
 	echo "Unable to quiesce LuCI YAML updates; installation aborted." >&2
 	exit 1
 }
+# A released RAM-YAML source owns an authenticated volatile lower-UCI delta.
+# Stop through the still-installed wrapper before applying the ordinary
+# no-pending-delta gate; every unrelated pending value remains visible and is
+# still rejected.
+case "$$upgrade_source_version" in
+	2.2.0-r1|2.2.0-r2|2.3.0-r1)
+	upgrade_restore_required=1
+	stop_memory_source_for_cold_upgrade || {
+		echo "Unable to stop and checkpoint the installed AdGuard Home RAM-YAML source; upgrade aborted." >&2
+		exit 1
+	}
+	;;
+esac
+ensure_no_official_pending_delta || exit 1
 ensure_original_snapshot || exit 1
 is_upgrade=0
 case "$${PKG_UPGRADE}:$$1" in
@@ -1320,15 +1469,17 @@ for init_link in /etc/rc.d/S??AdGuardHome /etc/rc.d/K??AdGuardHome; do
 	break
 done
 
+# Arm rollback before validating the source so any later failure restarts a
+# previously running coordinator through its still-present script.
+upgrade_restore_required=1
 prepare_upgrade_snapshot_source || {
-	echo "The active AdGuard Home v2.1 workdir or service state is not trustworthy; upgrade aborted before DNS or service changes." >&2
+	echo "The active AdGuard Home upgrade source or service state is not trustworthy; upgrade aborted." >&2
 	exit 1
 }
 
 # Every path below may change resolver or runtime state.  An EXIT cleanup will
-# restart a previously running v2.1 installation unless preinst commits the
+# restart a previously running supported installation unless preinst commits the
 # cold upgrade snapshot successfully.
-upgrade_restore_required=1
 
 ensure_dnsmasq_generic_upstream() {
 	local rollback_port="$$1" servers server has_generic=0 resolvfile
@@ -1534,7 +1685,7 @@ if [ -x /etc/init.d/adguardhome ]; then
 fi
 
 cold_snapshot_upgrade_yaml "$$upgrade_workdir" || {
-	echo "Unable to capture a stable private snapshot of the active AdGuard Home v2.1 YAML; upgrade aborted." >&2
+	echo "Unable to capture a stable private snapshot of the active AdGuard Home YAML; upgrade aborted." >&2
 	exit 1
 }
 
@@ -2349,13 +2500,21 @@ clear_owned_memory_delta_or_refuse() {
 	if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
 		effective_config="$$(uci -q get adguardhome.config.config_file)"
 		effective_work="$$(uci -q get adguardhome.config.work_dir)"
-		if [ "$$effective_config" = /tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml ] &&
-		   [ "$$effective_work" = /tmp/luci-app-adguardhome-memory/work ] &&
+		if [ "$$effective_work" = /tmp/luci-app-adguardhome-memory/work ] &&
 		   [ -x /etc/init.d/AdGuardHome ]; then
 			memory_status="$$(/etc/init.d/AdGuardHome memory_status 2>/dev/null)" || return 1
 			printf '%s\n' "$$memory_status" | grep -qx 'active=1' || return 1
-			uci -q revert adguardhome.config.config_file || return 1
+			# r2 owns only the volatile work_dir override; YAML remains at the
+			# active persistent path reported by the state-bound coordinator.
+			printf '%s\n' "$$memory_status" |
+				grep -Fqx "active_config_file=$$effective_config" || return 1
 			uci -q revert adguardhome.config.work_dir || return 1
+			# Accept and remove an exact leftover r1 config override only as a
+			# compatibility repair; r2 itself never creates this value.
+			if [ "$$effective_config" = \
+			     /tmp/luci-app-adguardhome-memory/work/AdGuardHome.yaml ]; then
+				uci -q revert adguardhome.config.config_file || return 1
+			fi
 		fi
 		if [ -e "$$delta_file" ] || [ -L "$$delta_file" ]; then
 			# Both UCI commit and reverting the plugin-owned RAM overrides may

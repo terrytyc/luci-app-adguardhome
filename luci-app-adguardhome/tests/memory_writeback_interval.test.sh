@@ -86,6 +86,9 @@ require_text "$defaults_file" 'set_upper_option memory_writeback_interval "$memo
 require_text "$init_file" 'memory_writeback_locked_command() {'
 require_text "$init_file" 'memory_copy_live_data_locked() ('
 require_text "$init_file" 'uid853_tree_is_writable() {'
+require_text "$init_file" 'sync_yaml_stale_memory_pattern() {'
+# shellcheck disable=SC2016
+require_text "$init_file" 'memory_rewrite_workdir_pattern "$MEMORY_WORK_DIR" "$work_dir" "$target_file"'
 require_text "$init_file" 'memory_copy_live_data_locked || return $?'
 # shellcheck disable=SC2016
 require_text "$init_file" '-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$target/"'
@@ -152,6 +155,41 @@ for forbidden in \
 	fi
 done
 
+# The persistent workdir is also the live YAML directory in r2.  A periodic
+# data copy may repair WORKDIR/data, but it must never change ownership or mode
+# on the persistent parent (including through the held directory descriptor).
+if printf '%s\n' "$copy_body" |
+	grep -Eq '(chown|chmod).*[$](MEMORY_BACKING_WORK_DIR|backing_fd)'; then
+	printf 'direct live data copy changes ownership or mode on the persistent backing parent\n' >&2
+	exit 1
+fi
+
+# Every data-tree mutator must run behind start-stop-daemon's uid-853 boundary;
+# the live-copy subprocess must not execute a root chown/chmod/mkdir/rm itself.
+root_mutators="$(printf '%s\n' "$copy_body" |
+	sed '/^[[:space:]]*#/d' |
+	grep -E '(^|[[:space:]])(/bin/)?(chown|chmod|mkdir|rm)([[:space:]]|$)' |
+	grep -Fv -- '-x /bin/' || true)"
+if [ -n "$root_mutators" ]; then
+	printf 'direct live data copy contains a root target mutator:\n%s\n' \
+		"$root_mutators" >&2
+	exit 1
+fi
+
+# These exact argv boundaries keep each target mutation unprivileged.
+# shellcheck disable=SC2016
+for unprivileged_mutator in \
+	'-n AGHDataClear -x /bin/rm -- -rf "$target"' \
+	'-n AGHDataMake -x /bin/mkdir -- -m 0700 "$target"' \
+	'-n AGHDataMode -x /bin/chmod -- 0700 "$target"' \
+	'-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$target/"'; do
+	if ! printf '%s\n' "$copy_body" | grep -Fq -- "$unprivileged_mutator"; then
+		printf 'direct live data copy lacks an unprivileged target mutation: %s\n' \
+			"$unprivileged_mutator" >&2
+		exit 1
+	fi
+done
+
 # A healthy persistent directory must be reused so cp overwrites matching files
 # without deleting unrelated existing files.  Only the explicit unusable-target
 # branch may remove and recreate it.
@@ -180,7 +218,8 @@ printf '%s\n' "$copy_body" | grep -Fq -- 'if [ "$target_ready" != 1 ]; then' || 
 	exit 1
 }
 # shellcheck disable=SC2016
-printf '%s\n' "$copy_body" | grep -Fq -- '/bin/rm -rf "$target"' || {
+printf '%s\n' "$copy_body" |
+	grep -Fq -- '-n AGHDataClear -x /bin/rm -- -rf "$target"' || {
 	printf 'direct live data copy cannot recover an unusable persistent data target\n' >&2
 	exit 1
 }

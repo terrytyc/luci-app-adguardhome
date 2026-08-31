@@ -418,7 +418,7 @@ return view.extend({
 			form.Flag,
 			'run_from_memory',
 			_('Run from memory'),
-			_('At startup, copies the persistent data directory into RAM and runs the official core there. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back.'),
+			_('At startup, copies only the persistent data directory into RAM and runs the official core there. AdGuardHome.yaml always remains in and is read from the persistent work directory. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back.'),
 		);
 		option.default = '0';
 		option.rmempty = false;

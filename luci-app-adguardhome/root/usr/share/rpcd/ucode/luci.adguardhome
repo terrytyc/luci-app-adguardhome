@@ -26,7 +26,7 @@ const TEMPLATE_DIRECTORY = '/usr/share/luci-app-adguardhome';
 const TEMPLATE_PATH = `${TEMPLATE_DIRECTORY}/default.yaml`;
 const MEMORY_RUNTIME_DIRECTORY = '/tmp/luci-app-adguardhome-memory';
 const MEMORY_WORK_DIRECTORY = `${MEMORY_RUNTIME_DIRECTORY}/work`;
-const MEMORY_CONFIG_PATH = `${MEMORY_WORK_DIRECTORY}/${CONFIG_FILENAME}`;
+const LEGACY_MEMORY_CONFIG_PATH = `${MEMORY_WORK_DIRECTORY}/${CONFIG_FILENAME}`;
 const MEMORY_STATE_PATH = `${MEMORY_RUNTIME_DIRECTORY}/state`;
 const ADGUARD_UID = 853;
 const ADGUARD_GID = 853;
@@ -96,19 +96,19 @@ function same_inode(left, right) {
 		left.dev?.minor == right.dev?.minor;
 }
 
-function memory_config_path(persistent_work_dir) {
+function memory_state_active(persistent_work_dir) {
 	if (!valid_work_dir(
 		persistent_work_dir,
 		persistent_work_dir,
 		`${persistent_work_dir}/${CONFIG_FILENAME}`
 	    ))
-		return null;
+		return false;
 
 	let runtime = lstat(MEMORY_RUNTIME_DIRECTORY);
 	let active = lstat(MEMORY_WORK_DIRECTORY);
-	let config = lstat(MEMORY_CONFIG_PATH);
 	let data = lstat(`${MEMORY_WORK_DIRECTORY}/data`);
 	let backing = lstat(persistent_work_dir);
+	let entries = lsdir(MEMORY_WORK_DIRECTORY);
 	if (runtime?.type != 'directory' || runtime.uid != 0 ||
 	    runtime.gid != ADGUARD_GID || runtime.mode != 0o710 ||
 	    active?.type != 'directory' || active.uid != ADGUARD_UID ||
@@ -118,12 +118,8 @@ function memory_config_path(persistent_work_dir) {
 	    backing?.type != 'directory' || backing.mode != 0o700 ||
 	    !((backing.uid == 0 && (backing.gid == 0 || backing.gid == ADGUARD_GID)) ||
 	      (backing.uid == ADGUARD_UID && backing.gid == ADGUARD_GID)) ||
-	    config?.type != 'file' || config.nlink != 1 || config.size <= 0 ||
-	    config.size > MAX_CONFIG_LENGTH ||
-	    !((config.uid == ADGUARD_UID && config.gid == ADGUARD_GID &&
-	       (config.mode == 0o600 || config.mode == 0o640)) ||
-	      (config.uid == 0 && config.gid == ADGUARD_GID && config.mode == 0o640)))
-		return null;
+	    type(entries) != 'array' || length(entries) != 1 || entries[0] != 'data')
+		return false;
 
 	let file = null;
 	try {
@@ -131,11 +127,11 @@ function memory_config_path(persistent_work_dir) {
 		if (before?.type != 'file' || before.uid != 0 || before.gid != 0 ||
 		    before.mode != 0o600 || before.nlink != 1 || before.size <= 0 ||
 		    before.size > 1024)
-			return null;
+			return false;
 
 		file = open(MEMORY_STATE_PATH, 'r');
 		if (!file)
-			return null;
+			return false;
 		let descriptor = file.fileno();
 		let opened = type(descriptor) == 'int'
 			? stat(`/proc/self/fd/${descriptor}`)
@@ -150,7 +146,7 @@ function memory_config_path(persistent_work_dir) {
 			after.mode == 0o600 && after.nlink == 1 &&
 			before.size == opened.size && before.size == after.size &&
 			length(content) == opened.size && length(lines) == 5 &&
-			lines[0] == 'version=2' &&
+			lines[0] == 'version=3' &&
 			lines[1] == `persistent_work_dir=${persistent_work_dir}` &&
 			type(backing_device) == 'int' &&
 			lines[2] == `backing_device=${backing_device}` &&
@@ -159,15 +155,45 @@ function memory_config_path(persistent_work_dir) {
 		if (!file.close())
 			valid = false;
 		file = null;
-		return valid ? MEMORY_CONFIG_PATH : null;
+		return valid;
 	}
 	catch (error) {
 		if (file) {
 			try { file.close(); }
 			catch (close_error) { }
 		}
-		return null;
+		return false;
 	}
+}
+
+function memory_active() {
+	let uci = null;
+	let active = false;
+
+	try {
+		uci = cursor();
+		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir');
+		let persistent_config = `${configured_work_dir}/${CONFIG_FILENAME}`;
+		let official_work_dir = uci.get('adguardhome', 'config', 'work_dir') ||
+			uci.get('adguardhome', 'config', 'workdir');
+		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
+		active = memory_state_active(configured_work_dir) &&
+			official_config_file == persistent_config &&
+			(official_work_dir == MEMORY_WORK_DIRECTORY ||
+			 official_work_dir == configured_work_dir);
+	}
+	catch (error) {
+		active = false;
+	}
+	if (uci) {
+		try {
+			uci.unload(CONFIG_NAME);
+			uci.unload('adguardhome');
+		}
+		catch (error) { }
+	}
+
+	return active;
 }
 
 function config_path() {
@@ -181,19 +207,21 @@ function config_path() {
 		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
 		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir');
 		let memory_namespace = lstat(MEMORY_RUNTIME_DIRECTORY);
-		let active_path = memory_config_path(configured_work_dir);
-		if (active_path) {
+		let persistent_config = `${configured_work_dir}/${CONFIG_FILENAME}`;
+		let active = memory_state_active(configured_work_dir);
+		if (active && official_config_file == persistent_config &&
+		    (official_work_dir == MEMORY_WORK_DIRECTORY ||
+		     official_work_dir == configured_work_dir)) {
 			// A valid root-private state record is authoritative for this boot.
-			// Lower UCI may briefly expose the backing paths while the init wrapper
-			// commits TLS or service fields; never open the stale disk YAML then.
-			work_dir = MEMORY_WORK_DIRECTORY;
+			// Lower UCI may briefly expose the backing workdir while the init wrapper
+			// commits service fields, but the YAML always remains persistent.
+			work_dir = configured_work_dir;
 		}
 		else if (memory_namespace ||
 		         official_work_dir == MEMORY_WORK_DIRECTORY ||
-		         official_config_file == MEMORY_CONFIG_PATH) {
+		         official_config_file == LEGACY_MEMORY_CONFIG_PATH) {
 			// A present but invalid RAM namespace is a corruption state, not an
-			// absent feature.  Never fall back to the stale backing YAML while the
-			// init transaction temporarily exposes persistent lower-UCI paths.
+			// absent feature.  Never open a path from an unbound memory generation.
 			work_dir = null;
 		}
 		else {
@@ -248,7 +276,7 @@ function service_running() {
 
 function service_status() {
 	let requested = false;
-	let active = config_path() == MEMORY_CONFIG_PATH;
+	let active = memory_active();
 	let uci = null;
 
 	try {
@@ -427,23 +455,46 @@ function requested_log_lines(value) {
 	return 500;
 }
 
-function read_log(value) {
+function requested_log_source(value) {
+	return value == 'plugin' ? 'plugin' : 'core';
+}
+
+function newest_first_log(output, source) {
+	let records = [];
+	for (let line in split(output, '\n'))
+		if (length(line))
+			push(records, line);
+
+	let newest_first = [];
+	for (let i = length(records) - 1; i >= 0; i--)
+		push(newest_first, records[i]);
+
+	return {
+		log: join('\n', newest_first),
+		lines: length(newest_first),
+		source,
+	};
+}
+
+function read_log(value, requested_source) {
 	let requested = requested_log_lines(value);
+	let source = requested_log_source(requested_source);
 	let pipe = null;
 	let output = null;
 	let status = -1;
 
 	try {
 		// ImmortalWrt 25.12.1's ucode popen() accepts a command string only.
-		// The sole interpolation has already been reduced to one of three
-		// decimal literals; every other byte is a fixed constant.  Filter
-		// before tailing because logread applies its own -l limit before -e.
-		pipe = popen(
-			`set -o pipefail; /sbin/logread -e '[Aa]d[Gg]uard[Hh]ome' | /usr/bin/tail -n ${requested}`,
-			'r'
-		);
+		// The source selects one of two fixed, anchored syslog-tag patterns and
+		// the line count has already been reduced to one of three decimal
+		// literals.  Filter before tailing because logread applies its own -l
+		// limit before -e.  `[[]` is the ERE-safe literal opening bracket.
+		let command = source == 'plugin'
+			? `set -o pipefail; /sbin/logread -e '^AdGuardHome:' | /usr/bin/tail -n ${requested}`
+			: `set -o pipefail; /sbin/logread -e '^AdGuardHome[[]' | /usr/bin/tail -n ${requested}`;
+		pipe = popen(command, 'r');
 		if (!pipe)
-			return { log: '', lines: 0 };
+			return { log: '', lines: 0, source };
 
 		output = pipe.read(MAX_LOG_LENGTH + 1);
 		status = pipe.close();
@@ -459,11 +510,11 @@ function read_log(value) {
 			}
 		}
 
-		return { log: '', lines: 0 };
+		return { log: '', lines: 0, source };
 	}
 
 	if (status != 0 || type(output) != 'string')
-		return { log: '', lines: 0 };
+		return { log: '', lines: 0, source };
 
 	if (length(output) > MAX_LOG_LENGTH) {
 		output = substr(output, length(output) - MAX_LOG_LENGTH);
@@ -472,12 +523,7 @@ function read_log(value) {
 			output = substr(output, newline + 1);
 	}
 
-	let actual = 0;
-	for (let line in split(output, '\n'))
-		if (length(line))
-			actual++;
-
-	return { log: output, lines: actual };
+	return newest_first_log(output, source);
 }
 
 function random_token() {
@@ -1767,9 +1813,9 @@ const methods = {
 		},
 	},
 	get_log: {
-		args: { lines: 100 },
+		args: { source: 'core', lines: 100 },
 		call: function(request) {
-			return read_log(request.args.lines);
+			return read_log(request.args.lines, request.args.source);
 		},
 	},
 	get_yaml: {

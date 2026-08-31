@@ -145,7 +145,7 @@ for (const [ name, source ] of [ [ 'overview', overview ], [ 'yaml', yaml ], [ '
 		`${name} view must use the shared operation status`);
 	assert.match(source, /operation\.start\(\)/,
 		`${name} view must show operation progress`);
-	assert.match(source, /operation\.success\(\)/,
+	assert.match(source, /operation\.success\(/,
 		`${name} view must show operation success`);
 	assert.match(source, /operation\.failure\(/,
 		`${name} view must show operation failure`);
