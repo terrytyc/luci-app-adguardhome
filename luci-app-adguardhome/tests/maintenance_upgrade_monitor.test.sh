@@ -87,4 +87,74 @@ case "$monitor_guard" in
 		;;
 esac
 
+# Cold upgrades are handled by default_postinst, whose init-loop return value
+# does not reflect a failed service start.  A private handoff record must carry
+# the source running state into the custom postinst, and that hook must verify
+# the exact running/stopped outcome before retiring the record.
+for required in \
+	'cold_postinst_dir=/var/run/luci-app-adguardhome-postinst' \
+	'cold_postinst_state="$${cold_postinst_dir}/cold-upgrade"' \
+	'write_cold_postinst_state() {' \
+	'load_cold_postinst_state() {' \
+	'verify_cold_upgrade_completion() {' \
+	'retire_cold_postinst_state() {' \
+	"printf 'format=1\\n'" \
+	"printf 'source_version=%s\\n' \"\$\$upgrade_source_version\"" \
+	"printf 'was_running=%s\\n' \"\$\$upgrade_was_running\"" \
+	'run_bounded 180 5 /etc/init.d/AdGuardHome do_redirect 1' \
+	'if [ "$$active" = 1 ]; then' \
+	"case \"\$\$old_enabled\" in ''|0) ;; *) return 1 ;; esac" \
+	'root_private_bounded_job_file "$$cold_postinst_state"'; do
+	grep -Fq -- "$required" "$makefile" || {
+		printf 'cold-upgrade completion contract is missing: %s\n' "$required" >&2
+		exit 1
+	}
+done
+
+cold_verify_body="$(awk '
+	$0 == "verify_cold_upgrade_completion() {" { copying = 1; depth = 0 }
+	copying {
+		print
+		opens = gsub(/\{/, "{")
+		closes = gsub(/\}/, "}")
+		depth += opens - closes
+		if (depth == 0) exit
+	}
+' "$makefile")"
+[ -n "$cold_verify_body" ] || {
+	printf 'cold-upgrade completion verifier is missing\n' >&2
+	exit 1
+}
+case "$cold_verify_body" in
+	*'case "$$cold_was_running" in'*'maintenance_wrapper_registered'*'maintenance_core_identity'*'verify_cold_storage_state 1'*'verify_cold_storage_state 0'*) ;;
+	*)
+		printf 'cold-upgrade running/stopped verifier is incomplete\n' >&2
+		exit 1
+		;;
+esac
+if printf '%s\n' "$cold_verify_body" | grep -Eq '(^|[[:space:]])sleep([[:space:]]|$)'; then
+	printf 'cold-upgrade completion uses a fixed sleep instead of bounded state checks\n' >&2
+	exit 1
+fi
+
+snapshot_line="$(grep -n '^cold_snapshot_upgrade_yaml "\$\$upgrade_workdir"' "$makefile" |
+	cut -d: -f1)"
+publish_line="$(grep -n '^write_cold_postinst_state ||' "$makefile" | cut -d: -f1)"
+commit_line="$(grep -n '^cold_postinst_committed=1$' "$makefile" | cut -d: -f1)"
+verify_line="$(grep -n '^[[:space:]]*verify_cold_upgrade_completion ||' "$makefile" |
+	cut -d: -f1)"
+retire_line="$(grep -n '^retire_cold_postinst_state ||' "$makefile" | cut -d: -f1)"
+case "$snapshot_line:$publish_line:$commit_line:$verify_line:$retire_line" in
+	*[!0-9:]*|:*|*:|*::*)
+		printf 'cold-upgrade lifecycle ordering markers are ambiguous\n' >&2
+		exit 1
+		;;
+esac
+if [ "$snapshot_line" -ge "$publish_line" ] ||
+   [ "$publish_line" -ge "$commit_line" ] ||
+   [ "$verify_line" -ge "$retire_line" ]; then
+	printf 'cold-upgrade completion state is published, verified, or retired out of order\n' >&2
+	exit 1
+fi
+
 printf 'ok - fail-closed maintenance monitor replacement contract\n'

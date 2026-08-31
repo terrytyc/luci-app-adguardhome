@@ -206,6 +206,10 @@ maintenance_config_snapshot="$${runtime_dir}/maintenance-adguardhome.config"
 maintenance_delta_snapshot="$${runtime_dir}/maintenance-adguardhome.delta"
 upgrade_yaml_snapshot="$${runtime_dir}/upgrade-active.yaml"
 upgrade_workdir_metadata="$${runtime_dir}/upgrade-workdir.meta"
+cold_postinst_dir=/var/run/luci-app-adguardhome-postinst
+cold_postinst_state="$${cold_postinst_dir}/cold-upgrade"
+cold_postinst_dir_created=0
+cold_postinst_committed=0
 yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
 yaml_update_lock="$${yaml_runtime_dir}/update.lock"
 yaml_maintenance_marker="$${yaml_runtime_dir}/removing"
@@ -789,6 +793,85 @@ private_single_file_between() {
 	[ "$$size" -ge "$$2" ]
 }
 
+validate_cold_postinst_state() {
+	local line1 line2 line3 extra entry source_version was_running
+	validate_runtime_parent || return 1
+	root_private_directory "$$cold_postinst_dir" || return 1
+	root_private_single_file "$$cold_postinst_state" || return 1
+	private_single_file_between "$$cold_postinst_state" 1 256 || return 1
+	{
+		IFS= read -r line1 && IFS= read -r line2 &&
+			IFS= read -r line3 && ! IFS= read -r extra
+	} <"$$cold_postinst_state" || return 1
+	[ "$$line1" = format=1 ] || return 1
+	case "$$line2" in
+		source_version=2.1.0-r1|source_version=2.2.0-r1|source_version=2.2.0-r2|source_version=2.3.0-r1)
+			source_version="$${line2#*=}"
+			;;
+		*) return 1 ;;
+	esac
+	case "$$line3" in
+		was_running=0|was_running=1) was_running="$${line3#*=}" ;;
+		*) return 1 ;;
+	esac
+	[ "$$source_version" = "$$upgrade_source_version" ] &&
+		[ "$$was_running" = "$$upgrade_was_running" ] || return 1
+	for entry in \
+		"$$cold_postinst_dir"/* \
+		"$$cold_postinst_dir"/.[!.]* \
+		"$$cold_postinst_dir"/..?*; do
+		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
+		[ "$$entry" = "$$cold_postinst_state" ] || return 1
+	done
+}
+
+write_cold_postinst_state() {
+	local stage
+	[ ! -e "$$cold_postinst_dir" ] && [ ! -L "$$cold_postinst_dir" ] || return 1
+	validate_runtime_parent || return 1
+	mkdir -m 0700 "$$cold_postinst_dir" || return 1
+	cold_postinst_dir_created=1
+	chown 0:0 "$$cold_postinst_dir" && chmod 0700 "$$cold_postinst_dir" || return 1
+	root_private_directory "$$cold_postinst_dir" || return 1
+	stage="$$(mktemp "$$cold_postinst_dir/.cold-upgrade.XXXXXX")" || return 1
+	case "$$stage" in "$$cold_postinst_dir"/.cold-upgrade.??????) ;; *) return 1 ;; esac
+	{
+		printf 'format=1\n'
+		printf 'source_version=%s\n' "$$upgrade_source_version"
+		printf 'was_running=%s\n' "$$upgrade_was_running"
+	} >"$$stage" || return 1
+	chown 0:0 "$$stage" && chmod 0600 "$$stage" || return 1
+	private_single_file_between "$$stage" 1 256 || return 1
+	[ ! -e "$$cold_postinst_state" ] && [ ! -L "$$cold_postinst_state" ] || return 1
+	mv "$$stage" "$$cold_postinst_state" || return 1
+	validate_cold_postinst_state
+}
+
+cleanup_cold_postinst_state() {
+	local entry cleanup_rc=0
+	[ "$$cold_postinst_committed" != 1 ] || return 0
+	[ "$$cold_postinst_dir_created" = 1 ] || return 0
+	root_private_directory "$$cold_postinst_dir" || return 1
+	for entry in \
+		"$$cold_postinst_dir"/* \
+		"$$cold_postinst_dir"/.[!.]* \
+		"$$cold_postinst_dir"/..?*; do
+		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
+		case "$$entry" in
+			"$$cold_postinst_state"|"$$cold_postinst_dir"/.cold-upgrade.??????)
+				root_private_single_file "$$entry" || {
+					cleanup_rc=1
+					continue
+				}
+				rm -f "$$entry" || cleanup_rc=1
+				;;
+			*) cleanup_rc=1 ;;
+		esac
+	done
+	[ "$$cleanup_rc" = 0 ] && rmdir "$$cold_postinst_dir" || cleanup_rc=1
+	return "$$cleanup_rc"
+}
+
 valid_runtime_temp_name() {
 	local entry="$$1" suffix
 	case "$$entry" in
@@ -1300,6 +1383,7 @@ preinst_exit() {
 	local primary_rc=$$? cleanup_rc=0
 	trap '' 0 HUP INT TERM
 	cleanup_upgrade_markers || cleanup_rc=$$?
+	cleanup_cold_postinst_state || cleanup_rc=1
 	[ "$$primary_rc" -ne 0 ] && exit "$$primary_rc"
 	exit "$$cleanup_rc"
 }
@@ -1327,6 +1411,11 @@ select_v22_upgrade_path() {
 		*) return 1 ;;
 	esac
 }
+
+if [ -e "$$cold_postinst_dir" ] || [ -L "$$cold_postinst_dir" ]; then
+	echo "Unfinished AdGuard Home cold-upgrade state exists; installation aborted." >&2
+	exit 1
+fi
 
 select_v22_upgrade_path || {
 	echo "Unable to determine the installed AdGuard Home memory layout; upgrade aborted." >&2
@@ -1688,10 +1777,15 @@ cold_snapshot_upgrade_yaml "$$upgrade_workdir" || {
 	echo "Unable to capture a stable private snapshot of the active AdGuard Home YAML; upgrade aborted." >&2
 	exit 1
 }
+write_cold_postinst_state || {
+	echo "Unable to publish the private AdGuard Home cold-upgrade completion state; upgrade aborted." >&2
+	exit 1
+}
 
-upgrade_restore_required=0
-yaml_maintenance_committed=1
 trap '' 0 HUP INT TERM
+upgrade_restore_required=0
+cold_postinst_committed=1
+yaml_maintenance_committed=1
 exit 0
 endef
 
@@ -1708,6 +1802,87 @@ if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	echo "AdGuard Home configuration migration failed; package installation aborted." >&2
 	exit 1
 fi
+
+# ImmortalWrt's default_postinst ignores init start failures.  Bound the final
+# cold-upgrade convergence check without an external timeout package so an APK
+# transaction cannot report success while the coordinator is still unusable.
+run_bounded() (
+	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0
+	shift 2
+	case "$$limit" in ""|*[!0-9]*) exit 125 ;; esac
+	case "$$grace" in ""|*[!0-9]*) exit 125 ;; esac
+	[ "$$#" -gt 0 ] || exit 125
+	[ -x /usr/bin/setsid ] || exit 125
+	marker="$$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
+	chmod 0600 "$$marker" || {
+		rm -f "$$marker"
+		exit 125
+	}
+	printf '0\n' >"$$marker" || {
+		rm -f "$$marker"
+		exit 125
+	}
+	bounded_signal_session() {
+		/bin/kill "-$$1" -- "-$$child" 2>/dev/null ||
+			/bin/kill "-$$1" "$$child" 2>/dev/null || true
+	}
+	bounded_abort() {
+		trap - HUP INT QUIT TERM
+		[ -z "$$watchdog" ] || /bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		[ -z "$$watchdog" ] || wait "$$watchdog" 2>/dev/null || true
+		if [ -n "$$child" ]; then
+			bounded_signal_session TERM
+			sleep "$$grace" 2>/dev/null || true
+			bounded_signal_session KILL
+			wait "$$child" 2>/dev/null || true
+		fi
+		rm -f "$$marker"
+		exit 125
+	}
+	trap bounded_abort HUP INT QUIT TERM
+	[ ! -e /proc/self/fd/187 ] || bounded_abort
+	exec 187<&0 || bounded_abort
+	/usr/bin/setsid "$$@" <&187 187<&- &
+	child=$$!
+	exec 187<&-
+	(
+		bounded_sleeper=""
+		bounded_watchdog_abort() {
+			trap - HUP INT QUIT TERM
+			[ -z "$$bounded_sleeper" ] || /bin/kill -TERM "$$bounded_sleeper" 2>/dev/null || true
+			[ -z "$$bounded_sleeper" ] || wait "$$bounded_sleeper" 2>/dev/null || true
+			exit 1
+		}
+		bounded_watchdog_sleep() {
+			sleep "$$1" &
+			bounded_sleeper=$$!
+			wait "$$bounded_sleeper"
+			bounded_sleep_rc=$$?
+			bounded_sleeper=""
+			return "$$bounded_sleep_rc"
+		}
+		trap bounded_watchdog_abort HUP INT QUIT TERM
+		bounded_watchdog_sleep "$$limit" || exit 1
+		/bin/kill -0 -- "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
+		printf '1\n' >"$$marker" || exit 1
+		bounded_signal_session TERM
+		bounded_watchdog_sleep "$$grace" || exit 0
+		bounded_signal_session KILL
+	) &
+	watchdog=$$!
+	wait "$$child" 2>/dev/null || rc=$$?
+	read -r expired <"$$marker" 2>/dev/null || expired=0
+	if [ "$$expired" = 1 ]; then
+		wait "$$watchdog" 2>/dev/null || true
+	else
+		/bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		wait "$$watchdog" 2>/dev/null || true
+	fi
+	trap - HUP INT QUIT TERM
+	rm -f "$$marker"
+	[ "$$expired" = 1 ] && exit 124
+	exit "$$rc"
+)
 
 entry_metadata() {
 	LC_ALL=C ls -ldn "$$1" 2>/dev/null
@@ -2002,6 +2177,128 @@ maintenance_core_identity() {
 	printf 'running:%s\n' "$$identity"
 }
 
+load_cold_postinst_state() {
+	local line1 line2 line3 extra entry size
+	root_private_directory "$$cold_postinst_dir" || return 1
+	root_private_single_file "$$cold_postinst_state" || return 1
+	size="$$(wc -c <"$$cold_postinst_state" 2>/dev/null)" || return 1
+	case "$$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$$size" -ge 1 ] 2>/dev/null && [ "$$size" -le 256 ] 2>/dev/null || return 1
+	{
+		IFS= read -r line1 && IFS= read -r line2 &&
+			IFS= read -r line3 && ! IFS= read -r extra
+	} <"$$cold_postinst_state" || return 1
+	[ "$$line1" = format=1 ] || return 1
+	case "$$line2" in
+		source_version=2.1.0-r1|source_version=2.2.0-r1|source_version=2.2.0-r2|source_version=2.3.0-r1)
+			cold_source_version="$${line2#*=}"
+			;;
+		*) return 1 ;;
+	esac
+	case "$$line3" in
+		was_running=0|was_running=1) cold_was_running="$${line3#*=}" ;;
+		*) return 1 ;;
+	esac
+	for entry in \
+		"$$cold_postinst_dir"/* \
+		"$$cold_postinst_dir"/.[!.]* \
+		"$$cold_postinst_dir"/..?*; do
+		[ -e "$$entry" ] || [ -L "$$entry" ] || continue
+		[ "$$entry" = "$$cold_postinst_state" ] || return 1
+	done
+}
+
+cold_status_value() {
+	local key="$$1"
+	printf '%s\n' "$$cold_memory_status" | awk -F= -v key="$$key" '
+		$$1 == key { count++; value=substr($$0, length(key) + 2) }
+		END { if (count == 1) print value; else exit 1 }
+	'
+}
+
+verify_cold_storage_state() {
+	local expected_running="$$1" requested work_dir active active_work active_config
+	local status_requested status_persistent status_backing backing_count
+	requested="$$(uci -q get AdGuardHome.AdGuardHome.run_from_memory)" || return 1
+	case "$$requested" in 0|1) ;; *) return 1 ;; esac
+	work_dir="$$(uci -q get AdGuardHome.AdGuardHome.workdir)" || return 1
+	case "$$work_dir" in ""|/|*/) return 1 ;; /*) ;; *) return 1 ;; esac
+	cold_memory_status="$$(run_bounded 20 2 /etc/init.d/AdGuardHome memory_status)" || return 1
+	status_requested="$$(cold_status_value requested)" || return 1
+	active="$$(cold_status_value active)" || return 1
+	status_persistent="$$(cold_status_value persistent_work_dir)" || return 1
+	active_work="$$(cold_status_value active_work_dir)" || return 1
+	active_config="$$(cold_status_value active_config_file)" || return 1
+	[ "$$status_requested" = "$$requested" ] &&
+		[ "$$status_persistent" = "$$work_dir" ] &&
+		[ "$$active_config" = "$${work_dir}/AdGuardHome.yaml" ] || return 1
+	if [ "$$expected_running" = 1 ] && [ "$$requested" = 1 ]; then
+		if [ "$$active" = 1 ]; then
+			[ "$$active_work" = /tmp/luci-app-adguardhome-memory/work ] || return 1
+			status_backing="$$(cold_status_value backing_work_dir)" || return 1
+			[ "$$status_backing" = "$$work_dir" ]
+			return
+		fi
+		# RAM mode is best-effort: the coordinator deliberately falls back to
+		# the persistent data tree when a safe RAM generation cannot be made.
+		# Accept that successful degraded state, but never a partial backing
+		# record that could make the active layout ambiguous.
+		[ "$$active" = 0 ] && [ "$$active_work" = "$$work_dir" ] || return 1
+		backing_count="$$(printf '%s\n' "$$cold_memory_status" |
+			awk '/^backing_work_dir=/ { count++ } END { print count + 0 }')" || return 1
+		[ "$$backing_count" = 0 ]
+		return
+	fi
+	[ "$$active" = 0 ] && [ "$$active_work" = "$$work_dir" ] || return 1
+	backing_count="$$(printf '%s\n' "$$cold_memory_status" |
+		awk '/^backing_work_dir=/ { count++ } END { print count + 0 }')" || return 1
+	[ "$$backing_count" = 0 ]
+}
+
+verify_cold_upgrade_completion() {
+	local wrapper_rc=0 core_identity old_enabled
+	[ "$$cold_upgrade" = 1 ] || return 0
+	case "$$cold_was_running" in
+		1)
+			maintenance_wrapper_registered || wrapper_rc=$$?
+			[ "$$wrapper_rc" = 0 ] || return 1
+			run_bounded 180 5 /etc/init.d/AdGuardHome do_redirect 1 \
+				>/dev/null 2>&1 || return 1
+			wrapper_rc=0
+			maintenance_wrapper_registered || wrapper_rc=$$?
+			[ "$$wrapper_rc" = 0 ] || return 1
+			run_bounded 5 1 /etc/init.d/AdGuardHome running \
+				>/dev/null 2>&1 || return 1
+			core_identity="$$(maintenance_core_identity)" || return 1
+			case "$$core_identity" in running:*) ;; *) return 1 ;; esac
+			old_enabled="$$(uci -q get AdGuardHome.AdGuardHome.old_enabled)" || return 1
+			[ "$$old_enabled" = 1 ] || return 1
+			verify_cold_storage_state 1
+			;;
+		0)
+			maintenance_wrapper_registered || wrapper_rc=$$?
+			[ "$$wrapper_rc" = 1 ] || return 1
+			core_identity="$$(maintenance_core_identity)" || return 1
+			[ "$$core_identity" = absent ] || return 1
+			old_enabled="$$(uci -q get AdGuardHome.AdGuardHome.old_enabled 2>/dev/null || true)"
+			case "$$old_enabled" in ''|0) ;; *) return 1 ;; esac
+			verify_cold_storage_state 0
+			;;
+		*) return 1 ;;
+	esac
+}
+
+retire_cold_postinst_state() {
+	local expected_source="$$cold_source_version" expected_running="$$cold_was_running"
+	[ "$$cold_upgrade" = 1 ] || return 0
+	load_cold_postinst_state || return 1
+	[ "$$cold_source_version" = "$$expected_source" ] &&
+		[ "$$cold_was_running" = "$$expected_running" ] || return 1
+	rm -f "$$cold_postinst_state" || return 1
+	[ ! -e "$$cold_postinst_state" ] && [ ! -L "$$cold_postinst_state" ] || return 1
+	rmdir "$$cold_postinst_dir"
+}
+
 maintenance_monitor_cgroup_supported() {
 	local directory=/sys/fs/cgroup/services/AdGuardHome/monitor
 	[ -d "$$directory" ] && [ ! -L "$$directory" ] || return 1
@@ -2171,6 +2468,16 @@ maintenance_upgrade_marker="$${runtime_dir}/maintenance-upgrade"
 maintenance_config_snapshot="$${runtime_dir}/maintenance-adguardhome.config"
 maintenance_delta_snapshot="$${runtime_dir}/maintenance-adguardhome.delta"
 maintenance_upgrade=0
+cold_postinst_dir=/var/run/luci-app-adguardhome-postinst
+cold_postinst_state="$${cold_postinst_dir}/cold-upgrade"
+cold_source_version=""
+cold_was_running=""
+cold_memory_status=""
+cold_upgrade=0
+package_upgrade=0
+case "$${PKG_UPGRADE}:$${1}" in
+	1:*|*:upgrade) package_upgrade=1 ;;
+esac
 yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
 yaml_update_lock="$${yaml_runtime_dir}/update.lock"
 yaml_maintenance_marker="$${yaml_runtime_dir}/removing"
@@ -2188,6 +2495,22 @@ elif [ -e "$$maintenance_config_snapshot" ] ||
      [ -e "$$maintenance_delta_snapshot" ] ||
      [ -L "$$maintenance_delta_snapshot" ]; then
 	echo "Incomplete AdGuard Home maintenance-upgrade bundle; installation aborted." >&2
+	exit 1
+fi
+
+if [ "$$maintenance_upgrade" = 1 ]; then
+	if [ -e "$$cold_postinst_dir" ] || [ -L "$$cold_postinst_dir" ]; then
+		echo "Conflicting AdGuard Home cold and maintenance upgrade state; installation aborted." >&2
+		exit 1
+	fi
+elif [ "$$package_upgrade" = 1 ]; then
+	load_cold_postinst_state || {
+		echo "Missing or unsafe AdGuard Home cold-upgrade completion state; installation aborted." >&2
+		exit 1
+	}
+	cold_upgrade=1
+elif [ -e "$$cold_postinst_dir" ] || [ -L "$$cold_postinst_dir" ]; then
+	echo "Unexpected AdGuard Home cold-upgrade state on a clean installation; installation aborted." >&2
 	exit 1
 fi
 
@@ -2254,6 +2577,13 @@ if [ "$$maintenance_upgrade" = 1 ]; then
 	}
 fi
 
+if [ "$$cold_upgrade" = 1 ]; then
+	verify_cold_upgrade_completion || {
+		echo "AdGuard Home did not reach its preserved cold-upgrade service state; installation aborted." >&2
+		exit 1
+	}
+fi
+
 rm -f /tmp/luci-indexcache.* || exit 1
 if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
 	rm -f /tmp/luci-modulecache || exit 1
@@ -2290,6 +2620,10 @@ root_private_directory "$$yaml_runtime_dir" &&
 	root_private_empty_file "$$yaml_maintenance_marker" || exit 1
 rm -f "$$yaml_maintenance_marker" || exit 1
 [ ! -e "$$yaml_maintenance_marker" ] && [ ! -L "$$yaml_maintenance_marker" ] || exit 1
+retire_cold_postinst_state || {
+	echo "Unable to retire the verified AdGuard Home cold-upgrade state; installation aborted." >&2
+	exit 1
+}
 exit 0
 endef
 
@@ -2827,6 +3161,8 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	}
 	snapshot_dir=/root/.luci-app-adguardhome
 	runtime_dir=/var/run/luci-app-adguardhome
+	cold_postinst_dir=/var/run/luci-app-adguardhome-postinst
+	cold_postinst_state="$${cold_postinst_dir}/cold-upgrade"
 	yaml_runtime_dir=/var/run/luci-app-adguardhome-yaml
 	if root_private_directory "$$snapshot_dir" &&
 	   root_private_file "$${snapshot_dir}/official-adguardhome.uci" &&
@@ -2842,6 +3178,25 @@ if [ -z "$${IPKG_INSTROOT}" ]; then
 	if root_private_directory "$$runtime_dir"; then
 		rm -f "$${runtime_dir}/upgrade" "$${runtime_dir}/init-enabled"
 		rmdir "$$runtime_dir" 2>/dev/null || true
+	fi
+	if [ -e "$$cold_postinst_dir" ] || [ -L "$$cold_postinst_dir" ]; then
+		if ! root_private_directory "$$cold_postinst_dir" ||
+		   ! root_private_bounded_job_file "$$cold_postinst_state"; then
+			echo "Unsafe cold-upgrade completion state was preserved after uninstall." >&2
+			exit 1
+		fi
+		for cold_entry in \
+			"$$cold_postinst_dir"/* \
+			"$$cold_postinst_dir"/.[!.]* \
+			"$$cold_postinst_dir"/..?*; do
+			[ -e "$$cold_entry" ] || [ -L "$$cold_entry" ] || continue
+			[ "$$cold_entry" = "$$cold_postinst_state" ] || {
+				echo "Unexpected cold-upgrade completion entry was preserved after uninstall." >&2
+				exit 1
+			}
+		done
+		rm -f "$$cold_postinst_state" || exit 1
+		rmdir "$$cold_postinst_dir" || exit 1
 	fi
 	# The package files, including the RPC object, have already been removed.
 	# Unload the in-memory object before unlinking its stable lock inode.
