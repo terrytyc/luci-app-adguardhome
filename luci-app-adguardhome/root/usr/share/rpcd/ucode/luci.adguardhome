@@ -206,22 +206,26 @@ function config_path() {
 			uci.get('adguardhome', 'config', 'workdir');
 		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
 		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir');
-		let memory_namespace = lstat(MEMORY_RUNTIME_DIRECTORY);
 		let persistent_config = `${configured_work_dir}/${CONFIG_FILENAME}`;
-		let active = memory_state_active(configured_work_dir);
-		if (active && official_config_file == persistent_config &&
+		if (official_config_file == persistent_config &&
 		    (official_work_dir == MEMORY_WORK_DIRECTORY ||
 		     official_work_dir == configured_work_dir)) {
-			// A valid root-private state record is authoritative for this boot.
-			// Lower UCI may briefly expose the backing workdir while the init wrapper
-			// commits service fields, but the YAML always remains persistent.
-			work_dir = configured_work_dir;
+			// YAML is independent of the data-only RAM generation.  Keep it
+			// available while lower UCI points its work directory at RAM, including
+			// recovery from missing or corrupt RAM data.  The exact lower config
+			// binding plus valid_work_dir() still constrain and validate the
+			// persistent namespace.
+			work_dir = valid_work_dir(
+				configured_work_dir,
+				configured_work_dir,
+				persistent_config
+			);
 		}
-		else if (memory_namespace ||
-		         official_work_dir == MEMORY_WORK_DIRECTORY ||
+		else if (official_work_dir == MEMORY_WORK_DIRECTORY ||
 		         official_config_file == LEGACY_MEMORY_CONFIG_PATH) {
-			// A present but invalid RAM namespace is a corruption state, not an
-			// absent feature.  Never open a path from an unbound memory generation.
+			// Never follow an unbound RAM work directory or the obsolete r1 RAM
+			// YAML path.  A corrupt data-only RAM namespace by itself must not hide
+			// an independently bound persistent YAML.
 			work_dir = null;
 		}
 		else {

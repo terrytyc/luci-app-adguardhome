@@ -4425,7 +4425,7 @@ yaml_file_hash() {
 
 validate_yaml_stage() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
-	local name token fd_path
+	local name token fd_path config_dir
 	case "$expected_hash" in
 		????????????????????????????????????????????????????????????????)
 			case "$expected_hash" in *[!0-9a-f]*) return 1 ;; esac
@@ -4438,15 +4438,17 @@ validate_yaml_stage() {
 			;;
 		*) return 1 ;;
 	esac
-	[ "${stage%/*}" = "$work_dir" ] || return 1
+	config_dir="${config_file%/*}"
+	[ -n "$config_dir" ] || return 1
 	name="${stage##*/}"
 	case "$name" in AdGuardHome.yaml.luci-*) ;; *) return 1 ;; esac
 	token="${name#AdGuardHome.yaml.luci-}"
 	[ "${#token}" -eq 32 ] || return 1
 	case "$token" in *[!0-9a-f]*) return 1 ;; esac
+	[ "$stage" = "${config_file}.luci-${token}" ] || return 1
 	[ -f "$stage" ] && [ ! -L "$stage" ] || return 1
 	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
-	path_contains_symlink "$work_dir" && return 1
+	path_contains_symlink "$config_dir" && return 1
 	case "$inherited_fd" in ""|*[!0-9]*) return 1 ;; esac
 	[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
 	fd_path="/proc/self/fd/${inherited_fd}"

@@ -67,8 +67,11 @@ const functions = functionNames.map(extractFunction).join('\n')
 
 const PERSISTENT_WORK_DIR = '/etc/AdGuardHome';
 const PERSISTENT_CONFIG = `${PERSISTENT_WORK_DIR}/AdGuardHome.yaml`;
+const CUSTOM_WORK_DIR = '/mnt/storage/AdGuardHome';
+const CUSTOM_CONFIG = `${CUSTOM_WORK_DIR}/AdGuardHome.yaml`;
 const MEMORY_RUNTIME_DIR = '/tmp/luci-app-adguardhome-memory';
 const MEMORY_WORK_DIR = `${MEMORY_RUNTIME_DIR}/work`;
+const LEGACY_MEMORY_CONFIG = `${MEMORY_WORK_DIR}/AdGuardHome.yaml`;
 const STATE_PATH = `${MEMORY_RUNTIME_DIR}/state`;
 const BACKING_DEVICE = 2049;
 const BACKING_INODE = 42;
@@ -76,8 +79,14 @@ const BACKING_INODE = 42;
 const fixture = {
 	requested: '0',
 	serviceRunning: true,
+	configuredWorkDir: PERSISTENT_WORK_DIR,
+	officialWorkDir: MEMORY_WORK_DIR,
+	officialConfigFile: PERSISTENT_CONFIG,
+	dataPresent: true,
 	entries: [ 'data' ],
 	version: 3,
+	symlinkPath: null,
+	writablePath: null,
 };
 
 const directory = (uid, gid, mode, inode, major = 8, minor = 1) => ({
@@ -91,22 +100,37 @@ const stateMetadata = content => ({
 
 function stateContent() {
 	return `version=${fixture.version}\n` +
-		`persistent_work_dir=${PERSISTENT_WORK_DIR}\n` +
+		`persistent_work_dir=${fixture.configuredWorkDir}\n` +
 		`backing_device=${BACKING_DEVICE}\n` +
 		`backing_inode=${BACKING_INODE}\n`;
 }
 
 function metadata(pathname) {
+	if (pathname === fixture.symlinkPath)
+		return { type: 'link', uid: 0, gid: 0, mode: 0o777 };
+	if (pathname === fixture.writablePath)
+		return {
+			...directory(0, 0, 0o777, 32),
+			perm: { group_write: true, other_write: true },
+		};
 	if (pathname === '/etc')
 		return directory(0, 0, 0o755, 20);
 	if (pathname === PERSISTENT_WORK_DIR)
+		return directory(853, 853, 0o700, BACKING_INODE);
+	if (pathname === '/mnt')
+		return directory(0, 0, 0o755, 30);
+	if (pathname === '/mnt/storage')
+		return directory(0, 0, 0o755, 31);
+	if (pathname === CUSTOM_WORK_DIR)
 		return directory(853, 853, 0o700, BACKING_INODE);
 	if (pathname === MEMORY_RUNTIME_DIR)
 		return directory(0, 853, 0o710, 50, 0, 23);
 	if (pathname === MEMORY_WORK_DIR)
 		return directory(853, 853, 0o700, 51, 0, 23);
 	if (pathname === `${MEMORY_WORK_DIR}/data`)
-		return directory(853, 853, 0o700, 52, 0, 23);
+		return fixture.dataPresent
+			? directory(853, 853, 0o700, 52, 0, 23)
+			: null;
 	if (pathname === STATE_PATH || pathname === '/proc/self/fd/77')
 		return stateMetadata(stateContent());
 	return null;
@@ -117,10 +141,10 @@ function uciCursor() {
 		get(config, section, option) {
 			const key = `${config}.${section}.${option}`;
 			return {
-				'AdGuardHome.AdGuardHome.workdir': PERSISTENT_WORK_DIR,
+				'AdGuardHome.AdGuardHome.workdir': fixture.configuredWorkDir,
 				'AdGuardHome.AdGuardHome.run_from_memory': fixture.requested,
-				'adguardhome.config.work_dir': MEMORY_WORK_DIR,
-				'adguardhome.config.config_file': PERSISTENT_CONFIG,
+				'adguardhome.config.work_dir': fixture.officialWorkDir,
+				'adguardhome.config.config_file': fixture.officialConfigFile,
 			}[key];
 		},
 		unload() {},
@@ -191,6 +215,8 @@ assert.doesNotMatch(configPathSource, /return\s+LEGACY_MEMORY_CONFIG_PATH/,
 assert.doesNotMatch(configPathSource,
 	/work_dir\s*=\s*MEMORY_WORK_DIRECTORY/,
 	'config_path must never select the RAM work directory for YAML');
+assert.doesNotMatch(configPathSource, /memory_namespace/,
+	'a stale data-only RAM namespace must not independently hide persistent YAML');
 
 assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), true,
 	'a valid version=3 data-only RAM generation should be active');
@@ -209,16 +235,54 @@ fixture.requested = '1';
 fixture.entries = [ 'data', 'AdGuardHome.yaml' ];
 assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
 	'a YAML file or any second top-level RAM work entry must invalidate RAM mode');
-assert.equal(api.config_path(), null,
-	'an invalid present RAM namespace must not fall back to any RAM YAML path');
+assert.equal(api.config_path(), PERSISTENT_CONFIG,
+	'corrupt RAM data must not hide the independently bound persistent YAML');
 status = api.service_status();
 assert.equal(status.memory_requested, true);
 assert.equal(status.memory_active, false,
 	'a requested checkbox must not manufacture an active RAM state');
 
+fixture.entries = [];
+fixture.dataPresent = false;
+assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
+	'a missing RAM data directory must invalidate the data generation');
+assert.equal(api.config_path(), PERSISTENT_CONFIG,
+	'missing RAM data with lower workdir still in RAM must keep persistent YAML available');
+
+fixture.officialConfigFile = `${PERSISTENT_WORK_DIR}/other.yaml`;
+assert.equal(api.config_path(), null,
+	'a RAM lower workdir without the exact persistent config binding must fail closed');
+
+fixture.officialConfigFile = LEGACY_MEMORY_CONFIG;
+assert.equal(api.config_path(), null,
+	'the obsolete r1 RAM YAML path must remain unavailable');
+
 fixture.entries = [ 'data' ];
+fixture.dataPresent = true;
+fixture.officialWorkDir = MEMORY_WORK_DIR;
+fixture.officialConfigFile = PERSISTENT_CONFIG;
 fixture.version = 2;
 assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
 	'a pre-r2 state record must not activate the data-only layout');
+
+fixture.configuredWorkDir = CUSTOM_WORK_DIR;
+fixture.officialConfigFile = CUSTOM_CONFIG;
+assert.equal(api.config_path(), CUSTOM_CONFIG,
+	'an exact lower config binding may anchor a validated custom persistent workdir');
+
+fixture.symlinkPath = '/mnt/storage';
+assert.equal(api.config_path(), null,
+	'a symlink ancestor must invalidate a custom persistent YAML namespace');
+
+fixture.symlinkPath = null;
+fixture.writablePath = '/mnt/storage';
+assert.equal(api.config_path(), null,
+	'a writable mount ancestor must invalidate a custom persistent YAML namespace');
+
+fixture.writablePath = null;
+fixture.configuredWorkDir = '/mnt/storage/../AdGuardHome';
+fixture.officialConfigFile = `${fixture.configuredWorkDir}/AdGuardHome.yaml`;
+assert.equal(api.config_path(), null,
+	'path traversal must remain invalid even with an exact lower config binding');
 
 console.log('r2 data-only RPC memory layout contract tests passed');
