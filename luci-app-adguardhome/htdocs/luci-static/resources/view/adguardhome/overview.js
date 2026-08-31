@@ -3,6 +3,7 @@
 'use strict';
 
 'require adguardhome.bcrypt as bcrypt';
+'require adguardhome.operation as operation';
 'require dom';
 'require form';
 'require poll';
@@ -22,6 +23,7 @@ const POLL_INTERVAL = 5;
 const YAML_POLL_INTERVAL = 1000;
 const YAML_POLL_LIMIT = 360;
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_./+@%:,=-]+$/;
+const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 
 const callGetServiceStatus = rpc.declare({
 	object: 'luci.adguardhome',
@@ -41,17 +43,17 @@ const callGetConfigInfo = rpc.declare({
 	expect: { '': { dns_port: null, web: null } },
 });
 
-const callGetPasswordInfo = rpc.declare({
+const callGetCredentials = rpc.declare({
 	object: 'luci.adguardhome',
-	method: 'get_password_info',
+	method: 'get_credentials',
 	expect: { '': { available: false, username: '', sha256: '' } },
 	reject: true,
 });
 
-const callSetPassword = rpc.declare({
+const callSetCredentials = rpc.declare({
 	object: 'luci.adguardhome',
-	method: 'set_password',
-	params: [ 'password_hash', 'sha256' ],
+	method: 'set_credentials',
+	params: [ 'username', 'password_hash', 'sha256' ],
 	expect: { '': { accepted: false, token: '', reused: false } },
 	reject: true,
 });
@@ -99,14 +101,14 @@ async function waitForYamlUpdate(token) {
 		if (typeof result?.error === 'string' && result.error)
 			throw new Error(result.error);
 		if (result?.state != 'pending' && result?.state != 'running')
-			throw new Error(_('The password update returned an unknown job state.'));
+			throw new Error(_('The credential update returned an unknown job state.'));
 
 		await delay(YAML_POLL_INTERVAL);
 	}
 
 	throw new Error(lastError
-		? _('The password update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
-		: _('The password update is still running. Do not submit it again; reload this page later.'));
+		? _('The credential update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
+		: _('The credential update is still running. Do not submit it again; reload this page later.'));
 }
 
 async function getServiceStatus() {
@@ -370,7 +372,6 @@ return view.extend({
 			form.DummyValue,
 			'_web_interface',
 			_('Management interface'),
-			_('HTTP keeps the host used to access LuCI and uses the port from YAML http.address. HTTPS uses YAML tls.server_name and tls.port_https.'),
 		);
 		webOption.renderWidget = () => managementContainer;
 
@@ -417,7 +418,7 @@ return view.extend({
 			form.Flag,
 			'run_from_memory',
 			_('Run from memory'),
-			_('At startup, copies the persistent data directory into RAM and runs the official core there. Normal stop or restart, and enabled periodic write-back, save a consistent checkpoint; an unexpected power loss can lose changes made since the last successful checkpoint.'),
+			_('At startup, copies the persistent data directory into RAM and runs the official core there. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back.'),
 		);
 		option.default = '0';
 		option.rmempty = false;
@@ -426,7 +427,7 @@ return view.extend({
 			form.Value,
 			'memory_writeback_interval',
 			_('Memory write-back interval (minutes)'),
-			_('At each interval, the plugin briefly stops and restarts the official core and its DNS service to write a consistent data checkpoint to the persistent working directory. Each checkpoint writes to persistent storage; use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; normal stop or restart still writes back.'),
+			_('At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back.'),
 		);
 		option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
 		option.placeholder = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
@@ -436,16 +437,15 @@ return view.extend({
 
 		option = section.option(
 			form.DummyValue,
-			'_change_password',
-			_('Management password'),
-			_('Changes the password for the admin account stored in AdGuardHome.yaml. The password is BCrypt-hashed in this browser and the plaintext is never sent to the router.'),
+			'_change_credentials',
+			_('Change Username and Password'),
 		);
 		option.renderWidget = () => E('button', {
 			class: 'cbi-button cbi-button-action',
 			type: 'button',
 			disabled: !L.hasViewPermission() ? 'disabled' : null,
-			click: ui.createHandlerFn(this, 'openPasswordDialog'),
-		}, _('Change Password'));
+			click: ui.createHandlerFn(this, 'openCredentialsDialog'),
+		}, _('Change Username and Password'));
 
 		const rendered = await map.render();
 
@@ -466,21 +466,31 @@ return view.extend({
 		return rendered;
 	},
 
-	async openPasswordDialog() {
+	async openCredentialsDialog() {
 		let info = null;
 		try {
-			info = await callGetPasswordInfo();
+			info = await callGetCredentials();
 			if (typeof info?.error === 'string' && info.error)
 				throw new Error(info.error);
-			if (info?.available !== true || info.username !== 'admin' ||
+			if (info?.available !== true || typeof info.username !== 'string' ||
+			    !USERNAME_RE.test(info.username) ||
 			    typeof info.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(info.sha256))
-				throw new Error(_('The YAML admin account is unavailable or ambiguous. Use the YAML editor to review the users section.'));
+				throw new Error(_('The YAML user account is unavailable or ambiguous. Use the YAML editor to review the users section.'));
 		} catch (error) {
-			ui.addNotification(null, E('p', {},
-				_('Unable to prepare the password change: %s').format(errorMessage(error))), 'error');
+			operation.failure(
+				_('Unable to prepare the username or password change: %s').format(errorMessage(error)),
+			);
 			return;
 		}
 
+		const usernameInput = E('input', {
+			class: 'cbi-input-text',
+			type: 'text',
+			autocomplete: 'username',
+			maxlength: '64',
+			placeholder: _('Leave empty to keep the current username'),
+			style: 'width: 100%',
+		});
 		const passwordInput = E('input', {
 			class: 'cbi-input-password',
 			type: 'password',
@@ -500,6 +510,7 @@ return view.extend({
 			class: 'cbi-button',
 			type: 'button',
 			click: () => {
+				usernameInput.value = '';
 				passwordInput.value = '';
 				confirmationInput.value = '';
 				ui.hideModal();
@@ -508,10 +519,11 @@ return view.extend({
 		const submitButton = E('button', {
 			class: 'cbi-button cbi-button-positive',
 			type: 'button',
-		}, _('Change Password'));
+		}, _('Change Username and Password'));
 		submitButton.addEventListener('click', ui.createHandlerFn(this, async () => {
-			await this.changePassword(
-				info.sha256,
+			await this.changeCredentials(
+				info,
+				usernameInput,
 				passwordInput,
 				confirmationInput,
 				status,
@@ -520,8 +532,16 @@ return view.extend({
 			);
 		}));
 
-		ui.showModal(_('Change AdGuard Home Password'), [
-			E('p', {}, _('Enter a new password for the admin account. Use at least 8 characters and no more than 72 UTF-8 bytes.')),
+		ui.showModal(_('Change Username and Password'), [
+			E('p', {}, [
+				`${_('Current username')}: `,
+				E('strong', {}, info.username),
+			]),
+			E('p', {}, _('Leave either field empty to keep it unchanged. A new password must contain at least 8 characters and no more than 72 UTF-8 bytes.')),
+			E('label', { class: 'cbi-value' }, [
+				E('span', { class: 'cbi-value-title' }, _('New username')),
+				E('span', { class: 'cbi-value-field' }, usernameInput),
+			]),
 			E('label', { class: 'cbi-value' }, [
 				E('span', { class: 'cbi-value-title' }, _('New password')),
 				E('span', { class: 'cbi-value-field' }, passwordInput),
@@ -537,10 +557,11 @@ return view.extend({
 				submitButton,
 			]),
 		]);
-		window.setTimeout(() => passwordInput.focus(), 0);
+		window.setTimeout(() => usernameInput.focus(), 0);
 	},
 
-	async changePassword(revision, passwordInput, confirmationInput, status, submitButton, cancelButton) {
+	async changeCredentials(info, usernameInput, passwordInput, confirmationInput, status, submitButton, cancelButton) {
+		let username = String(usernameInput.value ?? '');
 		let password = String(passwordInput.value ?? '');
 		let confirmation = String(confirmationInput.value ?? '');
 		const showError = message => {
@@ -549,15 +570,27 @@ return view.extend({
 			status.textContent = message;
 		};
 
+		if (!username && !password && !confirmation) {
+			showError(_('Enter a new username, a new password, or both.'));
+			return;
+		}
+		if (username && !USERNAME_RE.test(username)) {
+			showError(_('The username must be 1 to 64 characters and may contain only letters, numbers, dot, underscore, at sign, plus sign, or hyphen. It must start with a letter or number.'));
+			return;
+		}
+		if (username === info.username && !password && !confirmation) {
+			showError(_('The username is unchanged and no new password was entered.'));
+			return;
+		}
 		if (password !== confirmation) {
 			showError(_('The two passwords do not match.'));
 			return;
 		}
-		if (Array.from(password).length < 8) {
+		if (password && Array.from(password).length < 8) {
 			showError(_('The password must contain at least 8 characters.'));
 			return;
 		}
-		if (bcrypt.truncates(password)) {
+		if (password && bcrypt.truncates(password)) {
 			showError(_('The password exceeds the 72-byte BCrypt limit.'));
 			return;
 		}
@@ -565,44 +598,36 @@ return view.extend({
 
 		submitButton.disabled = true;
 		cancelButton.disabled = true;
-		status.style.display = '';
-		status.className = 'alert-message notice';
-		status.textContent = _('Hashing the password securely in this browser…');
-		let accepted = false;
+		operation.start();
 		try {
-			const passwordHash = await bcrypt.hash(password);
+			const passwordHash = password ? await bcrypt.hash(password) : '';
 			password = null;
+			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
-			const response = await callSetPassword(passwordHash, revision);
+			const response = await callSetCredentials(username, passwordHash, info.sha256);
 			if (typeof response?.error === 'string' && response.error)
 				throw new Error(response.error);
 			if (response?.accepted !== true || typeof response.token !== 'string' ||
 			    !/^[0-9a-f]{32}$/.test(response.token))
-				throw new Error(_('The server did not accept the password update job.'));
+				throw new Error(_('The server did not accept the credential update job.'));
 
-			accepted = true;
-			ui.hideModal();
-			ui.addNotification(null, E('p', {},
-				_('The password update was accepted and is being applied in the background.')), 'info');
 			const result = await waitForYamlUpdate(response.token);
 			if (result?.ok !== true)
 				throw new Error(typeof result?.error === 'string' && result.error
 					? result.error
-					: _('The server rejected the password update.'));
+					: _('The server rejected the credential update.'));
 
-			ui.addNotification(null, E('p', {}, result.restarted === true
-				? _('The admin password was changed and AdGuard Home restarted successfully.')
-				: _('The admin password was changed.')), 'info');
+			operation.success();
 		} catch (error) {
+			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
-			if (accepted)
-				ui.addNotification(null, E('p', {},
-					_('Unable to finish the password change: %s').format(errorMessage(error))), 'error');
-			else
-				showError(_('Unable to change the password: %s').format(errorMessage(error)));
+			operation.failure(
+				_('Unable to change the username or password: %s').format(errorMessage(error)),
+			);
 		} finally {
+			username = null;
 			password = null;
 			confirmation = null;
 			submitButton.disabled = false;

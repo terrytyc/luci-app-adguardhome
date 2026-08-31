@@ -14,7 +14,7 @@ OFFICIAL_CONFIG="adguardhome"
 OFFICIAL_SECTION="config"
 OFFICIAL_SERVICE="/etc/init.d/adguardhome"
 DEFAULT_WORK_DIR="/etc/AdGuardHome"
-DEFAULT_CONFIG_FILE="${DEFAULT_WORK_DIR}/AdGuardHome.yaml"
+PACKAGED_CONFIG_TEMPLATE="/usr/share/luci-app-adguardhome/default.yaml"
 CORE_BINARY="/usr/bin/AdGuardHome"
 ADGUARD_UID=853
 ADGUARD_GID=853
@@ -86,7 +86,7 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \ttls_prepare\t\tPrepare current YAML TLS access before core start
 \ttls_refresh\t\tRecheck ACME material after renewal
 \tmemory_checkpoint\tPersist a stopped RAM workdir without removing it
-\tmemory_writeback\tPersist and restart a live RAM workdir safely
+\tmemory_writeback\tCopy live RAM data directly to persistent storage
 \tmemory_cleanup\t\tPersist and remove a stopped RAM workdir
 \tmemory_prepare\t\tPrepare the requested RAM workdir while stopped
 \tmemory_status\t\tReport requested/active/backing RAM state"
@@ -631,42 +631,6 @@ memory_live_marker_load() {
 	return 0
 }
 
-memory_begin_live_checkpoint() {
-	local temporary="" device inode
-	[ "$MEMORY_ACTIVE" = 1 ] && [ -n "$MEMORY_BACKING_WORK_DIR" ] || return 1
-	memory_state_load || return 1
-	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || return 1
-	device="$MEMORY_STATE_BACKING_DEVICE"
-	inode="$MEMORY_STATE_BACKING_INODE"
-	if [ -e "$MEMORY_LIVE_RUNTIME_DIR" ] || [ -L "$MEMORY_LIVE_RUNTIME_DIR" ]; then
-		memory_live_marker_load >/dev/null 2>&1
-		return 1
-	fi
-	mkdir -m 0700 "$MEMORY_LIVE_RUNTIME_DIR" || return 1
-	if ! chown 0:0 "$MEMORY_LIVE_RUNTIME_DIR" ||
-	   ! chmod 0700 "$MEMORY_LIVE_RUNTIME_DIR" ||
-	   ! memory_live_runtime_dir_valid; then
-		rmdir "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null || true
-		return 1
-	fi
-	temporary="$(mktemp "$MEMORY_LIVE_RUNTIME_DIR/.active.XXXXXX")" || {
-		rmdir "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null || true
-		return 1
-	}
-	if ! printf 'version=1\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\n' \
-		"$MEMORY_BACKING_WORK_DIR" "$device" "$inode" >"$temporary" ||
-	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
-	   ! memory_private_state_file "$temporary" ||
-	   ! mv "$temporary" "$MEMORY_LIVE_MARKER" ||
-	   ! memory_live_marker_load; then
-		rm -f "$temporary" 2>/dev/null || true
-		if [ ! -e "$MEMORY_LIVE_MARKER" ] && [ ! -L "$MEMORY_LIVE_MARKER" ]; then
-			rmdir "$MEMORY_LIVE_RUNTIME_DIR" 2>/dev/null || true
-		fi
-		return 1
-	fi
-}
-
 memory_clear_live_checkpoint() {
 	memory_live_marker_load || return 1
 	rm -f "$MEMORY_LIVE_MARKER" || return 1
@@ -1093,7 +1057,7 @@ secure_config_inode() {
 }
 
 ensure_config_file() {
-	local previous_config source directory candidate candidate_hash
+	local source directory candidate candidate_hash
 	if [ -L "$config_file" ]; then
 		log_error "The AdGuard Home configuration file must not be a symlink: ${config_file}"
 		return 1
@@ -1104,42 +1068,34 @@ ensure_config_file() {
 	fi
 	mkdir -m 0700 -p "$work_dir" || return 1
 	path_contains_symlink "$work_dir" && return 1
-	previous_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
-	for source in "$previous_config" "$DEFAULT_CONFIG_FILE"; do
-		[ -n "$source" ] || continue
-		[ "$source" != "$config_file" ] || continue
-		[ -f "$source" ] || continue
-		[ ! -L "$source" ] || continue
-		directory="$(mktemp -d /tmp/AdGuardHome-seed.XXXXXX)" || return 1
-		candidate="${directory}/AdGuardHome.yaml"
-		if ! snapshot_config_file "$source" "$candidate" "" ""; then
-			rm -rf "$directory"
-			return 1
-		fi
-		candidate_hash="$(yaml_file_hash "$candidate")" || {
-			rm -rf "$directory"
-			return 1
-		}
-		if [ -e "$config_file" ] || [ -L "$config_file" ]; then
-			rm -rf "$directory"
-			log_error "Configuration path appeared while migrating: ${config_file}"
-			return 1
-		fi
-		install_config_candidate "$candidate" absent "$candidate_hash" "" || {
-			rm -rf "$directory"
-			return 1
-		}
-		rm -rf "$directory" || return 1
-		secure_active_config
-		return
-	done
-	log_error "Config file is missing: ${config_file}"
-	return 1
+	source="$PACKAGED_CONFIG_TEMPLATE"
+	if [ ! -f "$source" ] || [ -L "$source" ]; then
+		log_error "Packaged AdGuard Home configuration template is missing: ${source}"
+		return 1
+	fi
+	directory="$(mktemp -d /tmp/AdGuardHome-seed.XXXXXX)" || return 1
+	candidate="${directory}/AdGuardHome.yaml"
+	if ! snapshot_config_file "$source" "$candidate" "" ""; then
+		rm -rf "$directory"
+		return 1
+	fi
+	candidate_hash="$(yaml_file_hash "$candidate")" || {
+		rm -rf "$directory"
+		return 1
+	}
+	if [ -e "$config_file" ] || [ -L "$config_file" ]; then
+		rm -rf "$directory"
+		log_error "Configuration path appeared while initializing: ${config_file}"
+		return 1
+	fi
+	install_config_candidate "$candidate" absent "$candidate_hash" "" || {
+		rm -rf "$directory"
+		return 1
+	}
+	rm -rf "$directory" || return 1
+	secure_active_config
 }
 
-# Preserve the official core's runtime history and filter data when the managed
-# work directory changes.  Copy into an atomic sibling first, keep the source
-# untouched for rollback, and refuse to merge with an unrelated target tree.
 uid853_tree_is_plain() {
 	local tree="$1"
 	[ -d "$tree" ] && [ ! -L "$tree" ] || return 1
@@ -1154,6 +1110,25 @@ uid853_tree_is_plain() {
 				/usr/bin/head -n 1)" || exit 1
 			[ -z "$found" ]
 		' sh "$tree" >/dev/null 2>&1 || return 1
+	tree_is_mount_free "$tree"
+}
+
+uid853_tree_is_writable() {
+	local tree="$1"
+	uid853_tree_is_plain "$tree" || return 1
+	# A structurally plain tree may still contain foreign-owned or read-only
+	# entries.  cp -p must own each destination inode in order to preserve mode
+	# and timestamps, so require uid/gid 853 in addition to probing access as that
+	# user.  An unusable tree is treated as damaged and rebuilt by the caller.
+	# $1..$3 and found intentionally expand only in the lowered child shell.
+	# shellcheck disable=SC2016
+	run_bounded 30 2 \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHDataWriteScan -x /bin/sh -- -c '
+			set -o pipefail
+			found="$(/usr/bin/find "$1" -xdev \( -user "$2" -group "$3" \( -type d -exec /bin/sh -c '\''[ -w "$1" ] && [ -x "$1" ]'\'' sh {} \; -o -type f -exec /bin/sh -c '\''[ -w "$1" ]'\'' sh {} \; \) -o -print \) 2>/dev/null | /usr/bin/head -n 1)" || exit 1
+			[ -z "$found" ]
+		' sh "$tree" "$ADGUARD_UID" "$ADGUARD_GID" >/dev/null 2>&1 || return 1
 	tree_is_mount_free "$tree"
 }
 
@@ -1177,122 +1152,8 @@ tree_is_mount_free() {
 	' /proc/self/mountinfo
 }
 
-uid853_read_small_file() {
-	run_bounded 3 1 \
-		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-		-n AGHDataRead -x /bin/dd -- if="$1" bs=4096 count=1 2>/dev/null
-}
-
-restore_migration_workdir_access() {
+restore_workdir_access() {
 	chown "$2:$3" "$1" && chmod 0700 "$1"
-}
-
-read_migration_marker() {
-	local marker="$1" metadata mode links owner group remainder value
-	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	case "$owner:$group:$mode" in
-		"$ADGUARD_UID":"$ADGUARD_GID":drwx------)
-			uid853_read_small_file "$marker"
-			return
-			;;
-		0:0:drwx------|0:"$ADGUARD_GID":drwx------) ;;
-		*) return 1 ;;
-	esac
-	value="$(
-		trap 'restore_migration_workdir_access "$work_dir" "$owner" "$group" >/dev/null 2>&1 || true' EXIT
-		chown "0:${ADGUARD_GID}" "$work_dir" && chmod 0710 "$work_dir" || exit 1
-		uid853_read_small_file "$marker" || exit 1
-		restore_migration_workdir_access "$work_dir" "$owner" "$group" || exit 1
-		trap - EXIT
-	)" || return 1
-	printf '%s' "$value"
-}
-
-migrate_work_data() {
-	local old_work source_data target_data marker temporary marker_value metadata
-	local mode links original_owner original_group remainder
-	old_work="${previous_work_dir%/}"
-	[ -n "$old_work" ] || return 0
-	[ "$old_work" != "$work_dir" ] || return 0
-	validate_work_dir "$old_work" || return 1
-	source_data="${old_work}/data"
-	target_data="${work_dir}/data"
-	marker="${target_data}/.luci-app-adguardhome-migrated-from"
-	[ -d "$source_data" ] || return 0
-	if [ -L "$source_data" ] || path_contains_symlink "$old_work" ||
-	   ! uid853_tree_is_plain "$source_data"; then
-		log_error "Refusing to migrate data through a symlinked source: ${source_data}"
-		return 1
-	fi
-	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
-		marker_value=""
-		if [ -f "$marker" ] && [ ! -L "$marker" ]; then
-			marker_value="$(read_migration_marker "$marker")" || marker_value=""
-		fi
-		if [ "$marker_value" = "$old_work" ]; then
-			return 0
-		fi
-		log_error "Target data directory already exists; refusing to overwrite it: ${target_data}"
-		return 1
-	fi
-	temporary="$(mktemp -d "${work_dir}/.data-migration.XXXXXX")" || return 1
-	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || {
-		rm -rf "$temporary"
-		return 1
-	}
-	read -r mode links original_owner original_group remainder <<-EOF
-	$metadata
-	EOF
-	case "$original_owner:$original_group:$mode" in
-		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
-		*)
-			rm -rf "$temporary"
-			return 1
-			;;
-	esac
-	# Give uid 853 only traverse access to the parent during the copy; it can
-	# write solely inside the dedicated temporary directory.  The EXIT trap
-	# restores the exact owner/group and mode even on timeout or signal.
-	if ! (
-		target_installed=0
-		trap '[ "$target_installed" != 1 ] || rm -rf "$target_data"; restore_migration_workdir_access "$work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
-		chown "0:${ADGUARD_GID}" "$work_dir" && chmod 0710 "$work_dir" || exit 1
-		chown "${ADGUARD_UID}:${ADGUARD_GID}" "$temporary" &&
-			chmod 0700 "$temporary" || exit 1
-		# The source tree is controlled by the official uid.  Copy as that uid so
-		# a path substitution cannot make root read host secrets; scan again to
-		# reject any symlink introduced during the copy.
-		run_bounded 120 2 \
-			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-			-n AGHDataCopy -x /bin/cp -- -pR "${source_data}/." "$temporary/" || exit 1
-		chown "${ADGUARD_UID}:${ADGUARD_GID}" "$temporary" &&
-			chmod 0700 "$temporary" || exit 1
-		uid853_tree_is_plain "$temporary" || exit 1
-		printf '%s\n' "$old_work" | run_bounded 3 1 \
-			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-			-n AGHDataMark -x /bin/dd -- \
-			of="${temporary}/.luci-app-adguardhome-migrated-from" \
-			bs=4096 count=1 2>/dev/null || exit 1
-		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-			-n AGHDataMode -x /bin/chmod -- 0600 \
-			"${temporary}/.luci-app-adguardhome-migrated-from" || exit 1
-		uid853_tree_is_plain "$temporary" || exit 1
-		[ ! -e "$target_data" ] && [ ! -L "$target_data" ] || exit 1
-		target_installed=1
-		mv "$temporary" "$target_data" || exit 1
-		[ -d "$target_data" ] && [ ! -L "$target_data" ] || exit 1
-		restore_migration_workdir_access "$work_dir" \
-			"$original_owner" "$original_group" || exit 1
-		target_installed=0
-		trap - EXIT
-	); then
-		rm -rf "$temporary"
-		return 1
-	fi
-	log_error "Copied AdGuard Home runtime data from ${source_data} to ${target_data}"
 }
 
 sync_yaml_workdir_pattern() {
@@ -1423,7 +1284,7 @@ memory_copy_data_to_runtime() (
 	[ "$stage" = "${MEMORY_RUNTIME_DIR}/.work.${MEMORY_JOURNAL_SUFFIX}" ] || exit 1
 	original_owner="$MEMORY_JOURNAL_ORIGINAL_UID"
 	original_group="$MEMORY_JOURNAL_ORIGINAL_GID"
-	trap 'restore_migration_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
+	trap 'restore_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
 	chown "0:${ADGUARD_GID}" "$persistent_work_dir" &&
 		chmod 0710 "$persistent_work_dir" || exit 1
 	[ -d "$source" ] && [ ! -L "$source" ] &&
@@ -1436,7 +1297,7 @@ memory_copy_data_to_runtime() (
 	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" && chmod 0700 "$target" || exit 1
 	uid853_tree_is_plain "$target" || exit 1
 	memory_advance_journal prepare prepared || exit 1
-	restore_migration_workdir_access "$persistent_work_dir" \
+	restore_workdir_access "$persistent_work_dir" \
 		"$original_owner" "$original_group" || exit 1
 	memory_durability_barrier || exit 1
 	trap - EXIT
@@ -2375,6 +2236,78 @@ memory_checkpoint_full_locked() (
 	log_error "Persisted AdGuard Home memory workdir to ${MEMORY_BACKING_WORK_DIR}"
 )
 
+# A scheduled or manual live write-back deliberately trades checkpoint
+# consistency for availability.  The official core keeps using its RAM tree;
+# copy the currently visible files directly over the persistent data directory.
+# Existing files that have no matching RAM file are intentionally retained.  A
+# power loss or a concurrent database write can therefore leave an incomplete
+# persistent copy, which is acceptable for this mode.
+memory_copy_live_data_locked() (
+	local source="${MEMORY_WORK_DIR}/data" target="${MEMORY_BACKING_WORK_DIR}/data"
+	local backing_fd=/proc/self/fd/9 metadata mode links original_owner original_group remainder
+	local backing_device backing_inode core_pid target_ready=0
+	[ "$MEMORY_ACTIVE" = 1 ] || exit 2
+	[ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_active_tree_valid || exit 1
+	[ -d "$source" ] && [ ! -L "$source" ] || exit 1
+	uid853_tree_is_plain "$source" || exit 1
+	memory_state_load || exit 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	[ -d "$MEMORY_BACKING_WORK_DIR" ] &&
+		[ ! -L "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	exec 9<"$MEMORY_BACKING_WORK_DIR" || exit 1
+	[ -d "$backing_fd" ] && [ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	metadata="$(LC_ALL=C ls -ldnL "$backing_fd" 2>/dev/null)" || exit 1
+	read -r mode links original_owner original_group remainder <<-EOF
+	$metadata
+	EOF
+	case "$original_owner:$original_group:$mode" in
+		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+		*) exit 1 ;;
+	esac
+	memory_backing_identity "$backing_fd" || exit 1
+	backing_device="$MEMORY_IDENTITY_DEVICE"
+	backing_inode="$MEMORY_IDENTITY_INODE"
+	[ "$backing_device:$backing_inode" = \
+		"$MEMORY_STATE_BACKING_DEVICE:$MEMORY_STATE_BACKING_INODE" ] || exit 1
+	core_pid="$(official_pid)" || exit 2
+	case "$core_pid" in ""|*[!0-9]*) exit 2 ;; esac
+
+	trap 'chown "$original_owner:$original_group" "$backing_fd" >/dev/null 2>&1 && chmod 0700 "$backing_fd" >/dev/null 2>&1 || true' EXIT
+	chown "0:${ADGUARD_GID}" "$backing_fd" && chmod 0710 "$backing_fd" || exit 1
+	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		tree_is_mount_free "$target" || exit 1
+		if [ -d "$target" ] && [ ! -L "$target" ] &&
+		   memory_journal_tree_plain "$target" &&
+		   chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" &&
+		   chmod 0700 "$target" && uid853_tree_is_writable "$target"; then
+			target_ready=1
+		fi
+		# Only an unusable data node/tree is cleared.  A valid directory is kept
+		# intact so cp directly overwrites matching files without deleting extras.
+		if [ "$target_ready" != 1 ]; then
+			run_bounded 30 2 /bin/rm -rf "$target" >/dev/null 2>&1 || exit 1
+			[ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
+		fi
+	fi
+	if [ "$target_ready" != 1 ]; then
+		mkdir -m 0700 "$target" || exit 1
+		chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" || exit 1
+	fi
+	run_bounded 120 2 \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$target/" || exit 1
+	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" && chmod 0700 "$target" || exit 1
+	uid853_tree_is_plain "$target" || exit 1
+	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	chown "$original_owner:$original_group" "$backing_fd" &&
+		chmod 0700 "$backing_fd" || exit 1
+	trap - EXIT
+	[ "$(official_pid)" = "$core_pid" ] || exit 1
+	log_error "Copied live AdGuard Home RAM data directly to ${target}"
+)
+
 root_private_config_source() {
 	local candidate="$1" parent mode
 	parent="${candidate%/*}"
@@ -2569,7 +2502,11 @@ maintenance_upgrade_marker_is_valid() {
 		IFS= read -r line7 && IFS= read -r line8 &&
 		! IFS= read -r extra
 	} </proc/self/fd/8 || return 1
-	[ "$line1" = format=1 ] && [ "$line2" = source_version=2.2.0-r1 ] || return 1
+	[ "$line1" = format=1 ] || return 1
+	case "$line2" in
+		source_version=2.2.0-r1|source_version=2.2.0-r2) ;;
+		*) return 1 ;;
+	esac
 	case "$line3" in wrapper_running=0|wrapper_running=1)
 		MAINTENANCE_WRAPPER_RUNNING="${line3#*=}" ;; *) return 1 ;; esac
 	case "$line4" in delta_present=0|delta_present=1)
@@ -5255,7 +5192,7 @@ memory_prepare_locked_command() {
 # restored, so SIGKILL at any point is retried by the respawned monitor.
 # Return 2 when there is no pending operation.
 memory_restore_live_checkpoint_locked() {
-	local recovery_context="$1" marker_rc=0 expected_port expected_mode expected_work_dir
+	local marker_rc=0 expected_port expected_mode expected_work_dir
 	memory_live_marker_load || marker_rc=$?
 	case "$marker_rc" in
 		0) ;;
@@ -5305,56 +5242,17 @@ memory_restore_live_checkpoint_locked() {
 		orchestrate_core_locked || return 1
 	fi
 	memory_clear_live_checkpoint || return 1
-	[ "$recovery_context" = planned ] ||
-		log_error "Recovered the AdGuard Home service after an interrupted memory write-back"
+	log_error "Recovered the AdGuard Home service after an interrupted memory write-back"
 }
 
 memory_writeback_locked_command() {
-	local pending_rc=0 operation_rc=0 restore_rc=0
-	local expected_port expected_mode expected_work_dir
-	memory_restore_live_checkpoint_locked || pending_rc=$?
-	case "$pending_rc" in
-		0) return 0 ;;
-		2) ;;
-		*) return 1 ;;
-	esac
 	load_legacy_settings || return 1
 	[ "$legacy_enabled" = 1 ] && [ "$memory_requested" = 1 ] &&
 		[ "$MEMORY_ACTIVE" = 1 ] &&
 		[ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ] || return 2
-	load_runtime_dns_port || return 1
-	expected_port="$dns_port"
-	expected_mode="$redirect_mode"
-	expected_work_dir="$work_dir"
 	official_running || return 2
-	wait_for_core_ready "$expected_port" "$expected_mode" \
-		"$expected_work_dir" || return 2
-	memory_begin_live_checkpoint || return 1
-
-	clear_recorded_integration_locked || operation_rc=1
-	if [ "$operation_rc" = 0 ]; then
-		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || operation_rc=1
-	fi
-	if [ "$operation_rc" = 0 ]; then
-		wait_for_core_stopped || operation_rc=1
-	fi
-	if [ "$operation_rc" = 0 ]; then
-		memory_checkpoint_full_locked || operation_rc=1
-	fi
-
-	# Restore from the same validated RAM generation even when the checkpoint
-	# failed.  Its WAL recovery preserves either the complete old disk data or
-	# the complete new data, never a live partial copy.
-	memory_restore_live_checkpoint_locked planned || restore_rc=$?
-	if [ "$restore_rc" != 0 ]; then
-		log_error "Unable to restore AdGuard Home after a memory write-back attempt"
-		return 1
-	fi
-	if [ "$operation_rc" != 0 ]; then
-		log_error "Memory write-back failed; the RAM service was restored without replacing persistent data"
-		return 1
-	fi
-	log_error "Completed the scheduled AdGuard Home memory write-back"
+	memory_copy_live_data_locked || return $?
+	log_error "Completed the live AdGuard Home memory write-back without restarting the core"
 }
 
 memory_checkpoint() {
@@ -5418,7 +5316,6 @@ prepare_wrapper_locked() {
 		work_dir="$persistent_work_dir"
 		config_file="$persistent_config_file"
 		ensure_config_file || return 1
-		migrate_work_data || return 1
 		sync_yaml_managed_fields_checked || return 1
 		sync_official_uci || return 1
 		# A distinct success status tells start_service not to create a polling
@@ -5442,8 +5339,9 @@ prepare_wrapper_locked() {
 	fi
 	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
-	# A work-directory migration copies the lower service's current YAML.  Stop
-	# that writer before taking the copy so the new file cannot be torn.
+	# A work-directory change selects an independent YAML/data tree.  Stop the
+	# old writer before switching the official lower service paths, but never
+	# copy files from the previous directory into the new one.
 	if { [ ! -f "$config_file" ] || [ "${previous_work_dir%/}" != "$work_dir" ]; } &&
 	   official_running; then
 		clear_recorded_integration_locked || return 1
@@ -5454,11 +5352,10 @@ prepare_wrapper_locked() {
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	}
-	migrate_work_data || return 1
 	# Preserve the existing no-live-writer boundary in persistent mode.  Boot,
-	# migration, and the later orchestrator reach this block with the core
-	# stopped; an already-running disk core is validated here and transitioned
-	# by service_started(), which first stops it under the same integration lock.
+	# fresh workdir initialization, and the later orchestrator reach this block
+	# with the core stopped.  An already-running disk core is validated here and
+	# transitioned by service_started(), which first stops it under the same lock.
 	if ! official_running; then
 		sync_yaml_managed_fields_checked || return 1
 		memory_prepare_or_fallback_locked || return 1
@@ -5474,7 +5371,7 @@ prepare_wrapper_locked() {
 		clear_recorded_integration_locked || return 1
 	fi
 
-	# Any persistent migration and RAM copy-in completed while the core was
+	# Any fresh workdir initialization and RAM copy-in completed while the core was
 	# stopped.  A pre-existing disk core reaches only this non-writing check.
 	check_core_config || return 1
 	sync_official_uci || return 1
@@ -5514,7 +5411,6 @@ orchestrate_core_locked() {
 			fail_safe_locked >/dev/null 2>&1 || true
 			return 1
 		}
-		migrate_work_data || return 1
 	fi
 
 	# The core is stopped here, so the managed workdir rewrite cannot race its
@@ -5630,6 +5526,24 @@ monitor() {
 	exec 1000>&-
 	trap 'exit 0' TERM INT
 	while :; do
+		# Package postinst may need to replace a v2.2 monitor while preserving
+		# the running official core.  A freshly registered v2.3 monitor stays
+		# completely passive until the authenticated maintenance bundle is
+		# removed.  If postinst fails and leaves an unsafe partial bundle, exit
+		# for procd retry instead of reconciling or writing back with partial UCI.
+		if [ -e "$MAINTENANCE_UPGRADE_MARKER" ] ||
+		   [ -L "$MAINTENANCE_UPGRADE_MARKER" ]; then
+			if ! maintenance_upgrade_marker_is_valid ||
+			   { [ ! -e "$YAML_MAINTENANCE_MARKER" ] &&
+			     [ ! -L "$YAML_MAINTENANCE_MARKER" ]; } ||
+			   ! yaml_maintenance_marker_is_private; then
+				log_error "Unsafe maintenance-upgrade state; monitor remains passive"
+				return 1
+			fi
+			sleep "$MONITOR_INTERVAL" &
+			wait $!
+			continue
+		fi
 		run_locked reconcile_core_locked >/dev/null 2>&1 || true
 		configured_interval="$(uci -q get \
 			"${LEGACY_CONFIG}.${LEGACY_SECTION}.memory_writeback_interval")"

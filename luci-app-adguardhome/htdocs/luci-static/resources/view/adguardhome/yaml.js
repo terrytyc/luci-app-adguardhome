@@ -2,6 +2,7 @@
 
 'use strict';
 
+'require adguardhome.operation as operation';
 'require rpc';
 'require ui';
 'require view';
@@ -25,7 +26,7 @@ const callResetYaml = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'reset_yaml',
 	params: [ 'sha256' ],
-	expect: { '': { accepted: false, token: '', reused: false } },
+	expect: { '': { content: '', sha256: '' } },
 	reject: true,
 });
 
@@ -96,7 +97,7 @@ return view.extend({
 			type: 'button',
 			disabled: result.error || !result.sha256 || !L.hasViewPermission() ? 'disabled' : null,
 			click: ui.createHandlerFn(this, 'handleTemplateResetClick'),
-		}, _('Reset to Template'));
+		}, _('Restore Template'));
 		this.reloadButton = E('button', {
 			class: 'cbi-button',
 			type: 'button',
@@ -136,14 +137,16 @@ return view.extend({
 		if (this.operationBusy)
 			return;
 		this.setBusy(true);
+		operation.start();
 
 		try {
 			await this.reloadYaml();
-			ui.addNotification(null, E('p', {}, _('The YAML configuration was reloaded from disk.')), 'info');
+			operation.success();
 		} catch (error) {
 			this.invalidateYamlEditor();
-			ui.addNotification(null, E('p', {},
-				_('Unable to read the YAML configuration: %s').format(errorMessage(error))), 'error');
+			operation.failure(
+				_('Unable to read the YAML configuration: %s').format(errorMessage(error)),
+			);
 		} finally {
 			this.setBusy(false);
 		}
@@ -204,6 +207,7 @@ return view.extend({
 
 		this.setBusy(true);
 		const content = String(this.yamlEditor.value ?? '').replace(/\r\n?/g, '\n');
+		operation.start();
 
 		try {
 			const accepted = await callSetYaml(content, this.yamlHash);
@@ -214,8 +218,6 @@ return view.extend({
 			    !/^[0-9a-f]{32}$/.test(accepted.token))
 				throw new Error(_('The server did not accept the YAML update job.'));
 
-			ui.addNotification(null, E('p', {},
-				_('The YAML update was accepted and is being applied in the background.')), 'info');
 			const result = await this.waitForYamlUpdate(accepted.token);
 			if (result?.indeterminate === true)
 				throw uncertainYamlUpdateError(typeof result?.error === 'string' && result.error
@@ -233,32 +235,29 @@ return view.extend({
 			try {
 				await this.reloadYaml();
 			} catch (error) {
-				ui.addNotification(null, E('p', {},
-					_('The YAML configuration was saved, but the editor could not reload it: %s').format(errorMessage(error))), 'warning');
+				operation.success(
+					_('The YAML configuration was saved and applied, but the editor could not reload it: %s. Refresh this page before editing again.').format(errorMessage(error)),
+				);
+				return;
 			}
-
-			ui.addNotification(null, E('p', {}, result.restarted === true
-				? _('The YAML configuration was saved and AdGuard Home restarted successfully.')
-				: _('The YAML configuration was saved.')), 'info');
+			operation.success();
 		} catch (error) {
 			if (error?.yamlUpdateUncertain === true)
 				this.invalidateYamlEditor();
-			ui.addNotification(null, E('div', {}, [
-				E('p', {}, _('Unable to save the YAML configuration: %s').format(errorMessage(error))),
-				E('p', {}, _('If the file changed since it was loaded, reload it and merge your changes. Otherwise, check the YAML syntax and protected settings.')),
-			]), 'error');
+			operation.failure(
+				_('Unable to save the YAML configuration: %s').format(errorMessage(error)),
+			);
 		} finally {
 			this.setBusy(false);
 		}
 	},
 
 	handleTemplateResetClick() {
-		ui.showModal(_('Reset YAML to Template'), [
+		ui.showModal(_('Restore YAML Template'), [
 			E('p', { class: 'alert-message warning' },
-				_('This overwrites every YAML-managed setting, including DNS, upstreams, filters, rewrites, DHCP, Web/TLS and certificate paths.')),
+				_('This replaces only the text currently shown in the editor with the packaged template.')),
 			E('p', {},
-				_('The management login returns to admin / admin, DNS returns to port 53335, and the Web interface returns to HTTP port 3000. The persistent working directory, stored data, enable state, DNS mode and verbose setting are kept.')),
-			E('p', {}, _('A running service will restart; a disabled service will remain stopped. Continue?')),
+				_('The active YAML file, service and data remain unchanged until you choose Validate, Save & Apply. Continue editing after the template is loaded, or reload from disk to discard it.')),
 			E('div', { class: 'right' }, [
 				E('button', {
 					class: 'cbi-button',
@@ -273,7 +272,7 @@ return view.extend({
 						ui.hideModal();
 						await this.resetYaml();
 					}),
-				}, _('Reset to Template')),
+				}, _('Restore Template')),
 			]),
 		]);
 	},
@@ -284,44 +283,21 @@ return view.extend({
 
 		this.setBusy(true);
 		try {
-			const accepted = await callResetYaml(this.yamlHash);
-			if (typeof accepted?.error === 'string' && accepted.error)
-				throw new Error(accepted.error);
-			if (accepted?.accepted !== true ||
-			    typeof accepted.token !== 'string' ||
-			    !/^[0-9a-f]{32}$/.test(accepted.token))
-				throw new Error(_('The server did not accept the template reset job.'));
+			const template = await callResetYaml(this.yamlHash);
+			if (typeof template?.error === 'string' && template.error)
+				throw new Error(template.error);
+			if (typeof template?.content !== 'string' || !template.content ||
+			    typeof template.sha256 !== 'string' ||
+			    !/^[0-9a-f]{64}$/.test(template.sha256))
+				throw new Error(_('The packaged YAML template is unavailable.'));
 
-			ui.addNotification(null, E('p', {},
-				_('The template reset was accepted and is being applied in the background.')), 'info');
-			const result = await this.waitForYamlUpdate(accepted.token);
-			if (result?.indeterminate === true)
-				throw uncertainYamlUpdateError(typeof result?.error === 'string' && result.error
-					? result.error
-					: _('The template reset outcome is unknown. Reload the page before editing the YAML again.'));
-			if (result?.ok === true &&
-			    (typeof result.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(result.sha256)))
-				throw uncertainYamlUpdateError(_('The template reset succeeded, but its result could not be verified. Reload the page before editing the YAML again.'));
-			if (result?.ok !== true)
-				throw new Error(typeof result?.error === 'string' && result.error
-					? result.error
-					: _('The server rejected the packaged YAML template.'));
-
-			this.invalidateYamlEditor();
-			try {
-				await this.reloadYaml();
-			} catch (error) {
-				ui.addNotification(null, E('p', {},
-					_('The YAML configuration was reset, but the editor could not reload it: %s').format(errorMessage(error))), 'warning');
-			}
-			ui.addNotification(null, E('p', {}, result.restarted === true
-				? _('The YAML configuration was reset and AdGuard Home restarted successfully.')
-				: _('The YAML configuration was reset to the packaged template.')), 'info');
+			// Keep yamlHash unchanged: it still represents the active file revision
+			// that set_yaml must compare when the user later saves this editor text.
+			this.yamlEditor.value = template.content;
 		} catch (error) {
-			if (error?.yamlUpdateUncertain === true)
-				this.invalidateYamlEditor();
-			ui.addNotification(null, E('p', {},
-				_('Unable to reset the YAML configuration: %s').format(errorMessage(error))), 'error');
+			operation.failure(
+				_('Unable to restore the YAML template: %s').format(errorMessage(error)),
+			);
 		} finally {
 			this.setBusy(false);
 		}

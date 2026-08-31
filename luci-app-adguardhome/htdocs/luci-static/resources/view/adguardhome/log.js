@@ -2,6 +2,7 @@
 
 'use strict';
 
+'require adguardhome.operation as operation';
 'require rpc';
 'require ui';
 'require view';
@@ -98,15 +99,18 @@ return view.extend({
 		const lines = normalizeLineCount(this.lineSelect?.value ?? this.logLines);
 		this.logLines = lines;
 		this.refreshButton.disabled = true;
+		operation.start();
 
 		try {
 			const result = normalizeLog(await callGetLog(lines));
 			this.logOutput.value = result.log || _('No log output.');
 			this.logSummary.textContent =
 				_('Showing up to %d lines (%d returned).').format(lines, result.lines);
+			operation.success();
 		} catch (error) {
-			ui.addNotification(null, E('p', {},
-				_('Unable to read the runtime log: %s').format(errorMessage(error))), 'error');
+			operation.failure(
+				_('Unable to read the runtime log: %s').format(errorMessage(error)),
+			);
 		} finally {
 			this.refreshButton.disabled = false;
 		}

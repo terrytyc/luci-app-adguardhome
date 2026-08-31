@@ -24,8 +24,6 @@ const CONFIG_SECTION = 'AdGuardHome';
 const CONFIG_FILENAME = 'AdGuardHome.yaml';
 const TEMPLATE_DIRECTORY = '/usr/share/luci-app-adguardhome';
 const TEMPLATE_PATH = `${TEMPLATE_DIRECTORY}/default.yaml`;
-const TEMPLATE_WORK_DIR = '/etc/AdGuardHome';
-const TEMPLATE_FILTER_PATTERN = `${TEMPLATE_WORK_DIR}/data/userfilters/*`;
 const MEMORY_RUNTIME_DIRECTORY = '/tmp/luci-app-adguardhome-memory';
 const MEMORY_WORK_DIRECTORY = `${MEMORY_RUNTIME_DIRECTORY}/work`;
 const MEMORY_CONFIG_PATH = `${MEMORY_WORK_DIRECTORY}/${CONFIG_FILENAME}`;
@@ -338,10 +336,15 @@ function read_yaml() {
 	return { content, sha256: digest, path };
 }
 
-function safe_template_directory(path) {
+function safe_template_directory(path, shared_ancestor) {
 	let metadata = lstat(path);
+	// Some ImmortalWrt images expose the shared /usr ancestors as 0777.  They
+	// are not owned by this package, so accept their write bits while still
+	// requiring real root-owned directories.  The package-private directory
+	// remains non-writable to group/other and the leaf is inode-checked below.
 	return metadata?.type == 'directory' && metadata.uid == 0 && metadata.gid == 0 &&
-		!metadata.perm?.group_write && !metadata.perm?.other_write;
+		(shared_ancestor === true ||
+		 (!metadata.perm?.group_write && !metadata.perm?.other_write));
 }
 
 function read_template() {
@@ -354,9 +357,11 @@ function read_template() {
 	let valid = false;
 
 	try {
-		for (let directory in [ '/usr', '/usr/share', TEMPLATE_DIRECTORY ])
-			if (!safe_template_directory(directory))
+		for (let directory in [ '/usr', '/usr/share' ])
+			if (!safe_template_directory(directory, true))
 				return null;
+		if (!safe_template_directory(TEMPLATE_DIRECTORY, false))
+			return null;
 
 		before = lstat(TEMPLATE_PATH);
 		if (before?.type != 'file' || before.uid != 0 || before.gid != 0 ||
@@ -406,17 +411,7 @@ function template_for_path(path) {
 	if (substr(path, length(path) - length(suffix), length(suffix)) != suffix)
 		return null;
 
-	let work_dir = substr(path, 0, length(path) - length(suffix));
-	let content = read_template();
-	if (!content)
-		return null;
-
-	let marker = `    - ${TEMPLATE_FILTER_PATTERN}`;
-	let pieces = split(content, marker);
-	if (length(pieces) != 2)
-		return null;
-
-	return `${pieces[0]}    - ${work_dir}/data/userfilters/*${pieces[1]}`;
+	return read_template();
 }
 
 function read_config() {
@@ -1254,7 +1249,15 @@ function supported_password_scalar(value) {
 		match(scalar, /^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$/);
 }
 
-function admin_password_record(content) {
+function supported_username_scalar(value) {
+	let scalar = yaml_simple_scalar(value);
+	return type(scalar) == 'string' &&
+		match(scalar, /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/)
+		? scalar
+		: null;
+}
+
+function credential_record(content) {
 	if (type(content) != 'string')
 		return null;
 
@@ -1288,9 +1291,9 @@ function admin_password_record(content) {
 	let current_password_count = 0;
 	let current_password_line = -1;
 	let current_password_prefix = '';
-	let admin_count = 0;
-	let password_line = -1;
-	let password_prefix = '';
+	let current_name_line = -1;
+	let current_name_prefix = '';
+	let records = [];
 
 	for (let i = first + 1; i < last; i++) {
 		if (match(lines[i], /^[ \t]*($|#)/))
@@ -1302,17 +1305,25 @@ function admin_password_record(content) {
 			if (!list_indent)
 				list_indent = indent;
 			if (indent == list_indent) {
-				if (have_entry && current_name_count == 1 && current_name == 'admin') {
-					admin_count++;
-					if (current_password_count != 1 || current_password_line < 0)
+				if (have_entry) {
+					if (current_name_count != 1 || current_name == null ||
+					    current_name_line < 0 || current_password_count != 1 ||
+					    current_password_line < 0)
 						return null;
-					password_line = current_password_line;
-					password_prefix = current_password_prefix;
+					push(records, {
+						username: current_name,
+						name_line: current_name_line,
+						name_prefix: current_name_prefix,
+						password_line: current_password_line,
+						password_prefix: current_password_prefix,
+					});
 				}
 
 				have_entry = true;
 				current_name = null;
 				current_name_count = 0;
+				current_name_line = -1;
+				current_name_prefix = '';
 				current_password_count = 0;
 				current_password_line = -1;
 				current_password_prefix = '';
@@ -1324,9 +1335,11 @@ function admin_password_record(content) {
 					let key = trim(inline_field[1]);
 					if (key == 'name') {
 						current_name_count++;
-						current_name = yaml_simple_scalar(inline_field[2]);
+						current_name = supported_username_scalar(inline_field[2]);
 						if (current_name == null)
 							return null;
+						current_name_line = i;
+						current_name_prefix = `${sequence[1]}- name: `;
 					}
 					else if (key == 'password') {
 						if (!supported_password_scalar(inline_field[2]))
@@ -1349,9 +1362,11 @@ function admin_password_record(content) {
 		let key = trim(field[2]);
 		if (key == 'name') {
 			current_name_count++;
-			current_name = yaml_simple_scalar(field[3]);
+			current_name = supported_username_scalar(field[3]);
 			if (current_name == null)
 				return null;
+			current_name_line = i;
+			current_name_prefix = `${field[1]}name: `;
 		}
 		else if (key == 'password') {
 			if (!supported_password_scalar(field[3]))
@@ -1362,33 +1377,70 @@ function admin_password_record(content) {
 		}
 	}
 
-	if (have_entry && current_name_count == 1 && current_name == 'admin') {
-		admin_count++;
-		if (current_password_count != 1 || current_password_line < 0)
+	if (have_entry) {
+		if (current_name_count != 1 || current_name == null || current_name_line < 0 ||
+		    current_password_count != 1 || current_password_line < 0)
 			return null;
-		password_line = current_password_line;
-		password_prefix = current_password_prefix;
+		push(records, {
+			username: current_name,
+			name_line: current_name_line,
+			name_prefix: current_name_prefix,
+			password_line: current_password_line,
+			password_prefix: current_password_prefix,
+		});
 	}
 
-	if (admin_count != 1 || password_line < 0)
+	if (!length(records))
 		return null;
 
-	return { lines, password_line, password_prefix };
+	let target = null;
+	if (length(records) == 1)
+		target = records[0];
+	else {
+		for (let record in records) {
+			if (record.username != 'admin')
+				continue;
+			if (target)
+				return null;
+			target = record;
+		}
+	}
+	if (!target)
+		return null;
+
+	let usernames = [];
+	for (let record in records)
+		push(usernames, record.username);
+	target.lines = lines;
+	target.usernames = usernames;
+	target.record_count = length(records);
+	return target;
 }
 
-function password_info() {
+function credentials_info() {
 	let yaml = read_yaml();
 	if (!yaml)
 		return { available: false, error: 'YAML configuration is unavailable' };
 
-	return admin_password_record(yaml.content)
-		? { available: true, username: 'admin', sha256: yaml.sha256 }
-		: { available: false, error: 'The YAML admin account is unavailable or ambiguous' };
+	let record = credential_record(yaml.content);
+	return record
+		? { available: true, username: record.username, sha256: yaml.sha256 }
+		: { available: false, error: 'The YAML user account is unavailable or ambiguous' };
 }
 
-function update_admin_password(password_hash, expected_hash) {
-	if (type(password_hash) != 'string' || length(password_hash) != 60 ||
-	    !match(password_hash, /^\$2[aby]\$10\$[./A-Za-z0-9]{53}$/))
+function update_credentials(username, password_hash, expected_hash) {
+	if (type(username) != 'string' || type(password_hash) != 'string')
+		return { error: 'Invalid username or BCrypt password hash' };
+
+	let change_username = length(username) > 0;
+	let change_password = length(password_hash) > 0;
+	if (!change_username && !change_password)
+		return { error: 'No username or password change was requested' };
+	if (change_username &&
+	    !match(username, /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/))
+		return { error: 'Invalid username' };
+	if (change_password && (length(password_hash) != 60 ||
+	    !match(password_hash, /^\$2[aby]\$10\$[./A-Za-z0-9]{53}$/)))
 		return { error: 'Invalid BCrypt password hash' };
 	if (type(expected_hash) != 'string' ||
 	    !match(expected_hash, /^[0-9a-f]{64}$/))
@@ -1398,15 +1450,37 @@ function update_admin_password(password_hash, expected_hash) {
 	if (!yaml)
 		return { error: 'YAML configuration is unavailable' };
 	if (yaml.sha256 != expected_hash)
-		return { error: 'YAML changed since the password dialog was opened' };
+		return { error: 'YAML changed since the credential dialog was opened' };
 
-	let record = admin_password_record(yaml.content);
+	let record = credential_record(yaml.content);
 	if (!record)
-		return { error: 'The YAML admin account is unavailable or ambiguous' };
+		return { error: 'The YAML user account is unavailable or ambiguous' };
+	if (change_username && username == record.username)
+		change_username = false;
+	if (!change_username && !change_password)
+		return { error: 'No username or password change was requested' };
 
-	record.lines[record.password_line] =
-		`${record.password_prefix}${password_hash}`;
-	return update_yaml(join('\n', record.lines), expected_hash);
+	if (change_username) {
+		for (let existing in record.usernames)
+			if (existing == username && existing != record.username)
+				return { error: 'The requested username already exists' };
+		if (record.record_count > 1)
+			return {
+				error: 'Cannot change the username while multiple YAML user accounts are configured; change only the password or use the YAML editor',
+			};
+		// Always emit a quoted YAML string.  Plain values such as true, null or
+		// an all-numeric username would otherwise be parsed as another YAML type.
+		// USERNAME_RE excludes apostrophes, so single-quoting needs no escaping.
+		record.lines[record.name_line] = `${record.name_prefix}'${username}'`;
+	}
+	if (change_password)
+		record.lines[record.password_line] =
+			`${record.password_prefix}${password_hash}`;
+
+	let content = join('\n', record.lines);
+	if (sha256(content) == yaml.sha256)
+		return { error: 'No username or password change was requested' };
+	return update_yaml(content, expected_hash);
 }
 
 function reset_yaml(expected_hash) {
@@ -1424,7 +1498,10 @@ function reset_yaml(expected_hash) {
 	if (!content)
 		return { error: 'The packaged YAML template is unavailable or unsafe' };
 
-	return update_yaml(content, expected_hash);
+	// Restoring the template is an editor-only operation.  Return the audited
+	// packaged bytes without queueing an update or touching the active YAML;
+	// set_yaml remains the sole validate/save/apply boundary.
+	return { content, sha256: sha256(content) };
 }
 
 function yaml_section_value(content, section, key) {
@@ -1714,13 +1791,29 @@ const methods = {
 	},
 	get_password_info: {
 		call: function() {
-			return password_info();
+			return credentials_info();
 		},
 	},
 	set_password: {
 		args: { password_hash: '', sha256: '' },
 		call: function(request) {
-			return update_admin_password(
+			return update_credentials(
+				'',
+				request.args.password_hash,
+				request.args.sha256
+			);
+		},
+	},
+	get_credentials: {
+		call: function() {
+			return credentials_info();
+		},
+	},
+	set_credentials: {
+		args: { username: '', password_hash: '', sha256: '' },
+		call: function(request) {
+			return update_credentials(
+				request.args.username,
 				request.args.password_hash,
 				request.args.sha256
 			);

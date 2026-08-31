@@ -1,175 +1,197 @@
-auth_attempts: 5
-block_auth_min: 15
-clients:
-  persistent: []
-  runtime_sources:
-    arp: true
-    dhcp: true
-    hosts: true
-    rdns: false
-    whois: true
-dhcp:
-  dhcpv4:
-    gateway_ip: ""
-    icmp_timeout_msec: 1000
-    lease_duration: 86400
-    options: []
-    range_end: ""
-    range_start: ""
-    subnet_mask: ""
-  dhcpv6:
-    lease_duration: 86400
-    ra_allow_slaac: false
-    ra_slaac_only: false
-    range_start: ""
-  enabled: false
-  interface_name: ""
-dns:
-  aaaa_disabled: false
-  allowed_clients: []
-  anonymize_client_ip: false
-  bind_hosts:
-    - 0.0.0.0
-    - "::"
-  blocked_hosts:
-    - version.bind
-    - id.server
-    - hostname.bind
-  bogus_nxdomain: []
-  bootstrap_dns:
-    - 119.29.29.29
-    - 223.5.5.5
-  cache_enabled: true
-  cache_optimistic: true
-  cache_optimistic_answer_ttl: 30s
-  cache_optimistic_max_age: 12h
-  cache_size: 4194304
-  cache_time: 30
-  cache_ttl_max: 0
-  cache_ttl_min: 0
-  disallowed_clients: []
-  edns_client_subnet:
-    custom_ip: ""
-    enabled: false
-    use_custom: false
-  enable_dnssec: false
-  fastest_timeout: 1s
-  ipset: []
-  local_ptr_upstreams: []
-  max_goroutines: 300
-  port: 53335
-  private_networks: []
-  ratelimit: 0
-  ratelimit_whitelist: []
-  refuse_any: false
-  trusted_proxies:
-    - 127.0.0.0/8
-    - ::1/128
-  upstream_dns:
-    - 223.5.5.5
-  upstream_dns_file: ""
-  upstream_mode: load_balance
-  upstream_timeout: 10s
-  use_private_ptr_resolvers: true
-filtering:
-  blocked_response_ttl: 10
-  blocked_services:
-    ids: []
-    schedule:
-      time_zone: Local
-  blocking_ipv4: ""
-  blocking_ipv6: ""
-  blocking_mode: default
-  filtering_enabled: true
-  filters_update_interval: 24
-  parental_block_host: family-block.dns.adguard.com
-  parental_cache_size: 1048576
-  parental_enabled: false
-  protection_disabled_until: null
-  protection_enabled: true
-  rewrites: []
-  safe_fs_patterns:
-    - /etc/AdGuardHome/data/userfilters/*
-  safe_search:
-    bing: true
-    duckduckgo: true
-    enabled: false
-    google: true
-    pixabay: true
-    yandex: true
-    youtube: true
-  safebrowsing_block_host: standard-block.dns.adguard.com
-  safebrowsing_cache_size: 1048576
-  safebrowsing_enabled: false
-  safesearch_cache_size: 1048576
-filters:
-  - enabled: true
-    id: 1228750870
-    name: AdGuard DNS filter
-    url: https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt
-  - enabled: true
-    id: 139789112
-    name: EasyList-去除国际网页中大多数广告，包括不需要的框架、图像和对象
-    url: https://easylist-downloads.adblockplus.org/easylist.txt
-  - enabled: true
-    id: 139789121
-    name: EasyList China-EasyList针对国内的补充规则
-    url: https://easylist-downloads.adblockplus.org/easylistchina.txt
-  - enabled: true
-    id: 139789221
-    name: anti-AD命中率最高列表
-    url: https://anti-ad.net/easylist.txt
-  - enabled: true
-    id: 139789332
-    name: AdGuard DNS filter
-    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
-  - enabled: false
-    id: 149789121
-    name: AdAway Default Blocklist
-    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt
 http:
-  address: 0.0.0.0:3000
+  pprof:
+    port: 6060
+    enabled: false
   doh:
-    insecure_enabled: false
     routes:
       - GET /dns-query
       - POST /dns-query
       - GET /dns-query/{ClientID}
       - POST /dns-query/{ClientID}
-  pprof:
-    enabled: false
-    port: 6060
-  session_ttl: 720h
-http_proxy: ""
-language: zh-cn
-log:
-  compress: false
-  file: ""
-  local_time: false
-  max_age: 3
-  max_backups: 0
-  max_size: 100
-  verbose: false
-os:
-  group: ""
-  rlimit_nofile: 0
-  user: ""
-querylog:
-  enabled: true
-  file_enabled: true
-  ignored: []
-  ignored_enabled: false
-  interval: 90d
-  size_memory: 1000
-schema_version: 34
-statistics:
-  enabled: true
-  ignored: []
-  ignored_enabled: false
-  interval: 1d
-theme: auto
-user_rules: null
+    insecure_enabled: false
+  address: 0.0.0.0:3000
+  session_ttl: 30m
 users:
   - name: admin
     password: $2y$10$vHRcARdPCieYG3RXWomV5evDYN.Nj/edtwEkQgQJZcK6z7qTLaIc6
-whitelist_filters: []
+auth_attempts: 5
+block_auth_min: 15
+http_proxy: ""
+language: ""
+theme: auto
+dns:
+  bind_hosts:
+    - 0.0.0.0
+  port: 53335
+  anonymize_client_ip: false
+  ratelimit: 0
+  ratelimit_subnet_len_ipv4: 24
+  ratelimit_subnet_len_ipv6: 56
+  ratelimit_whitelist: []
+  refuse_any: true
+  upstream_dns:
+    - 223.5.5.5
+    - 114.114.114.114
+    - 119.29.29.29
+  upstream_dns_file: ""
+  bootstrap_dns:
+    - 223.5.5.5
+  fallback_dns: []
+  upstream_mode: load_balance
+  fastest_timeout: 1s
+  allowed_clients: []
+  disallowed_clients: []
+  blocked_hosts:
+    - version.bind
+    - id.server
+    - hostname.bind
+  trusted_proxies:
+    - 127.0.0.0/8
+    - ::1/128
+  cache_enabled: true
+  cache_size: 83886080
+  cache_ttl_min: 60
+  cache_ttl_max: 3600
+  cache_optimistic: false
+  cache_optimistic_answer_ttl: 30s
+  cache_optimistic_max_age: 12h
+  bogus_nxdomain: []
+  aaaa_disabled: false
+  enable_dnssec: false
+  edns_client_subnet:
+    custom_ip: ""
+    enabled: false
+    use_custom: false
+  max_goroutines: 300
+  handle_ddr: true
+  ipset: []
+  ipset_file: ""
+  bootstrap_prefer_ipv6: false
+  upstream_timeout: 10s
+  private_networks: []
+  use_private_ptr_resolvers: true
+  local_ptr_upstreams: []
+  use_dns64: false
+  dns64_prefixes: []
+  serve_http3: false
+  use_http3_upstreams: false
+  serve_plain_dns: true
+  hostsfile_enabled: true
+  pending_requests:
+    enabled: true
+tls:
+  enabled: false
+  force_https: false
+  port_https: 443
+  port_dns_over_tls: 853
+  port_dns_over_quic: 853
+  port_dnscrypt: 0
+  dnscrypt_config_file: ""
+  certificate_chain: ""
+  private_key: ""
+  strict_sni_check: false
+querylog:
+  dir_path: ""
+  ignored: []
+  interval: 30d
+  size_memory: 1000
+  enabled: true
+  ignored_enabled: false
+  file_enabled: true
+statistics:
+  dir_path: ""
+  ignored: []
+  interval: 30d
+  enabled: true
+  ignored_enabled: false
+filters:
+  - enabled: false
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_1.txt
+    name: AdGuard DNS filter
+    id: 1
+  - enabled: false
+    url: https://adguardteam.github.io/HostlistsRegistry/assets/filter_2.txt
+    name: AdAway Default Blocklist
+    id: 2
+  - enabled: false
+    url: https://raw.githubusercontent.com/217heidai/adblockfilters/main/rules/adblockdns.txt
+    name: adblockdns
+    id: 1785103257
+whitelist_filters:
+  - enabled: false
+    url: https://raw.githubusercontent.com/BlueSkyXN/AdGuardHomeRules/master/ok.txt
+    name: BlueSkyXN_WhiteList
+    id: 1785103258
+user_rules: []
+dhcp:
+  enabled: false
+  interface_name: ""
+  local_domain_name: lan
+  dhcpv4:
+    gateway_ip: ""
+    subnet_mask: ""
+    range_start: ""
+    range_end: ""
+    lease_duration: 86400
+    icmp_timeout_msec: 1000
+    options: []
+  dhcpv6:
+    range_start: ""
+    lease_duration: 86400
+    ra_slaac_only: false
+    ra_allow_slaac: false
+filtering:
+  blocking_ipv4: ""
+  blocking_ipv6: ""
+  blocked_services:
+    schedule:
+      time_zone: UTC
+    ids: []
+  protection_disabled_until: null
+  safe_search:
+    enabled: false
+    bing: true
+    duckduckgo: true
+    ecosia: true
+    google: true
+    pixabay: true
+    yandex: true
+    youtube: true
+  blocking_mode: default
+  parental_block_host: family-block.dns.adguard.com
+  safebrowsing_block_host: standard-block.dns.adguard.com
+  safe_fs_patterns:
+    - /tmp/lib/adguardhome/userfilters/*
+  safebrowsing_cache_size: 1048576
+  safesearch_cache_size: 1048576
+  parental_cache_size: 1048576
+  cache_time: 30
+  filters_update_interval: 24
+  blocked_response_ttl: 10
+  filtering_enabled: true
+  rewrites_enabled: true
+  parental_enabled: false
+  safebrowsing_enabled: false
+  protection_enabled: true
+clients:
+  runtime_sources:
+    whois: true
+    arp: true
+    rdns: true
+    dhcp: true
+    hosts: true
+  persistent: []
+log:
+  enabled: true
+  file: ""
+  max_backups: 0
+  max_size: 100
+  max_age: 3
+  compress: false
+  local_time: false
+  verbose: false
+os:
+  group: ""
+  user: ""
+  rlimit_nofile: 0
+schema_version: 34

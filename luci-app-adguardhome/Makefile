@@ -4,8 +4,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adguardhome
-PKG_VERSION:=2.2.0
-PKG_RELEASE:=2
+PKG_VERSION:=2.3.0
+PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -44,8 +44,8 @@ endef
 
 # APK maps this hook to both pre-install and pre-upgrade.  A first install
 # snapshots the untouched official UCI/runtime state for safe uninstall.  The
-# supported in-place sources are the released v2.1.0-r1 and v2.2.0-r1
-# packages; reject any other installed version before creating maintenance
+# supported in-place sources are the released v2.1.0-r1, v2.2.0-r1 and
+# v2.2.0-r2 packages; reject any other installed version before creating maintenance
 # state or touching DNS.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
@@ -177,9 +177,12 @@ if [ "$$is_upgrade" = 1 ]; then
 	}
 	case "$$installed_version" in
 		2.1.0-r1) maintenance_upgrade=0 ;;
-		2.2.0-r1) maintenance_upgrade=1 ;;
+		2.2.0-r1|2.2.0-r2)
+			maintenance_upgrade=1
+			maintenance_source_version="$$installed_version"
+			;;
 		*)
-			echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1 or 2.2.0-r1; found '$$installed_version'." >&2
+			echo "In-place upgrade requires luci-app-adguardhome 2.1.0-r1, 2.2.0-r1 or 2.2.0-r2; found '$$installed_version'." >&2
 			exit 1
 			;;
 	esac
@@ -208,6 +211,7 @@ upgrade_restore_required=0
 upgrade_was_running=0
 upgrade_workdir=""
 maintenance_upgrade="$${maintenance_upgrade:-0}"
+maintenance_source_version="$${maintenance_source_version:-}"
 maintenance_marker_created=0
 maintenance_config_created=0
 maintenance_delta_created=0
@@ -990,6 +994,33 @@ runtime_dir_is_empty() {
 	done
 }
 
+# Treat a procd instance in its respawn delay as running by checking whether
+# the expected monitor is registered, rather than relying on its transient PID.
+# Return 0 for the exact coordinator instance, 1 when the service is absent,
+# and 2 for an unreadable or unexpected service object.
+maintenance_wrapper_registered() {
+	local payload command0 command1
+	payload="$$(run_bounded 5 1 ubus -S call service list \
+		'{"name":"AdGuardHome"}' 2>/dev/null)" || return 2
+	if ! printf '%s\n' "$$payload" |
+	     jsonfilter -e '@.AdGuardHome.instances.monitor' >/dev/null 2>&1; then
+		# An empty or absent uppercase service is stopped.  Any differently
+		# named instance is unexpected and must not be mistaken for that state.
+		if printf '%s\n' "$$payload" |
+		   jsonfilter -e '@.AdGuardHome.instances.*' >/dev/null 2>&1; then
+			return 2
+		fi
+		return 1
+	fi
+	command0="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.command[0]' 2>/dev/null)" || return 2
+	command1="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.command[1]' 2>/dev/null)" || return 2
+	[ "$$command0" = /etc/init.d/AdGuardHome ] &&
+		[ "$$command1" = monitor ] && return 0
+	return 2
+}
+
 capture_maintenance_delta() (
 	local source=/tmp/.uci/adguardhome target="$$1" source_fd=/proc/self/fd/8
 	root_private_directory /tmp/.uci || exit 1
@@ -1016,7 +1047,13 @@ maintenance_upgrade_bundle_valid() {
 		IFS= read -r line7 && IFS= read -r line8 &&
 		! IFS= read -r extra
 	} <"$$maintenance_upgrade_marker" || return 1
-	[ "$$line1" = format=1 ] && [ "$$line2" = source_version=2.2.0-r1 ] || return 1
+	[ "$$line1" = format=1 ] || return 1
+	case "$$line2" in
+		source_version=2.2.0-r1|source_version=2.2.0-r2) ;;
+		*) return 1 ;;
+	esac
+	[ -z "$$maintenance_source_version" ] ||
+		[ "$$line2" = "source_version=$$maintenance_source_version" ] || return 1
 	case "$$line3" in wrapper_running=0|wrapper_running=1)
 		wrapper_running="$${line3#*=}" ;; *) return 1 ;; esac
 	case "$$line4" in delta_present=0|delta_present=1)
@@ -1066,6 +1103,7 @@ write_maintenance_upgrade_marker() {
 	local wrapper_running="$$1" delta_present="$$2" config_hash config_size
 	local delta_hash=none delta_size=0
 	case "$$wrapper_running:$$delta_present" in [01]:[01]) ;; *) return 1 ;; esac
+	case "$$maintenance_source_version" in 2.2.0-r1|2.2.0-r2) ;; *) return 1 ;; esac
 	config_hash="$$(snapshot_sha256 "$$maintenance_config_snapshot")" || return 1
 	config_size="$$(wc -c <"$$maintenance_config_snapshot")" || return 1
 	if [ "$$delta_present" = 1 ]; then
@@ -1076,7 +1114,7 @@ write_maintenance_upgrade_marker() {
 		[ ! -L "$$maintenance_upgrade_marker" ] || return 1
 	{
 		printf 'format=1\n'
-		printf 'source_version=2.2.0-r1\n'
+		printf 'source_version=%s\n' "$$maintenance_source_version"
 		printf 'wrapper_running=%s\n' "$$wrapper_running"
 		printf 'delta_present=%s\n' "$$delta_present"
 		printf 'config_sha256=%s\n' "$$config_hash"
@@ -1190,14 +1228,13 @@ if [ "$$maintenance_upgrade" = 1 ]; then
 		trap '' 0 HUP INT TERM
 		exit 0
 	fi
-	wrapper_running_rc=0
-	run_bounded 5 1 /etc/init.d/AdGuardHome running \
-		>/dev/null 2>&1 || wrapper_running_rc=$$?
-	case "$$wrapper_running_rc" in
+	wrapper_registered_rc=0
+	maintenance_wrapper_registered || wrapper_registered_rc=$$?
+	case "$$wrapper_registered_rc" in
 		0) maintenance_wrapper_running=1 ;;
 		1) maintenance_wrapper_running=0 ;;
 		*)
-			echo "Unable to determine the AdGuard Home coordinator state." >&2
+			echo "Unable to determine the registered AdGuard Home coordinator state." >&2
 			exit 1
 			;;
 	esac
@@ -1223,7 +1260,7 @@ if [ "$$maintenance_upgrade" = 1 ]; then
 	fi
 	write_maintenance_upgrade_marker "$$maintenance_wrapper_running" \
 		"$$maintenance_delta_present" || {
-		echo "Unable to mark the AdGuard Home r1 maintenance upgrade." >&2
+		echo "Unable to mark the AdGuard Home maintenance upgrade." >&2
 		exit 1
 	}
 	maintenance_upgrade_committed=1
@@ -1601,7 +1638,11 @@ maintenance_upgrade_bundle_valid() {
 		IFS= read -r line7 && IFS= read -r line8 &&
 		! IFS= read -r extra
 	} <"$$maintenance_upgrade_marker" || return 1
-	[ "$$line1" = format=1 ] && [ "$$line2" = source_version=2.2.0-r1 ] || return 1
+	[ "$$line1" = format=1 ] || return 1
+	case "$$line2" in
+		source_version=2.2.0-r1|source_version=2.2.0-r2) ;;
+		*) return 1 ;;
+	esac
 	case "$$line3" in wrapper_running=0|wrapper_running=1)
 		maintenance_wrapper_running="$${line3#*=}" ;; *) return 1 ;; esac
 	case "$$line4" in delta_present=0|delta_present=1)
@@ -1748,13 +1789,231 @@ verify_maintenance_layers() {
 	esac
 }
 
-verify_maintenance_wrapper_state() {
-	local running_rc=0
-	/etc/init.d/AdGuardHome running >/dev/null 2>&1 || running_rc=$$?
-	case "$$maintenance_wrapper_running:$$running_rc" in
-		1:0|0:1) return 0 ;;
+maintenance_process_identity() {
+	local pid="$$1" started
+	case "$$pid" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$$pid" -ge 2 ] 2>/dev/null && [ -r "/proc/$$pid/stat" ] || return 1
+	started="$$(awk 'NR == 1 { print $$22 }' "/proc/$$pid/stat" 2>/dev/null)" || return 1
+	case "$$started" in ''|*[!0-9]*) return 1 ;; esac
+	printf '%s:%s\n' "$$pid" "$$started"
+}
+
+maintenance_wrapper_registered() {
+	local payload command0 command1
+	payload="$$(ubus -S call service list '{"name":"AdGuardHome"}' 2>/dev/null)" || return 2
+	if ! printf '%s\n' "$$payload" |
+	     jsonfilter -e '@.AdGuardHome.instances.monitor' >/dev/null 2>&1; then
+		if printf '%s\n' "$$payload" |
+		   jsonfilter -e '@.AdGuardHome.instances.*' >/dev/null 2>&1; then
+			return 2
+		fi
+		return 1
+	fi
+	command0="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.command[0]' 2>/dev/null)" || return 2
+	command1="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.command[1]' 2>/dev/null)" || return 2
+	[ "$$command0" = /etc/init.d/AdGuardHome ] &&
+		[ "$$command1" = monitor ] && return 0
+	return 2
+}
+
+maintenance_monitor_pid() {
+	local pid
+	pid="$$(ubus -S call service list '{"name":"AdGuardHome"}' 2>/dev/null |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.pid' 2>/dev/null)" || return 1
+	case "$$pid" in ''|*[!0-9]*) return 1 ;; esac
+	[ "$$pid" -ge 2 ] 2>/dev/null || return 1
+	printf '%s\n' "$$pid"
+}
+
+# Capture the official lowercase service state without changing it.  A PID
+# identity detects any restart while an explicit registered/absent token also
+# covers its own procd respawn delay.
+maintenance_core_identity() {
+	local payload pid identity
+	payload="$$(ubus -S call service list '{"name":"adguardhome"}' 2>/dev/null)" || return 1
+	if ! printf '%s\n' "$$payload" |
+	     jsonfilter -e '@.adguardhome.instances.adguardhome' >/dev/null 2>&1; then
+		if printf '%s\n' "$$payload" |
+		   jsonfilter -e '@.adguardhome.instances.*' >/dev/null 2>&1; then
+			return 1
+		fi
+		printf 'absent\n'
+		return 0
+	fi
+	pid="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.adguardhome.instances.adguardhome.pid' 2>/dev/null)" || {
+		printf 'registered\n'
+		return 0
+	}
+	identity="$$(maintenance_process_identity "$$pid")" || return 1
+	printf 'running:%s\n' "$$identity"
+}
+
+maintenance_monitor_cgroup_supported() {
+	local directory=/sys/fs/cgroup/services/AdGuardHome/monitor
+	[ -d "$$directory" ] && [ ! -L "$$directory" ] || return 1
+	[ -e "$$directory/cgroup.kill" ] && [ ! -L "$$directory/cgroup.kill" ] &&
+		[ -w "$$directory/cgroup.kill" ] || return 1
+	[ -r "$$directory/cgroup.procs" ] && [ ! -L "$$directory/cgroup.procs" ] || return 1
+	[ -r "$$directory/cgroup.events" ] && [ ! -L "$$directory/cgroup.events" ]
+}
+
+maintenance_monitor_pid_is_contained() {
+	local directory=/sys/fs/cgroup/services/AdGuardHome/monitor
+	local payload command0 command1 running pid
+	payload="$$(ubus -S call service list '{"name":"AdGuardHome"}' 2>/dev/null)" || return 1
+	command0="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.command[0]' 2>/dev/null)" || return 1
+	command1="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.command[1]' 2>/dev/null)" || return 1
+	[ "$$command0" = /etc/init.d/AdGuardHome ] &&
+		[ "$$command1" = monitor ] || return 1
+	running="$$(printf '%s\n' "$$payload" |
+		jsonfilter -e '@.AdGuardHome.instances.monitor.running' 2>/dev/null)" || return 1
+	case "$$running" in
+		true|1)
+			pid="$$(printf '%s\n' "$$payload" |
+				jsonfilter -e '@.AdGuardHome.instances.monitor.pid' 2>/dev/null)" || return 1
+			case "$$pid" in ''|*[!0-9]*) return 1 ;; esac
+			[ "$$pid" -ge 2 ] 2>/dev/null || return 1
+			grep -qx "$$pid" "$$directory/cgroup.procs" 2>/dev/null && return 0
+			# A main process may exit naturally between the ubus snapshot and
+			# cgroup read.  Only that confirmed disappearance is equivalent to
+			# respawn delay.
+			[ ! -e "/proc/$$pid" ] && [ ! -L "/proc/$$pid" ]
+			;;
+		false|0)
+			# A stopped registered instance is precisely procd's respawn-delay
+			# state.  It must not expose a contradictory PID field.
+			! printf '%s\n' "$$payload" |
+				jsonfilter -e '@.AdGuardHome.instances.monitor.pid' >/dev/null 2>&1
+			;;
 		*) return 1 ;;
 	esac
+}
+
+maintenance_monitor_cgroup_quiescent() {
+	local directory=/sys/fs/cgroup/services/AdGuardHome/monitor procs populated
+	if [ ! -e "$$directory" ] && [ ! -L "$$directory" ]; then
+		return 0
+	fi
+	maintenance_monitor_cgroup_supported || return 1
+	procs="$$(cat "$$directory/cgroup.procs" 2>/dev/null)" || return 1
+	populated="$$(awk '
+		$$1 == "populated" { count++; value=$$2 }
+		END { if (count == 1) print value; else exit 1 }
+	' "$$directory/cgroup.events" 2>/dev/null)" || return 1
+	[ -z "$$procs" ] && [ "$$populated" = 0 ]
+}
+
+maintenance_kill_monitor_cgroup() {
+	local directory=/sys/fs/cgroup/services/AdGuardHome/monitor
+	if [ ! -e "$$directory" ] && [ ! -L "$$directory" ]; then
+		return 0
+	fi
+	maintenance_monitor_cgroup_supported || return 1
+	{ printf '1\n' >"$$directory/cgroup.kill"; } 2>/dev/null && return 0
+	# procd may remove an already empty instance cgroup between validation and
+	# the write.  Accept only that confirmed disappearance; every other failure
+	# remains fatal rather than falling back to incomplete PID signalling.
+	[ ! -e "$$directory" ] && [ ! -L "$$directory" ]
+}
+
+# Deleting the procd instance cancels a pending respawn but signals only its
+# main PID.  cgroup.kill then atomically removes every old child, including a
+# run_locked shell waiting on the integration lock with v2.2 code in memory.
+retire_maintenance_monitor() {
+	local registered_rc=0 delete_rc=0 attempt=0
+	local directory=/sys/fs/cgroup/services/AdGuardHome/monitor
+	maintenance_wrapper_registered || registered_rc=$$?
+	case "$$registered_rc" in
+		0)
+			# The supported 25.12.1 procd retains this cgroup even during its
+			# respawn delay.  Without cgroup.kill, a complete generation retire
+			# cannot be guaranteed, so validate before changing procd state.
+			maintenance_monitor_cgroup_supported &&
+				maintenance_monitor_pid_is_contained || return 1
+			ubus -S call service delete \
+				'{"name":"AdGuardHome","instance":"monitor"}' \
+				>/dev/null 2>&1 || delete_rc=$$?
+			if [ "$$delete_rc" != 0 ]; then
+				registered_rc=0
+				maintenance_wrapper_registered || registered_rc=$$?
+				[ "$$registered_rc" = 1 ] || return 1
+			fi
+			;;
+		1)
+			if [ -e "$$directory" ] || [ -L "$$directory" ]; then
+				maintenance_monitor_cgroup_supported || return 1
+			fi
+			;;
+		*) return 1 ;;
+	esac
+	while [ "$$attempt" -lt 30 ]; do
+		maintenance_kill_monitor_cgroup || return 1
+		registered_rc=0
+		maintenance_wrapper_registered || registered_rc=$$?
+		case "$$registered_rc" in 0) ;; 1) ;; *) return 1 ;; esac
+		if [ "$$registered_rc" = 1 ] && maintenance_monitor_cgroup_quiescent; then
+			return 0
+		fi
+		attempt=$$((attempt + 1))
+		sleep 1
+	done
+	return 1
+}
+
+verify_maintenance_wrapper_state() {
+	local registered_rc=0 running_rc=0
+	maintenance_wrapper_registered || registered_rc=$$?
+	case "$$maintenance_wrapper_running:$$registered_rc" in
+		1:0)
+			/etc/init.d/AdGuardHome running >/dev/null 2>&1 || running_rc=$$?
+			[ "$$running_rc" = 0 ]
+			;;
+		0:1) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+replace_maintenance_monitor() {
+	local core_identity attempt=0 old_monitor_pid="" old_monitor_identity=""
+	local new_monitor_pid new_monitor_identity
+	core_identity="$$(maintenance_core_identity)" || return 1
+	old_monitor_pid="$$(maintenance_monitor_pid)" || old_monitor_pid=""
+	if [ -n "$$old_monitor_pid" ]; then
+		old_monitor_identity="$$(maintenance_process_identity "$$old_monitor_pid")" || return 1
+	fi
+	retire_maintenance_monitor || return 1
+	[ "$$(maintenance_core_identity)" = "$$core_identity" ] || return 1
+	case "$$maintenance_wrapper_running" in
+		0) ;;
+		1)
+			# With the authenticated marker present, start_service() registers
+			# only the installed v2.3 monitor and service_started() leaves the
+			# official lowercase core and resolver integration untouched.
+			PKG_UPGRADE=1 /etc/init.d/AdGuardHome start >/dev/null 2>&1 || return 1
+			while [ "$$attempt" -lt 30 ]; do
+				if verify_maintenance_wrapper_state; then
+					break
+				fi
+				attempt=$$((attempt + 1))
+				sleep 1
+			done
+			[ "$$attempt" -lt 30 ] || return 1
+			new_monitor_pid="$$(maintenance_monitor_pid)" || return 1
+			new_monitor_identity="$$(maintenance_process_identity "$$new_monitor_pid")" || return 1
+			[ -z "$$old_monitor_identity" ] ||
+				[ "$$new_monitor_identity" != "$$old_monitor_identity" ] || return 1
+			[ -r "/proc/$$new_monitor_pid/cgroup" ] &&
+				grep -qx '0::/services/AdGuardHome/monitor' \
+					"/proc/$$new_monitor_pid/cgroup" || return 1
+			;;
+		*) return 1 ;;
+	esac
+	[ "$$(maintenance_core_identity)" = "$$core_identity" ]
 }
 runtime_dir=/var/run/luci-app-adguardhome
 maintenance_upgrade_marker="$${runtime_dir}/maintenance-upgrade"
@@ -1823,6 +2082,13 @@ if [ "$$maintenance_upgrade" = 1 ]; then
 	exec 190>>"$$integration_lock" || exit 1
 	/usr/bin/flock -x 190 || exit 1
 	maintenance_upgrade_bundle_valid || exit 1
+	# Replace the complete old procd instance after acquiring the integration
+	# lock.  Its dedicated cgroup is emptied before the installed monitor is
+	# registered, so no v2.2 child can resume after this hook releases the lock.
+	replace_maintenance_monitor || {
+		echo "Unable to activate the v2.3 AdGuard Home monitor without restarting the core." >&2
+		exit 1
+	}
 	restore_maintenance_layers || {
 		echo "Unable to restore the AdGuard Home UCI layers after upgrade." >&2
 		exit 1
@@ -1866,6 +2132,7 @@ if [ "$$maintenance_upgrade" = 1 ]; then
 		[ ! -L "$$maintenance_upgrade_marker" ] || exit 1
 	rmdir "$$runtime_dir" || exit 1
 fi
+
 [ /proc/self/fd/191 -ef "$$yaml_update_lock" ] || exit 1
 root_private_directory "$$yaml_runtime_dir" &&
 	root_private_empty_file "$$yaml_update_lock" &&

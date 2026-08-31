@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-adguardhome 2.2.0\n"
-"PO-Revision-Date: 2026-08-28 00:00+0800\n"
+"Project-Id-Version: luci-app-adguardhome 2.3.0\n"
+"PO-Revision-Date: 2026-08-31 00:00+0800\n"
 "Last-Translator: terrytyc\n"
 "Language-Team: Chinese (Simplified)\n"
 "MIME-Version: 1.0\n"
@@ -114,44 +114,71 @@ msgstr "详细日志"
 msgid "Run from memory"
 msgstr "从内存运行"
 
-msgid "At startup, copies the persistent data directory into RAM and runs the official core there. Normal stop or restart, and enabled periodic write-back, save a consistent checkpoint; an unexpected power loss can lose changes made since the last successful checkpoint."
-msgstr "启动时把持久化 data 目录复制到内存，并让官方核心在内存副本中运行。正常停止、重启及已启用的周期回写都会保存一致性检查点；意外断电可能丢失自上次成功检查点之后的改动。"
+msgid "At startup, copies the persistent data directory into RAM and runs the official core there. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back."
+msgstr "启动时把持久化 data 目录复制到内存，并让官方核心在内存副本中运行。手动及周期回写会直接把实时内存 data 复制到持久化存储，不重启核心或 DNS 服务，也不保证并发变更或极端断电情况下的一致性。正常停止或重启时仍会执行完整回写。"
 
 msgid "Memory write-back interval (minutes)"
 msgstr "内存数据回写周期（分钟）"
 
-msgid "At each interval, the plugin briefly stops and restarts the official core and its DNS service to write a consistent data checkpoint to the persistent working directory. Each checkpoint writes to persistent storage; use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; normal stop or restart still writes back."
-msgstr "每到设定周期，插件会短暂停止并重启官方核心及其 DNS 服务，把一致性 data 检查点写回持久化工作目录。每次检查点都会写入持久化存储；建议设置为 60 分钟或更长以减少闪存磨损。设为 0 可停用周期回写，但正常停止或重启时仍会回写。"
+msgid "At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back."
+msgstr "每到设定周期，插件会直接把实时内存 data 复制到持久化工作目录，不重启核心或 DNS 服务。该复制不保证并发变更或极端断电情况下的一致性。建议设置为 60 分钟或更长以减少闪存磨损。设为 0 可停用周期回写；正常停止或重启时仍会执行完整回写。"
 
 msgid "Enter 0 to disable periodic write-back, or a whole number from 1 to 10080."
 msgstr "请输入 0 以停用周期回写，或输入 1 到 10080 之间的整数。"
 
-msgid "Management password"
-msgstr "管理密码"
+msgid "Change Username and Password"
+msgstr "修改用户及密码"
 
-msgid "Changes the password for the admin account stored in AdGuardHome.yaml. The password is BCrypt-hashed in this browser and the plaintext is never sent to the router."
-msgstr "修改 AdGuardHome.yaml 中 admin 账号的密码。密码会在本浏览器中进行 BCrypt 哈希，明文不会发送到路由器。"
+msgid "Current username"
+msgstr "当前用户名"
 
-msgid "Change Password"
-msgstr "修改密码"
+msgid "New username"
+msgstr "新用户名"
 
-msgid "Change AdGuard Home Password"
-msgstr "修改 AdGuard Home 密码"
+msgid "Leave empty to keep the current username"
+msgstr "留空则不修改当前用户名"
 
-msgid "Enter a new password for the admin account. Use at least 8 characters and no more than 72 UTF-8 bytes."
-msgstr "请输入 admin 账号的新密码，至少 8 个字符，且不超过 72 个 UTF-8 字节。"
+msgid "Leave either field empty to keep it unchanged. A new password must contain at least 8 characters and no more than 72 UTF-8 bytes."
+msgstr "用户名或密码留空时将保持不变。新密码必须至少包含 8 个字符，且不超过 72 个 UTF-8 字节。"
+
+msgid "Enter a new username, a new password, or both."
+msgstr "请输入新用户名、新密码，或同时输入两者。"
+
+msgid "The username must be 1 to 64 characters and may contain only letters, numbers, dot, underscore, at sign, plus sign, or hyphen. It must start with a letter or number."
+msgstr "用户名必须为 1 到 64 个字符，只能包含字母、数字、点、下划线、@、加号或连字符，并且必须以字母或数字开头。"
+
+msgid "The username is unchanged and no new password was entered."
+msgstr "用户名没有变化，且未输入新密码。"
+
+msgid "The YAML user account is unavailable or ambiguous. Use the YAML editor to review the users section."
+msgstr "YAML 中的用户账号不可用或存在歧义，请在 YAML 编辑器中检查 users 段。"
+
+msgid "Unable to prepare the username or password change: %s"
+msgstr "无法准备用户名或密码修改：%s"
+
+msgid "The server did not accept the credential update job."
+msgstr "服务器未接受用户凭据更新任务。"
+
+msgid "The server rejected the credential update."
+msgstr "服务器拒绝了用户凭据更新。"
+
+msgid "Unable to change the username or password: %s"
+msgstr "无法修改用户名或密码：%s"
+
+msgid "The credential update returned an unknown job state."
+msgstr "用户凭据更新任务返回了未知状态。"
+
+msgid "The credential update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later."
+msgstr "用户凭据更新仍在运行，但暂时无法获取其状态：%s。请勿重复提交，稍后重新加载此页面。"
+
+msgid "The credential update is still running. Do not submit it again; reload this page later."
+msgstr "用户凭据更新仍在运行。请勿重复提交，稍后重新加载此页面。"
 
 msgid "New password"
 msgstr "新密码"
 
 msgid "Confirm password"
 msgstr "确认密码"
-
-msgid "The YAML admin account is unavailable or ambiguous. Use the YAML editor to review the users section."
-msgstr "YAML 中的 admin 账号不可用或存在歧义，请在 YAML 编辑器中检查 users 段。"
-
-msgid "Unable to prepare the password change: %s"
-msgstr "无法准备密码修改：%s"
 
 msgid "The two passwords do not match."
 msgstr "两次输入的密码不一致。"
@@ -161,39 +188,6 @@ msgstr "密码必须至少包含 8 个字符。"
 
 msgid "The password exceeds the 72-byte BCrypt limit."
 msgstr "密码超过 BCrypt 的 72 字节限制。"
-
-msgid "Hashing the password securely in this browser…"
-msgstr "正在本浏览器中安全地计算密码哈希……"
-
-msgid "The server did not accept the password update job."
-msgstr "服务器未接受密码更新任务。"
-
-msgid "The password update was accepted and is being applied in the background."
-msgstr "密码更新任务已接受，正在后台应用。"
-
-msgid "The server rejected the password update."
-msgstr "服务器拒绝了密码更新。"
-
-msgid "The admin password was changed and AdGuard Home restarted successfully."
-msgstr "admin 密码已修改，AdGuard Home 已成功重启。"
-
-msgid "The admin password was changed."
-msgstr "admin 密码已修改。"
-
-msgid "Unable to finish the password change: %s"
-msgstr "无法完成密码修改：%s"
-
-msgid "Unable to change the password: %s"
-msgstr "无法修改密码：%s"
-
-msgid "The password update returned an unknown job state."
-msgstr "密码更新任务返回了未知状态。"
-
-msgid "The password update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later."
-msgstr "密码更新仍在运行，但暂时无法获取其状态：%s。请勿重复提交，稍后重新加载此页面。"
-
-msgid "The password update is still running. Do not submit it again; reload this page later."
-msgstr "密码更新仍在运行。请勿重复提交，稍后重新加载此页面。"
 
 msgid "This field is required."
 msgstr "此字段为必填项。"
@@ -273,38 +267,23 @@ msgstr "校验、保存并应用"
 msgid "Reload from disk"
 msgstr "从磁盘重新载入"
 
-msgid "Reset to Template"
-msgstr "重置为模板"
+msgid "Restore Template"
+msgstr "恢复模板"
 
-msgid "Reset YAML to Template"
-msgstr "将 YAML 重置为模板"
+msgid "Restore YAML Template"
+msgstr "恢复 YAML 模板"
 
-msgid "This overwrites every YAML-managed setting, including DNS, upstreams, filters, rewrites, DHCP, Web/TLS and certificate paths."
-msgstr "此操作会覆盖所有由 YAML 管理的设置，包括 DNS、上游、过滤器、重写、DHCP、Web/TLS 和证书路径。"
+msgid "This replaces only the text currently shown in the editor with the packaged template."
+msgstr "此操作只会用软件包模板替换编辑器中当前显示的文本。"
 
-msgid "The management login returns to admin / admin, DNS returns to port 53335, and the Web interface returns to HTTP port 3000. The persistent working directory, stored data, enable state, DNS mode and verbose setting are kept."
-msgstr "管理登录将恢复为 admin / admin，DNS 恢复为 53335 端口，Web 界面恢复为 HTTP 3000 端口；持久化工作目录、已存数据、启用状态、DNS 模式和详细日志设置会保留。"
+msgid "The active YAML file, service and data remain unchanged until you choose Validate, Save & Apply. Continue editing after the template is loaded, or reload from disk to discard it."
+msgstr "在点击“校验、保存并应用”前，当前 YAML 文件、服务和数据都不会改变。模板载入后可继续编辑，也可从磁盘重新载入以放弃这些内容。"
 
-msgid "A running service will restart; a disabled service will remain stopped. Continue?"
-msgstr "服务原本运行时会重启，原本停用时会保持停用。是否继续？"
+msgid "The packaged YAML template is unavailable."
+msgstr "软件包自带的 YAML 模板不可用。"
 
-msgid "The server did not accept the template reset job."
-msgstr "服务器未接受模板重置任务。"
-
-msgid "The template reset was accepted and is being applied in the background."
-msgstr "模板重置任务已接受，正在后台应用。"
-
-msgid "The server rejected the packaged YAML template."
-msgstr "服务器拒绝了软件包自带的 YAML 模板。"
-
-msgid "The YAML configuration was reset and AdGuard Home restarted successfully."
-msgstr "YAML 配置已重置，AdGuard Home 已成功重启。"
-
-msgid "The YAML configuration was reset to the packaged template."
-msgstr "YAML 配置已重置为软件包自带模板。"
-
-msgid "Unable to reset the YAML configuration: %s"
-msgstr "无法重置 YAML 配置：%s"
+msgid "Unable to restore the YAML template: %s"
+msgstr "无法恢复 YAML 模板：%s"
 
 msgid "Unable to read the YAML configuration: %s"
 msgstr "无法读取 YAML 配置：%s"
@@ -327,20 +306,11 @@ msgstr "取消"
 msgid "The server rejected the YAML configuration. Check its syntax and protected settings."
 msgstr "服务器拒绝了 YAML 配置。请检查语法及受保护的设置。"
 
-msgid "The YAML configuration was saved and AdGuard Home restarted successfully."
-msgstr "YAML 配置已保存，AdGuard Home 已成功重启。"
-
-msgid "The YAML configuration was saved."
-msgstr "YAML 配置已保存。"
-
-msgid "The YAML configuration was saved, but the editor could not reload it: %s"
-msgstr "YAML 配置已保存，但编辑器无法重新载入：%s"
-
-msgid "The YAML configuration was reset, but the editor could not reload it: %s"
-msgstr "YAML 配置已重置，但编辑器无法重新载入：%s"
-
 msgid "Unable to save the YAML configuration: %s"
 msgstr "无法保存 YAML 配置：%s"
+
+msgid "The YAML configuration was saved and applied, but the editor could not reload it: %s. Refresh this page before editing again."
+msgstr "YAML 配置已保存并应用，但编辑器无法重新载入：%s。请刷新此页面后再继续编辑。"
 
 msgid "If the file changed since it was loaded, reload it and merge your changes. Otherwise, check the YAML syntax and protected settings."
 msgstr "若文件在加载后已发生变化，请重新载入并合并改动；否则请检查 YAML 语法和受保护的设置。"
@@ -365,9 +335,3 @@ msgstr "YAML 更新结果未知。再次编辑前请重新加载页面。"
 
 msgid "The YAML update succeeded, but its result could not be verified. Reload the page before editing it again."
 msgstr "YAML 更新已成功，但无法验证其结果。再次编辑前请重新加载页面。"
-
-msgid "The template reset outcome is unknown. Reload the page before editing the YAML again."
-msgstr "模板重置结果未知。再次编辑 YAML 前请重新加载页面。"
-
-msgid "The template reset succeeded, but its result could not be verified. Reload the page before editing the YAML again."
-msgstr "模板重置已成功，但无法验证其结果。再次编辑 YAML 前请重新加载页面。"

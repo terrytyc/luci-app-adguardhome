@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.adguardhome": [ "get_yaml", "set_yaml", "reset_yaml", "get_password_info", "set_password", "get_yaml_update" ]
+				"luci.adguardhome": [ "get_yaml", "set_yaml", "reset_yaml", "get_password_info", "set_password", "get_credentials", "set_credentials", "get_yaml_update" ]
 			},
 			"uci": [ "AdGuardHome" ]
 		}
