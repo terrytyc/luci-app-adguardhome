@@ -491,7 +491,11 @@ memory_active_tree_valid() {
 		[ "$entry" = "$MEMORY_DATA_DIR" ] && [ "$found" = 0 ] || return 1
 		found=1
 	done
-	[ "$found" = 1 ]
+	[ "$found" = 1 ] || return 1
+	# The top-level shape alone cannot expose a same-device bind mount or a
+	# special file nested below data/.  Reuse the bounded uid-853 tree scan and
+	# its mountinfo checks before treating this RAM generation as active.
+	uid853_tree_is_plain "$MEMORY_WORK_DIR"
 }
 
 # Return 0 for a complete state, 1 when no memory state exists, and 2 for an
