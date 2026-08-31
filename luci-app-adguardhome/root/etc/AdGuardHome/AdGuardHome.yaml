@@ -160,10 +160,6 @@ filtering:
   blocking_mode: default
   parental_block_host: family-block.dns.adguard.com
   safebrowsing_block_host: standard-block.dns.adguard.com
-  rewrites:
-    - domain: us.terrytyc.com
-      answer: 199.180.114.212
-      enabled: true
   safe_fs_patterns:
     - /tmp/lib/adguardhome/userfilters/*
   safebrowsing_cache_size: 1048576
