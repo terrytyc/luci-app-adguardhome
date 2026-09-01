@@ -32,7 +32,7 @@ function extractFunction(source, name) {
 	assert.fail(`unterminated ${name}()`);
 }
 
-async function testReadOnlyYamlView() {
+async function testYamlViewPermissionGuard() {
 	let yamlReads = 0;
 	let writeCalls = 0;
 	let successes = 0;
@@ -102,19 +102,19 @@ async function testReadOnlyYamlView() {
 	const loaded = await definition.load.call(definition);
 	definition.render.call(definition, loaded);
 	assert.equal(definition.yamlEditor.readOnly, true,
-		'a read-only session must receive a read-only YAML editor');
+		'the frontend must keep the YAML editor read-only without write permission');
 	assert.equal(definition.saveButton.disabled, true,
-		'a read-only session must not receive an enabled YAML save button');
+		'the frontend must disable YAML saving without write permission');
 	assert.equal(definition.resetButton.disabled, true,
-		'a read-only session must not receive an enabled template reset button');
+		'the frontend must disable template reset without write permission');
 	assert.equal(definition.reloadButton.disabled, false,
-		'a read-only session must still be able to reload YAML from disk');
+		'the frontend permission guard must not break an already authorized YAML reload');
 
 	await definition.handleReload.call(definition);
 	assert.equal(yamlReads, 2,
-		'the read-only YAML page must load once and permit one explicit reload');
+		'the YAML page must load once and permit one explicit reload');
 	assert.equal(writeCalls, 0,
-		'the read-only YAML page must not invoke any write-authorized RPC');
+		'the permission guard must not invoke a YAML mutation RPC');
 	assert.equal(successes, 1);
 	assert.equal(definition.yamlEditor.readOnly, true);
 	assert.equal(definition.saveButton.disabled, true);
@@ -215,10 +215,10 @@ assert.equal(permission.write.uci, undefined,
 	'the browser must not receive direct UCI write access');
 assert.ok(permission.read.ubus['luci.adguardhome'].includes('get_settings'),
 	'the read ACL must expose the settings snapshot RPC');
-assert.ok(permission.read.ubus['luci.adguardhome'].includes('get_yaml'),
-	'the read ACL must let a read-only session load the YAML tab');
-assert.ok(!permission.write.ubus['luci.adguardhome'].includes('get_yaml'),
-	'the YAML snapshot RPC must not be needlessly restricted to write access');
+assert.ok(!permission.read.ubus['luci.adguardhome'].includes('get_yaml'),
+	'the read ACL must not expose YAML secrets to read-only sessions');
+assert.ok(permission.write.ubus['luci.adguardhome'].includes('get_yaml'),
+	'the YAML snapshot RPC must require write access');
 assert.ok(permission.write.ubus['luci.adguardhome'].includes('set_settings'),
 	'the write ACL must expose the settings transaction RPC');
 assert.ok(permission.write.ubus['luci.adguardhome'].includes('get_settings_update'),
@@ -231,7 +231,7 @@ assert.deepEqual(
 assert.equal(fs.existsSync(ucitrackPath), false,
 	'the app must not register a duplicate global UCI apply trigger');
 
-testReadOnlyYamlView().then(() => {
+testYamlViewPermissionGuard().then(() => {
 	console.log('2.4 RPC-owned single-UCI frontend and metadata contract tests passed');
 }).catch(error => {
 	console.error(error);
