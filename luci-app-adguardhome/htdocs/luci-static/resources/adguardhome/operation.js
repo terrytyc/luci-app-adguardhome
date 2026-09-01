@@ -18,8 +18,33 @@ return baseclass.extend({
 	_activeScope: null,
 	_applyPendingUntil: 0,
 	_applyNavigationGuard: null,
+	_applyModalObserver: null,
+	_applyModalSeen: false,
+	_applyEventClear: null,
+	_pageShowGuard: null,
+	_bfcacheReloading: false,
+
+	_installPageShowGuard() {
+		if (this._pageShowGuard != null)
+			return;
+
+		this._pageShowGuard = event => {
+			if (event?.persisted !== true || this._bfcacheReloading)
+				return;
+
+			// A page restored from the back-forward cache retains its old
+			// promises, timers and form snapshot.  Rebuild the LuCI view instead
+			// of reactivating an obsolete scope and allowing stale XHR results to
+			// update it.
+			this._bfcacheReloading = true;
+			window.location.reload();
+		};
+		window.addEventListener('pageshow', this._pageShowGuard);
+	},
 
 	createPageScope() {
+		this._installPageShowGuard();
+
 		if (this._activeScope != null) {
 			const hadVisibleOperation = this._timer != null;
 			this._clearTimer();
@@ -110,17 +135,69 @@ return baseclass.extend({
 			);
 		} catch (error) { }
 		this._installApplyNavigationGuard();
-
-		const clear = () => this.clearApplyPending();
-		document.addEventListener('uci-applied', clear, { once: true });
-		document.addEventListener('uci-reverted', clear, { once: true });
+		this._watchApplyModal();
+		this._installApplyEventGuards();
 	},
 
 	clearApplyPending() {
 		this._applyPendingUntil = 0;
 		try { window.sessionStorage.removeItem(APPLY_STORAGE_KEY); }
 		catch (error) { }
+		this._stopApplyModalWatch();
+		this._removeApplyEventGuards();
 		this._removeApplyNavigationGuard();
+	},
+
+	_installApplyEventGuards() {
+		this._removeApplyEventGuards();
+		this._applyEventClear = () => this.clearApplyPending();
+		document.addEventListener('uci-applied', this._applyEventClear, { once: true });
+		document.addEventListener('uci-reverted', this._applyEventClear, { once: true });
+	},
+
+	_removeApplyEventGuards() {
+		if (this._applyEventClear == null)
+			return;
+		document.removeEventListener('uci-applied', this._applyEventClear);
+		document.removeEventListener('uci-reverted', this._applyEventClear);
+		this._applyEventClear = null;
+	},
+
+	_watchApplyModal() {
+		this._stopApplyModalWatch();
+
+		const body = document.body;
+		const Observer = window.MutationObserver;
+		if (body == null || typeof Observer !== 'function')
+			return;
+
+		this._applyModalSeen =
+			body.classList?.contains('modal-overlay-active') === true;
+		this._applyModalObserver = new Observer(() => {
+			const active =
+				body.classList?.contains('modal-overlay-active') === true;
+			if (active) {
+				this._applyModalSeen = true;
+				return;
+			}
+
+			// Do not clear a marker merely because a newly loaded document has
+			// no modal.  Only the document which observed its own apply modal
+			// may retire the marker when that modal closes or is cancelled.
+			if (this._applyModalSeen)
+				this.clearApplyPending();
+		});
+		this._applyModalObserver.observe(body, {
+			attributes: true,
+			attributeFilter: [ 'class' ],
+		});
+	},
+
+	_stopApplyModalWatch() {
+		if (this._applyModalObserver != null)
+			this._applyModalObserver.disconnect();
+		this._applyModalObserver = null;
+		this._applyModalSeen = false;
 	},
 
 	applyPending() {

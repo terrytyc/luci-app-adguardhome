@@ -32,12 +32,49 @@ function translated(value) {
 	return result;
 }
 
-function loadOperation() {
+function loadOperation(sharedStorage) {
 	const source = fs.readFileSync(operationPath, 'utf8');
 	const listeners = new Map();
-	const storage = new Map();
+	const onceListeners = new Map();
+	const storage = sharedStorage ?? new Map();
 	const rendered = [];
 	const bodyClasses = new Set();
+	const mutationObservers = new Set();
+	let reloads = 0;
+
+	const notifyBodyMutation = () => {
+		for (const observer of [ ...mutationObservers ])
+			observer.callback([], observer);
+	};
+	const addBodyClass = bodyClasses.add.bind(bodyClasses);
+	const deleteBodyClass = bodyClasses.delete.bind(bodyClasses);
+	bodyClasses.add = name => {
+		const changed = !bodyClasses.has(name);
+		addBodyClass(name);
+		if (changed)
+			notifyBodyMutation();
+		return bodyClasses;
+	};
+	bodyClasses.delete = name => {
+		const changed = deleteBodyClass(name);
+		if (changed)
+			notifyBodyMutation();
+		return changed;
+	};
+
+	class FakeMutationObserver {
+		constructor(callback) {
+			this.callback = callback;
+		}
+
+		observe() {
+			mutationObservers.add(this);
+		}
+
+		disconnect() {
+			mutationObservers.delete(this);
+		}
+	}
 	const fakeDocument = {
 		body: {
 			classList: {
@@ -47,21 +84,31 @@ function loadOperation() {
 		documentElement: {
 			contains(node) { return node.isConnected === true; },
 		},
-		addEventListener(type, callback) {
+		addEventListener(type, callback, options) {
 			if (!listeners.has(type))
 				listeners.set(type, []);
 			listeners.get(type).push(callback);
+			if (options != null && typeof options === 'object' && options.once === true) {
+				if (!onceListeners.has(type))
+					onceListeners.set(type, new Set());
+				onceListeners.get(type).add(callback);
+			}
 		},
 		removeEventListener(type, callback) {
 			if (!listeners.has(type))
 				return;
 			listeners.set(type, listeners.get(type).filter(entry => entry !== callback));
+			onceListeners.get(type)?.delete(callback);
 		},
 	};
 	const fakeWindow = {
 		addEventListener: fakeDocument.addEventListener.bind(fakeDocument),
 		setTimeout(callback) { return setTimeout(callback, 0); },
 		clearTimeout(id) { clearTimeout(id); },
+		MutationObserver: FakeMutationObserver,
+		location: {
+			reload() { reloads++; },
+		},
 		sessionStorage: {
 			getItem(key) { return storage.has(key) ? storage.get(key) : null; },
 			setItem(key, value) { storage.set(key, String(value)); },
@@ -95,10 +142,69 @@ function loadOperation() {
 		bodyClasses,
 		listeners,
 		rendered,
+		storage,
+		dispatch(type, event = {}) {
+			for (const listener of [ ...(listeners.get(type) ?? []) ]) {
+				if (onceListeners.get(type)?.has(listener))
+					fakeDocument.removeEventListener(type, listener);
+				listener(event);
+			}
+		},
+		observedMutations: () => mutationObservers.size,
+		reloads: () => reloads,
 	};
 }
 
+function loadOverview(operation, ui) {
+	const overviewPath = path.join(
+		packageRoot,
+		'htdocs/luci-static/resources/view/adguardhome/overview.js'
+	);
+	const source = fs.readFileSync(overviewPath, 'utf8');
+	const rpc = { declare: () => async () => ({}) };
+	const view = { extend: definition => definition };
+	const sandbox = {
+		E: () => ({}),
+		L: { env: {} },
+		URL,
+		_: translated,
+		console,
+		window: {
+			location: { href: 'https://router.example/cgi-bin/luci/admin/services/adguardhome' },
+			setTimeout,
+		},
+	};
+	vm.createContext(sandbox);
+	return vm.runInContext(
+		'(function(bcrypt, operation, dom, form, poll, rpc, uci, ui, view, window, L, E, _, URL, console) {\n' +
+			source +
+			'\n}).call(globalThis, {}, operation, {}, {}, {}, rpc, {}, ui, view, window, L, E, _, URL, console)',
+		Object.assign(sandbox, { operation, rpc, ui, view }),
+		{ filename: overviewPath },
+	);
+}
+
 async function main() {
+	const bfcacheState = loadOperation();
+	bfcacheState.operation.createPageScope();
+	const bfcacheRoot = { isConnected: true };
+	const bfcacheScope = bfcacheState.operation.createPageScope();
+	bfcacheScope.attach(bfcacheRoot);
+	assert.equal((bfcacheState.listeners.get('pageshow') ?? []).length, 1,
+		'multiple view scopes must share one BFCache restoration guard');
+	bfcacheState.dispatch('pageshow', { persisted: false });
+	assert.equal(bfcacheState.reloads(), 0,
+		'an ordinary initial pageshow must not reload the view');
+	bfcacheState.dispatch('pagehide', { persisted: true });
+	assert.equal(bfcacheScope.active(), false,
+		'pagehide must permanently invalidate the old page scope');
+	bfcacheState.dispatch('pageshow', { persisted: true });
+	bfcacheState.dispatch('pageshow', { persisted: true });
+	assert.equal(bfcacheState.reloads(), 1,
+		'a BFCache restoration must rebuild the LuCI view exactly once');
+	assert.equal(bfcacheScope.active(), false,
+		'a BFCache restoration must not reactivate old promises or DOM updates');
+
 	const state = loadOperation();
 	const root = { isConnected: false };
 	const scope = state.operation.createPageScope();
@@ -131,7 +237,13 @@ async function main() {
 
 	state.operation.markApplyPending();
 	assert.equal(state.operation.applyPending(), true);
+	assert.equal(state.observedMutations(), 1,
+		'marking an apply must watch its modal lifecycle');
+	assert.equal(state.operation.applyPending(), true,
+		'the marker must survive the synchronous gap before the modal appears');
 	state.bodyClasses.add('modal-overlay-active');
+	assert.equal(state.operation.applyPending(), true,
+		'the marker must remain active while the LuCI apply modal is visible');
 	const modalButtonClick = {
 		target: {
 			closest: selector => selector === 'button' ? {} : null,
@@ -178,6 +290,14 @@ async function main() {
 	assert.equal(guardedClick.immediate, true);
 
 	state.bodyClasses.delete('modal-overlay-active');
+	assert.equal(state.operation.applyPending(), false,
+		'closing or cancelling the observed apply modal must clear the retry marker immediately');
+	assert.equal(state.observedMutations(), 0,
+		'clearing the retry marker must disconnect its modal observer');
+	assert.equal((state.listeners.get('uci-applied') ?? []).length, 0,
+		'clearing the retry marker must remove its apply event listener');
+	assert.equal((state.listeners.get('uci-reverted') ?? []).length, 0,
+		'clearing the retry marker must remove its revert event listener');
 	const releasedClick = {
 		target: { closest: selector => selector === 'a[href]' ? {} : null },
 		prevented: false,
@@ -188,8 +308,30 @@ async function main() {
 		listener(releasedClick);
 	assert.equal(releasedClick.prevented, false,
 		'navigation must be released as soon as LuCI closes its apply modal');
+	assert.equal(state.operation.applyPending(), false);
+
+	state.operation.markApplyPending();
+	state.bodyClasses.add('modal-overlay-active');
+	state.dispatch('uci-applied');
 	assert.equal(state.operation.applyPending(), false,
-		'closing the modal must clear a stale retry marker');
+		'a successful checked apply must clear its marker immediately');
+	assert.equal(state.observedMutations(), 0);
+	state.bodyClasses.delete('modal-overlay-active');
+
+	state.operation.markApplyPending();
+	state.bodyClasses.add('modal-overlay-active');
+	state.dispatch('uci-reverted');
+	assert.equal(state.operation.applyPending(), false,
+		'a reverted checked apply must clear its marker immediately');
+	assert.equal(state.observedMutations(), 0);
+	state.bodyClasses.delete('modal-overlay-active');
+
+	state.operation.markApplyPending();
+	state.operation._applyPendingUntil = Date.now() - 1;
+	state.storage.set('luci.adguardhome.applyPendingUntil', String(Date.now() - 1));
+	assert.equal(state.operation.applyPending(), false,
+		'an expired marker must clear its observer and navigation guard');
+	assert.equal(state.observedMutations(), 0);
 
 	state.operation.markApplyPending();
 
@@ -238,6 +380,106 @@ async function main() {
 	await new Promise(resolve => setTimeout(resolve, 5));
 	assert.equal(obsoleteLoadSettled, false,
 		'an obsolete LuCI load chain must remain pending instead of rendering an empty old view');
+
+	const sharedStorage = new Map();
+	const origin = loadOperation(sharedStorage);
+	const originScope = origin.operation.createPageScope();
+	originScope.attach({ isConnected: true });
+	origin.operation.markApplyPending();
+	origin.bodyClasses.add('modal-overlay-active');
+	origin.dispatch('pagehide', { persisted: true });
+	assert.equal(origin.operation.applyPending(), true,
+		'leaving during an active apply must retain the cross-document retry marker');
+
+	const destination = loadOperation(sharedStorage);
+	const destinationScope = destination.operation.createPageScope();
+	destinationScope.attach({ isConnected: true });
+	assert.equal(destination.operation.applyPending(), true,
+		'a YAML or log page must inherit an in-progress apply marker');
+	let destinationAttempts = 0;
+	const destinationResult = await destination.operation.requestDuringApply(async () => {
+		destinationAttempts++;
+		if (destinationAttempts === 1) {
+			const error = new Error('XHR request timed out');
+			error.name = 'RequestError';
+			throw error;
+		}
+		return 'loaded';
+	}, destinationScope);
+	assert.equal(destinationResult, 'loaded');
+	assert.equal(destinationAttempts, 2,
+		'the destination tab must retry a transient initial RPC failure during apply');
+
+	const completedStorage = new Map();
+	const completedOrigin = loadOperation(completedStorage);
+	completedOrigin.operation.markApplyPending();
+	completedOrigin.bodyClasses.add('modal-overlay-active');
+	completedOrigin.bodyClasses.delete('modal-overlay-active');
+	const completedDestination = loadOperation(completedStorage);
+	assert.equal(completedDestination.operation.applyPending(), false,
+		'a cancelled or failed apply must not leak retry state into a later tab');
+
+	const applyEvents = [];
+	let pageActive = true;
+	const overviewOperation = {
+		isPageActive: () => pageActive,
+		markApplyPending: () => applyEvents.push('mark'),
+	};
+	const overviewUi = {
+		changes: {
+			apply(checked) {
+				applyEvents.push(`apply:${checked}`);
+				return 'apply-result';
+			},
+		},
+	};
+	const overviewView = loadOverview(overviewOperation, overviewUi);
+	let resolveSave;
+	const savePromise = new Promise(resolve => { resolveSave = resolve; });
+	const overviewContext = {
+		pageScope: {},
+		handleSave() {
+			applyEvents.push('save');
+			return savePromise;
+		},
+	};
+	const applyPromise = overviewView.handleSaveApply.call(overviewContext, null, '0');
+	assert.deepEqual(applyEvents, [ 'save' ],
+		'apply must not start before the asynchronous save completes');
+	resolveSave();
+	assert.equal(await applyPromise, 'apply-result');
+	assert.deepEqual(applyEvents, [ 'save', 'mark', 'apply:true' ],
+		'a checked apply must run strictly after save and marker installation');
+
+	applyEvents.length = 0;
+	pageActive = false;
+	const inactiveContext = {
+		pageScope: {},
+		handleSave() {
+			applyEvents.push('save');
+			return Promise.resolve();
+		},
+	};
+	assert.equal(await overviewView.handleSaveApply.call(inactiveContext, null, '0'), undefined);
+	assert.deepEqual(applyEvents, [ 'save' ],
+		'a view which became inactive after saving must not start an apply');
+
+	applyEvents.length = 0;
+	pageActive = true;
+	const saveFailure = new Error('save failed');
+	const failingContext = {
+		pageScope: {},
+		handleSave() {
+			applyEvents.push('save');
+			return Promise.reject(saveFailure);
+		},
+	};
+	await assert.rejects(
+		overviewView.handleSaveApply.call(failingContext, null, '0'),
+		saveFailure,
+	);
+	assert.deepEqual(applyEvents, [ 'save' ],
+		'a failed save must not mark or start an apply');
 
 	for (const name of [ 'overview', 'yaml', 'log' ]) {
 		const source = fs.readFileSync(path.join(
