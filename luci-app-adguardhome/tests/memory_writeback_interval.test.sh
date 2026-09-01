@@ -6,14 +6,13 @@ script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 package_dir="${script_dir}/.."
 defaults_file="${package_dir}/root/etc/uci-defaults/40_luci-AdGuardHome"
 init_file="${package_dir}/root/etc/init.d/AdGuardHome"
-config_file="${package_dir}/root/etc/config/AdGuardHome"
 overview_file="${package_dir}/htdocs/luci-static/resources/view/adguardhome/overview.js"
 po_file="${package_dir}/po/zh_Hans/AdGuardHome.po"
 readme_file="${package_dir}/../README.md"
 makefile="${package_dir}/Makefile"
 
 for required_file in \
-	"$defaults_file" "$init_file" "$config_file" "$overview_file" "$po_file" "$readme_file" \
+	"$defaults_file" "$init_file" "$overview_file" "$po_file" "$readme_file" \
 	"$makefile"; do
 	[ -f "$required_file" ] || {
 		printf 'required product file not found: %s\n' "$required_file" >&2
@@ -79,10 +78,9 @@ require_text() {
 	}
 }
 
-require_text "$config_file" "option memory_writeback_interval '60'"
 # Literal shell variables are the source contract under inspection.
 # shellcheck disable=SC2016
-require_text "$defaults_file" 'set_upper_option memory_writeback_interval "$memory_writeback_interval"'
+require_text "$defaults_file" 'set_luci_option memory_writeback_interval "$memory_writeback_interval"'
 require_text "$init_file" 'memory_writeback_locked_command() {'
 require_text "$init_file" 'memory_copy_live_data_locked() ('
 require_text "$init_file" 'uid853_tree_is_writable() {'
@@ -95,6 +93,7 @@ require_text "$init_file" '-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$ta
 require_text "$init_file" 'PACKAGED_CONFIG_TEMPLATE="/usr/share/luci-app-adguardhome/default.yaml"'
 require_text "$overview_file" "'memory_writeback_interval',"
 require_text "$overview_file" 'option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);'
+require_text "$overview_file" 'option.retain = true;'
 require_text "$overview_file" "option.depends('run_from_memory', '1');"
 require_text "$overview_file" 'interval > MAX_MEMORY_WRITEBACK_INTERVAL'
 require_text "$overview_file" 'Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back.'
@@ -113,7 +112,7 @@ function_body() {
 
 writeback_body="$(function_body "$init_file" memory_writeback_locked_command)"
 copy_body="$(function_body "$init_file" memory_copy_live_data_locked)"
-writable_body="$(function_body "$init_file" uid853_tree_is_writable)"
+writable_body="$(function_body "$init_file" uid853_mounted_tree_is_writable)"
 ensure_body="$(function_body "$init_file" ensure_config_file)"
 orchestrate_body="$(function_body "$init_file" orchestrate_core_locked)"
 stop_body="$(function_body "$init_file" stop_wrapper_locked)"
@@ -155,8 +154,8 @@ for forbidden in \
 	fi
 done
 
-# The persistent workdir is also the live YAML directory in r2.  A periodic
-# data copy may repair WORKDIR/data, but it must never change ownership or mode
+# The persistent workdir is also the live YAML directory in v2.4.  A periodic
+# data copy must never change ownership or mode
 # on the persistent parent (including through the held directory descriptor).
 if printf '%s\n' "$copy_body" |
 	grep -Eq '(chown|chmod).*[$](MEMORY_BACKING_WORK_DIR|backing_fd)'; then
@@ -176,11 +175,9 @@ if [ -n "$root_mutators" ]; then
 	exit 1
 fi
 
-# These exact argv boundaries keep each target mutation unprivileged.
+# These exact argv boundaries keep each permitted target mutation unprivileged.
 # shellcheck disable=SC2016
 for unprivileged_mutator in \
-	'-n AGHDataClear -x /bin/rm -- -rf "$target"' \
-	'-n AGHDataMake -x /bin/mkdir -- -m 0700 "$target"' \
 	'-n AGHDataMode -x /bin/chmod -- 0700 "$target"' \
 	'-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$target/"'; do
 	if ! printf '%s\n' "$copy_body" | grep -Fq -- "$unprivileged_mutator"; then
@@ -190,16 +187,10 @@ for unprivileged_mutator in \
 	fi
 done
 
-# A healthy persistent directory must be reused so cp overwrites matching files
-# without deleting unrelated existing files.  Only the explicit unusable-target
-# branch may remove and recreate it.
+# The persistent directory is always reused: cp overwrites matching files while
+# retaining unrelated files.  No clear/recreate path is permitted.
 # shellcheck disable=SC2016
-printf '%s\n' "$copy_body" | grep -Fq -- 'target_ready=1' || {
-	printf 'direct live data copy does not preserve a valid persistent data directory\n' >&2
-	exit 1
-}
-# shellcheck disable=SC2016
-printf '%s\n' "$copy_body" | grep -Fq -- 'uid853_tree_is_writable "$target"' || {
+printf '%s\n' "$copy_body" | grep -Fq -- 'uid853_mounted_tree_is_writable "$target"' || {
 	printf 'direct live data copy does not detect an unwritable persistent data tree\n' >&2
 	exit 1
 }
@@ -212,15 +203,16 @@ for ownership_guard in '-user "$2"' '-group "$3"' '"$ADGUARD_UID" "$ADGUARD_GID"
 		exit 1
 	fi
 done
+for forbidden_mutator in 'AGHDataClear' 'AGHDataMake' '/bin/rm' '/bin/mkdir'; do
+	if printf '%s\n' "$copy_body" | grep -Fq -- "$forbidden_mutator"; then
+		printf 'direct live data copy may clear or recreate persistent data: %s\n' \
+			"$forbidden_mutator" >&2
+		exit 1
+	fi
+done
 # shellcheck disable=SC2016
-printf '%s\n' "$copy_body" | grep -Fq -- 'if [ "$target_ready" != 1 ]; then' || {
-	printf 'direct live data copy lacks the damaged-target recovery boundary\n' >&2
-	exit 1
-}
-# shellcheck disable=SC2016
-printf '%s\n' "$copy_body" |
-	grep -Fq -- '-n AGHDataClear -x /bin/rm -- -rf "$target"' || {
-	printf 'direct live data copy cannot recover an unusable persistent data target\n' >&2
+printf '%s\n' "$copy_body" | grep -Fq -- 'target="$MEMORY_BACKING_DATA_MOUNT"' || {
+	printf 'direct live data copy does not target the authenticated persistent alias\n' >&2
 	exit 1
 }
 # shellcheck disable=SC2016
@@ -246,10 +238,10 @@ if grep -Fq -- 'memory_begin_live_checkpoint' "$init_file"; then
 	printf '2.3 runtime still contains a path that can create a live checkpoint marker\n' >&2
 	exit 1
 fi
-# A normal wrapper restart and stop already cross a stopped-core boundary, so
-# they must retain the complete YAML/data checkpoint used for orderly shutdown.
-printf '%s\n' "$orchestrate_body" | grep -Fq -- 'memory_checkpoint_full_locked || return 1' || {
-	printf 'normal restart no longer checkpoints the stopped RAM workdir\n' >&2
+# A normal wrapper restart directly copies to the persistent alias without
+# tearing down the RAM generation; an orderly stop performs full deactivation.
+printf '%s\n' "$orchestrate_body" | grep -Fq -- 'memory_copy_stopped_data_locked || return 1' || {
+	printf 'normal restart no longer writes stopped RAM data directly\n' >&2
 	exit 1
 }
 printf '%s\n' "$stop_body" | grep -Fq -- 'memory_deactivate_locked 1 || return 1' || {

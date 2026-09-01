@@ -97,8 +97,14 @@ for required in \
 	'cold_postinst_state="$${cold_postinst_dir}/cold-upgrade"' \
 	'write_cold_postinst_state() {' \
 	'load_cold_postinst_state() {' \
+	'cold_stopped_barrier_valid() {' \
+	'cold_postinst_dir_is_empty() {' \
+	'consume_cold_stopped_barrier() {' \
 	'verify_cold_upgrade_completion() {' \
 	'retire_cold_postinst_state() {' \
+	'upgrade_stopped_marker="$${runtime_dir}/upgrade-was-stopped"' \
+	'elif cold_stopped_barrier_valid; then' \
+	'elif cold_postinst_dir_is_empty && cold_stopped_barrier_valid; then' \
 	"printf 'format=1\\n'" \
 	"printf 'source_version=%s\\n' \"\$\$upgrade_source_version\"" \
 	"printf 'was_running=%s\\n' \"\$\$upgrade_was_running\"" \
@@ -145,7 +151,13 @@ commit_line="$(grep -n '^cold_postinst_committed=1$' "$makefile" | cut -d: -f1)"
 verify_line="$(grep -n '^[[:space:]]*verify_cold_upgrade_completion ||' "$makefile" |
 	cut -d: -f1)"
 retire_line="$(grep -n '^retire_cold_postinst_state ||' "$makefile" | cut -d: -f1)"
-case "$snapshot_line:$publish_line:$commit_line:$verify_line:$retire_line" in
+early_consume_line="$(grep -n '^[[:space:]]*consume_cold_stopped_barrier ||' "$makefile" |
+	head -n 1 | cut -d: -f1)"
+consume_line="$(grep -n '^[[:space:]]*consume_cold_stopped_barrier ||' "$makefile" |
+	tail -n 1 | cut -d: -f1)"
+rpcd_line="$(grep -n '^[[:space:]]*! /etc/init.d/rpcd reload' "$makefile" |
+	head -n 1 | cut -d: -f1)"
+case "$snapshot_line:$publish_line:$commit_line:$verify_line:$early_consume_line:$rpcd_line:$retire_line:$consume_line" in
 	*[!0-9:]*|:*|*:|*::*)
 		printf 'cold-upgrade lifecycle ordering markers are ambiguous\n' >&2
 		exit 1
@@ -153,7 +165,10 @@ case "$snapshot_line:$publish_line:$commit_line:$verify_line:$retire_line" in
 esac
 if [ "$snapshot_line" -ge "$publish_line" ] ||
    [ "$publish_line" -ge "$commit_line" ] ||
-   [ "$verify_line" -ge "$retire_line" ]; then
+   [ "$early_consume_line" -ge "$rpcd_line" ] ||
+   [ "$verify_line" -ge "$rpcd_line" ] ||
+   [ "$rpcd_line" -ge "$retire_line" ] ||
+   [ "$retire_line" -ge "$consume_line" ]; then
 	printf 'cold-upgrade completion state is published, verified, or retired out of order\n' >&2
 	exit 1
 fi

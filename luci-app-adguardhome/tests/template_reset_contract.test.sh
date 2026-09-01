@@ -25,7 +25,7 @@ cmp -s "$active_template" "$reset_template" || {
 for file in "$active_template" "$reset_template"; do
 	actual_sha256="$(sha256sum "$file" | awk '{ print $1 }')"
 	[ "$actual_sha256" = "$expected_sha256" ] || {
-		printf 'template does not match the requested v2.3 bytes: %s\n' "$file" >&2
+		printf 'template does not match the requested frozen bytes: %s\n' "$file" >&2
 		exit 1
 	}
 done
@@ -140,4 +140,4 @@ for forbidden in (
         raise SystemExit(f"template button still applies or discards editor state: {forbidden}")
 PY
 
-printf 'ok - v2.3 packaged template and reset safety contract\n'
+printf 'ok - v2.4 packaged template and reset safety contract\n'

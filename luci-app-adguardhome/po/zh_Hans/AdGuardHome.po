@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-adguardhome 2.3.0\n"
-"PO-Revision-Date: 2026-08-31 00:00+0800\n"
+"Project-Id-Version: luci-app-adguardhome 2.4.0\n"
+"PO-Revision-Date: 2026-09-01 00:00+0800\n"
 "Last-Translator: terrytyc\n"
 "Language-Team: Chinese (Simplified)\n"
 "MIME-Version: 1.0\n"
@@ -72,6 +72,9 @@ msgstr "HTTP 沿用访问 LuCI 时的主机地址并使用 YAML http.address 中
 msgid "Settings"
 msgstr "设置"
 
+msgid "DNS and memory integration"
+msgstr "DNS 与内存运行集成"
+
 msgid "General Settings"
 msgstr "常规设置"
 
@@ -120,11 +123,35 @@ msgstr "启动时只把持久化 data 目录复制到内存，并让官方核心
 msgid "Memory write-back interval (minutes)"
 msgstr "内存数据回写周期（分钟）"
 
+msgid "The memory write-back interval is invalid."
+msgstr "内存数据回写周期无效。"
+
 msgid "At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back."
 msgstr "每到设定周期，插件会直接把实时内存 data 复制到持久化工作目录，不重启核心或 DNS 服务。该复制不保证并发变更或极端断电情况下的一致性。建议设置为 60 分钟或更长以减少闪存磨损。设为 0 可停用周期回写；正常停止或重启时仍会执行完整回写。"
 
 msgid "Enter 0 to disable periodic write-back, or a whole number from 1 to 10080."
 msgstr "请输入 0 以停用周期回写，或输入 1 到 10080 之间的整数。"
+
+msgid "The settings returned by the service are invalid."
+msgstr "服务返回的设置无效。"
+
+msgid "The server did not accept the settings update job."
+msgstr "服务器未接受设置更新任务。"
+
+msgid "The server rejected the settings update."
+msgstr "服务器拒绝了设置更新。"
+
+msgid "The settings update returned an unknown job state."
+msgstr "设置更新任务返回了未知状态。"
+
+msgid "The settings update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later."
+msgstr "设置更新仍在运行，但暂时无法获取其状态：%s。请勿重复提交，稍后重新加载此页面。"
+
+msgid "The settings update is still running. Do not submit it again; reload this page later."
+msgstr "设置更新仍在运行。请勿重复提交，稍后重新加载此页面。"
+
+msgid "Unable to apply settings: %s"
+msgstr "无法应用设置：%s"
 
 msgid "Change Username and Password"
 msgstr "修改用户及密码"
@@ -350,3 +377,21 @@ msgstr "YAML 更新结果未知。再次编辑前请重新加载页面。"
 
 msgid "The YAML update succeeded, but its result could not be verified. Reload the page before editing it again."
 msgstr "YAML 更新已成功，但无法验证其结果。再次编辑前请重新加载页面。"
+
+msgid "The current settings state is unknown. Reload this page before applying settings again."
+msgstr "当前设置状态未知。再次应用设置前请重新加载此页面。"
+
+msgid "The settings update outcome is unknown. Reload this page before applying settings again."
+msgstr "设置更新结果未知。再次应用设置前请重新加载此页面。"
+
+msgid "The settings update request may have reached the router, but its result could not be read: %s. Reload this page before applying settings again."
+msgstr "设置更新请求可能已到达路由器，但无法读取结果：%s。再次应用设置前请重新加载此页面。"
+
+msgid "The server accepted the settings update job but did not return a valid status token. Reload this page before applying settings again."
+msgstr "服务器已接受设置更新任务，但未返回有效的状态令牌。再次应用设置前请重新加载此页面。"
+
+msgid "The settings update succeeded, but its result could not be verified. Reload this page before applying settings again."
+msgstr "设置更新已成功，但无法验证结果。再次应用设置前请重新加载此页面。"
+
+msgid "The settings update finished, but the page could not reload its result: %s. Reload this page before applying settings again."
+msgstr "设置更新已结束，但页面无法重新载入结果：%s。再次应用设置前请重新加载此页面。"

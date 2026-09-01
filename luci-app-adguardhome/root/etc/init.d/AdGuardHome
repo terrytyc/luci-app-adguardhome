@@ -1,15 +1,16 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: Apache-2.0
 
-# Compatibility and DNS-integration coordinator for the historical mixed-case
-# UCI name.  The packaged lowercase service remains the only process supervisor.
+# DNS-integration coordinator for the packaged lowercase service.  Plugin and
+# official settings share /etc/config/adguardhome but use separate named
+# sections, so the official init script remains the only process supervisor.
 
 USE_PROCD=1
 START=18
 STOP=90
 
-LEGACY_CONFIG="AdGuardHome"
-LEGACY_SECTION="AdGuardHome"
+LEGACY_CONFIG="adguardhome"
+LEGACY_SECTION="luci"
 OFFICIAL_CONFIG="adguardhome"
 OFFICIAL_SECTION="config"
 OFFICIAL_SERVICE="/etc/init.d/adguardhome"
@@ -26,8 +27,11 @@ MAX_TLS_FILE_SIZE=1048576
 MAX_UCI_CONFIG_SIZE=1048576
 MANAGED_JAIL_OPTION="managed_jail_mount"
 MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
+MANAGED_DATA_JAIL_OPTION="managed_data_jail_mount"
 UCI_CONFIG_DIRECTORY="/etc/config"
 UCI_DELTA_DIRECTORY="/tmp/.uci"
+MANAGED_CONFIG_SNAPSHOT_DIR="/root/.luci-app-adguardhome"
+MANAGED_CONFIG_SNAPSHOT="${MANAGED_CONFIG_SNAPSHOT_DIR}/managed-adguardhome.config"
 
 # The configured workdir is always the persistent backing store.  Memory mode
 # mirrors only its data tree into this fixed plugin namespace.  The YAML stays
@@ -36,8 +40,9 @@ UCI_DELTA_DIRECTORY="/tmp/.uci"
 MEMORY_RUNTIME_DIR="/tmp/luci-app-adguardhome-memory"
 MEMORY_WORK_DIR="${MEMORY_RUNTIME_DIR}/work"
 MEMORY_DATA_DIR="${MEMORY_WORK_DIR}/data"
-# Recognized only to repair a stale r1 lower-UCI pair after /tmp disappeared.
-# r2 never creates or reads this path.
+MEMORY_BACKING_DATA_MOUNT="${MEMORY_RUNTIME_DIR}/backing-data"
+# Recognized only during the one-time v2.3 transition when a persisted RAM YAML
+# path remains after its volatile state disappeared.  v2.4 never writes it.
 LEGACY_MEMORY_CONFIG_FILE="${MEMORY_WORK_DIR}/AdGuardHome.yaml"
 MEMORY_STATE_FILE="${MEMORY_RUNTIME_DIR}/state"
 MEMORY_JOURNAL_DIR="/root/.luci-app-adguardhome-memory"
@@ -78,13 +83,14 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_cleanup memory_prepare memory_status"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_cleanup memory_prepare memory_status"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
 \tweb_listening <port>\tVerify an official-core TCP listener
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
+\tsettings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate>\tApply an authenticated asynchronous settings job
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
 \tyaml_update_job <old-hash> <new-hash> <stage> <stage-fd> <lock-fd> <token>\tRun an asynchronous LuCI YAML edit
 \ttls_prepare\t\tPrepare current YAML TLS access before core start
@@ -97,6 +103,121 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 
 log_error() {
 	logger -t AdGuardHome "$*"
+}
+
+managed_config_snapshot_dir_valid() {
+	local metadata mode links owner group remainder
+	[ -d "$MANAGED_CONFIG_SNAPSHOT_DIR" ] &&
+		[ ! -L "$MANAGED_CONFIG_SNAPSHOT_DIR" ] || return 1
+	metadata="$(LC_ALL=C ls -ldn "$MANAGED_CONFIG_SNAPSHOT_DIR" 2>/dev/null)" || return 1
+	read -r mode links owner group remainder <<-EOF
+	$metadata
+	EOF
+	[ "$mode:$owner:$group" = "drwx------:0:0" ] && [ "$links" -ge 2 ] 2>/dev/null
+}
+
+prepare_managed_config_snapshot_dir() {
+	if [ ! -e "$MANAGED_CONFIG_SNAPSHOT_DIR" ] &&
+	   [ ! -L "$MANAGED_CONFIG_SNAPSHOT_DIR" ]; then
+		mkdir -m 0700 "$MANAGED_CONFIG_SNAPSHOT_DIR" || return 1
+		chown 0:0 "$MANAGED_CONFIG_SNAPSHOT_DIR" || return 1
+	fi
+	managed_config_snapshot_dir_valid
+}
+
+refresh_managed_config_snapshot() {
+	local source="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}" temporary
+	uci_guard_config_file_valid "$source" || return 1
+	prepare_managed_config_snapshot_dir || return 1
+	temporary="$(mktemp "${MANAGED_CONFIG_SNAPSHOT_DIR}/.managed-adguardhome.XXXXXX")" || return 1
+	case "$temporary" in
+		"${MANAGED_CONFIG_SNAPSHOT_DIR}/.managed-adguardhome."??????) ;;
+		*) rm -f "$temporary"; return 1 ;;
+	esac
+	if ! cp -p "$source" "$temporary" || ! chown 0:0 "$temporary" ||
+	   ! chmod 0600 "$temporary" || ! uci_guard_config_file_valid "$temporary" ||
+	   ! cmp -s "$source" "$temporary" ||
+	   ! mv -f "$temporary" "$MANAGED_CONFIG_SNAPSHOT"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	uci_guard_config_file_valid "$MANAGED_CONFIG_SNAPSHOT" &&
+		cmp -s "$source" "$MANAGED_CONFIG_SNAPSHOT"
+}
+
+restore_managed_config_snapshot() {
+	local target="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}" temporary
+	[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+	managed_config_snapshot_dir_valid || return 1
+	uci_guard_config_file_valid "$MANAGED_CONFIG_SNAPSHOT" || return 1
+	[ -d "$UCI_CONFIG_DIRECTORY" ] && [ ! -L "$UCI_CONFIG_DIRECTORY" ] || return 1
+	temporary="$(mktemp "${UCI_CONFIG_DIRECTORY}/.managed-adguardhome-restore.XXXXXX")" || return 1
+	case "$temporary" in
+		"${UCI_CONFIG_DIRECTORY}/.managed-adguardhome-restore."??????) ;;
+		*) rm -f "$temporary"; return 1 ;;
+	esac
+	if ! cp -p "$MANAGED_CONFIG_SNAPSHOT" "$temporary" ||
+	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! uci_guard_config_file_valid "$temporary" ||
+	   ! cmp -s "$MANAGED_CONFIG_SNAPSHOT" "$temporary" ||
+	   ! mv -f "$temporary" "$target"; then
+		rm -f "$temporary"
+		return 1
+	fi
+	uci_guard_config_file_valid "$target" &&
+		cmp -s "$MANAGED_CONFIG_SNAPSHOT" "$target"
+}
+
+ensure_managed_config_present() {
+	local target="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}"
+	# A missing committed file plus a pending delta is ambiguous.  Never restore
+	# a snapshot underneath an unrelated LuCI/CLI edit.
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	if [ -e "$target" ] || [ -L "$target" ]; then
+		uci_guard_config_file_valid "$target"
+		return
+	fi
+	# A settings CAS must remain read-only until its locked revision comparison.
+	[ "${SETTINGS_CAS_GUARD:-0}" != 1 ] || return 1
+	restore_managed_config_snapshot || {
+		log_error "Lowercase AdGuard Home UCI is missing and its recovery snapshot is unavailable"
+		return 1
+	}
+	log_error "Restored missing /etc/config/adguardhome from the private managed snapshot"
+}
+
+count_merged_section() {
+	MERGED_SECTION_TOTAL=$((MERGED_SECTION_TOTAL + 1))
+	case "$1" in
+		"$OFFICIAL_SECTION") MERGED_CONFIG_NAME_COUNT=$((MERGED_CONFIG_NAME_COUNT + 1)) ;;
+		"$LEGACY_SECTION") MERGED_LUCI_NAME_COUNT=$((MERGED_LUCI_NAME_COUNT + 1)) ;;
+		*) MERGED_SECTION_ERROR=1 ;;
+	esac
+}
+
+count_official_section_type() {
+	MERGED_OFFICIAL_TYPE_COUNT=$((MERGED_OFFICIAL_TYPE_COUNT + 1))
+	[ "$1" = "$OFFICIAL_SECTION" ] || MERGED_SECTION_ERROR=1
+}
+
+count_luci_section_type() {
+	MERGED_LUCI_TYPE_COUNT=$((MERGED_LUCI_TYPE_COUNT + 1))
+	[ "$1" = "$LEGACY_SECTION" ] || MERGED_SECTION_ERROR=1
+}
+
+validate_loaded_merged_sections() {
+	MERGED_SECTION_TOTAL=0
+	MERGED_CONFIG_NAME_COUNT=0
+	MERGED_LUCI_NAME_COUNT=0
+	MERGED_OFFICIAL_TYPE_COUNT=0
+	MERGED_LUCI_TYPE_COUNT=0
+	MERGED_SECTION_ERROR=0
+	config_foreach count_merged_section
+	config_foreach count_official_section_type adguardhome
+	config_foreach count_luci_section_type luci
+	[ "$MERGED_SECTION_ERROR" = 0 ] && [ "$MERGED_SECTION_TOTAL" = 2 ] &&
+		[ "$MERGED_CONFIG_NAME_COUNT" = 1 ] && [ "$MERGED_LUCI_NAME_COUNT" = 1 ] &&
+		[ "$MERGED_OFFICIAL_TYPE_COUNT" = 1 ] && [ "$MERGED_LUCI_TYPE_COUNT" = 1 ]
 }
 
 # Run one command in its own session with a self-contained wall-clock guard.
@@ -373,26 +494,58 @@ validate_managed_work_dir_namespace() {
 }
 
 validate_managed_work_dir() {
-	local value="${1%/}" official_work official_config
+	local value="${1%/}" official_work
 	validate_managed_work_dir_namespace "$1" || return 1
 	[ "$value" = "$DEFAULT_WORK_DIR" ] && return 0
 	[ -e "$value" ] || [ -L "$value" ] || return 0
-	# While the official service runs from the fixed RAM mirror its effective
-	# lower UCI deliberately points at MEMORY_WORK_DIR.  A root-private state
-	# record is then the anchor for the still-persistent custom backing path.
+	# An active v4 state record authenticates the existing custom backing even
+	# while the authoritative settings contain a validated next-workdir request.
 	if memory_state_binds_persistent "$value"; then
 		return 0
 	fi
 	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
 	[ -n "$official_work" ] ||
 		official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
-	official_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
-	if [ "${official_work%/}" = "$value" ] &&
-	   [ "$official_config" = "${value}/AdGuardHome.yaml" ]; then
+	# config_file is derived from this authoritative work_dir and is normalized
+	# separately.  It must never be required as a second custom-directory anchor.
+	if [ "${official_work%/}" = "$value" ]; then
 		return 0
 	fi
 	log_error "Refusing an existing custom work directory not anchored by official adguardhome UCI: '$value'"
 	return 1
+}
+
+normalize_managed_config_file_persistent() {
+	local requested_work_dir="${1%/}" expected current_work current_config
+	validate_managed_work_dir_namespace "$requested_work_dir" || return 1
+	expected="${requested_work_dir}/AdGuardHome.yaml"
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}")" = adguardhome ] || return 1
+	current_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
+	[ "${current_work%/}" = "$requested_work_dir" ] || return 1
+	current_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	[ "$current_config" != "$expected" ] || return 0
+	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file=${expected}" || return 1
+	if ! uci -q commit "$OFFICIAL_CONFIG"; then
+		uci -q revert "$OFFICIAL_CONFIG" >/dev/null 2>&1 || true
+		return 1
+	fi
+	uci_guard_no_delta "$OFFICIAL_CONFIG" &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = \
+			"$requested_work_dir" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = "$expected" ]
+}
+
+normalize_managed_config_file() {
+	local requested_work_dir="${1%/}" committed_config="$2" expected
+	expected="${requested_work_dir}/AdGuardHome.yaml"
+	[ "$committed_config" != "$expected" ] || return 0
+	# The locked settings revision must be compared before any repair commit.
+	[ "${SETTINGS_CAS_GUARD:-0}" != 1 ] || return 1
+	memory_run_with_official_path_guard normalize_managed_config_file_persistent \
+		"$requested_work_dir" || return 1
+	refresh_managed_config_snapshot || return 1
+	log_error "Normalized managed config_file to ${expected}; config_file is derived from work_dir"
 }
 
 path_contains_symlink() {
@@ -465,6 +618,7 @@ memory_private_state_file() {
 }
 
 memory_active_tree_valid() {
+	local backing="${1:-${MEMORY_BACKING_WORK_DIR:-}}"
 	local metadata mode links owner group remainder entry found=0
 	memory_runtime_dir_valid || return 1
 	[ -d "$MEMORY_WORK_DIR" ] && [ ! -L "$MEMORY_WORK_DIR" ] || return 1
@@ -481,8 +635,8 @@ memory_active_tree_valid() {
 	EOF
 	[ "$owner:$group:$mode" = \
 		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || return 1
-	# The r2 RAM workdir has exactly one top-level entry: data/.  In particular,
-	# never accept an r1 AdGuardHome.yaml copy as part of the active generation.
+	# The RAM namespace has exactly one top-level entry: data/.  In particular,
+	# never accept an AdGuardHome.yaml copy as part of the active generation.
 	for entry in \
 		"$MEMORY_WORK_DIR"/* \
 		"$MEMORY_WORK_DIR"/.[!.]* \
@@ -495,45 +649,72 @@ memory_active_tree_valid() {
 	# The top-level shape alone cannot expose a same-device bind mount or a
 	# special file nested below data/.  Reuse the bounded uid-853 tree scan and
 	# its mountinfo checks before treating this RAM generation as active.
-	uid853_tree_is_plain "$MEMORY_WORK_DIR"
+	uid853_tree_is_plain "$MEMORY_WORK_DIR" || return 1
+	[ "${MEMORY_MOUNTS_SUSPENDED:-0}" = 1 ] || memory_bindings_valid "$backing"
 }
 
 # Return 0 for a complete state, 1 when no memory state exists, and 2 for an
 # unsafe/incomplete namespace.  Callers must never delete a status-2 object.
 memory_state_load() {
-	local version backing device inode line_count
+	local version backing device inode persistent_data_device persistent_data_inode
+	local memory_data_device memory_data_inode line_count numeric
 	MEMORY_STATE_VALIDATED=0
 	MEMORY_STATE_PERSISTENT_WORK_DIR=""
 	MEMORY_STATE_BACKING_DEVICE=""
 	MEMORY_STATE_BACKING_INODE=""
+	MEMORY_STATE_PERSISTENT_DATA_DEVICE=""
+	MEMORY_STATE_PERSISTENT_DATA_INODE=""
+	MEMORY_STATE_MEMORY_DATA_DEVICE=""
+	MEMORY_STATE_MEMORY_DATA_INODE=""
 	if [ ! -e "$MEMORY_RUNTIME_DIR" ] && [ ! -L "$MEMORY_RUNTIME_DIR" ]; then
 		return 1
 	fi
 	memory_runtime_dir_valid || return 2
 	memory_private_state_file "$MEMORY_STATE_FILE" || return 2
 	line_count="$(wc -l <"$MEMORY_STATE_FILE" 2>/dev/null)" || return 2
-	[ "$line_count" = 4 ] || return 2
+	[ "$line_count" = 8 ] || return 2
 	version="$(sed -n 's/^version=//p' "$MEMORY_STATE_FILE")"
 	backing="$(sed -n 's/^persistent_work_dir=//p' "$MEMORY_STATE_FILE")"
 	device="$(sed -n 's/^backing_device=//p' "$MEMORY_STATE_FILE")"
 	inode="$(sed -n 's/^backing_inode=//p' "$MEMORY_STATE_FILE")"
-	[ "$version" = 3 ] || return 2
+	persistent_data_device="$(sed -n 's/^persistent_data_device=//p' "$MEMORY_STATE_FILE")"
+	persistent_data_inode="$(sed -n 's/^persistent_data_inode=//p' "$MEMORY_STATE_FILE")"
+	memory_data_device="$(sed -n 's/^memory_data_device=//p' "$MEMORY_STATE_FILE")"
+	memory_data_inode="$(sed -n 's/^memory_data_inode=//p' "$MEMORY_STATE_FILE")"
+	[ "$version" = 4 ] || return 2
 	[ "$(grep -c '^version=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
 	[ "$(grep -c '^persistent_work_dir=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
 	[ "$(grep -c '^backing_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
 	[ "$(grep -c '^backing_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	case "$device:$inode" in
-		*[!0-9:]*|:*|*::*) return 2 ;;
-		[0-9]*:[0-9]*) ;;
-		*) return 2 ;;
-	esac
+	[ "$(grep -c '^persistent_data_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^persistent_data_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^memory_data_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	[ "$(grep -c '^memory_data_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
+	for numeric in "$device" "$inode" "$persistent_data_device" \
+		"$persistent_data_inode" "$memory_data_device" "$memory_data_inode"; do
+		case "$numeric" in ""|*[!0-9]*) return 2 ;; esac
+	done
 	validate_managed_work_dir_namespace "$backing" || return 2
 	memory_backing_identity "$backing" || return 2
 	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = "$device:$inode" ] || return 2
-	memory_active_tree_valid || return 2
+	MEMORY_STATE_PERSISTENT_WORK_DIR="${backing%/}"
+	memory_active_tree_valid "$backing" || return 2
+	if [ "${MEMORY_MOUNTS_SUSPENDED:-0}" = 1 ]; then
+		memory_suspended_identities_match "$backing" \
+			"$persistent_data_device" "$persistent_data_inode" \
+			"$memory_data_device" "$memory_data_inode" || return 2
+	else
+		memory_binding_identities_match "$backing" \
+			"$persistent_data_device" "$persistent_data_inode" \
+			"$memory_data_device" "$memory_data_inode" || return 2
+	fi
 	MEMORY_STATE_PERSISTENT_WORK_DIR="${backing%/}"
 	MEMORY_STATE_BACKING_DEVICE="$device"
 	MEMORY_STATE_BACKING_INODE="$inode"
+	MEMORY_STATE_PERSISTENT_DATA_DEVICE="$persistent_data_device"
+	MEMORY_STATE_PERSISTENT_DATA_INODE="$persistent_data_inode"
+	MEMORY_STATE_MEMORY_DATA_DEVICE="$memory_data_device"
+	MEMORY_STATE_MEMORY_DATA_INODE="$memory_data_inode"
 	MEMORY_STATE_VALIDATED=1
 	return 0
 }
@@ -653,11 +834,17 @@ memory_clear_live_checkpoint() {
 
 load_legacy_settings() {
 	local configured_work_dir official_work official_config legacy_work legacy_config state_rc=0
-	config_load "$LEGACY_CONFIG"
-	config_get_bool legacy_enabled "$LEGACY_SECTION" enabled 0
-	config_get configured_work_dir "$LEGACY_SECTION" workdir "$DEFAULT_WORK_DIR"
+	local legacy_memory_transition=0
+	ensure_managed_config_present || return 1
+	config_load "$LEGACY_CONFIG" || return 1
+	validate_loaded_merged_sections || {
+		log_error "Merged AdGuard Home UCI must contain exactly the named config and luci sections"
+		return 1
+	}
+	config_get_bool legacy_enabled "$OFFICIAL_SECTION" enabled 0
+	config_get configured_work_dir "$OFFICIAL_SECTION" work_dir "$DEFAULT_WORK_DIR"
 	config_get redirect_mode "$LEGACY_SECTION" redirect "dnsmasq-upstream"
-	config_get_bool verbose "$LEGACY_SECTION" verbose 0
+	config_get_bool verbose "$OFFICIAL_SECTION" verbose 0
 	config_get_bool memory_requested "$LEGACY_SECTION" run_from_memory 0
 	config_get memory_writeback_interval "$LEGACY_SECTION" memory_writeback_interval \
 		"$MEMORY_WRITEBACK_DEFAULT_MINUTES"
@@ -667,14 +854,28 @@ load_legacy_settings() {
 	official_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
 	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
 	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
 	previous_work_dir="$official_work"
 	[ -n "$previous_work_dir" ] || previous_work_dir="$legacy_work"
+	if [ "${official_work%/}" = "$MEMORY_WORK_DIR" ] ||
+	   [ "$official_config" = "$LEGACY_MEMORY_CONFIG_FILE" ] ||
+	   [ "${legacy_work%/}" = "$MEMORY_WORK_DIR" ] ||
+	   [ "$legacy_config" = "$LEGACY_MEMORY_CONFIG_FILE" ]; then
+		legacy_memory_transition=1
+	else
+		# config_file is never an independent YAML selector.  Validate the
+		# authoritative workdir first, then repair its derived field before any
+		# normal runtime code can read a YAML pathname.
+		validate_managed_work_dir "$configured_work_dir" || return 1
+		normalize_managed_config_file "$configured_work_dir" "$official_config" || return 1
+		official_config="${configured_work_dir%/}/AdGuardHome.yaml"
+	fi
 	# Recover a durable RAM copy/checkpoint transaction before validating the
 	# backing metadata.  A crash may intentionally leave that inode frozen at
 	# root:853/0710, which is accepted only while the root-private journal binds
 	# its path and device/inode identity.
 	# The durable journal binds its own backing path and device/inode.  Recover it
-	# before interpreting a possibly newer upper-UCI workdir request; otherwise a
+	# before interpreting a possibly newer authoritative workdir request; otherwise a
 	# path change made just before a crash could permanently block safe recovery.
 	memory_recover_journal_locked "" || return 1
 
@@ -685,13 +886,10 @@ load_legacy_settings() {
 		0)
 			;;
 		1)
-			# A generic `uci commit` can persist the otherwise volatile RAM
-			# delta.  After reboot /tmp is empty, so repair only the exact fixed
-			# pair from the trusted upper workdir before validating its anchor.
-			if [ "${official_work%/}" = "$MEMORY_WORK_DIR" ] ||
-			   [ "$official_config" = "$LEGACY_MEMORY_CONFIG_FILE" ] ||
-			   [ "${legacy_work%/}" = "$MEMORY_WORK_DIR" ] ||
-			   [ "$legacy_config" = "$LEGACY_MEMORY_CONFIG_FILE" ]; then
+			# Repair a stale v2.3 RAM workdir pair in the merged package during
+			# the one-time transition.  v2.4 never writes /tmp as work_dir.
+			if [ "$legacy_memory_transition" = 1 ]; then
+				[ "${SETTINGS_CAS_GUARD:-0}" != 1 ] || return 1
 				if [ "${official_work%/}" != "$MEMORY_WORK_DIR" ] ||
 				   { [ "$official_config" != "${configured_work_dir%/}/AdGuardHome.yaml" ] &&
 				     [ "$official_config" != "$LEGACY_MEMORY_CONFIG_FILE" ]; }; then
@@ -732,16 +930,14 @@ load_legacy_settings() {
 		MEMORY_ACTIVE=1
 		MEMORY_BACKING_WORK_DIR="$MEMORY_STATE_PERSISTENT_WORK_DIR"
 		previous_work_dir="$MEMORY_BACKING_WORK_DIR"
-		work_dir="$MEMORY_WORK_DIR"
-		# A new upper-UCI workdir request is reconciled only after the current
-		# generation has stopped and checkpointed.  Until then its YAML remains
-		# the persistent file bound by the v3 state record, never the newly
+		work_dir="$persistent_work_dir"
+		# A new authoritative workdir request is reconciled only after the current
+		# generation has stopped and been written back.  Until then its YAML remains
+		# the persistent file bound by the v4 state record, never the newly
 		# requested directory and never a RAM copy.
 		config_file="${MEMORY_BACKING_WORK_DIR}/AdGuardHome.yaml"
-		# Recover the volatile lower-UCI work-dir override after a killed commit
-		# guard or an accidental global UCI commit in the same boot.  The v3 state
-		# record has already bound both the RAM data tree and persistent inode;
-		# config_file always remains the persistent YAML.
+		# The official work_dir and YAML remain persistent.  The state record
+		# authenticates only the RAM data overlay and its persistent backing.
 		memory_apply_official_path_delta || return 1
 	fi
 
@@ -1171,6 +1367,250 @@ tree_is_mount_free() {
 	' /proc/self/mountinfo
 }
 
+path_is_exact_mountpoint() {
+	local target="${1%/}"
+	case "$target" in /*) ;; *) return 1 ;; esac
+	[ -r /proc/self/mountinfo ] || return 1
+	awk -v wanted="$target" '$5 == wanted { found++ } END { exit found == 1 ? 0 : 1 }' \
+		/proc/self/mountinfo
+}
+
+tree_has_no_nested_mounts() {
+	local tree="${1%/}"
+	case "$tree" in /*) ;; *) return 1 ;; esac
+	[ -r /proc/self/mountinfo ] || return 1
+	awk -v base="$tree" '
+		$5 != base && index($5, base "/") == 1 { found = 1 }
+		END { exit found ? 1 : 0 }
+	' /proc/self/mountinfo
+}
+
+uid853_mounted_tree_is_writable() {
+	local tree="$1"
+	[ -d "$tree" ] && [ ! -L "$tree" ] || return 1
+	path_is_exact_mountpoint "$tree" || return 1
+	tree_has_no_nested_mounts "$tree" || return 1
+	# The root mount is expected; reject special nodes and foreign ownership
+	# inside it while allowing find to remain on that mounted filesystem.
+	# shellcheck disable=SC2016
+	run_bounded 30 2 \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHMountedDataScan -x /bin/sh -- -c '
+			set -o pipefail
+			found="$(/usr/bin/find "$1" -xdev \( \
+				! -type f ! -type d -o \
+				! -user "$2" -o ! -group "$3" \) -print 2>/dev/null |
+				/usr/bin/head -n 1)" || exit 1
+			[ -z "$found" ] && [ -w "$1" ] && [ -x "$1" ]
+		' sh "$tree" "$ADGUARD_UID" "$ADGUARD_GID" >/dev/null 2>&1 || return 1
+	tree_has_no_nested_mounts "$tree"
+}
+
+memory_bindings_valid() {
+	local backing="${1%/}" target
+	[ -n "$backing" ] || return 1
+	validate_managed_work_dir_namespace "$backing" || return 1
+	target="${backing}/data"
+	[ -d "$MEMORY_BACKING_DATA_MOUNT" ] &&
+		[ ! -L "$MEMORY_BACKING_DATA_MOUNT" ] || return 1
+	[ -d "$target" ] && [ ! -L "$target" ] || return 1
+	path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	path_is_exact_mountpoint "$target" || return 1
+	[ "$target" -ef "$MEMORY_DATA_DIR" ] || return 1
+	[ ! "$MEMORY_BACKING_DATA_MOUNT" -ef "$MEMORY_DATA_DIR" ] || return 1
+	tree_has_no_nested_mounts "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	tree_has_no_nested_mounts "$target" || return 1
+	if [ "${MEMORY_STATE_VALIDATED:-0}" = 1 ]; then
+		memory_binding_identities_match "$backing" \
+			"$MEMORY_STATE_PERSISTENT_DATA_DEVICE" \
+			"$MEMORY_STATE_PERSISTENT_DATA_INODE" \
+			"$MEMORY_STATE_MEMORY_DATA_DEVICE" \
+			"$MEMORY_STATE_MEMORY_DATA_INODE"
+	fi
+}
+
+# Prove that the private backing alias still names the original on-disk data
+# inode and that both the visible workdir/data mount and the RAM source name the
+# same tmpfs inode.  Path equality alone cannot authenticate a bind mount.
+memory_binding_identities_match() {
+	local backing="${1%/}" persistent_device="$2" persistent_inode="$3"
+	local memory_device="$4" memory_inode="$5" target
+	local actual_device actual_inode numeric
+	target="${backing}/data"
+	for numeric in "$persistent_device" "$persistent_inode" \
+		"$memory_device" "$memory_inode"; do
+		case "$numeric" in ""|*[!0-9]*) return 1 ;; esac
+	done
+	memory_backing_identity "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	actual_device="$MEMORY_IDENTITY_DEVICE"
+	actual_inode="$MEMORY_IDENTITY_INODE"
+	[ "$actual_device:$actual_inode" = "$persistent_device:$persistent_inode" ] || return 1
+	memory_backing_identity "$MEMORY_DATA_DIR" || return 1
+	actual_device="$MEMORY_IDENTITY_DEVICE"
+	actual_inode="$MEMORY_IDENTITY_INODE"
+	[ "$actual_device:$actual_inode" = "$memory_device:$memory_inode" ] || return 1
+	memory_backing_identity "$target" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$memory_device:$memory_inode" ]
+}
+
+memory_suspended_identities_match() {
+	local backing="${1%/}" persistent_device="$2" persistent_inode="$3"
+	local memory_device="$4" memory_inode="$5"
+	memory_backing_identity "${backing}/data" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$persistent_device:$persistent_inode" ] || return 1
+	memory_backing_identity "$MEMORY_DATA_DIR" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$memory_device:$memory_inode" ]
+}
+
+memory_activate_data_bindings() {
+	local backing="${1%/}" target
+	[ -n "$backing" ] || return 1
+	target="${backing}/data"
+	memory_runtime_dir_valid || return 1
+	[ -d "$MEMORY_DATA_DIR" ] && [ ! -L "$MEMORY_DATA_DIR" ] &&
+		uid853_tree_is_plain "$MEMORY_DATA_DIR" || return 1
+	[ -d "$target" ] && [ ! -L "$target" ] &&
+		uid853_tree_is_plain "$target" || return 1
+	[ ! -e "$MEMORY_BACKING_DATA_MOUNT" ] &&
+		[ ! -L "$MEMORY_BACKING_DATA_MOUNT" ] || return 1
+	mkdir -m 0700 "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	chown 0:0 "$MEMORY_BACKING_DATA_MOUNT" || {
+		rmdir "$MEMORY_BACKING_DATA_MOUNT" 2>/dev/null || true
+		return 1
+	}
+	if ! /bin/mount -o bind "$target" "$MEMORY_BACKING_DATA_MOUNT" ||
+	   ! path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT" ||
+	   ! [ "$MEMORY_BACKING_DATA_MOUNT" -ef "$target" ] ||
+	   ! tree_has_no_nested_mounts "$MEMORY_BACKING_DATA_MOUNT"; then
+		/bin/umount "$MEMORY_BACKING_DATA_MOUNT" >/dev/null 2>&1 || true
+		rmdir "$MEMORY_BACKING_DATA_MOUNT" 2>/dev/null || true
+		return 1
+	fi
+	if ! /bin/mount -o bind "$MEMORY_DATA_DIR" "$target" ||
+	   ! memory_bindings_valid "$backing"; then
+		if path_is_exact_mountpoint "$target" && [ "$target" -ef "$MEMORY_DATA_DIR" ]; then
+			/bin/umount "$target" >/dev/null 2>&1 || true
+		fi
+		/bin/umount "$MEMORY_BACKING_DATA_MOUNT" >/dev/null 2>&1 || true
+		rmdir "$MEMORY_BACKING_DATA_MOUNT" 2>/dev/null || true
+		return 1
+	fi
+	MEMORY_MOUNTS_SUSPENDED=0
+}
+
+memory_suspend_data_bindings() {
+	local backing="${1%/}" target
+	[ -n "$backing" ] || return 1
+	target="${backing}/data"
+	memory_bindings_valid "$backing" || return 1
+	if ! /bin/umount "$target" || [ -L "$target" ] ||
+	   path_is_exact_mountpoint "$target"; then
+		memory_restore_data_bindings_after_suspend_failure "$backing" ||
+			log_error "Unable to restore AdGuard Home data bindings after overlay suspend failed"
+		return 1
+	fi
+	if ! /bin/umount "$MEMORY_BACKING_DATA_MOUNT" ||
+	   path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT"; then
+		memory_restore_data_bindings_after_suspend_failure "$backing" ||
+			log_error "Unable to restore AdGuard Home data bindings after backing suspend failed"
+		return 1
+	fi
+	if ! rmdir "$MEMORY_BACKING_DATA_MOUNT"; then
+		memory_restore_data_bindings_after_suspend_failure "$backing" ||
+			log_error "Unable to restore AdGuard Home data bindings after backing cleanup failed"
+		return 1
+	fi
+	MEMORY_MOUNTS_SUSPENDED=1
+}
+
+# Reconstruct the exact authenticated active pair after any ordered-suspend
+# failure.  Restore the persistent alias first while workdir/data still exposes
+# the on-disk inode, then restore the RAM overlay.  A foreign mount or changed
+# inode is never hidden by a compensating bind.
+memory_restore_data_bindings_after_suspend_failure() {
+	local backing="${1%/}" target metadata mode links owner group remainder
+	local alias_mounted=0 target_mounted=0
+	[ -n "$backing" ] && [ "${MEMORY_STATE_VALIDATED:-0}" = 1 ] || return 1
+	target="${backing}/data"
+	memory_runtime_dir_valid || return 1
+	memory_backing_identity "$MEMORY_DATA_DIR" || return 1
+	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+		"$MEMORY_STATE_MEMORY_DATA_DEVICE:$MEMORY_STATE_MEMORY_DATA_INODE" ] || return 1
+	path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT" && alias_mounted=1
+	path_is_exact_mountpoint "$target" && target_mounted=1
+
+	if [ "$alias_mounted" = 1 ]; then
+		memory_backing_identity "$MEMORY_BACKING_DATA_MOUNT" || return 1
+		[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+			"$MEMORY_STATE_PERSISTENT_DATA_DEVICE:$MEMORY_STATE_PERSISTENT_DATA_INODE" ] || return 1
+	else
+		# Without the alias, the persistent inode must still be visible at the
+		# ordinary data path.  A RAM or foreign mount here cannot be repaired.
+		[ "$target_mounted" = 0 ] || return 1
+		[ -d "$target" ] && [ ! -L "$target" ] || return 1
+		memory_backing_identity "$target" || return 1
+		[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+			"$MEMORY_STATE_PERSISTENT_DATA_DEVICE:$MEMORY_STATE_PERSISTENT_DATA_INODE" ] || return 1
+		if [ -e "$MEMORY_BACKING_DATA_MOUNT" ] ||
+		   [ -L "$MEMORY_BACKING_DATA_MOUNT" ]; then
+			[ -d "$MEMORY_BACKING_DATA_MOUNT" ] &&
+				[ ! -L "$MEMORY_BACKING_DATA_MOUNT" ] || return 1
+			metadata="$(LC_ALL=C ls -ldn "$MEMORY_BACKING_DATA_MOUNT" 2>/dev/null)" || return 1
+			read -r mode links owner group remainder <<-EOF
+			$metadata
+			EOF
+			[ "$mode:$owner:$group" = "drwx------:0:0" ] || return 1
+			rmdir "$MEMORY_BACKING_DATA_MOUNT" || return 1
+		fi
+		mkdir -m 0700 "$MEMORY_BACKING_DATA_MOUNT" || return 1
+		chown 0:0 "$MEMORY_BACKING_DATA_MOUNT" || {
+			rmdir "$MEMORY_BACKING_DATA_MOUNT" 2>/dev/null || true
+			return 1
+		}
+		if ! /bin/mount -o bind "$target" "$MEMORY_BACKING_DATA_MOUNT" ||
+		   ! path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT"; then
+			/bin/umount "$MEMORY_BACKING_DATA_MOUNT" >/dev/null 2>&1 || true
+			rmdir "$MEMORY_BACKING_DATA_MOUNT" 2>/dev/null || true
+			return 1
+		fi
+		memory_backing_identity "$MEMORY_BACKING_DATA_MOUNT" || return 1
+		[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+			"$MEMORY_STATE_PERSISTENT_DATA_DEVICE:$MEMORY_STATE_PERSISTENT_DATA_INODE" ] || return 1
+	fi
+
+	if [ "$target_mounted" = 1 ]; then
+		memory_backing_identity "$target" || return 1
+		[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
+			"$MEMORY_STATE_MEMORY_DATA_DEVICE:$MEMORY_STATE_MEMORY_DATA_INODE" ] || return 1
+	else
+		/bin/mount -o bind "$MEMORY_DATA_DIR" "$target" || return 1
+	fi
+	MEMORY_MOUNTS_SUSPENDED=0
+	memory_bindings_valid "$backing"
+}
+
+memory_remove_incomplete_bindings() {
+	local backing="${1%/}" target
+	[ -n "$backing" ] || return 1
+	target="${backing}/data"
+	if path_is_exact_mountpoint "$target"; then
+		[ -d "$MEMORY_DATA_DIR" ] && [ "$target" -ef "$MEMORY_DATA_DIR" ] || return 1
+		/bin/umount "$target" || return 1
+	fi
+	if path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT"; then
+		/bin/umount "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	fi
+	if [ -e "$MEMORY_BACKING_DATA_MOUNT" ] || [ -L "$MEMORY_BACKING_DATA_MOUNT" ]; then
+		[ -d "$MEMORY_BACKING_DATA_MOUNT" ] &&
+			[ ! -L "$MEMORY_BACKING_DATA_MOUNT" ] || return 1
+		rmdir "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	fi
+	MEMORY_MOUNTS_SUSPENDED=1
+}
+
 restore_workdir_access() {
 	chown "$2:$3" "$1" && chmod 0700 "$1"
 }
@@ -1371,18 +1811,35 @@ memory_create_runtime_parent() {
 }
 
 memory_write_state() {
-	local backing="${1%/}" temporary device inode
+	local backing="${1%/}" replace_existing="${2:-0}" temporary device inode
+	local persistent_data_device persistent_data_inode memory_data_device memory_data_inode
 	memory_runtime_dir_valid || return 1
-	[ ! -e "$MEMORY_STATE_FILE" ] && [ ! -L "$MEMORY_STATE_FILE" ] || return 1
+	case "$replace_existing" in
+		0) [ ! -e "$MEMORY_STATE_FILE" ] && [ ! -L "$MEMORY_STATE_FILE" ] || return 1 ;;
+		1) memory_private_state_file "$MEMORY_STATE_FILE" || return 1 ;;
+		*) return 1 ;;
+	esac
 	memory_backing_identity "$backing" || return 1
 	device="$MEMORY_IDENTITY_DEVICE"
 	inode="$MEMORY_IDENTITY_INODE"
+	memory_bindings_valid "$backing" || return 1
+	memory_backing_identity "$MEMORY_BACKING_DATA_MOUNT" || return 1
+	persistent_data_device="$MEMORY_IDENTITY_DEVICE"
+	persistent_data_inode="$MEMORY_IDENTITY_INODE"
+	memory_backing_identity "$MEMORY_DATA_DIR" || return 1
+	memory_data_device="$MEMORY_IDENTITY_DEVICE"
+	memory_data_inode="$MEMORY_IDENTITY_INODE"
+	memory_binding_identities_match "$backing" \
+		"$persistent_data_device" "$persistent_data_inode" \
+		"$memory_data_device" "$memory_data_inode" || return 1
 	temporary="$(mktemp "${MEMORY_RUNTIME_DIR}/.state.XXXXXX")" || return 1
-	if ! printf 'version=3\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\n' \
-		"$backing" "$device" "$inode" >"$temporary" ||
+	if ! printf 'version=4\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\npersistent_data_device=%s\npersistent_data_inode=%s\nmemory_data_device=%s\nmemory_data_inode=%s\n' \
+		"$backing" "$device" "$inode" \
+		"$persistent_data_device" "$persistent_data_inode" \
+		"$memory_data_device" "$memory_data_inode" >"$temporary" ||
 	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
 	   ! memory_private_state_file "$temporary" ||
-	   ! mv "$temporary" "$MEMORY_STATE_FILE"; then
+	   ! mv -f "$temporary" "$MEMORY_STATE_FILE"; then
 		rm -f "$temporary"
 		return 1
 	fi
@@ -1390,11 +1847,18 @@ memory_write_state() {
 	MEMORY_STATE_PERSISTENT_WORK_DIR="$backing"
 	MEMORY_STATE_BACKING_DEVICE="$device"
 	MEMORY_STATE_BACKING_INODE="$inode"
+	MEMORY_STATE_PERSISTENT_DATA_DEVICE="$persistent_data_device"
+	MEMORY_STATE_PERSISTENT_DATA_INODE="$persistent_data_inode"
+	MEMORY_STATE_MEMORY_DATA_DEVICE="$memory_data_device"
+	MEMORY_STATE_MEMORY_DATA_INODE="$memory_data_inode"
 	MEMORY_STATE_VALIDATED=1
 }
 
 memory_remove_active_tree() {
-	memory_active_tree_valid || return 1
+	[ "${MEMORY_MOUNTS_SUSPENDED:-0}" = 1 ] || return 1
+	memory_active_tree_valid "$MEMORY_BACKING_WORK_DIR" || return 1
+	[ ! -e "$MEMORY_BACKING_DATA_MOUNT" ] &&
+		[ ! -L "$MEMORY_BACKING_DATA_MOUNT" ] || return 1
 	# MEMORY_RUNTIME_DIR is root-owned and non-writable by uid 853, so the work
 	# leaf cannot be replaced while this exact fixed-path removal runs.
 	tree_is_mount_free "$MEMORY_WORK_DIR" || return 1
@@ -1435,38 +1899,45 @@ memory_prepare_runtime_locked() {
 			return 1
 		fi
 	else
-		if ! mkdir -m 0700 "$data_target" ||
+		if ! mkdir -m 0700 "$data_source" ||
+		   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_source" ||
+		   ! mkdir -m 0700 "$data_target" ||
 		   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_target" ||
+		   ! uid853_tree_is_plain "$data_source" ||
 		   ! uid853_tree_is_plain "$data_target" ||
 		   ! memory_advance_journal prepare prepared; then
 			memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
 			return 1
 		fi
 	fi
+	MEMORY_MOUNTS_SUSPENDED=1
 	if [ -e "$MEMORY_WORK_DIR" ] || [ -L "$MEMORY_WORK_DIR" ] ||
 	   ! mv "$stage" "$MEMORY_WORK_DIR" ||
 	   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$MEMORY_WORK_DIR" ||
 	   ! chmod 0700 "$MEMORY_WORK_DIR" ||
-	   ! memory_active_tree_valid ||
+	   ! memory_active_tree_valid "$persistent_work_dir" ||
 	   ! memory_advance_journal prepare new_installed ||
+	   ! memory_activate_data_bindings "$persistent_work_dir" ||
 	   ! memory_write_state "$persistent_work_dir" ||
+	   ! memory_active_tree_valid "$persistent_work_dir" ||
 	   ! memory_advance_journal prepare committed ||
 	   ! memory_clear_journal; then
+		memory_remove_incomplete_bindings "$persistent_work_dir" >/dev/null 2>&1 || true
 		memory_recover_journal_locked "$persistent_work_dir" >/dev/null 2>&1 || true
 		return 1
 	fi
 	MEMORY_ACTIVE=1
 	MEMORY_BACKING_WORK_DIR="$persistent_work_dir"
 	previous_work_dir="$persistent_work_dir"
-	work_dir="$MEMORY_WORK_DIR"
+	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
-	# Only safe_fs_patterns needs to follow the effective work directory.  The
-	# file being edited remains the persistent YAML and is never copied to RAM.
+	# The official workdir and YAML remain persistent; only its data child is a
+	# managed RAM bind mount.
 	if ! sync_yaml_managed_fields_checked; then
 		log_error "Unable to activate the persistent YAML for the RAM data workdir"
 		# No core has used this freshly copied generation yet.  If the ordinary
 		# deactivation path can restore the persistent managed field and remove
-		# the v3 state, let the caller fall back to disk for this start.  Preserve
+		# the v4 state, let the caller fall back to disk for this start.  Preserve
 		# the generation only when cleanup itself cannot be proven complete.
 		if memory_deactivate_locked 0; then
 			log_error "Discarded the unused RAM generation after YAML activation failed"
@@ -1474,7 +1945,7 @@ memory_prepare_runtime_locked() {
 		fi
 		return 2
 	fi
-	log_error "AdGuard Home data workdir prepared in memory from ${persistent_work_dir}"
+	log_error "AdGuard Home data directory prepared in memory from ${persistent_work_dir}/data"
 }
 
 memory_journal_dir_valid() {
@@ -1804,6 +2275,9 @@ memory_discard_incomplete_prepare_runtime() {
 		return 0
 	fi
 	memory_prepare_runtime_dir_valid || return 1
+	if [ "$MEMORY_JOURNAL_PHASE" != committed ]; then
+		memory_remove_incomplete_bindings "$MEMORY_JOURNAL_BACKING" || return 1
+	fi
 	for entry in \
 		"$MEMORY_RUNTIME_DIR"/* \
 		"$MEMORY_RUNTIME_DIR"/.[!.]* \
@@ -1811,6 +2285,10 @@ memory_discard_incomplete_prepare_runtime() {
 		[ -e "$entry" ] || [ -L "$entry" ] || continue
 		case "$entry" in
 			"$stage"|"$MEMORY_WORK_DIR")
+				[ -d "$entry" ] && [ ! -L "$entry" ] || return 1
+				;;
+			"$MEMORY_BACKING_DATA_MOUNT")
+				[ "$MEMORY_JOURNAL_PHASE" = committed ] || return 1
 				[ -d "$entry" ] && [ ! -L "$entry" ] || return 1
 				;;
 			"$MEMORY_STATE_FILE"|"$MEMORY_RUNTIME_DIR"/.state.??????)
@@ -2165,9 +2643,9 @@ memory_checkpoint_full_locked() (
 # power loss or a concurrent database write can therefore leave an incomplete
 # persistent copy, which is acceptable for this mode.
 memory_copy_live_data_locked() (
-	local source="${MEMORY_WORK_DIR}/data" target="${MEMORY_BACKING_WORK_DIR}/data"
+	local source="${MEMORY_WORK_DIR}/data" target="$MEMORY_BACKING_DATA_MOUNT"
 	local backing_fd=/proc/self/fd/9 metadata mode links original_owner original_group remainder
-	local backing_device backing_inode core_pid target_ready=0
+	local backing_device backing_inode core_pid="" require_live="${1:-1}"
 	[ "$MEMORY_ACTIVE" = 1 ] || exit 2
 	[ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
 	memory_active_tree_valid || exit 1
@@ -2183,7 +2661,7 @@ memory_copy_live_data_locked() (
 	read -r mode links original_owner original_group remainder <<-EOF
 	$metadata
 	EOF
-	# In r2 this directory also contains the live persistent YAML.  While the
+	# In v2.4 this directory also contains the live persistent YAML.  While the
 	# core runs, never freeze or chown that parent: doing so would make the Web
 	# UI's atomic YAML save fail.  The official service must already own its
 	# config directory before a live write-back is eligible.
@@ -2194,41 +2672,29 @@ memory_copy_live_data_locked() (
 	backing_inode="$MEMORY_IDENTITY_INODE"
 	[ "$backing_device:$backing_inode" = \
 		"$MEMORY_STATE_BACKING_DEVICE:$MEMORY_STATE_BACKING_INODE" ] || exit 1
-	core_pid="$(official_pid)" || exit 2
-	case "$core_pid" in ""|*[!0-9]*) exit 2 ;; esac
+	case "$require_live" in
+		1)
+			core_pid="$(official_pid)" || exit 2
+			case "$core_pid" in ""|*[!0-9]*) exit 2 ;; esac
+			;;
+		0)
+			official_running && exit 1
+			adguard_uid_process_exists && exit 1
+			;;
+		*) exit 1 ;;
+	esac
 
-	if [ -e "$target" ] || [ -L "$target" ]; then
-		tree_is_mount_free "$target" || exit 1
-		if [ -d "$target" ] && [ ! -L "$target" ] &&
-		   memory_journal_tree_plain "$target" &&
-		   uid853_tree_is_writable "$target" &&
-		   run_bounded 5 1 \
-			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-			-n AGHDataMode -x /bin/chmod -- 0700 "$target"; then
-			target_ready=1
-		fi
-		# Only an unusable data node/tree is cleared.  A valid directory is kept
-		# intact so cp directly overwrites matching files without deleting extras.
-		if [ "$target_ready" != 1 ]; then
-			run_bounded 30 2 \
-				/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-				-n AGHDataClear -x /bin/rm -- -rf "$target" \
-				>/dev/null 2>&1 || exit 1
-			[ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
-		fi
-	fi
-	if [ "$target_ready" != 1 ]; then
-		run_bounded 5 1 \
-			/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-			-n AGHDataMake -x /bin/mkdir -- -m 0700 "$target" || exit 1
-	fi
+	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
+	# Direct write-back only overwrites matching paths and deliberately retains
+	# extra persistent files.  Never clear or replace the persistent data root.
+	uid853_mounted_tree_is_writable "$target" || exit 1
 	run_bounded 120 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHMemorySave -x /bin/cp -- -pR "${source}/." "$target/" || exit 1
 	run_bounded 5 1 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataMode -x /bin/chmod -- 0700 "$target" || exit 1
-	uid853_tree_is_plain "$target" || exit 1
+	uid853_mounted_tree_is_writable "$target" || exit 1
 	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
 	metadata="$(LC_ALL=C ls -ldnL "$backing_fd" 2>/dev/null)" || exit 1
 	read -r mode links original_owner original_group remainder <<-EOF
@@ -2236,9 +2702,13 @@ memory_copy_live_data_locked() (
 	EOF
 	[ "$original_owner:$original_group:$mode" = \
 		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || exit 1
-	[ "$(official_pid)" = "$core_pid" ] || exit 1
-	log_error "Copied live AdGuard Home RAM data directly to ${target}"
+	[ -z "$core_pid" ] || [ "$(official_pid)" = "$core_pid" ] || exit 1
+	log_error "Copied live AdGuard Home RAM data directly to ${MEMORY_BACKING_WORK_DIR}/data"
 )
+
+memory_copy_stopped_data_locked() {
+	memory_copy_live_data_locked 0
+}
 
 root_private_config_source() {
 	local candidate="$1" parent mode
@@ -2482,11 +2952,11 @@ maintenance_upgrade_marker_is_valid() {
 	done
 }
 
-# ImmortalWrt's default package post-install helper invokes every packaged init
-# script once even during an upgrade.  Consume the root-private marker left by
-# a successful stopped v2.1 migration so that one automatic invocation is a
-# no-op; a later manual start or boot follows the normal enabled-state path.
-consume_upgrade_stopped_marker() (
+# ImmortalWrt's default package post-install helper may invoke the packaged init
+# script repeatedly when a later custom-postinst step fails.  Validate but do
+# not consume the root-private stop barrier here; only the successful custom
+# hook may retire it together with its cold-upgrade completion state.
+upgrade_stopped_marker_is_valid() (
 	local entry metadata mode links owner group size remainder
 	[ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ] || exit 1
 	normalizer_lock_directory_is_private || exit 2
@@ -2506,9 +2976,6 @@ consume_upgrade_stopped_marker() (
 	[ "$mode" = "-rw-------" ] && [ "$links" = 1 ] &&
 		[ "$owner" = 0 ] && [ "$group" = 0 ] && [ "$size" = 2 ] || exit 2
 	grep -qx '1' /proc/self/fd/9 || exit 2
-	rm -f "$UPGRADE_STOPPED_MARKER" || exit 2
-	[ ! -e "$UPGRADE_STOPPED_MARKER" ] && [ ! -L "$UPGRADE_STOPPED_MARKER" ] || exit 2
-	rmdir "$NORMALIZER_RUNTIME_DIR" || exit 2
 )
 
 normalizer_lock_is_private() {
@@ -2741,7 +3208,7 @@ check_config() {
 	local candidate="$1" requested_work_dir="$2"
 	valid_config_candidate_path "$candidate" || return 1
 	# This root-only migration validator may run immediately before the official
-	# lower UCI is anchored to a newly-created custom directory.  Enforce the
+	# section is anchored to a newly-created custom directory.  Enforce the
 	# namespace and trusted ancestors here; runtime entry points additionally
 	# require the exact existing-directory UCI anchor.
 	validate_managed_work_dir_namespace "$requested_work_dir" || return 1
@@ -3393,14 +3860,20 @@ uci_guard_restore_file() {
 }
 
 uci_guard_no_delta() {
-	local changes
-	changes="$(uci -q changes "$1" 2>/dev/null)" || return 1
+	local package="$1" changes target delta
+	if ! changes="$(uci -q changes "$package" 2>/dev/null)"; then
+		target="${UCI_CONFIG_DIRECTORY}/${package}"
+		delta="${UCI_DELTA_DIRECTORY}/${package}"
+		[ ! -e "$target" ] && [ ! -L "$target" ] &&
+			[ ! -e "$delta" ] && [ ! -L "$delta" ]
+		return
+	fi
 	[ -z "$changes" ]
 }
 
-# Used before a repair commit when no active v3 state may exist (for example,
-# after /tmp disappeared at reboot).  Permit only the exact r2 work-dir delta
-# and the exact r1 config-path delta; any user or foreign option blocks commit.
+# Legacy-transition validator for a repair commit after volatile v2.3 state has
+# disappeared.  Permit only its two exact historical RAM-path fields; any user
+# or foreign option blocks the repair.
 uci_guard_only_memory_path_delta() {
 	local changes line seen_config=0 seen_work=0 count=0
 	changes="$(uci -q changes "$OFFICIAL_CONFIG" 2>/dev/null)" || return 1
@@ -3498,15 +3971,24 @@ uci_guard_clear_delta() {
 }
 
 uci_guard_snapshot_configs() {
-	local directory
+	local directory source marker
 	directory="$(mktemp -d /tmp/AdGuardHome-uci-guard.XXXXXX)" || return 1
+	source="${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}"
+	marker="${directory}/.originally-absent"
 	if ! chown 0:0 "$directory" || ! chmod 0700 "$directory" ||
-	   ! uci_guard_snapshot_dir_valid "$directory" ||
-	   ! uci_guard_snapshot_file "${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}" \
-		"${directory}/${OFFICIAL_CONFIG}" ||
-	   ! uci_guard_snapshot_file "${UCI_GUARD_CONFIG_FD_PATH}/${LEGACY_CONFIG}" \
-		"${directory}/${LEGACY_CONFIG}"; then
-		rm -f "${directory}/${OFFICIAL_CONFIG}" "${directory}/${LEGACY_CONFIG}" 2>/dev/null || true
+	   ! uci_guard_snapshot_dir_valid "$directory"; then
+		rmdir "$directory" 2>/dev/null || true
+		return 1
+	fi
+	if [ -e "$source" ] || [ -L "$source" ]; then
+		if ! uci_guard_snapshot_file "$source" "${directory}/${OFFICIAL_CONFIG}"; then
+			rm -f "${directory}/${OFFICIAL_CONFIG}" 2>/dev/null || true
+			rmdir "$directory" 2>/dev/null || true
+			return 1
+		fi
+	elif ! (umask 077; : >"$marker") || ! chown 0:0 "$marker" ||
+	     ! chmod 0600 "$marker" || [ ! -f "$marker" ] || [ -L "$marker" ]; then
+		rm -f "$marker" 2>/dev/null || true
 		rmdir "$directory" 2>/dev/null || true
 		return 1
 	fi
@@ -3514,32 +3996,46 @@ uci_guard_snapshot_configs() {
 }
 
 uci_guard_discard_snapshot() {
-	local directory="$1"
+	local directory="$1" snapshot marker
+	snapshot="${directory}/${OFFICIAL_CONFIG}"
+	marker="${directory}/.originally-absent"
 	uci_guard_snapshot_dir_valid "$directory" || return 1
-	uci_guard_config_file_valid "${directory}/${OFFICIAL_CONFIG}" || return 1
-	uci_guard_config_file_valid "${directory}/${LEGACY_CONFIG}" || return 1
-	rm -f "${directory}/${OFFICIAL_CONFIG}" "${directory}/${LEGACY_CONFIG}" || return 1
+	if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+		uci_guard_config_file_valid "$snapshot" || return 1
+		[ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
+		rm -f "$snapshot" || return 1
+	else
+		[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+		[ "$(wc -c <"$marker" 2>/dev/null)" = 0 ] || return 1
+		rm -f "$marker" || return 1
+	fi
 	rmdir "$directory"
 }
 
 uci_guard_rollback_configs_once() {
-	local directory="$1"
+	local directory="$1" snapshot marker target
+	snapshot="${directory}/${OFFICIAL_CONFIG}"
+	marker="${directory}/.originally-absent"
+	target="${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}"
 	uci_guard_snapshot_dir_valid "$directory" || return 1
 	uci_guard_clear_delta "$OFFICIAL_CONFIG" || return 1
-	uci_guard_clear_delta "$LEGACY_CONFIG" || return 1
-	uci_guard_restore_file "${directory}/${OFFICIAL_CONFIG}" \
-		"${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}" || return 1
-	uci_guard_restore_file "${directory}/${LEGACY_CONFIG}" \
-		"${UCI_GUARD_CONFIG_FD_PATH}/${LEGACY_CONFIG}" || return 1
-	memory_durability_barrier || return 1
-	cmp -s "${directory}/${OFFICIAL_CONFIG}" \
-		"${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}" || return 1
-	cmp -s "${directory}/${LEGACY_CONFIG}" \
-		"${UCI_GUARD_CONFIG_FD_PATH}/${LEGACY_CONFIG}" || return 1
-	uci_guard_no_delta "$OFFICIAL_CONFIG" &&
-		uci_guard_no_delta "$LEGACY_CONFIG" &&
-		uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1 &&
-		uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}" >/dev/null 2>&1
+	if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+		uci_guard_config_file_valid "$snapshot" || return 1
+		[ ! -e "$marker" ] && [ ! -L "$marker" ] || return 1
+		uci_guard_restore_file "$snapshot" "$target" || return 1
+		memory_durability_barrier || return 1
+		cmp -s "$snapshot" "$target" || return 1
+	else
+		[ -f "$marker" ] && [ ! -L "$marker" ] || return 1
+		[ "$(wc -c <"$marker" 2>/dev/null)" = 0 ] || return 1
+		if [ -e "$target" ] || [ -L "$target" ]; then
+			uci_guard_config_file_valid "$target" || return 1
+			rm -f "$target" || return 1
+		fi
+		memory_durability_barrier || return 1
+		[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+	fi
+	uci_guard_no_delta "$OFFICIAL_CONFIG"
 }
 
 uci_guard_rollback_configs() {
@@ -3555,9 +4051,7 @@ memory_commit_official_persistent_paths() {
 	local backing="${1%/}"
 	validate_managed_work_dir_namespace "$backing" || return 1
 	uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1 || return 1
-	if ! uci_guard_no_delta "$OFFICIAL_CONFIG"; then
-		uci_guard_only_memory_path_delta || return 1
-	fi
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
 	if ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file=${backing}/AdGuardHome.yaml" ||
 	   ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir=${backing}"; then
 		uci -q revert "$OFFICIAL_CONFIG" >/dev/null 2>&1 || true
@@ -3582,42 +4076,15 @@ memory_commit_official_persistent_paths() {
 	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = "${backing}/AdGuardHome.yaml" ] &&
 		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$backing" ] &&
 		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")" ] &&
-		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")" ]
+		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")" ] &&
+		uci_guard_no_delta "$OFFICIAL_CONFIG" &&
+		refresh_managed_config_snapshot
 }
 
 memory_clear_official_path_delta() {
-	local effective_config effective_work legacy_config legacy_work backing
-	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
-	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
-	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
-	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
-	if [ "$effective_config" != "$LEGACY_MEMORY_CONFIG_FILE" ] &&
-	   [ "${effective_work%/}" != "$MEMORY_WORK_DIR" ] &&
-	   [ "$legacy_config" != "$LEGACY_MEMORY_CONFIG_FILE" ] &&
-		[ "${legacy_work%/}" != "$MEMORY_WORK_DIR" ]; then
-		return 0
-	fi
-	if [ "$MEMORY_ACTIVE" = 1 ]; then
-		backing="${MEMORY_BACKING_WORK_DIR%/}"
-		[ -n "$backing" ] && memory_state_binds_persistent "$backing" || return 1
-	else
-		backing="${persistent_work_dir%/}"
-	fi
-	# Prefer dropping the known volatile work-dir override (and any r1 legacy
-	# config override).  A real commit is needed only when a global `uci commit`
-	# previously persisted a RAM path itself.
-	uci -q revert "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file" >/dev/null 2>&1 || true
-	uci -q revert "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir" >/dev/null 2>&1 || true
-	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
-	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
-	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
-	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
-	if [ "$effective_config" = "${backing}/AdGuardHome.yaml" ] &&
-	   [ "${effective_work%/}" = "$backing" ] &&
-	   [ -z "$legacy_config" ] && [ -z "$legacy_work" ]; then
-		return 0
-	fi
-	memory_commit_official_persistent_paths "$backing"
+	# v2.4 never stores a runtime workdir override in /tmp/.uci.  Refuse every
+	# pending package delta before a coordinator-owned commit.
+	uci_guard_no_delta "$OFFICIAL_CONFIG"
 }
 
 memory_apply_official_path_delta() {
@@ -3625,30 +4092,23 @@ memory_apply_official_path_delta() {
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
 	backing="${MEMORY_BACKING_WORK_DIR%/}"
 	[ -n "$backing" ] && memory_state_binds_persistent "$backing" || return 1
-	if ! uci_guard_no_delta "$OFFICIAL_CONFIG" &&
-	   ! uci_guard_expected_memory_delta; then
-		return 1
-	fi
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
 	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
 	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
 	legacy_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")"
 	legacy_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
-	[ "$effective_config" = "${backing}/AdGuardHome.yaml" ] &&
-		{ [ "${effective_work%/}" = "$backing" ] ||
-		  [ "${effective_work%/}" = "$MEMORY_WORK_DIR" ]; } &&
-		[ -z "$legacy_config" ] && [ -z "$legacy_work" ] || return 1
-	if ! uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir=${MEMORY_WORK_DIR}"; then
-		# Avoid leaving a half-applied volatile override.  The committed backing paths
-		# are always the safe fallback and load_legacy_settings() will adopt the
-		# still-valid RAM generation from its state record on the next invocation.
-		memory_commit_official_persistent_paths "$backing" >/dev/null 2>&1 || true
-		return 1
-	fi
-	if uci_guard_expected_memory_delta; then
+	[ -z "$legacy_config" ] && [ -z "$legacy_work" ] || return 1
+	# While RAM data is active, the authoritative package may still describe
+	# the state-authenticated old backing or may already contain a validated new
+	# workdir request.  In the latter case load_legacy_settings() deliberately
+	# keeps config_file on the old state's persistent YAML until the orchestrator
+	# stops the writer, directly copies data, removes the old binds, and switches.
+	if [ "$effective_config" = "${backing}/AdGuardHome.yaml" ] &&
+	   [ "${effective_work%/}" = "$backing" ]; then
 		return 0
 	fi
-	memory_commit_official_persistent_paths "$backing" >/dev/null 2>&1 || true
-	return 1
+	[ "$effective_config" = "$persistent_config_file" ] &&
+		[ "${effective_work%/}" = "$persistent_work_dir" ]
 }
 
 memory_restore_official_persistent_paths() {
@@ -3660,9 +4120,8 @@ memory_restore_official_persistent_paths() {
 }
 
 memory_run_with_official_path_guard() (
-	local restore_delta=0 snapshot_ready=0 transaction_complete=0
+	local snapshot_ready=0 transaction_complete=0
 	local primary_rc=1 final_rc snapshot_directory=""
-	[ "$MEMORY_ACTIVE" != 1 ] || restore_delta=1
 	cleanup_memory_path_guard() {
 		final_rc=$?
 		# Disable recursive EXIT handling, then make the compensating restore
@@ -3682,10 +4141,6 @@ memory_run_with_official_path_guard() (
 				final_rc=1
 			fi
 		fi
-		if [ "$restore_delta" = 1 ] && [ "$snapshot_ready" != 1 ] &&
-		   ! memory_apply_official_path_delta; then
-			final_rc=1
-		fi
 		exit "$final_rc"
 	}
 	trap cleanup_memory_path_guard 0
@@ -3695,33 +4150,17 @@ memory_run_with_official_path_guard() (
 	UCI_GUARD_CONFIG_FD_PATH=/proc/self/fd/191
 	[ -d "$UCI_GUARD_CONFIG_FD_PATH" ] &&
 		[ "$UCI_GUARD_CONFIG_FD_PATH" -ef "$UCI_CONFIG_DIRECTORY" ] || exit 1
-	# A package commit must never absorb user changes or make the volatile RAM
-	# workdir persistent.  Validate the complete delta, not only its effective
-	# values, before exposing a persistent two-package transaction.
-	if [ "$restore_delta" = 1 ]; then
-		if ! uci_guard_expected_memory_delta; then
-			# A newly prepared RAM generation has a durable state record before
-			# its volatile lower-UCI pair exists.  Bootstrap only that exact
-			# zero-delta state; a partial or unrelated pending change must remain
-			# an error and must not be hidden by applying our two values over it.
-			uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
-			memory_apply_official_path_delta || exit 1
-			uci_guard_expected_memory_delta || exit 1
-		fi
-	else
-		uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
-	fi
-	uci_guard_no_delta "$LEGACY_CONFIG" || exit 1
+	# Plugin and official sections share one file.  Reject every pending delta so
+	# a coordinator commit can never absorb a concurrent LuCI edit.
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
 	memory_clear_official_path_delta || exit 1
 	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
-	uci_guard_no_delta "$LEGACY_CONFIG" || exit 1
 	snapshot_directory="$(uci_guard_snapshot_configs)" || exit 1
 	snapshot_ready=1
 	"$@"
 	primary_rc=$?
 	[ "$primary_rc" = 0 ] || exit "$primary_rc"
 	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
-	uci_guard_no_delta "$LEGACY_CONFIG" || exit 1
 	memory_durability_barrier || exit 1
 	snapshot_ready=0
 	transaction_complete=1
@@ -3780,11 +4219,14 @@ ${TLS_NEW_MANAGED_MOUNTS}"
 		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_TLS_FINGERPRINT}" || return 1
 		legacy_changed=1
 	fi
-	[ "$official_changed" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
-	[ "$legacy_changed" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+	if [ "$official_changed" != 0 ] || [ "$legacy_changed" != 0 ]; then
+		# Both sections now live in one authoritative package; publish their TLS
+		# lists and fingerprint in one commit.
+		uci -q commit "$OFFICIAL_CONFIG" || return 1
+	fi
 
-	# A successful commit status is insufficient for this cross-package update.
-	# Reload both packages and prove that the complete list/marker state matches
+	# A successful commit status is insufficient.  Reload the merged package and
+	# prove that the complete list/marker state matches
 	# the transaction we just calculated before its guard discards the snapshot.
 	expected_managed="$TLS_NEW_MANAGED_MOUNTS"
 	expected_fingerprint="$TLS_FINGERPRINT"
@@ -3802,7 +4244,62 @@ ${TLS_NEW_MANAGED_MOUNTS}"
 }
 
 sync_tls_access() {
-	memory_run_with_official_path_guard sync_tls_access_persistent
+	memory_run_with_official_path_guard sync_tls_access_persistent || return 1
+	refresh_managed_config_snapshot
+}
+
+collect_memory_data_jail_mount() {
+	[ "$1" = "$MEMORY_DATA_JAIL_WANTED" ] || return 0
+	MEMORY_DATA_JAIL_COUNT=$((MEMORY_DATA_JAIL_COUNT + 1))
+}
+
+memory_data_jail_count() {
+	MEMORY_DATA_JAIL_WANTED="$1"
+	MEMORY_DATA_JAIL_COUNT=0
+	config_load "$OFFICIAL_CONFIG" || return 1
+	config_list_foreach "$OFFICIAL_SECTION" jail_mount_rw collect_memory_data_jail_mount
+}
+
+sync_memory_data_jail_access_persistent() {
+	local desired="" old changed=0
+	[ "$MEMORY_ACTIVE" != 1 ] || desired="${MEMORY_BACKING_WORK_DIR%/}/data"
+	old="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_DATA_JAIL_OPTION}")"
+	if [ -n "$old" ] && [ "$old" != "$desired" ]; then
+		uci -q del_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${old}" \
+			>/dev/null 2>&1 || true
+		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_DATA_JAIL_OPTION}" \
+			>/dev/null 2>&1 || true
+		old=""
+		changed=1
+	fi
+	if [ -n "$desired" ]; then
+		memory_data_jail_count "$desired" || return 1
+		case "$MEMORY_DATA_JAIL_COUNT" in
+			0)
+				uci -q add_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${desired}" || return 1
+				uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_DATA_JAIL_OPTION}=${desired}" || return 1
+				changed=1
+				;;
+			1)
+				# A pre-existing unowned entry remains user-owned.  Record ownership
+				# only when this plugin already created the exact entry.
+				[ -z "$old" ] || [ "$old" = "$desired" ] || return 1
+				;;
+			*) return 1 ;;
+		esac
+	elif [ -n "$old" ]; then
+		uci -q del_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${old}" \
+			>/dev/null 2>&1 || true
+		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_DATA_JAIL_OPTION}" || return 1
+		changed=1
+	fi
+	[ "$changed" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
+	if [ -n "$desired" ]; then
+		memory_data_jail_count "$desired" || return 1
+		[ "$MEMORY_DATA_JAIL_COUNT" = 1 ]
+	else
+		[ -z "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.${MANAGED_DATA_JAIL_OPTION}")" ]
+	fi
 }
 
 sync_official_uci_persistent() {
@@ -3815,11 +4312,23 @@ sync_official_uci_persistent() {
 	if ! uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1; then
 		uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}=adguardhome" || return 1
 		UCI_CHANGED=1
+	elif [ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}")" != adguardhome ]; then
+		return 1
+	fi
+	if ! uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}" >/dev/null 2>&1; then
+		uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}=luci" || return 1
+		UCI_CHANGED=1
+	elif [ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}")" != luci ]; then
+		return 1
 	fi
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" enabled "$legacy_enabled" || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config_file "$official_config" || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" work_dir "$official_work" || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" verbose "$verbose" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" redirect "$redirect_mode" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" run_from_memory "$memory_requested" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" memory_writeback_interval \
+		"$memory_writeback_interval" || return 1
 	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config || return 1
 	uci_delete_if_present "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" workdir || return 1
 	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
@@ -3827,20 +4336,97 @@ sync_official_uci_persistent() {
 		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = "$official_config" ] &&
 		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$official_work" ] &&
 		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")" = "$verbose" ] &&
+		[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.redirect")" = "$redirect_mode" ] &&
+		[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.run_from_memory")" = "$memory_requested" ] &&
+		[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.memory_writeback_interval")" = "$memory_writeback_interval" ] &&
 		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config")" ] &&
 		[ -z "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")" ] || return 1
-	sync_tls_access_persistent
+	sync_tls_access_persistent || return 1
+	sync_memory_data_jail_access_persistent
 }
 
 sync_official_uci() {
-	memory_run_with_official_path_guard sync_official_uci_persistent
+	memory_run_with_official_path_guard sync_official_uci_persistent || return 1
+	refresh_managed_config_snapshot
+}
+
+settings_commit_persistent() {
+	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
+	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
+	local normalized_interval
+	case "$requested_enabled:$requested_verbose:$requested_memory" in
+		[01]:[01]:[01]) ;;
+		*) return 1 ;;
+	esac
+	case "$requested_redirect" in none|redirect|dnsmasq-upstream) ;;
+		*) return 1 ;;
+	esac
+	validate_managed_work_dir_namespace "$requested_work_dir" || return 1
+	normalized_interval="$(normalize_memory_writeback_interval "$requested_interval")" || return 1
+	[ "$normalized_interval" = "$requested_interval" ] || return 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}")" = adguardhome ] || return 1
+	[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}")" = luci ] || return 1
+	UCI_CHANGED=0
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" enabled \
+		"$requested_enabled" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config_file \
+		"${requested_work_dir}/AdGuardHome.yaml" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" work_dir \
+		"$requested_work_dir" || return 1
+	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" verbose \
+		"$requested_verbose" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" redirect \
+		"$requested_redirect" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" run_from_memory \
+		"$requested_memory" || return 1
+	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" memory_writeback_interval \
+		"$requested_interval" || return 1
+	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = "$requested_enabled" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = \
+			"${requested_work_dir}/AdGuardHome.yaml" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$requested_work_dir" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")" = "$requested_verbose" ] &&
+		[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.redirect")" = "$requested_redirect" ] &&
+		[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.run_from_memory")" = "$requested_memory" ] &&
+		[ "$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.memory_writeback_interval")" = \
+			"$requested_interval" ]
+}
+
+# Hash the same seven-line canonical settings record as the ucode RPC.
+settings_values_revision() {
+	local value_enabled="$1" value_work_dir="${2%/}" value_verbose="$3"
+	local value_redirect="$4" value_memory="$5" value_interval="$6"
+	local output revision marker extra
+	output="$(printf 'enabled=%s\nconfig_file=%s\nwork_dir=%s\nverbose=%s\nredirect=%s\nrun_from_memory=%s\nmemory_writeback_interval=%s\n' \
+		"$value_enabled" "${value_work_dir}/AdGuardHome.yaml" "$value_work_dir" \
+		"$value_verbose" "$value_redirect" "$value_memory" \
+		"$value_interval" | sha256sum)" || return 1
+	read -r revision marker extra <<-EOF
+	$output
+	EOF
+	case "$revision" in
+		*[!0-9a-f]*) return 1 ;;
+	esac
+	[ "${#revision}" = 64 ] && [ "$marker" = - ] && [ -z "$extra" ] || return 1
+	printf '%s\n' "$revision"
+}
+
+# Use the derived persistent YAML path, not the temporarily retained old
+# runtime YAML used while an active RAM generation transitions to a new
+# workdir.
+settings_current_revision() {
+	settings_values_revision "$legacy_enabled" "$persistent_work_dir" \
+		"$verbose" "$redirect_mode" "$memory_requested" \
+		"$memory_writeback_interval"
 }
 
 disable_official_autostart_persistent() {
-	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = 0 ] && return 0
-	uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled=0" || return 1
-	uci -q commit "$OFFICIAL_CONFIG" || return 1
-	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = 0 ]
+	# Stopping a service must not rewrite its only authoritative enabled option.
+	# The official process is stopped explicitly by the caller.
+	return 0
 }
 
 disable_official_autostart() {
@@ -3942,7 +4528,8 @@ snapshot_dnsmasq_state() {
 	# Publish the marker last so an interrupted, incomplete snapshot is never
 	# treated as authoritative during recovery.
 	uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}=1" || return 1
-	uci -q commit "$LEGACY_CONFIG"
+	uci -q commit "$LEGACY_CONFIG" || return 1
+	refresh_managed_config_snapshot
 }
 
 add_conditional_snapshot_server() {
@@ -3962,7 +4549,8 @@ clear_dnsmasq_snapshot_metadata() {
 		uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${option}" >/dev/null 2>&1 || true
 	done
 	uci -q delete "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_MARKER}" || return 1
-	uci -q commit "$LEGACY_CONFIG"
+	uci -q commit "$LEGACY_CONFIG" || return 1
+	refresh_managed_config_snapshot
 }
 
 restore_dnsmasq_snapshot() {
@@ -4041,6 +4629,7 @@ set_dnsmasq_upstream() {
 	fingerprint="$(dnsmasq_managed_fingerprint)" || return 1
 	uci -q set "${LEGACY_CONFIG}.${LEGACY_SECTION}.${SNAPSHOT_ACTIVE_FINGERPRINT}=${fingerprint}" || return 1
 	uci -q commit "$LEGACY_CONFIG" || return 1
+	refresh_managed_config_snapshot || return 1
 	reload_service_if_present /etc/init.d/dnsmasq restart
 }
 
@@ -4141,6 +4730,7 @@ record_redirect_state() {
 	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_port "$dns_port" || return 1
 	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_enabled "$active" || return 1
 	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+	refresh_managed_config_snapshot || return 1
 	printf '%s' "$active" >/var/run/AdGredir 2>/dev/null || true
 }
 
@@ -4148,6 +4738,7 @@ record_redirect_inactive() {
 	UCI_CHANGED=0
 	uci_set_if_changed "$LEGACY_CONFIG" "$LEGACY_SECTION" old_enabled 0 || return 1
 	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$LEGACY_CONFIG" || return 1
+	refresh_managed_config_snapshot || return 1
 	printf '0' >/var/run/AdGredir 2>/dev/null || true
 }
 
@@ -4245,6 +4836,25 @@ official_pid() {
 	ubus -S call service list '{"name":"adguardhome"}' 2>/dev/null |
 		jsonfilter -e '@.adguardhome.instances.*.pid' 2>/dev/null |
 		awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
+}
+
+official_memory_data_mount_visible() {
+	local supervisor pid executable jail_data
+	[ "$MEMORY_ACTIVE" = 1 ] || return 0
+	supervisor="$(official_pid)" || return 1
+	case "$supervisor" in ""|*[!0-9]*) return 1 ;; esac
+	for pid in $(pidof AdGuardHome 2>/dev/null); do
+		pid_is_supervised_descendant "$pid" "$supervisor" || continue
+		executable="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || continue
+		case "$executable" in
+			"$CORE_BINARY"|"$CORE_BINARY (deleted)") ;;
+			*) continue ;;
+		esac
+		jail_data="/proc/${pid}/root${MEMORY_BACKING_WORK_DIR}/data"
+		[ -d "$jail_data" ] && [ ! -L "$jail_data" ] &&
+			[ "$jail_data" -ef "$MEMORY_DATA_DIR" ] && return 0
+	done
+	return 1
 }
 
 pid_is_supervised_descendant() {
@@ -4384,10 +4994,11 @@ wait_for_core_ready() {
 		dns_port="$expected_port"
 		redirect_mode="$expected_mode"
 		work_dir="$expected_work_dir"
-		if official_running && dns_port_listening; then
+		if official_running && official_memory_data_mount_visible && dns_port_listening; then
 			stable=$((stable + 1))
 			if [ "$stable" -ge "$READY_STABLE_COUNT" ]; then
 				runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir" &&
+					official_memory_data_mount_visible &&
 					dns_port_listening
 				return
 			fi
@@ -4975,7 +5586,8 @@ restore_tls_fingerprint() {
 	else
 		uci -q delete "$option" 2>/dev/null || true
 	fi
-	uci -q commit "$LEGACY_CONFIG"
+	uci -q commit "$LEGACY_CONFIG" || return 1
+	refresh_managed_config_snapshot
 }
 
 tls_refresh_locked() {
@@ -5044,6 +5656,23 @@ fail_safe_locked() {
 	return "$rc"
 }
 
+memory_reactivate_after_deactivation_failure() {
+	local backing="${1%/}"
+	[ -n "$backing" ] || return 1
+	official_running && return 1
+	MEMORY_STATE_VALIDATED=0
+	MEMORY_MOUNTS_SUSPENDED=1
+	memory_activate_data_bindings "$backing" || return 1
+	if ! memory_write_state "$backing" 1; then
+		MEMORY_STATE_VALIDATED=0
+		memory_suspend_data_bindings "$backing" >/dev/null 2>&1 || true
+		return 1
+	fi
+	MEMORY_ACTIVE=1
+	MEMORY_BACKING_WORK_DIR="$backing"
+	memory_active_tree_valid "$backing"
+}
+
 memory_deactivate_locked() {
 	local checkpoint="${1:-1}" old_backing
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
@@ -5053,17 +5682,25 @@ memory_deactivate_locked() {
 	}
 	old_backing="$MEMORY_BACKING_WORK_DIR"
 	if [ "$checkpoint" = 1 ]; then
-		memory_checkpoint_full_locked || return 1
-	else
-		memory_recover_journal_locked || return 1
+		# The core is stopped but both authenticated mounts remain present.  Copy
+		# RAM data directly over matching persistent paths through the backing
+		# alias; retain unrelated files and never replace the data root.
+		memory_copy_stopped_data_locked || return 1
 	fi
-	memory_restore_official_persistent_paths || return 1
+	memory_suspend_data_bindings "$old_backing" || return 1
+	if ! memory_restore_official_persistent_paths; then
+		memory_reactivate_after_deactivation_failure "$old_backing" >/dev/null 2>&1 || true
+		return 1
+	fi
 	# The persistent YAML may contain a safe_fs_patterns item rewritten for the
 	# RAM workdir.  Restore that managed item before removing the RAM generation.
-	previous_work_dir="$MEMORY_WORK_DIR"
+	previous_work_dir="$old_backing"
 	work_dir="$old_backing"
 	config_file="${old_backing}/AdGuardHome.yaml"
-	sync_yaml_managed_fields_checked || return 1
+	if ! sync_yaml_managed_fields_checked; then
+		memory_reactivate_after_deactivation_failure "$old_backing" >/dev/null 2>&1 || true
+		return 1
+	fi
 	memory_remove_active_tree || return 1
 	memory_private_state_file "$MEMORY_STATE_FILE" || return 1
 	rm -f "$MEMORY_STATE_FILE" || return 1
@@ -5074,16 +5711,17 @@ memory_deactivate_locked() {
 	previous_work_dir="$old_backing"
 	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
+	sync_official_uci || return 1
 	if [ "$checkpoint" = 1 ]; then
-		log_error "Removed the AdGuard Home memory workdir after a successful checkpoint"
+		log_error "Removed the AdGuard Home memory workdir after a successful direct write-back"
 	else
 		log_error "Removed an unused AdGuard Home memory workdir"
 	fi
 }
 
 # Reconcile an already-active RAM generation with the newly requested backing
-# path or checkbox value.  Changing either is a stop/checkpoint boundary; a
-# failed checkpoint leaves the RAM tree intact and never starts stale disk data.
+# path or checkbox value.  Changing either is a stop/direct-writeback boundary;
+# a failed write-back leaves the RAM tree intact and never starts stale disk data.
 memory_reconcile_requested_storage_locked() {
 	if [ "$MEMORY_ACTIVE" = 1 ] &&
 	   { [ "$memory_requested" != 1 ] ||
@@ -5112,7 +5750,7 @@ memory_prepare_or_fallback_locked() {
 			return 1
 			;;
 	esac
-	# Preparation has not changed lower UCI and has cleaned only objects created
+	# Preparation has not changed authoritative UCI and has cleaned only objects created
 	# by this attempt.  Preserve availability by using the validated persistent
 	# tree for this start, while leaving the requested checkbox set for retry.
 	MEMORY_ACTIVE=0
@@ -5127,7 +5765,7 @@ memory_checkpoint_locked_command() {
 	load_legacy_settings || return 1
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
 	official_running && return 1
-	memory_checkpoint_full_locked
+	memory_copy_stopped_data_locked
 }
 
 memory_cleanup_locked_command() {
@@ -5249,8 +5887,9 @@ memory_status() {
 	printf 'requested=%s\nactive=%s\npersistent_work_dir=%s\n' \
 		"$memory_requested" "$MEMORY_ACTIVE" "$persistent_work_dir"
 	if [ "$MEMORY_ACTIVE" = 1 ]; then
-		printf 'active_work_dir=%s\nactive_config_file=%s\nbacking_work_dir=%s\n' \
-			"$MEMORY_WORK_DIR" "$config_file" "$MEMORY_BACKING_WORK_DIR"
+		printf 'active_work_dir=%s\nactive_data_dir=%s\nactive_config_file=%s\nbacking_work_dir=%s\n' \
+			"$persistent_work_dir" "$MEMORY_DATA_DIR" "$config_file" \
+			"$MEMORY_BACKING_WORK_DIR"
 	else
 		printf 'active_work_dir=%s\nactive_config_file=%s\n' \
 			"$persistent_work_dir" "$persistent_config_file"
@@ -5294,7 +5933,7 @@ prepare_wrapper_locked() {
 	if [ "$MEMORY_ACTIVE" = 1 ]; then
 		# A coordinator restart in the same boot adopts its validated RAM
 		# generation.  Recopying the persistent backing here would discard
-		# changes made by the official Web UI since the last checkpoint.
+		# changes made by the official Web UI since the last write-back.
 		if official_running; then
 			check_core_config || return 1
 		else
@@ -5308,7 +5947,7 @@ prepare_wrapper_locked() {
 	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
 	# A work-directory change selects an independent YAML/data tree.  Stop the
-	# old writer before switching the official lower service paths, but never
+	# old writer before switching the official service paths, but never
 	# copy files from the previous directory into the new one.
 	if { [ ! -f "$config_file" ] || [ "${previous_work_dir%/}" != "$work_dir" ]; } &&
 	   official_running; then
@@ -5345,6 +5984,124 @@ prepare_wrapper_locked() {
 	sync_official_uci || return 1
 }
 
+settings_update_locked() {
+	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
+	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
+	local expected_revision="$7" current_revision
+	local old_enabled old_work_dir old_verbose old_redirect old_memory old_interval
+	case "$expected_revision" in
+		*[!0-9a-f]*) return 1 ;;
+	esac
+	[ "${#expected_revision}" = 64 ] || return 1
+	# run_locked() has acquired the integration lock.  Keep every recovery path
+	# that can commit UCI disabled until this second, authoritative CAS succeeds.
+	SETTINGS_CAS_GUARD=1
+	if ! load_legacy_settings; then
+		SETTINGS_CAS_GUARD=0
+		return 1
+	fi
+	current_revision="$(settings_current_revision)" || {
+		SETTINGS_CAS_GUARD=0
+		return 1
+	}
+	SETTINGS_CAS_GUARD=0
+	if [ "$current_revision" != "$expected_revision" ]; then
+		log_error "Refusing a stale AdGuard Home settings update"
+		return 1
+	fi
+	old_enabled="$legacy_enabled"
+	old_work_dir="$persistent_work_dir"
+	old_verbose="$verbose"
+	old_redirect="$redirect_mode"
+	old_memory="$memory_requested"
+	old_interval="$memory_writeback_interval"
+	if ! memory_run_with_official_path_guard settings_commit_persistent \
+		"$requested_enabled" "$requested_work_dir" "$requested_verbose" \
+		"$requested_redirect" "$requested_memory" "$requested_interval" ||
+	   ! refresh_managed_config_snapshot; then
+		if memory_run_with_official_path_guard settings_commit_persistent \
+			"$old_enabled" "$old_work_dir" "$old_verbose" \
+			"$old_redirect" "$old_memory" "$old_interval" >/dev/null 2>&1 &&
+		   refresh_managed_config_snapshot >/dev/null 2>&1; then
+			return 1
+		fi
+		log_error "Unable to prove that the previous AdGuard Home settings were restored"
+		return 2
+	fi
+	if orchestrate_core_locked; then
+		return 0
+	fi
+	log_error "Unable to apply the new AdGuard Home settings; restoring the previous settings"
+	if memory_run_with_official_path_guard settings_commit_persistent \
+		"$old_enabled" "$old_work_dir" "$old_verbose" \
+		"$old_redirect" "$old_memory" "$old_interval" &&
+	   refresh_managed_config_snapshot && orchestrate_core_locked; then
+		log_error "Restored the previous AdGuard Home settings after apply failed"
+		return 1
+	else
+		log_error "Unable to fully restore the previous AdGuard Home settings"
+		return 2
+	fi
+}
+
+settings_update_job_locked() {
+	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
+	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
+	local expected_revision="$7" token="$8" candidate_revision="$9"
+	local calculated_revision current_revision restarted=0 settings_rc terminal
+	yaml_job_hash_valid "$expected_revision" || return 1
+	yaml_job_token_valid "$token" || return 1
+	yaml_job_hash_valid "$candidate_revision" || return 1
+	yaml_job_runtime_is_private || return 1
+	# The random root-private job pathname and both revisions are the one-shot
+	# capability issued by rpcd.  No UCI or runtime state may change until the
+	# exact pending record has been authenticated under the integration lock.
+	yaml_job_pending_matches "$token" "$expected_revision" \
+		"$candidate_revision" || return 1
+	calculated_revision="$(settings_values_revision \
+		"$requested_enabled" "$requested_work_dir" "$requested_verbose" \
+		"$requested_redirect" "$requested_memory" "$requested_interval")" || {
+		write_yaml_job_state "$token" \
+			"failure:${expected_revision}:${candidate_revision}" >/dev/null 2>&1 || true
+		return 1
+	}
+	if [ "$calculated_revision" != "$candidate_revision" ]; then
+		write_yaml_job_state "$token" \
+			"failure:${expected_revision}:${candidate_revision}" >/dev/null 2>&1 || true
+		return 1
+	fi
+	write_yaml_job_state "$token" \
+		"running:$$:${expected_revision}:${candidate_revision}" || return 1
+
+	settings_update_locked "$requested_enabled" "$requested_work_dir" \
+		"$requested_verbose" "$requested_redirect" "$requested_memory" \
+		"$requested_interval" "$expected_revision"
+	settings_rc=$?
+	case "$settings_rc" in
+		0)
+			if load_legacy_settings &&
+			   current_revision="$(settings_current_revision)" &&
+			   [ "$current_revision" = "$candidate_revision" ]; then
+				official_running && restarted=1
+				if write_yaml_job_state "$token" \
+				   "success:${candidate_revision}:${restarted}:${expected_revision}:${candidate_revision}"; then
+					return 0
+				fi
+			fi
+			terminal="indeterminate:${expected_revision}:${candidate_revision}"
+			;;
+		1) terminal="failure:${expected_revision}:${candidate_revision}" ;;
+		*) terminal="indeterminate:${expected_revision}:${candidate_revision}" ;;
+	esac
+	write_yaml_job_state "$token" "$terminal" >/dev/null 2>&1 || true
+	return 1
+}
+
+settings_update() {
+	[ "$#" = 9 ] || return 1
+	run_locked settings_update_job_locked "$@"
+}
+
 orchestrate_core_locked() {
 	if ! load_legacy_settings; then
 		fail_safe_locked >/dev/null 2>&1 || true
@@ -5358,14 +6115,12 @@ orchestrate_core_locked() {
 		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 		wait_for_core_stopped || return 1
 	fi
-	# rc.common maps this wrapper's reload/restart path to start_service() and
-	# service_started(), so an unchanged active RAM generation reaches this
-	# orchestrator.  Treat that stopped-core boundary as a full durable
-	# checkpoint while retaining the same RAM generation for the restart.
+	# A coordinated reload/restart reaches this stopped-core boundary.  Directly
+	# overwrite matching persistent data while retaining the same RAM generation.
 	if [ "$MEMORY_ACTIVE" = 1 ] && [ "$legacy_enabled" = 1 ] &&
 	   [ "$memory_requested" = 1 ] &&
 	   [ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ]; then
-		memory_checkpoint_full_locked || return 1
+		memory_copy_stopped_data_locked || return 1
 	fi
 	if [ "$legacy_enabled" != 1 ] && [ "$MEMORY_ACTIVE" = 1 ]; then
 		memory_deactivate_locked 1 || return 1
@@ -5481,6 +6236,14 @@ reconcile() {
 # This is the only process supervised by the compatibility wrapper.  It never
 # launches or adopts the core; it merely reconciles DNS takeover with the state
 # reported by the official lowercase procd service.
+monitor_terminate() {
+	trap - TERM INT
+	# rc.common/procd may replace an instance without calling stop_service().
+	# Cleanup here could therefore race the replacement's freshly applied DNS
+	# integration.  Coordinated stop always cleans through stop_wrapper_locked.
+	exit 0
+}
+
 monitor() {
 	local configured_interval interval last_interval="" interval_seconds=0
 	local now=0 next_writeback=0 writeback_rc=0
@@ -5489,10 +6252,10 @@ monitor() {
 	# control lock before looping; otherwise every later start/stop/reload waits
 	# forever behind the monitor instance.
 	exec 1000>&-
-	trap 'exit 0' TERM INT
+	trap monitor_terminate TERM INT
 	while :; do
 		# Package postinst may need to replace a v2.2 monitor while preserving
-		# the running official core.  A freshly registered v2.3 monitor stays
+		# the running official core.  A freshly registered v2.4 monitor stays
 		# completely passive until the authenticated maintenance bundle is
 		# removed.  If postinst fails and leaves an unsafe partial bundle, exit
 		# for procd retry instead of reconciling or writing back with partial UCI.
@@ -5559,6 +6322,11 @@ isrunning() {
 
 start_service() {
 	local prepare_rc=0 marker_rc=1
+	# rc_procd closes the service transaction even when this function returns
+	# non-zero, so initialize the service_started() gate before every early exit.
+	START_PREPARED=0
+	START_DISABLED=0
+	START_MAINTENANCE_UPGRADE=0
 	if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	   [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
 		log_error "Configuration migration is incomplete; refusing to start the coordinator"
@@ -5568,9 +6336,6 @@ start_service() {
 		log_error "Unsafe YAML job runtime; refusing to start the coordinator"
 		return 1
 	fi
-	START_PREPARED=0
-	START_DISABLED=0
-	START_MAINTENANCE_UPGRADE=0
 	if [ -e "$MAINTENANCE_UPGRADE_MARKER" ] ||
 	   [ -L "$MAINTENANCE_UPGRADE_MARKER" ]; then
 		if [ "${PKG_UPGRADE:-0}" != 1 ] ||
@@ -5604,23 +6369,25 @@ start_service() {
 		esac
 	elif [ -e "$UPGRADE_STOPPED_MARKER" ] || [ -L "$UPGRADE_STOPPED_MARKER" ]; then
 		marker_rc=0
-		consume_upgrade_stopped_marker || marker_rc=$?
+		upgrade_stopped_marker_is_valid || marker_rc=$?
 		case "$marker_rc" in
 			0)
+				START_PREPARED=1
+				START_DISABLED=1
 				if [ "${PKG_UPGRADE:-0}" = 1 ]; then
-					START_PREPARED=1
-					START_DISABLED=1
-					log_error "Preserved the stopped AdGuard Home state across the package upgrade"
+					log_error "Preserved the stopped AdGuard Home state while package post-install remains pending"
 					return 0
 				fi
-				log_error "Discarded a stale stopped-upgrade marker before a normal start"
+				log_error "Cold-upgrade post-install is incomplete; refusing to start AdGuard Home"
+				return 1
 				;;
 			*)
 				log_error "Unsafe stopped-upgrade marker; refusing to start the coordinator"
 				return 1
 				;;
 		esac
-	else
+	fi
+	if [ "$START_PREPARED" != 1 ]; then
 		run_locked prepare_wrapper_locked || prepare_rc=$?
 		case "$prepare_rc" in
 			0) START_PREPARED=1 ;;
@@ -5631,7 +6398,10 @@ start_service() {
 				;;
 		esac
 	fi
-	[ "$START_PREPARED" = 1 ] || return 0
+	if [ "$START_PREPARED" != 1 ]; then
+		log_error "AdGuard Home coordinator preparation failed"
+		return 1
+	fi
 	procd_open_instance monitor
 	procd_set_param command "$initscript" monitor
 	procd_set_param stdout 1
@@ -5674,7 +6444,7 @@ stop_wrapper_locked() {
 	fi
 	if [ "$MEMORY_ACTIVE" = 1 ]; then
 		# K89 stops the official service before this K90 shutdown hook.  A
-		# manual stop reaches the same checkpoint boundary explicitly.
+		# manual stop reaches the same stopped-core write-back boundary explicitly.
 		if official_running; then
 			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 		fi
@@ -5699,7 +6469,14 @@ stop_service() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger "$LEGACY_CONFIG"
+	# The official lowercase service already owns this merged UCI package.
+	# LuCI settings use the coordinator's locked RPC transaction, so registering
+	# a second reload trigger here would restart both services for one change.
+	return 0
+}
+
+reload_service() {
+	run_locked orchestrate_core_locked
 }
 
 restart() {

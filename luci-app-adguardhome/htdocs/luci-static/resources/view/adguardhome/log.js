@@ -25,6 +25,9 @@ function normalizeLineCount(value) {
 }
 
 function normalizeLog(result) {
+	if (typeof result?.error === 'string' && result.error)
+		throw new Error(result.error);
+
 	return {
 		log: typeof result?.log === 'string' ? result.log : '',
 		lines: Number.isInteger(Number(result?.lines)) && Number(result.lines) >= 0

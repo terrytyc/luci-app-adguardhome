@@ -155,13 +155,18 @@ function loadOperation(sharedStorage) {
 	};
 }
 
-function loadOverview(operation, ui) {
+function loadOverview(operation, ui, rpcHandlers = {}) {
 	const overviewPath = path.join(
 		packageRoot,
 		'htdocs/luci-static/resources/view/adguardhome/overview.js'
 	);
 	const source = fs.readFileSync(overviewPath, 'utf8');
-	const rpc = { declare: () => async () => ({}) };
+	const rpc = {
+		declare: specification => async (...args) => {
+			const handler = rpcHandlers[specification.method];
+			return typeof handler === 'function' ? handler(...args) : {};
+		},
+	};
 	const view = { extend: definition => definition };
 	const sandbox = {
 		E: () => ({}),
@@ -171,7 +176,7 @@ function loadOverview(operation, ui) {
 		console,
 		window: {
 			location: { href: 'https://router.example/cgi-bin/luci/admin/services/adguardhome' },
-			setTimeout,
+			setTimeout(callback) { return setTimeout(callback, 0); },
 		},
 	};
 	vm.createContext(sandbox);
@@ -182,6 +187,114 @@ function loadOverview(operation, ui) {
 		Object.assign(sandbox, { operation, rpc, ui, view }),
 		{ filename: overviewPath },
 	);
+}
+
+async function runSettingsSubmissionScenario(kind) {
+	const oldRevision = 'a'.repeat(64);
+	const terminalRevision = 'b'.repeat(64);
+	const currentRevision = 'c'.repeat(64);
+	const values = new Map([
+		[ 'config.enabled', '1' ],
+		[ 'config.work_dir', '/etc/AdGuardHome' ],
+		[ 'config.verbose', '0' ],
+		[ 'luci.redirect', 'dnsmasq-upstream' ],
+		[ 'luci.run_from_memory', '0' ],
+		[ 'luci.memory_writeback_interval', '60' ],
+	]);
+	const failures = [];
+	let successes = 0;
+	let setCalls = 0;
+	let statusCalls = 0;
+	let resetCalls = 0;
+	let context = null;
+
+	const operation = {
+		isPageActive: () => true,
+		pageInactiveError: () => Object.assign(new Error('inactive'), { pageInactive: true }),
+		isPageInactiveError: error => error?.pageInactive === true,
+		start: () => ({}),
+		failure: message => failures.push(String(message)),
+		success: () => { successes++; },
+		requestDuringApply: request => request(),
+	};
+	const rpcHandlers = {
+		set_settings: async () => {
+			setCalls++;
+			if (kind === 'request-transport')
+				throw new Error('XHR request failed');
+			if (kind === 'bad-token')
+				return { accepted: true, token: 'invalid' };
+			return { accepted: true, token: 'd'.repeat(32) };
+		},
+		get_settings_update: async () => {
+			statusCalls++;
+			if (kind === 'status-transport')
+				throw new Error('status XHR failed');
+			if (kind === 'indeterminate')
+				return {
+					state: 'done',
+					ok: false,
+					indeterminate: true,
+					error: 'coordinator outcome unknown',
+				};
+			return { state: 'done', ok: true, revision: terminalRevision };
+		},
+		get_settings: async () => {
+			if (kind === 'reload-failure')
+				throw new Error('authoritative reload failed');
+			return {
+				enabled: false,
+				config_file: '/mnt/storage/AdGuardHome/AdGuardHome.yaml',
+				work_dir: '/mnt/storage/AdGuardHome',
+				verbose: true,
+				redirect: 'redirect',
+				run_from_memory: true,
+				memory_writeback_interval: 77,
+				revision: currentRevision,
+			};
+		},
+	};
+	const view = loadOverview(operation, {}, rpcHandlers);
+	const map = {
+		readonly: false,
+		checkDepends() {},
+		async parse() {},
+		async reset() {
+			resetCalls++;
+			if (kind === 'success') {
+				assert.equal(context.settingsRevision, oldRevision,
+					'the authoritative revision must not be adopted before the visible form resets');
+				assert.equal(context.committedSettings.memoryWritebackInterval, 60);
+			}
+		},
+		data: {
+			get(_config, section, option) {
+				return values.get(`${section}.${option}`);
+			},
+			set(_config, section, option, value) {
+				values.set(`${section}.${option}`, value);
+			},
+		},
+	};
+	context = {
+		pageScope: {},
+		settingsMap: map,
+		settingsRevision: oldRevision,
+		committedSettings: { memoryWritebackInterval: 60 },
+	};
+
+	await view.submitSettings.call(context);
+	return {
+		context,
+		failures,
+		map,
+		resetCalls,
+		setCalls,
+		statusCalls,
+		successes,
+		values,
+		view,
+	};
 }
 
 async function main() {
@@ -420,66 +533,63 @@ async function main() {
 		'a cancelled or failed apply must not leak retry state into a later tab');
 
 	const applyEvents = [];
-	let pageActive = true;
-	const overviewOperation = {
-		isPageActive: () => pageActive,
-		markApplyPending: () => applyEvents.push('mark'),
-	};
-	const overviewUi = {
-		changes: {
-			apply(checked) {
-				applyEvents.push(`apply:${checked}`);
-				return 'apply-result';
-			},
-		},
-	};
+	const overviewOperation = { isPageActive: () => true };
+	const overviewUi = {};
 	const overviewView = loadOverview(overviewOperation, overviewUi);
 	let resolveSave;
 	const savePromise = new Promise(resolve => { resolveSave = resolve; });
-	const overviewContext = {
-		pageScope: {},
-		handleSave() {
-			applyEvents.push('save');
-			return savePromise;
-		},
-	};
+	const overviewContext = { handleSave() {
+		applyEvents.push('save');
+		return savePromise;
+	} };
 	const applyPromise = overviewView.handleSaveApply.call(overviewContext, null, '0');
 	assert.deepEqual(applyEvents, [ 'save' ],
-		'apply must not start before the asynchronous save completes');
-	resolveSave();
-	assert.equal(await applyPromise, 'apply-result');
-	assert.deepEqual(applyEvents, [ 'save', 'mark', 'apply:true' ],
-		'a checked apply must run strictly after save and marker installation');
-
-	applyEvents.length = 0;
-	pageActive = false;
-	const inactiveContext = {
-		pageScope: {},
-		handleSave() {
-			applyEvents.push('save');
-			return Promise.resolve();
-		},
-	};
-	assert.equal(await overviewView.handleSaveApply.call(inactiveContext, null, '0'), undefined);
+		'Save & Apply must delegate to the single RPC settings transaction');
+	resolveSave('settings-result');
+	assert.equal(await applyPromise, 'settings-result');
 	assert.deepEqual(applyEvents, [ 'save' ],
-		'a view which became inactive after saving must not start an apply');
+		'Save & Apply must not invoke a second global LuCI apply path');
 
-	applyEvents.length = 0;
-	pageActive = true;
-	const saveFailure = new Error('save failed');
-	const failingContext = {
-		pageScope: {},
-		handleSave() {
-			applyEvents.push('save');
-			return Promise.reject(saveFailure);
-		},
-	};
-	await assert.rejects(
-		overviewView.handleSaveApply.call(failingContext, null, '0'),
-		saveFailure,
-	);
-	assert.deepEqual(applyEvents, [ 'save' ],
-		'a failed save must not mark or start an apply');
+	for (const kind of [
+		'request-transport',
+		'status-transport',
+		'indeterminate',
+		'reload-failure',
+		'bad-token',
+	]) {
+		const result = await runSettingsSubmissionScenario(kind);
+		assert.equal(result.context.settingsRevision, null,
+			`${kind} must invalidate the stale settings revision`);
+		assert.equal(result.context.committedSettings, null,
+			`${kind} must discard the stale committed snapshot`);
+		assert.equal(result.map.readonly, true,
+			`${kind} must lock the visible form until a full reload`);
+		assert.equal(result.resetCalls, 1,
+			`${kind} must redraw the settings form in read-only mode`);
+		assert.equal(result.failures.length, 1,
+			`${kind} must show one explicit settings failure`);
+		assert.equal(result.successes, 0);
+
+		await result.view.submitSettings.call(result.context);
+		assert.equal(result.setCalls, 1,
+			`${kind} must reject another submission locally after invalidating CAS state`);
+	}
+
+	const statusTransport = await runSettingsSubmissionScenario('status-transport');
+	assert.equal(statusTransport.statusCalls, 10,
+		'settings status transport failures must be bounded before the form is locked');
+
+	const successfulSettings = await runSettingsSubmissionScenario('success');
+	assert.equal(successfulSettings.failures.length, 0);
+	assert.equal(successfulSettings.successes, 1);
+	assert.equal(successfulSettings.resetCalls, 1,
+		'a successful transaction must redraw the authoritative settings once');
+	assert.equal(successfulSettings.context.settingsRevision, 'c'.repeat(64));
+	assert.equal(successfulSettings.context.committedSettings.workDir, '/mnt/storage/AdGuardHome');
+	assert.equal(successfulSettings.values.get('config.work_dir'), '/mnt/storage/AdGuardHome',
+		'the visible JSON model must contain the authoritative work directory');
+	assert.equal(successfulSettings.values.get('luci.memory_writeback_interval'), '77',
+		'the visible JSON model must contain the authoritative write-back interval');
 
 	for (const name of [ 'overview', 'yaml', 'log' ]) {
 		const source = fs.readFileSync(path.join(
@@ -512,8 +622,51 @@ async function main() {
 	), 'utf8');
 	assert.match(
 		overview,
-		/handleSaveApply\(ev, mode\)\s*\{\s*return this\.handleSave\(ev\)\.then\(\(\) => \{[\s\S]*?operation\.markApplyPending\(\);\s*return ui\.changes\.apply\(mode == '0'\);[\s\S]*?\}\);\s*\}/,
-		'the cross-tab retry window must begin after save succeeds and immediately before LuCI applies changes',
+		/handleSaveApply\(\)\s*\{\s*return this\.handleSave\(\);\s*\}/,
+		'Save & Apply must use only the RPC-backed save transaction',
+	);
+	assert.doesNotMatch(overview, /operation\.markApplyPending\(|ui\.changes\.apply\(/,
+		'the settings page must not enter LuCI global UCI apply');
+	assert.match(
+		overview,
+		/result\?\.indeterminate === true[\s\S]*?throw uncertainSettingsUpdateError[\s\S]*?error\?\.settingsUpdateUncertain === true[\s\S]*?this\.settingsRevision = null;[\s\S]*?this\.committedSettings = null;[\s\S]*?map\.readonly = true;[\s\S]*?await map\.reset\(\);/,
+		'an indeterminate settings update must invalidate the stale CAS state and lock the form until reload',
+	);
+	assert.match(
+		overview,
+		/throw uncertainSettingsUpdateError\(lastError[\s\S]*?The settings update is still running/,
+		'a lost settings status response must also invalidate the form because the job may still commit',
+	);
+	assert.match(
+		overview,
+		/response\?\.unchanged !== true[\s\S]*?response\.token[\s\S]*?throw uncertainSettingsUpdateError\([\s\S]*?did not return a valid status token/,
+		'an accepted settings job without a valid token must be treated as an uncertain outcome',
+	);
+	assert.match(
+		overview,
+		/committed = await getSettings\(scope\);\s*updateSettingsMap\(map, committed\);\s*await map\.reset\(\);[\s\S]*?this\.settingsRevision = committed\.revision;/,
+		'the visible settings form must be reset to the authoritative snapshot before adopting its revision',
+	);
+	assert.match(
+		overview,
+		/if \(typeof this\.settingsRevision !== 'string' \|\|[\s\S]*?!\/\^\[0-9a-f\]\{64\}\$\/\.test\(this\.settingsRevision\)\)[\s\S]*?Reload this page before applying settings again/,
+		'a settings form whose reconciliation failed must reject another submission locally',
+	);
+	assert.doesNotMatch(overview, /require uci|uci\.load\(|new form\.Map\(/,
+		'the settings page must not read or write UCI directly');
+	assert.match(overview, /new form\.JSONMap\(/,
+		'the settings page must render from an RPC-owned local JSON model');
+	assert.match(overview, /map\.readonly = !L\.hasViewPermission\(\);/,
+		'the local JSON settings model must honor the menu write permission');
+	assert.match(
+		overview,
+		/poll\.remove\(this\.statusPollCallback\)[\s\S]*?this\.statusPollCallback = statusPollCallback;[\s\S]*?poll\.add\(statusPollCallback, POLL_INTERVAL\);/,
+		'the settings view must replace its previous status poll callback',
+	);
+	assert.match(
+		overview,
+		/if \(!operation\.isPageActive\(pageScope\)\) \{\s*removeStatusPoll\(\);\s*return;\s*\}/,
+		'an inactive settings page must unregister its status poll callback',
 	);
 	assert.match(
 		overview,

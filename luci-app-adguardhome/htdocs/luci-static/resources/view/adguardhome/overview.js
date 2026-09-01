@@ -8,12 +8,11 @@
 'require form';
 'require poll';
 'require rpc';
-'require uci';
 'require ui';
 'require view';
 
-const CONFIG_NAME = 'AdGuardHome';
-const SECTION_NAME = 'AdGuardHome';
+const CORE_SECTION_NAME = 'config';
+const LUCI_SECTION_NAME = 'luci';
 
 const DEFAULT_WORK_DIR = '/etc/AdGuardHome';
 const DEFAULT_MEMORY_WRITEBACK_INTERVAL = 60;
@@ -22,6 +21,8 @@ const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
 const POLL_INTERVAL = 5;
 const YAML_POLL_INTERVAL = 1000;
 const YAML_POLL_LIMIT = 360;
+const SETTINGS_POLL_INTERVAL = 1000;
+const SETTINGS_POLL_LIMIT = 360;
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_./+@%:,=-]+$/;
 const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 
@@ -41,6 +42,38 @@ const callGetConfigInfo = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_config_info',
 	expect: { '': { dns_port: null, web: null } },
+});
+
+const callGetSettings = rpc.declare({
+	object: 'luci.adguardhome',
+	method: 'get_settings',
+	expect: { '': {} },
+	reject: true,
+});
+
+const callSetSettings = rpc.declare({
+	object: 'luci.adguardhome',
+	method: 'set_settings',
+	params: [
+		'enabled',
+		'config_file',
+		'work_dir',
+		'verbose',
+		'redirect',
+		'run_from_memory',
+		'memory_writeback_interval',
+		'revision',
+	],
+	expect: { '': { accepted: false, token: '', reused: false } },
+	reject: true,
+});
+
+const callGetSettingsUpdate = rpc.declare({
+	object: 'luci.adguardhome',
+	method: 'get_settings_update',
+	params: [ 'token', 'consume' ],
+	expect: { '': { state: '', ok: false, revision: '' } },
+	reject: true,
 });
 
 const callGetCredentials = rpc.declare({
@@ -68,6 +101,12 @@ const callGetYamlUpdate = rpc.declare({
 
 function errorMessage(error) {
 	return String(error?.message ?? error ?? _('Unknown error'));
+}
+
+function uncertainSettingsUpdateError(message) {
+	const error = new Error(message);
+	error.settingsUpdateUncertain = true;
+	return error;
 }
 
 function delay(milliseconds) {
@@ -116,6 +155,50 @@ async function waitForYamlUpdate(token, scope) {
 	throw new Error(lastError
 		? _('The credential update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
 		: _('The credential update is still running. Do not submit it again; reload this page later.'));
+}
+
+async function waitForSettingsUpdate(token, scope) {
+	let consecutiveErrors = 0;
+	let lastError = null;
+
+	for (let attempt = 0; attempt < SETTINGS_POLL_LIMIT; attempt++) {
+		if (!operation.isPageActive(scope))
+			throw operation.pageInactiveError();
+
+		let result = null;
+		try {
+			result = await callGetSettingsUpdate(token, false);
+			if (!operation.isPageActive(scope))
+				throw operation.pageInactiveError();
+			consecutiveErrors = 0;
+			lastError = null;
+		} catch (error) {
+			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+				throw operation.pageInactiveError();
+			lastError = error;
+			consecutiveErrors++;
+			if (consecutiveErrors >= 10)
+				break;
+			await delay(SETTINGS_POLL_INTERVAL);
+			continue;
+		}
+
+		if (result?.state == 'done') {
+			try { await callGetSettingsUpdate(token, true); }
+			catch (error) { }
+			return result;
+		}
+		if (typeof result?.error === 'string' && result.error)
+			throw uncertainSettingsUpdateError(result.error);
+		if (result?.state != 'pending' && result?.state != 'running')
+			throw uncertainSettingsUpdateError(_('The settings update returned an unknown job state.'));
+
+		await delay(SETTINGS_POLL_INTERVAL);
+	}
+
+	throw uncertainSettingsUpdateError(lastError
+		? _('The settings update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
+		: _('The settings update is still running. Do not submit it again; reload this page later.'));
 }
 
 async function getServiceStatus(scope) {
@@ -325,13 +408,94 @@ function validateMemoryWritebackInterval(_sectionId, value) {
 	return true;
 }
 
+function normalizeSettings(result) {
+	if (typeof result?.error === 'string' && result.error)
+		throw new Error(result.error);
+
+	const workDir = typeof result?.work_dir === 'string'
+		? result.work_dir
+		: '';
+	const interval = Number(result?.memory_writeback_interval);
+	if (typeof result?.enabled !== 'boolean' ||
+	    typeof result?.verbose !== 'boolean' ||
+	    typeof result?.run_from_memory !== 'boolean' ||
+	    validateWorkDir(null, workDir) !== true ||
+	    result?.config_file !== `${workDir}/AdGuardHome.yaml` ||
+	    ![ 'none', 'dnsmasq-upstream', 'redirect' ].includes(result?.redirect) ||
+	    !Number.isInteger(interval) || interval < 0 ||
+	    interval > MAX_MEMORY_WRITEBACK_INTERVAL ||
+	    typeof result?.revision !== 'string' ||
+	    !/^[0-9a-f]{64}$/.test(result.revision))
+		throw new Error(_('The settings returned by the service are invalid.'));
+
+	return {
+		enabled: result.enabled,
+		configFile: result.config_file,
+		workDir,
+		verbose: result.verbose,
+		redirect: result.redirect,
+		runFromMemory: result.run_from_memory,
+		memoryWritebackInterval: interval,
+		revision: result.revision,
+	};
+}
+
+async function getSettings(scope) {
+	return normalizeSettings(await operation.requestDuringApply(callGetSettings, scope));
+}
+
+function settingsMapData(settings) {
+	return {
+		_status: {},
+		config: {
+			enabled: settings.enabled ? '1' : '0',
+			config_file: settings.configFile,
+			work_dir: settings.workDir,
+			verbose: settings.verbose ? '1' : '0',
+		},
+		luci: {
+			redirect: settings.redirect,
+			run_from_memory: settings.runFromMemory ? '1' : '0',
+			memory_writeback_interval: String(settings.memoryWritebackInterval),
+		},
+	};
+}
+
+function settingsFromMap(map, revision, fallbackInterval) {
+	const get = (section, option) => map.data.get('json', section, option);
+	const workDir = String(get(CORE_SECTION_NAME, 'work_dir') ?? '');
+	const intervalValue = get(LUCI_SECTION_NAME, 'memory_writeback_interval');
+	const interval = Number(intervalValue == null ? fallbackInterval : intervalValue);
+	if (!Number.isInteger(interval) || interval < 0 ||
+	    interval > MAX_MEMORY_WRITEBACK_INTERVAL)
+		throw new Error(_('The memory write-back interval is invalid.'));
+
+	return {
+		enabled: get(CORE_SECTION_NAME, 'enabled') === '1',
+		configFile: `${workDir}/AdGuardHome.yaml`,
+		workDir,
+		verbose: get(CORE_SECTION_NAME, 'verbose') === '1',
+		redirect: String(get(LUCI_SECTION_NAME, 'redirect') ?? ''),
+		runFromMemory: get(LUCI_SECTION_NAME, 'run_from_memory') === '1',
+		memoryWritebackInterval: interval,
+		revision,
+	};
+}
+
+function updateSettingsMap(map, settings) {
+	const data = settingsMapData(settings);
+	for (const section of [ CORE_SECTION_NAME, LUCI_SECTION_NAME ])
+		for (const option in data[section])
+			map.data.set('json', section, option, data[section][option]);
+}
+
 return view.extend({
 	async load() {
 		const pageScope = operation.createPageScope();
 		this.pageScope = pageScope;
 		try {
 			const result = await Promise.all([
-				operation.requestDuringApply(() => uci.load(CONFIG_NAME), pageScope),
+				getSettings(pageScope),
 				getServiceStatus(pageScope),
 				getCoreVersion(pageScope),
 				getConfigInfo(pageScope),
@@ -342,16 +506,20 @@ return view.extend({
 		}
 	},
 
-	async render([_config, serviceStatus, version, configInfo, pageScope]) {
+	async render([settings, serviceStatus, version, configInfo, pageScope]) {
 		if (!operation.isPageActive(pageScope))
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
 		let running = serviceStatus.running;
-		const map = new form.Map(
-			CONFIG_NAME,
+		const map = new form.JSONMap(
+			settingsMapData(settings),
 			_('AdGuard Home'),
 			_('The core is provided and updated by the official ImmortalWrt adguardhome package. Default web login: admin / admin.'),
 		);
+		// JSONMap deliberately skips the UCI ACL probe performed by form.Map.
+		// Derive its read-only state from the menu ACL so read-only sessions do
+		// not receive editable controls or enabled page action buttons.
+		map.readonly = !L.hasViewPermission();
 
 		const statusContainer = E('span', {}, renderServiceStatus(running));
 		const storageContainer = E('span', {}, renderStorageStatus(serviceStatus));
@@ -398,33 +566,21 @@ return view.extend({
 		);
 		webOption.renderWidget = () => managementContainer;
 
-		const section = map.section(
+		const coreSection = map.section(
 			form.NamedSection,
-			SECTION_NAME,
-			'AdGuardHome',
+			CORE_SECTION_NAME,
+			CORE_SECTION_NAME,
 			_('Settings'),
 		);
-		section.addremove = false;
+		coreSection.addremove = false;
 
-		let option = section.option(form.Flag, 'enabled', _('Enable'));
+		let option = coreSection.option(form.Flag, 'enabled', _('Enable'));
 		option.default = '0';
 		option.rmempty = false;
 
-		option = section.option(
-			form.ListValue,
-			'redirect',
-			_('DNS redirect mode'),
-			_('Choose how LAN DNS traffic is routed to the DNS port read dynamically from WORKDIR/AdGuardHome.yaml.'),
-		);
-		option.value('none', _('None'));
-		option.value('dnsmasq-upstream', _('Use AdGuard Home as dnsmasq upstream'));
-		option.value('redirect', _('Redirect LAN port 53 to AdGuard Home'));
-		option.default = 'dnsmasq-upstream';
-		option.rmempty = false;
-
-		option = section.option(
+		option = coreSection.option(
 			form.Value,
-			'workdir',
+			'work_dir',
 			_('Working directory'),
 			_('Runtime data is stored here. The YAML configuration is fixed at WORKDIR/AdGuardHome.yaml.'),
 		);
@@ -433,32 +589,11 @@ return view.extend({
 		option.rmempty = false;
 		option.validate = validateWorkDir;
 
-		option = section.option(form.Flag, 'verbose', _('Verbose logging'));
+		option = coreSection.option(form.Flag, 'verbose', _('Verbose logging'));
 		option.default = '0';
 		option.rmempty = false;
 
-		option = section.option(
-			form.Flag,
-			'run_from_memory',
-			_('Run from memory'),
-			_('At startup, copies only the persistent data directory into RAM and runs the official core there. AdGuardHome.yaml always remains in and is read from the persistent work directory. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back.'),
-		);
-		option.default = '0';
-		option.rmempty = false;
-
-		option = section.option(
-			form.Value,
-			'memory_writeback_interval',
-			_('Memory write-back interval (minutes)'),
-			_('At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back.'),
-		);
-		option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
-		option.placeholder = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
-		option.rmempty = false;
-		option.validate = validateMemoryWritebackInterval;
-		option.depends('run_from_memory', '1');
-
-		option = section.option(
+		option = coreSection.option(
 			form.DummyValue,
 			'_change_credentials',
 			_('Change Username and Password'),
@@ -470,13 +605,69 @@ return view.extend({
 			click: ui.createHandlerFn(this, 'openCredentialsDialog'),
 		}, _('Change Username and Password'));
 
+		const luciSection = map.section(
+			form.NamedSection,
+			LUCI_SECTION_NAME,
+			LUCI_SECTION_NAME,
+			_('DNS and memory integration'),
+		);
+		luciSection.addremove = false;
+
+		option = luciSection.option(
+			form.ListValue,
+			'redirect',
+			_('DNS redirect mode'),
+			_('Choose how LAN DNS traffic is routed to the DNS port read dynamically from WORKDIR/AdGuardHome.yaml.'),
+		);
+		option.value('none', _('None'));
+		option.value('dnsmasq-upstream', _('Use AdGuard Home as dnsmasq upstream'));
+		option.value('redirect', _('Redirect LAN port 53 to AdGuard Home'));
+		option.default = 'dnsmasq-upstream';
+		option.rmempty = false;
+
+		option = luciSection.option(
+			form.Flag,
+			'run_from_memory',
+			_('Run from memory'),
+			_('At startup, copies only the persistent data directory into RAM and runs the official core there. AdGuardHome.yaml always remains in and is read from the persistent work directory. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back.'),
+		);
+		option.default = '0';
+		option.rmempty = false;
+
+		option = luciSection.option(
+			form.Value,
+			'memory_writeback_interval',
+			_('Memory write-back interval (minutes)'),
+			_('At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back.'),
+		);
+		option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
+		option.placeholder = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
+		option.rmempty = false;
+		option.retain = true;
+		option.validate = validateMemoryWritebackInterval;
+		option.depends('run_from_memory', '1');
+
+		this.settingsMap = map;
+		this.committedSettings = settings;
+		this.settingsRevision = settings.revision;
+
 		const rendered = await map.render();
 		if (!operation.isPageActive(pageScope))
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
-		poll.add(async () => {
-			if (!operation.isPageActive(pageScope))
+		if (typeof this.statusPollCallback === 'function')
+			poll.remove(this.statusPollCallback);
+
+		const removeStatusPoll = () => {
+			poll.remove(statusPollCallback);
+			if (this.statusPollCallback === statusPollCallback)
+				this.statusPollCallback = null;
+		};
+		const statusPollCallback = async () => {
+			if (!operation.isPageActive(pageScope)) {
+				removeStatusPoll();
 				return;
+			}
 
 			let currentStatus = null;
 			let currentConfigInfo = null;
@@ -486,12 +677,16 @@ return view.extend({
 					getConfigInfo(pageScope),
 				]);
 			} catch (error) {
-				if (operation.isPageInactiveError(error))
+				if (operation.isPageInactiveError(error)) {
+					removeStatusPoll();
 					return;
+				}
 				throw error;
 			}
-			if (!operation.isPageActive(pageScope))
+			if (!operation.isPageActive(pageScope)) {
+				removeStatusPoll();
 				return;
+			}
 
 			dom.content(statusContainer, renderServiceStatus(currentStatus.running));
 			dom.content(storageContainer, renderStorageStatus(currentStatus));
@@ -500,7 +695,9 @@ return view.extend({
 				String(currentConfigInfo.dnsPort ?? _('Unavailable')),
 			);
 			dom.content(managementContainer, renderManagementLink(currentConfigInfo.web, currentStatus.running));
-		}, POLL_INTERVAL);
+		};
+		this.statusPollCallback = statusPollCallback;
+		poll.add(statusPollCallback, POLL_INTERVAL);
 
 		return pageScope.attach(E('div', {}, rendered));
 	},
@@ -685,12 +882,140 @@ return view.extend({
 		}
 	},
 
-	handleSaveApply(ev, mode) {
-		return this.handleSave(ev).then(() => {
-			if (!operation.isPageActive(this.pageScope))
+	async submitSettings() {
+		const scope = this.pageScope;
+		const map = this.settingsMap;
+		if (!map || !operation.isPageActive(scope))
+			return;
+		if (typeof this.settingsRevision !== 'string' ||
+		    !/^[0-9a-f]{64}$/.test(this.settingsRevision)) {
+			const operationTicket = operation.start();
+			operation.failure(
+				_('The current settings state is unknown. Reload this page before applying settings again.'),
+				operationTicket,
+			);
+			return;
+		}
+
+		try {
+			map.checkDepends();
+			await map.parse();
+		} catch (error) {
+			return;
+		}
+		if (!operation.isPageActive(scope))
+			return;
+
+		const operationTicket = operation.start();
+		try {
+			const candidate = settingsFromMap(
+				map,
+				this.settingsRevision,
+				this.committedSettings?.memoryWritebackInterval,
+			);
+			let response = null;
+			try {
+				response = await operation.requestDuringApply(() => callSetSettings(
+					candidate.enabled,
+					candidate.configFile,
+					candidate.workDir,
+					candidate.verbose,
+					candidate.redirect,
+					candidate.runFromMemory,
+					candidate.memoryWritebackInterval,
+					candidate.revision,
+				), scope);
+			} catch (error) {
+				if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+					throw operation.pageInactiveError();
+				throw uncertainSettingsUpdateError(
+					_('The settings update request may have reached the router, but its result could not be read: %s. Reload this page before applying settings again.').format(errorMessage(error)),
+				);
+			}
+			if (typeof response?.error === 'string' && response.error)
+				throw new Error(response.error);
+			if (response?.accepted !== true)
+				throw new Error(_('The server did not accept the settings update job.'));
+
+			if (response?.unchanged !== true) {
+				if (typeof response.token !== 'string' ||
+				    !/^[0-9a-f]{32}$/.test(response.token))
+					throw uncertainSettingsUpdateError(
+						_('The server accepted the settings update job but did not return a valid status token. Reload this page before applying settings again.'),
+					);
+				const result = await waitForSettingsUpdate(response.token, scope);
+				if (result?.indeterminate === true)
+					throw uncertainSettingsUpdateError(typeof result?.error === 'string' && result.error
+						? result.error
+						: _('The settings update outcome is unknown. Reload this page before applying settings again.'));
+				if (result?.ok === true &&
+				    (typeof result.revision !== 'string' ||
+				     !/^[0-9a-f]{64}$/.test(result.revision)))
+					throw uncertainSettingsUpdateError(
+						_('The settings update succeeded, but its result could not be verified. Reload this page before applying settings again.'),
+					);
+				if (result?.ok !== true)
+					throw new Error(typeof result?.error === 'string' && result.error
+						? result.error
+						: _('The server rejected the settings update.'));
+			}
+
+			let committed = null;
+			try {
+				committed = await getSettings(scope);
+				updateSettingsMap(map, committed);
+				await map.reset();
+				if (!operation.isPageActive(scope))
+					throw operation.pageInactiveError();
+			} catch (error) {
+				if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+					throw operation.pageInactiveError();
+				throw uncertainSettingsUpdateError(
+					_('The settings update finished, but the page could not reload its result: %s. Reload this page before applying settings again.').format(errorMessage(error)),
+				);
+			}
+			this.committedSettings = committed;
+			this.settingsRevision = committed.revision;
+			operation.success(undefined, operationTicket);
+		} catch (error) {
+			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
 				return;
-			operation.markApplyPending();
-			return ui.changes.apply(mode == '0');
+			if (error?.settingsUpdateUncertain === true) {
+				this.settingsRevision = null;
+				this.committedSettings = null;
+				map.readonly = true;
+				try { await map.reset(); }
+				catch (resetError) { }
+				if (!operation.isPageActive(scope))
+					return;
+			}
+			operation.failure(
+				_('Unable to apply settings: %s').format(errorMessage(error)),
+				operationTicket,
+			);
+		}
+	},
+
+	handleSave() {
+		if (this.settingsSubmission)
+			return this.settingsSubmission;
+
+		const submission = this.submitSettings();
+		this.settingsSubmission = submission;
+		return submission.finally(() => {
+			if (this.settingsSubmission === submission)
+				this.settingsSubmission = null;
 		});
+	},
+
+	handleSaveApply() {
+		return this.handleSave();
+	},
+
+	handleReset() {
+		if (!this.settingsMap || !this.committedSettings)
+			return Promise.resolve();
+		updateSettingsMap(this.settingsMap, this.committedSettings);
+		return this.settingsMap.reset();
 	},
 });

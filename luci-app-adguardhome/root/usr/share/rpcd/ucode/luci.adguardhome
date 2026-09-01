@@ -19,19 +19,21 @@ const YAML_JOB_DIRECTORY = '/var/run/luci-app-adguardhome-yaml';
 const YAML_JOB_LOCK = `${YAML_JOB_DIRECTORY}/update.lock`;
 const YAML_MAINTENANCE_MARKER = `${YAML_JOB_DIRECTORY}/removing`;
 const YAML_JOB_STATE_LIMIT = 256;
-const CONFIG_NAME = 'AdGuardHome';
-const CONFIG_SECTION = 'AdGuardHome';
+const CONFIG_NAME = 'adguardhome';
+const CONFIG_SECTION = 'config';
+const LUCI_SECTION = 'luci';
 const CONFIG_FILENAME = 'AdGuardHome.yaml';
 const TEMPLATE_DIRECTORY = '/usr/share/luci-app-adguardhome';
 const TEMPLATE_PATH = `${TEMPLATE_DIRECTORY}/default.yaml`;
 const MEMORY_RUNTIME_DIRECTORY = '/tmp/luci-app-adguardhome-memory';
 const MEMORY_WORK_DIRECTORY = `${MEMORY_RUNTIME_DIRECTORY}/work`;
-const LEGACY_MEMORY_CONFIG_PATH = `${MEMORY_WORK_DIRECTORY}/${CONFIG_FILENAME}`;
+const MEMORY_BACKING_DATA_MOUNT = `${MEMORY_RUNTIME_DIRECTORY}/backing-data`;
 const MEMORY_STATE_PATH = `${MEMORY_RUNTIME_DIRECTORY}/state`;
 const ADGUARD_UID = 853;
 const ADGUARD_GID = 853;
+const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
 
-function valid_work_dir(value, official_work_dir, official_config_file) {
+function valid_work_dir(value) {
 	if (type(value) != 'string' ||
 	    !match(value, /^\/[A-Za-z0-9_./+@%:,=-]+$/) ||
 	    match(value, /\/\//) ||
@@ -69,12 +71,123 @@ function valid_work_dir(value, official_work_dir, official_config_file) {
 	}
 	if (final_metadata && final_metadata.type != 'directory')
 		return null;
-	if (value != '/etc/AdGuardHome' && final_metadata &&
-	    (official_work_dir != value ||
-	     official_config_file != `${value}/${CONFIG_FILENAME}`))
+	return value;
+}
+
+function configured_boolean(value) {
+	if (type(value) != 'string')
 		return null;
 
-	return value;
+	switch (lc(value)) {
+		case '1':
+		case 'on':
+		case 'true':
+		case 'yes':
+		case 'enabled':
+			return true;
+		case '0':
+		case 'off':
+		case 'false':
+		case 'no':
+		case 'disabled':
+			return false;
+		default:
+			return null;
+	}
+}
+
+function configured_interval(value) {
+	if (type(value) != 'string' || !match(value, /^(0|[1-9][0-9]*)$/))
+		return null;
+
+	let interval = int(value);
+	return type(interval) == 'int' && interval >= 0 &&
+		interval <= MAX_MEMORY_WRITEBACK_INTERVAL ? interval : null;
+}
+
+function settings_revision(settings) {
+	if (!settings)
+		return null;
+
+	return sha256(
+		`enabled=${settings.enabled ? 1 : 0}\n` +
+		`config_file=${settings.config_file}\n` +
+		`work_dir=${settings.work_dir}\n` +
+		`verbose=${settings.verbose ? 1 : 0}\n` +
+		`redirect=${settings.redirect}\n` +
+		`run_from_memory=${settings.run_from_memory ? 1 : 0}\n` +
+		`memory_writeback_interval=${settings.memory_writeback_interval}\n`
+	);
+}
+
+function settings_snapshot() {
+	let uci = null;
+	let settings = null;
+
+	try {
+		uci = cursor();
+		let enabled = configured_boolean(
+			uci.get(CONFIG_NAME, CONFIG_SECTION, 'enabled'));
+		let work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
+		let config_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		let verbose = configured_boolean(
+			uci.get(CONFIG_NAME, CONFIG_SECTION, 'verbose'));
+		let redirect = uci.get(CONFIG_NAME, LUCI_SECTION, 'redirect');
+		let run_from_memory = configured_boolean(
+			uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory'));
+		let interval = configured_interval(
+			uci.get(CONFIG_NAME, LUCI_SECTION, 'memory_writeback_interval'));
+
+		if (enabled != null && valid_work_dir(work_dir) &&
+		    config_file == `${work_dir}/${CONFIG_FILENAME}` && verbose != null &&
+		    (redirect == 'none' || redirect == 'dnsmasq-upstream' ||
+		     redirect == 'redirect') && run_from_memory != null && interval != null) {
+			settings = {
+				enabled,
+				config_file,
+				work_dir,
+				verbose,
+				redirect,
+				run_from_memory,
+				memory_writeback_interval: interval,
+			};
+			settings.revision = settings_revision(settings);
+		}
+	}
+	catch (error) {
+		settings = null;
+	}
+
+	if (uci) {
+		try { uci.unload(CONFIG_NAME); }
+		catch (error) { }
+	}
+
+	return settings?.revision ? settings : null;
+}
+
+function settings_candidate(enabled, config_file, work_dir, verbose, redirect,
+						run_from_memory, interval) {
+	if (type(enabled) != 'bool' || type(verbose) != 'bool' ||
+	    type(run_from_memory) != 'bool' || type(config_file) != 'string' ||
+	    !valid_work_dir(work_dir) ||
+	    config_file != `${work_dir}/${CONFIG_FILENAME}` ||
+	    (redirect != 'none' && redirect != 'dnsmasq-upstream' &&
+	     redirect != 'redirect') || type(interval) != 'int' || interval < 0 ||
+	    interval > MAX_MEMORY_WRITEBACK_INTERVAL)
+		return null;
+
+	let settings = {
+		enabled,
+		config_file,
+		work_dir,
+		verbose,
+		redirect,
+		run_from_memory,
+		memory_writeback_interval: interval,
+	};
+	settings.revision = settings_revision(settings);
+	return settings.revision ? settings : null;
 }
 
 function encoded_device(metadata) {
@@ -96,18 +209,23 @@ function same_inode(left, right) {
 		left.dev?.minor == right.dev?.minor;
 }
 
+function same_directory_inode(left, right) {
+	return left?.type == 'directory' && right?.type == 'directory' &&
+		left.inode == right.inode &&
+		left.dev?.major == right.dev?.major &&
+		left.dev?.minor == right.dev?.minor;
+}
+
 function memory_state_active(persistent_work_dir) {
-	if (!valid_work_dir(
-		persistent_work_dir,
-		persistent_work_dir,
-		`${persistent_work_dir}/${CONFIG_FILENAME}`
-	    ))
+	if (!valid_work_dir(persistent_work_dir))
 		return false;
 
 	let runtime = lstat(MEMORY_RUNTIME_DIRECTORY);
 	let active = lstat(MEMORY_WORK_DIRECTORY);
 	let data = lstat(`${MEMORY_WORK_DIRECTORY}/data`);
 	let backing = lstat(persistent_work_dir);
+	let visible_data = lstat(`${persistent_work_dir}/data`);
+	let backing_data = lstat(MEMORY_BACKING_DATA_MOUNT);
 	let entries = lsdir(MEMORY_WORK_DIRECTORY);
 	if (runtime?.type != 'directory' || runtime.uid != 0 ||
 	    runtime.gid != ADGUARD_GID || runtime.mode != 0o710 ||
@@ -118,6 +236,12 @@ function memory_state_active(persistent_work_dir) {
 	    backing?.type != 'directory' || backing.mode != 0o700 ||
 	    !((backing.uid == 0 && (backing.gid == 0 || backing.gid == ADGUARD_GID)) ||
 	      (backing.uid == ADGUARD_UID && backing.gid == ADGUARD_GID)) ||
+	    visible_data?.type != 'directory' || visible_data.uid != ADGUARD_UID ||
+	    visible_data.gid != ADGUARD_GID || visible_data.mode != 0o700 ||
+	    backing_data?.type != 'directory' || backing_data.uid != ADGUARD_UID ||
+	    backing_data.gid != ADGUARD_GID || backing_data.mode != 0o700 ||
+	    !same_directory_inode(visible_data, data) ||
+	    same_directory_inode(backing_data, data) ||
 	    type(entries) != 'array' || length(entries) != 1 || entries[0] != 'data')
 		return false;
 
@@ -140,18 +264,26 @@ function memory_state_active(persistent_work_dir) {
 		let after = lstat(MEMORY_STATE_PATH);
 		let lines = type(content) == 'string' ? split(content, '\n') : [];
 		let backing_device = encoded_device(backing);
+		let persistent_data_device = encoded_device(backing_data);
+		let memory_data_device = encoded_device(data);
 		let valid = same_inode(before, opened) && same_inode(before, after) &&
 			opened.uid == 0 && opened.gid == 0 && opened.mode == 0o600 &&
 			opened.nlink == 1 && after.uid == 0 && after.gid == 0 &&
 			after.mode == 0o600 && after.nlink == 1 &&
 			before.size == opened.size && before.size == after.size &&
-			length(content) == opened.size && length(lines) == 5 &&
-			lines[0] == 'version=3' &&
+			length(content) == opened.size && length(lines) == 9 &&
+			lines[0] == 'version=4' &&
 			lines[1] == `persistent_work_dir=${persistent_work_dir}` &&
 			type(backing_device) == 'int' &&
 			lines[2] == `backing_device=${backing_device}` &&
 			lines[3] == `backing_inode=${backing.inode}` &&
-			lines[4] == '';
+			type(persistent_data_device) == 'int' &&
+			lines[4] == `persistent_data_device=${persistent_data_device}` &&
+			lines[5] == `persistent_data_inode=${backing_data.inode}` &&
+			type(memory_data_device) == 'int' &&
+			lines[6] == `memory_data_device=${memory_data_device}` &&
+			lines[7] == `memory_data_inode=${data.inode}` &&
+			lines[8] == '';
 		if (!file.close())
 			valid = false;
 		file = null;
@@ -172,15 +304,11 @@ function memory_active() {
 
 	try {
 		uci = cursor();
-		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir');
-		let persistent_config = `${configured_work_dir}/${CONFIG_FILENAME}`;
-		let official_work_dir = uci.get('adguardhome', 'config', 'work_dir') ||
-			uci.get('adguardhome', 'config', 'workdir');
-		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
-		active = memory_state_active(configured_work_dir) &&
-			official_config_file == persistent_config &&
-			(official_work_dir == MEMORY_WORK_DIRECTORY ||
-			 official_work_dir == configured_work_dir);
+		let work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
+		let config_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		active = valid_work_dir(work_dir) &&
+			config_file == `${work_dir}/${CONFIG_FILENAME}` &&
+			memory_state_active(work_dir);
 	}
 	catch (error) {
 		active = false;
@@ -188,7 +316,6 @@ function memory_active() {
 	if (uci) {
 		try {
 			uci.unload(CONFIG_NAME);
-			uci.unload('adguardhome');
 		}
 		catch (error) { }
 	}
@@ -202,39 +329,10 @@ function config_path() {
 
 	try {
 		uci = cursor();
-		let official_work_dir = uci.get('adguardhome', 'config', 'work_dir') ||
-			uci.get('adguardhome', 'config', 'workdir');
-		let official_config_file = uci.get('adguardhome', 'config', 'config_file');
-		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'workdir');
-		let persistent_config = `${configured_work_dir}/${CONFIG_FILENAME}`;
-		if (official_config_file == persistent_config &&
-		    (official_work_dir == MEMORY_WORK_DIRECTORY ||
-		     official_work_dir == configured_work_dir)) {
-			// YAML is independent of the data-only RAM generation.  Keep it
-			// available while lower UCI points its work directory at RAM, including
-			// recovery from missing or corrupt RAM data.  The exact lower config
-			// binding plus valid_work_dir() still constrain and validate the
-			// persistent namespace.
-			work_dir = valid_work_dir(
-				configured_work_dir,
-				configured_work_dir,
-				persistent_config
-			);
-		}
-		else if (official_work_dir == MEMORY_WORK_DIRECTORY ||
-		         official_config_file == LEGACY_MEMORY_CONFIG_PATH) {
-			// Never follow an unbound RAM work directory or the obsolete r1 RAM
-			// YAML path.  A corrupt data-only RAM namespace by itself must not hide
-			// an independently bound persistent YAML.
-			work_dir = null;
-		}
-		else {
-			work_dir = valid_work_dir(
-				configured_work_dir,
-				official_work_dir,
-				official_config_file
-			);
-		}
+		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
+		let configured_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		if (configured_file == `${configured_work_dir}/${CONFIG_FILENAME}`)
+			work_dir = valid_work_dir(configured_work_dir);
 	}
 	catch (error) {
 		work_dir = null;
@@ -243,7 +341,6 @@ function config_path() {
 	if (uci) {
 		try {
 			uci.unload(CONFIG_NAME);
-			uci.unload('adguardhome');
 		}
 		catch (error) {
 			// Failure to unload a read-only cursor does not alter the result.
@@ -285,7 +382,7 @@ function service_status() {
 
 	try {
 		uci = cursor();
-		let value = lc(`${uci.get(CONFIG_NAME, CONFIG_SECTION, 'run_from_memory') || ''}`);
+		let value = lc(`${uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory') || ''}`);
 		requested = value == '1' || value == 'on' || value == 'true' ||
 			value == 'yes' || value == 'enabled';
 	}
@@ -498,7 +595,7 @@ function read_log(value, requested_source) {
 			: `set -o pipefail; /sbin/logread -e '^AdGuardHome[[]' | /usr/bin/tail -n ${requested}`;
 		pipe = popen(command, 'r');
 		if (!pipe)
-			return { log: '', lines: 0, source };
+			return { error: 'Unable to open the system log reader', source };
 
 		output = pipe.read(MAX_LOG_LENGTH + 1);
 		status = pipe.close();
@@ -510,15 +607,17 @@ function read_log(value, requested_source) {
 				pipe.close();
 			}
 			catch (close_error) {
-				// Ignore cleanup errors and return an empty bounded result.
+				// Ignore cleanup errors; the read failure is returned below.
 			}
 		}
 
-		return { log: '', lines: 0, source };
+		return { error: 'Unable to read the system log', source };
 	}
 
-	if (status != 0 || type(output) != 'string')
-		return { log: '', lines: 0, source };
+	if (status != 0)
+		return { error: 'The system log reader exited unsuccessfully', source };
+	if (type(output) != 'string')
+		return { error: 'The system log reader returned invalid output', source };
 
 	if (length(output) > MAX_LOG_LENGTH) {
 		output = substr(output, length(output) - MAX_LOG_LENGTH);
@@ -1031,6 +1130,122 @@ function finish_yaml_process(token, expected_hash, candidate_hash, stage, origin
 	close_yaml_job_lock(lock);
 }
 
+function finish_settings_process(token, expected_hash, candidate_hash,
+								 held_lock) {
+	let lock = { file: held_lock };
+	if (!lock.file)
+		return;
+
+	let record = read_yaml_job(token);
+	let exact = record && record.expected_hash == expected_hash &&
+		record.candidate_hash == candidate_hash;
+	let authenticated_terminal = exact && (
+		record.state == 'failure' || record.state == 'indeterminate' ||
+		(record.state == 'success' && record.sha256 == candidate_hash)
+	);
+
+	// The init coordinator is the sole success publisher.  A normal wait status,
+	// or even a matching UCI revision, cannot prove that service, DNS and RAM
+	// convergence finished.  If the child disappeared before replacing its
+	// authenticated pending/running record, make the outcome indeterminate.
+	if (!authenticated_terminal)
+		replace_yaml_job(token,
+			`indeterminate:${expected_hash}:${candidate_hash}\n`);
+	close_yaml_job_lock(lock);
+}
+
+function update_settings(enabled, config_file, work_dir, verbose, redirect,
+					 run_from_memory, interval, expected_revision) {
+	if (type(expected_revision) != 'string' ||
+	    !match(expected_revision, /^[0-9a-f]{64}$/))
+		return { error: 'Invalid or missing settings revision' };
+
+	let candidate = settings_candidate(
+		enabled, config_file, work_dir, verbose, redirect,
+		run_from_memory, interval
+	);
+	if (!candidate)
+		return { error: 'Invalid settings' };
+
+	let current = settings_snapshot();
+	if (!current)
+		return { error: 'Current settings are unavailable or invalid' };
+	if (current.revision != expected_revision)
+		return { error: 'Settings changed since the page was loaded' };
+	if (candidate.revision == current.revision)
+		return {
+			accepted: true,
+			unchanged: true,
+			revision: current.revision,
+		};
+
+	let token = random_token();
+	if (!token)
+		return { error: 'Unable to allocate a settings update token' };
+	let job = prepare_yaml_job(token, expected_revision, candidate.revision);
+	if (job.error)
+		return job;
+	if (job.reused)
+		return { accepted: true, token: job.token, reused: true };
+
+	// The optimistic revision check above happens before the shared job lock is
+	// acquired.  Re-read while holding that lock so another completed settings
+	// transaction cannot turn this request into a stale overwrite.  The init
+	// coordinator performs the same check again under its integration lock.
+	let locked_current = settings_snapshot();
+	if (!locked_current || locked_current.revision != expected_revision) {
+		let discarded = discard_yaml_job(token);
+		let released = close_yaml_job_lock({ file: job.lock });
+		if (!discarded || !released)
+			return { error: 'Unable to abandon stale settings update state' };
+		return { error: locked_current
+			? 'Settings changed since the page was loaded'
+			: 'Current settings are unavailable or invalid' };
+	}
+
+	let launched = false;
+	try {
+		// Spawn the coordinator directly without a shell.  The child inherits the
+		// already-locked job descriptor, serializing this whole settings transaction
+		// with YAML edits while the init script performs its own integration-locked
+		// UCI commit, convergence and rollback.
+		let child = uloop.process(YAML_UPDATE_COMMAND, [
+			'settings_update',
+			candidate.enabled ? '1' : '0',
+			candidate.work_dir,
+			candidate.verbose ? '1' : '0',
+			candidate.redirect,
+			candidate.run_from_memory ? '1' : '0',
+			`${candidate.memory_writeback_interval}`,
+			expected_revision,
+			token,
+			candidate.revision,
+		], { PATH: '/usr/sbin:/usr/bin:/sbin:/bin' }, function() {
+			finish_settings_process(
+				token, expected_revision, candidate.revision, job.lock
+			);
+		});
+		if (!child) {
+			discard_yaml_job(token);
+			close_yaml_job_lock({ file: job.lock });
+			return { error: 'Unable to start the settings update transaction' };
+		}
+		launched = true;
+		// Keep the parent descriptor locked until the child callback publishes
+		// the terminal record.  This closes the exit-to-callback race and keeps
+		// YAML edits mutually exclusive for the entire settings transaction.
+	}
+	catch (error) {
+		if (launched)
+			return { accepted: true, token, reused: false };
+		discard_yaml_job(token);
+		close_yaml_job_lock({ file: job.lock });
+		return { error: 'Settings update transaction failed' };
+	}
+
+	return { accepted: true, token, reused: false };
+}
+
 function update_yaml(content, expected_hash) {
 	if (type(content) != 'string' || !length(content) ||
 	    length(content) > MAX_CONFIG_LENGTH || index(content, "\u0000") >= 0)
@@ -1258,6 +1473,66 @@ function yaml_job_status(token, consume) {
 	}
 	if (!close_yaml_job_lock(lock))
 		return { error: 'Unable to release YAML update lock' };
+
+	return result;
+}
+
+function settings_job_status(token, consume) {
+	let record = read_yaml_job(token);
+	if (!record)
+		return { error: 'Settings update job is unavailable' };
+
+	let lock = open_yaml_job_lock();
+	if (!lock.file) {
+		if (lock.error)
+			return { error: lock.error };
+		return { state: record.state == 'pending' ? 'pending' : 'running' };
+	}
+
+	record = read_yaml_job(token);
+	if (!record) {
+		close_yaml_job_lock(lock);
+		return { error: 'Settings update job is unavailable' };
+	}
+	if (record.state == 'pending' || record.state == 'running') {
+		if (!replace_yaml_job(token,
+		    `indeterminate:${record.expected_hash}:${record.candidate_hash}\n`)) {
+			close_yaml_job_lock(lock);
+			return { error: 'Unable to recover interrupted settings update state' };
+		}
+		record = read_yaml_job(token);
+		if (!record) {
+			close_yaml_job_lock(lock);
+			return { error: 'Settings update job is unavailable' };
+		}
+	}
+
+	let result = record.state == 'success'
+		? {
+			state: 'done',
+			ok: true,
+			revision: record.sha256,
+			restarted: record.restarted,
+		}
+		: record.state == 'indeterminate'
+		? {
+			state: 'done',
+			ok: false,
+			indeterminate: true,
+			error: 'The settings update was interrupted; reload the current settings before editing them again',
+		}
+		: {
+			state: 'done',
+			ok: false,
+			error: 'Settings were rejected or changed concurrently',
+		};
+
+	if (consume === true && !discard_yaml_job(token)) {
+		close_yaml_job_lock(lock);
+		return { error: 'Unable to consume settings update result' };
+	}
+	if (!close_yaml_job_lock(lock))
+		return { error: 'Unable to release settings update lock' };
 
 	return result;
 }
@@ -1816,6 +2091,13 @@ const methods = {
 			return config_info();
 		},
 	},
+	get_settings: {
+		call: function() {
+			return settings_snapshot() || {
+				error: 'Current settings are unavailable or invalid',
+			};
+		},
+	},
 	get_log: {
 		args: { source: 'core', lines: 100 },
 		call: function(request) {
@@ -1873,6 +2155,36 @@ const methods = {
 		args: { token: '', consume: false },
 		call: function(request) {
 			return yaml_job_status(request.args.token, request.args.consume);
+		},
+	},
+	set_settings: {
+		args: {
+			enabled: false,
+			config_file: '',
+			work_dir: '',
+			verbose: false,
+			redirect: '',
+			run_from_memory: false,
+			memory_writeback_interval: -1,
+			revision: '',
+		},
+		call: function(request) {
+			return update_settings(
+				request.args.enabled,
+				request.args.config_file,
+				request.args.work_dir,
+				request.args.verbose,
+				request.args.redirect,
+				request.args.run_from_memory,
+				request.args.memory_writeback_interval,
+				request.args.revision
+			);
+		},
+	},
+	get_settings_update: {
+		args: { token: '', consume: false },
+		call: function(request) {
+			return settings_job_status(request.args.token, request.args.consume);
 		},
 	},
 };
