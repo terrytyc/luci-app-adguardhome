@@ -142,11 +142,12 @@ grep -Fq 'elif cold_stopped_barrier_valid; then' "$postinst" || {
 	# shellcheck disable=SC2034
 	cold_was_running=0
 	consume_cold_stopped_barrier || exit 1
-	[ ! -e "$upgrade_stopped_marker" ] && [ ! -L "$upgrade_stopped_marker" ]
+	[ ! -e "$runtime_dir" ] && [ ! -L "$runtime_dir" ] || exit 1
 
 	# A kill between unlinking the state file and rmdir leaves an authenticated
 	# empty private directory plus the barrier.  The retry may remove only that
 	# exact empty directory before consuming the still-valid barrier.
+	mkdir -m 0700 "$runtime_dir"
 	printf '1\n' >"$upgrade_stopped_marker"
 	chmod 0600 "$upgrade_stopped_marker"
 	mkdir -m 0700 "$cold_postinst_dir"
@@ -156,7 +157,7 @@ grep -Fq 'elif cold_stopped_barrier_valid; then' "$postinst" || {
 	# shellcheck disable=SC2034
 	cold_was_running=0
 	consume_cold_stopped_barrier || exit 1
-	[ ! -e "$upgrade_stopped_marker" ] && [ ! -L "$upgrade_stopped_marker" ]
+	[ ! -e "$runtime_dir" ] && [ ! -L "$runtime_dir" ]
 ) || {
 	printf 'marker-only cold-upgrade tail recovery failed\n' >&2
 	exit 1

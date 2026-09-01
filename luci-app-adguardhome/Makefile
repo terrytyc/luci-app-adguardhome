@@ -2365,7 +2365,8 @@ consume_cold_stopped_barrier() {
 	cold_stopped_barrier_valid || return 1
 	rm -f "$$upgrade_stopped_marker" || return 1
 	[ ! -e "$$upgrade_stopped_marker" ] &&
-		[ ! -L "$$upgrade_stopped_marker" ]
+		[ ! -L "$$upgrade_stopped_marker" ] || return 1
+	rmdir "$$runtime_dir"
 }
 
 cold_status_value() {
