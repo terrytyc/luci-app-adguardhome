@@ -36,6 +36,7 @@ async function testYamlViewPermissionGuard() {
 	let yamlReads = 0;
 	let writeCalls = 0;
 	let successes = 0;
+	const notifications = [];
 	const scope = {
 		attach(node) { return node; },
 	};
@@ -68,7 +69,7 @@ async function testYamlViewPermissionGuard() {
 	};
 	const ui = {
 		createHandlerFn: () => () => {},
-		addNotification() {},
+		addNotification: (...args) => notifications.push(args),
 		showModal() {},
 	};
 	const element = (tag, attrs = {}, children = []) => {
@@ -85,10 +86,13 @@ async function testYamlViewPermissionGuard() {
 		return node;
 	};
 	const view = { extend: definition => definition };
+	const translate = value => Object.assign(new String(value), {
+		format: replacement => value.replace('%s', String(replacement)),
+	});
 	const sandbox = {
 		E: element,
 		L: { hasViewPermission: () => false },
-		_: value => value,
+		_: translate,
 		window: { setTimeout },
 	};
 	vm.createContext(sandbox);
@@ -119,6 +123,31 @@ async function testYamlViewPermissionGuard() {
 	assert.equal(definition.yamlEditor.readOnly, true);
 	assert.equal(definition.saveButton.disabled, true);
 	assert.equal(definition.resetButton.disabled, true);
+
+	rpcHandlers.get_yaml = async () => {
+		yamlReads++;
+		throw new Error('Access denied');
+	};
+	const denied = await definition.load.call(definition);
+	assert.equal(denied.content, '',
+		'an ACL denial must not expose stale YAML content');
+	assert.equal(denied.sha256, '',
+		'an ACL denial must not expose a usable YAML revision');
+	assert.match(String(denied.error?.message), /Access denied/,
+		'the YAML page must retain an ACL denial as a handled load error');
+	definition.render.call(definition, denied);
+	assert.equal(definition.yamlEditor.value, '',
+		'the ACL-denied editor must be empty');
+	assert.equal(definition.yamlEditor.readOnly, true,
+		'the ACL-denied editor must remain read-only');
+	assert.equal(definition.saveButton.disabled, true,
+		'the ACL-denied page must disable YAML saving');
+	assert.equal(definition.resetButton.disabled, true,
+		'the ACL-denied page must disable template reset');
+	assert.equal(notifications.length, 1,
+		'the ACL denial must be reported through the handled page notification');
+	assert.equal(writeCalls, 0,
+		'the ACL-denied path must not invoke a YAML mutation RPC');
 }
 
 assert.match(overview, /^const CORE_SECTION_NAME = 'config';$/m,
