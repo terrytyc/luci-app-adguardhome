@@ -10,6 +10,7 @@ LEGACY_SECTION="AdGuardHome"
 
 DEFAULT_WORK_DIR="/etc/AdGuardHome"
 DEFAULT_CONFIG_FILE="${DEFAULT_WORK_DIR}/AdGuardHome.yaml"
+PACKAGED_CONFIG_TEMPLATE="/usr/share/luci-app-adguardhome/default.yaml"
 LEGACY_ROOT_CONFIG="/etc/AdGuardHome.yaml"
 OFFICIAL_DEFAULT_CONFIG="/etc/adguardhome/adguardhome.yaml"
 OFFICIAL_DEFAULT_WORK_DIR="/var/lib/adguardhome"
@@ -39,6 +40,7 @@ LUCI_CHANGED=0
 OFFICIAL_CHANGED=0
 DHCP_CHANGED=0
 IMPORT_OFFICIAL=0
+IMPORT_OFFICIAL_USES_TEMPLATE=0
 OFFICIAL_WAS_RUNNING=0
 OFFICIAL_PAUSED=0
 IS_UPGRADE=0
@@ -1930,7 +1932,7 @@ official_state_is_meaningful() {
 }
 
 select_migration_source() {
-	local legacy_config_path upper_work_dir
+	local legacy_config_path upper_work_dir import_target_config
 
 	if [ "$LEGACY_CONFIG_PRESENT" = 1 ]; then
 		legacy_config_path="$(uci -q get "${LEGACY_CONFIG}.${LEGACY_SECTION}.configpath")"
@@ -1950,6 +1952,7 @@ select_migration_source() {
 
 	if [ "$IS_UPGRADE" != 1 ] && official_state_is_meaningful; then
 		IMPORT_OFFICIAL=1
+		IMPORT_OFFICIAL_USES_TEMPLATE=0
 		DATA_SOURCE_WORK_DIR=""
 		# The official package normally separates its YAML under /etc from its
 		# runtime data under volatile /var/lib.  The refactored app requires YAML
@@ -1972,14 +1975,42 @@ select_migration_source() {
 			}
 				;;
 		esac
+		import_target_config="${TARGET_WORK_DIR}/AdGuardHome.yaml"
 		if [ -e "$OFFICIAL_CONFIG_FILE" ] || [ -L "$OFFICIAL_CONFIG_FILE" ]; then
 			valid_yaml_source_path "$OFFICIAL_CONFIG_FILE" || {
 				echo "Unsafe official AdGuard Home config source '$OFFICIAL_CONFIG_FILE'; import aborted." >&2
 				return 1
 			}
 			SOURCE_CONFIG_FILE="$OFFICIAL_CONFIG_FILE"
+		elif [ -e "$import_target_config" ] || [ -L "$import_target_config" ]; then
+			# APK conffile handling or an interrupted earlier installation may
+			# leave either the package template or the real user YAML at the
+			# managed target even when the official UCI path is missing.
+			valid_yaml_source_path "$import_target_config" || {
+				echo "Unsafe managed AdGuard Home config source '$import_target_config'; import aborted." >&2
+				return 1
+			}
+			SOURCE_CONFIG_FILE="$import_target_config"
 		else
-			SOURCE_CONFIG_FILE="$DEFAULT_CONFIG_FILE"
+			trusted_root_file_source "$PACKAGED_CONFIG_TEMPLATE" || {
+				echo "Unsafe packaged AdGuard Home config template; import aborted." >&2
+				return 1
+			}
+			SOURCE_CONFIG_FILE="$PACKAGED_CONFIG_TEMPLATE"
+			IMPORT_OFFICIAL_USES_TEMPLATE=1
+		fi
+		# The APK payload is installed before this script runs.  Whenever the
+		# selected source is the managed target, compare it with the separate
+		# immutable copy to tell a newly installed template from user YAML.  This
+		# also covers an official config_file already pointing at that target.
+		if [ "$SOURCE_CONFIG_FILE" = "$import_target_config" ]; then
+			trusted_root_file_source "$PACKAGED_CONFIG_TEMPLATE" || {
+				echo "Unsafe packaged AdGuard Home config template; import aborted." >&2
+				return 1
+			}
+			if cmp -s "$SOURCE_CONFIG_FILE" "$PACKAGED_CONFIG_TEMPLATE"; then
+				IMPORT_OFFICIAL_USES_TEMPLATE=1
+			fi
 		fi
 		return 0
 	fi
@@ -2104,7 +2135,16 @@ initialize_merged_options() {
 		verbose="$OFFICIAL_VERBOSE"
 		run_from_memory=0
 		memory_writeback_interval=60
-		redirect=none
+		# A meaningful official UCI/data state can exist before the official
+		# first-run YAML has been created.  In that case the installer supplies
+		# the package template and must also publish the confirmed plugin default.
+		# A real imported YAML may already have its own external DNS integration,
+		# so keep that existing network policy untouched.
+		if [ "$IMPORT_OFFICIAL_USES_TEMPLATE" = 1 ]; then
+			redirect=dnsmasq-upstream
+		else
+			redirect=none
+		fi
 	else
 		# A genuinely untouched official installation adopts the plugin defaults
 		# shown in the public merged-UCI schema.  Meaningful official installations
@@ -2121,9 +2161,7 @@ initialize_merged_options() {
 	set_luci_option memory_writeback_interval "$memory_writeback_interval" || return 1
 
 	if [ "$IMPORT_OFFICIAL" = 1 ]; then
-		# Existing official installations may already integrate with dnsmasq or
-		# own port 53.  Import them without changing that network policy.
-		set_luci_option redirect none || return 1
+		set_luci_option redirect "$redirect" || return 1
 	else
 		case "$redirect" in
 			none|redirect|dnsmasq-upstream) set_luci_option redirect "$redirect" || return 1 ;;

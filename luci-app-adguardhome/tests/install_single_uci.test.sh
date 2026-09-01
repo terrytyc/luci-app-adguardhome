@@ -52,6 +52,8 @@ require_text "$defaults" 'UCI_CONFIG="adguardhome"'
 require_text "$defaults" 'UCI_SECTION="luci"'
 require_text "$defaults" 'OFFICIAL_SECTION="config"'
 require_text "$defaults" 'LEGACY_CONFIG="AdGuardHome"'
+require_text "$defaults" 'IMPORT_OFFICIAL_USES_TEMPLATE=0'
+require_text "$defaults" 'IMPORT_OFFICIAL_USES_TEMPLATE=1'
 require_text "$defaults" 'uci -q set "${UCI_CONFIG}.${UCI_SECTION}=luci"'
 require_text "$defaults" 'set_official_option enabled "$enabled"'
 require_text "$defaults" 'set_official_option verbose "$verbose"'
@@ -86,6 +88,18 @@ for expected in \
 		exit 1
 	}
 done
+
+import_defaults="$(sed -n '/# A meaningful official UCI\/data state can exist/,/^[[:space:]]*fi$/p' "$defaults")"
+for expected in \
+	'if [ "$IMPORT_OFFICIAL_USES_TEMPLATE" = 1 ]; then' \
+	'redirect=dnsmasq-upstream' \
+	'redirect=none'; do
+	printf '%s\n' "$import_defaults" | grep -Fq "$expected" || {
+		printf 'official import default selection is missing: %s\n' "$expected" >&2
+		exit 1
+	}
+done
+require_text "$defaults" 'set_luci_option redirect "$redirect"'
 
 cleanup_line="$(grep -n '^cleanup_runtime_artifacts || exit 1$' "$defaults" | tail -n 1 | cut -d: -f1)"
 remove_line="$(grep -n '^remove_legacy_upper_config || {' "$defaults" | tail -n 1 | cut -d: -f1)"
