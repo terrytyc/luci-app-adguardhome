@@ -205,9 +205,12 @@ async function runSettingsSubmissionScenario(kind) {
 	let successes = 0;
 	let setCalls = 0;
 	let statusCalls = 0;
+	let loadCalls = 0;
 	let resetCalls = 0;
 	let setArguments = null;
 	let context = null;
+	const optionCache = new Map(values);
+	const visibleValues = new Map(optionCache);
 
 	const operation = {
 		isPageActive: () => true,
@@ -260,8 +263,17 @@ async function runSettingsSubmissionScenario(kind) {
 		readonly: false,
 		checkDepends() {},
 		async parse() {},
+		async load() {
+			loadCalls++;
+			optionCache.clear();
+			for (const [ key, value ] of values)
+				optionCache.set(key, value);
+		},
 		async reset() {
 			resetCalls++;
+			visibleValues.clear();
+			for (const [ key, value ] of optionCache)
+				visibleValues.set(key, value);
 			if (kind === 'success') {
 				assert.equal(context.settingsRevision, oldRevision,
 					'the authoritative revision must not be adopted before the visible form resets');
@@ -289,12 +301,14 @@ async function runSettingsSubmissionScenario(kind) {
 		context,
 		failures,
 		map,
+		loadCalls,
 		resetCalls,
 		setCalls,
 		setArguments,
 		statusCalls,
 		successes,
 		values,
+		visibleValues,
 		view,
 	};
 }
@@ -568,6 +582,8 @@ async function main() {
 			`${kind} must lock the visible form until a full reload`);
 		assert.equal(result.resetCalls, 1,
 			`${kind} must redraw the settings form in read-only mode`);
+		assert.equal(result.loadCalls, 0,
+			`${kind} must not adopt an unconfirmed candidate into option caches`);
 		assert.equal(result.failures.length, 1,
 			`${kind} must show one explicit settings failure`);
 		assert.equal(result.successes, 0);
@@ -586,6 +602,8 @@ async function main() {
 	assert.equal(successfulSettings.successes, 1);
 	assert.equal(successfulSettings.resetCalls, 1,
 		'a successful transaction must redraw the authoritative settings once');
+	assert.equal(successfulSettings.loadCalls, 1,
+		'a successful transaction must reload JSONMap option caches once');
 	assert.equal(successfulSettings.context.settingsRevision, 'c'.repeat(64));
 	assert.equal(successfulSettings.context.committedSettings.workDir, '/mnt/storage/AdGuardHome');
 	assert.deepEqual(successfulSettings.setArguments, [
@@ -601,6 +619,18 @@ async function main() {
 		'the visible JSON model must contain the authoritative work directory');
 	assert.equal(successfulSettings.values.get('luci.memory_writeback_interval'), '77',
 		'the visible JSON model must contain the authoritative write-back interval');
+	assert.equal(successfulSettings.visibleValues.get('config.enabled'), '0',
+		'the redrawn enabled flag must show the authoritative value');
+	assert.equal(successfulSettings.visibleValues.get('config.work_dir'), '/mnt/storage/AdGuardHome',
+		'the redrawn work directory must show the authoritative value');
+	assert.equal(successfulSettings.visibleValues.get('config.verbose'), '1',
+		'the redrawn verbose flag must show the authoritative value');
+	assert.equal(successfulSettings.visibleValues.get('luci.redirect'), 'redirect',
+		'the redrawn DNS mode must show the authoritative value');
+	assert.equal(successfulSettings.visibleValues.get('luci.run_from_memory'), '1',
+		'the redrawn memory checkbox must show the authoritative value without a browser refresh');
+	assert.equal(successfulSettings.visibleValues.get('luci.memory_writeback_interval'), '77',
+		'dependent fields must redraw from the authoritative option cache');
 
 	for (const name of [ 'overview', 'yaml', 'log' ]) {
 		const source = fs.readFileSync(path.join(
@@ -655,8 +685,13 @@ async function main() {
 	);
 	assert.match(
 		overview,
-		/committed = await getSettings\(scope\);\s*updateSettingsMap\(map, committed\);\s*await map\.reset\(\);[\s\S]*?this\.settingsRevision = committed\.revision;/,
+		/committed = await getSettings\(scope\);\s*await reloadSettingsMap\(map, committed\);[\s\S]*?this\.settingsRevision = committed\.revision;/,
 		'the visible settings form must be reset to the authoritative snapshot before adopting its revision',
+	);
+	assert.match(
+		overview,
+		/async function reloadSettingsMap\(map, settings\)\s*\{\s*updateSettingsMap\(map, settings\);[\s\S]*?await map\.load\(\);\s*return map\.reset\(\);\s*\}/,
+		'the settings redraw must reload JSONMap option caches before resetting the form',
 	);
 	assert.match(
 		overview,

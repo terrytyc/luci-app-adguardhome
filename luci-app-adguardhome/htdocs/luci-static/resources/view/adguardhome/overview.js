@@ -484,6 +484,27 @@ function updateSettingsMap(map, settings) {
 			map.data.set('json', section, option, data[section][option]);
 }
 
+async function reloadSettingsMap(map, settings) {
+	updateSettingsMap(map, settings);
+	// JSONMap options cache their cfgvalue during load().  Merely replacing the
+	// JSON data and calling reset() would redraw the old cached values.
+	await map.load();
+	return map.reset();
+}
+
+function credentialField(title, input) {
+	return E('label', {
+		class: 'adguardhome-credential-field',
+		style: 'display: block; width: 100%; margin: .75rem 0; box-sizing: border-box',
+	}, [
+		E('span', {
+			class: 'adguardhome-credential-title',
+			style: 'display: block; margin-bottom: .25rem; text-align: left; line-height: 1.4',
+		}, title),
+		input,
+	]);
+}
+
 return view.extend({
 	async load() {
 		const pageScope = operation.createPageScope();
@@ -723,21 +744,21 @@ return view.extend({
 			autocomplete: 'username',
 			maxlength: '64',
 			placeholder: _('Leave empty to keep the current username'),
-			style: 'width: 100%',
+			style: 'width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box',
 		});
 		const passwordInput = E('input', {
 			class: 'cbi-input-password',
 			type: 'password',
 			autocomplete: 'new-password',
 			maxlength: '256',
-			style: 'width: 100%',
+			style: 'width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box',
 		});
 		const confirmationInput = E('input', {
 			class: 'cbi-input-password',
 			type: 'password',
 			autocomplete: 'new-password',
 			maxlength: '256',
-			style: 'width: 100%',
+			style: 'width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box',
 		});
 		const status = E('p', { class: 'alert-message', style: 'display: none' });
 		const cancelButton = E('button', {
@@ -772,18 +793,9 @@ return view.extend({
 				E('strong', {}, info.username),
 			]),
 			E('p', {}, _('Leave either field empty to keep it unchanged. A new password must contain at least 8 characters and no more than 72 UTF-8 bytes.')),
-			E('label', { class: 'cbi-value' }, [
-				E('span', { class: 'cbi-value-title' }, _('New username')),
-				E('span', { class: 'cbi-value-field' }, usernameInput),
-			]),
-			E('label', { class: 'cbi-value' }, [
-				E('span', { class: 'cbi-value-title' }, _('New password')),
-				E('span', { class: 'cbi-value-field' }, passwordInput),
-			]),
-			E('label', { class: 'cbi-value' }, [
-				E('span', { class: 'cbi-value-title' }, _('Confirm password')),
-				E('span', { class: 'cbi-value-field' }, confirmationInput),
-			]),
+			credentialField(_('New username'), usernameInput),
+			credentialField(_('New password'), passwordInput),
+			credentialField(_('Confirm password'), confirmationInput),
 			status,
 			E('div', { class: 'right' }, [
 				cancelButton,
@@ -957,8 +969,7 @@ return view.extend({
 			let committed = null;
 			try {
 				committed = await getSettings(scope);
-				updateSettingsMap(map, committed);
-				await map.reset();
+				await reloadSettingsMap(map, committed);
 				if (!operation.isPageActive(scope))
 					throw operation.pageInactiveError();
 			} catch (error) {
@@ -1009,7 +1020,6 @@ return view.extend({
 	handleReset() {
 		if (!this.settingsMap || !this.committedSettings)
 			return Promise.resolve();
-		updateSettingsMap(this.settingsMap, this.committedSettings);
-		return this.settingsMap.reset();
+		return reloadSettingsMap(this.settingsMap, this.committedSettings);
 	},
 });

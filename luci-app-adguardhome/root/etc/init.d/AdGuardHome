@@ -27,7 +27,6 @@ MAX_TLS_FILE_SIZE=1048576
 MAX_UCI_CONFIG_SIZE=1048576
 MANAGED_JAIL_OPTION="managed_jail_mount"
 MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
-MANAGED_DATA_JAIL_OPTION="managed_data_jail_mount"
 MANAGED_DNSMASQ_UPSTREAM="managed_dnsmasq_upstream"
 UCI_CONFIG_DIRECTORY="/etc/config"
 UCI_DELTA_DIRECTORY="/tmp/.uci"
@@ -3296,46 +3295,41 @@ memory_data_jail_count() {
 	config_list_foreach "$OFFICIAL_SECTION" jail_mount_rw collect_memory_data_jail_mount
 }
 
+# The official jail already mounts work_dir read-write, but that ordinary bind
+# does not carry the nested RAM data bind into ujail.  Keep exactly one explicit
+# child mount while RAM mode is active.  This derived jail_mount_rw entry is the
+# sole persistent record; actual RAM state continues to require the authenticated
+# state file and mount identities.
 sync_memory_data_jail_access_persistent() {
-	local desired="" old changed=0
+	local desired="" backing candidate changed=0
 	[ "$MEMORY_ACTIVE" != 1 ] || desired="${MEMORY_BACKING_WORK_DIR%/}/data"
-	old="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DATA_JAIL_OPTION}")"
-	if [ -n "$old" ] && [ "$old" != "$desired" ]; then
-		uci -q del_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${old}" \
-			>/dev/null 2>&1 || true
-		uci -q delete "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DATA_JAIL_OPTION}" \
-			>/dev/null 2>&1 || true
-		old=""
-		changed=1
-	fi
+	for backing in "$previous_work_dir" "$persistent_work_dir" \
+		"$MEMORY_BACKING_WORK_DIR"; do
+		[ -n "$backing" ] || continue
+		candidate="${backing%/}/data"
+		[ "$candidate" = "$desired" ] && continue
+		if uci -q del_list \
+		   "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${candidate}" \
+		   >/dev/null 2>&1; then
+			changed=1
+		fi
+	done
 	if [ -n "$desired" ]; then
 		memory_data_jail_count "$desired" || return 1
 		case "$MEMORY_DATA_JAIL_COUNT" in
 			0)
-				uci -q add_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${desired}" || return 1
-				uci -q set "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DATA_JAIL_OPTION}=${desired}" || return 1
+				uci -q add_list \
+					"${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${desired}" || return 1
 				changed=1
 				;;
-			1)
-				# A pre-existing unowned entry remains user-owned.  Record ownership
-				# only when this plugin already created the exact entry.
-				[ -z "$old" ] || [ "$old" = "$desired" ] || return 1
-				;;
+			1) ;;
 			*) return 1 ;;
 		esac
-	elif [ -n "$old" ]; then
-		uci -q del_list "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${old}" \
-			>/dev/null 2>&1 || true
-		uci -q delete "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DATA_JAIL_OPTION}" || return 1
-		changed=1
 	fi
 	[ "$changed" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
-	if [ -n "$desired" ]; then
-		memory_data_jail_count "$desired" || return 1
-		[ "$MEMORY_DATA_JAIL_COUNT" = 1 ]
-	else
-		[ -z "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DATA_JAIL_OPTION}")" ]
-	fi
+	[ -z "$desired" ] && return 0
+	memory_data_jail_count "$desired" || return 1
+	[ "$MEMORY_DATA_JAIL_COUNT" = 1 ]
 }
 
 sync_official_uci_persistent() {
