@@ -18,7 +18,7 @@ init_file="${package_dir}/root/etc/init.d/AdGuardHome"
 defaults_file="${package_dir}/root/etc/uci-defaults/40_luci-AdGuardHome"
 makefile="${package_dir}/Makefile"
 helper_source="${package_dir}/scripts/run-bounded.mk"
-expander="${package_dir}/scripts/expand-bounded.awk"
+expander="${package_dir}/scripts/expand-helpers.awk"
 
 for required_file in "$init_file" "$defaults_file" "$makefile" "$helper_source" "$expander"; do
 	[ -f "$required_file" ] || {
@@ -50,8 +50,8 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT QUIT TERM
 
-awk -v helper="$helper_source" -f "$expander" "$init_file" >"${temp_dir}/init.expanded"
-awk -v helper="$helper_source" -f "$expander" "$defaults_file" >"${temp_dir}/defaults.expanded"
+awk -v helper_dir="${package_dir}/scripts" -f "$expander" "$init_file" >"${temp_dir}/init.expanded"
+awk -v helper_dir="${package_dir}/scripts" -f "$expander" "$defaults_file" >"${temp_dir}/defaults.expanded"
 extract_helper "${temp_dir}/init.expanded" >"${temp_dir}/init.helper"
 extract_helper "${temp_dir}/defaults.expanded" >"${temp_dir}/defaults.helper"
 for expanded in "${temp_dir}/init.expanded" "${temp_dir}/defaults.expanded"; do

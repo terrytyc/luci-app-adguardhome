@@ -21,12 +21,12 @@ reject_text() {
 }
 
 require_text "$makefile" 'PKG_VERSION:=2.4.0'
-require_text "$makefile" 'PKG_RELEASE:=4'
-require_text "$makefile" '2.4.0-r1|2.4.0-r2|2.4.0-r3)'
-require_text "$makefile" 'Only luci-app-adguardhome 2.4.0-r1, r2 or r3 can be upgraded in place.'
+require_text "$makefile" 'PKG_RELEASE:=5'
+require_text "$makefile" '2.4.0-r1|2.4.0-r2|2.4.0-r3|2.4.0-r4)'
+require_text "$makefile" 'Only luci-app-adguardhome 2.4.0-r1, r2, r3 or r4 can be upgraded in place.'
 reject_text "$makefile" '/usr/lib/opkg/'
 require_text "$makefile" "printf 'source_version=%s\\n'"
-require_text "$makefile" "grep -Eq '^source_version=2[.]4[.]0-r[123]\$\$'"
+require_text "$makefile" "grep -Eq '^source_version=2[.]4[.]0-r[1234]\$\$'"
 require_text "$makefile" 'managed_dnsmasq_upstream'
 require_text "$makefile" 'official-adguardhome.config'
 require_text "$makefile" 'managed-adguardhome.config'
@@ -61,7 +61,7 @@ require_text "$defaults" 'set_luci_option redirect "$redirect"'
 require_text "$defaults" 'set_luci_option run_from_memory 0'
 require_text "$defaults" 'set_luci_option memory_writeback_interval 60'
 require_text "$defaults" 'upgrade_state_is_valid && baseline_config_is_valid'
-require_text "$defaults" "grep -Eq '^source_version=2[.]4[.]0-r[123]\$'"
+require_text "$defaults" "grep -Eq '^source_version=2[.]4[.]0-r[1234]\$'"
 require_text "$defaults" 'refresh_managed_config_snapshot'
 require_text "$defaults" 'normalize_config'
 require_text "$defaults" 'SOURCE_WORK_DIR="$(resolve_source_work_dir "$configured_work")"'

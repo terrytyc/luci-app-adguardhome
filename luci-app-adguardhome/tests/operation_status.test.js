@@ -40,7 +40,6 @@ function loadOperation() {
 	const rendered = [];
 	const timers = new Map();
 	let nextTimer = 1;
-	let now = 1000;
 	let hidden = 0;
 
 	const fakeWindow = {
@@ -63,7 +62,6 @@ function loadOperation() {
 		},
 	};
 	const sandbox = {
-		Date: { now: () => now },
 		E: (tag, attrs, child) => ({ tag, attrs, text: String(child) }),
 		L: { env: { apply_display: 2 } },
 		Number,
@@ -90,7 +88,6 @@ function loadOperation() {
 			assert.ok(entry, 'expected a pending timer');
 			const [ id, timer ] = entry;
 			timers.delete(id);
-			now += timer.delay;
 			timer.callback();
 		},
 		hidden: () => hidden,
@@ -98,22 +95,25 @@ function loadOperation() {
 }
 
 const state = loadOperation();
-state.operation.start();
+const initialTicket = state.operation.start();
 assert.equal(state.rendered.at(-1).child.text,
-	'Applying configuration changes… 90s');
+	'Applying configuration changes…');
 assert.deepEqual(state.rendered.at(-1).classes,
 	[ 'alert-message', 'notice', 'spinning' ]);
 assert.equal(state.rendered.at(-1).child.tag, 'p');
-state.advanceOne();
-assert.equal(state.rendered.at(-1).child.text,
-	'Applying configuration changes… 89s');
+assert.equal(state.timers.size, 0,
+	'pending operations must wait for a real result without repaint or countdown timers');
+assert.equal(state.rendered.length, 1);
+assert.equal(state.operation._modalVisible, true,
+	'a pending operation without a timer must still own its visible modal');
 
-state.operation.success();
+state.operation.success(undefined, initialTicket);
 assert.equal(state.rendered.at(-1).child.text, 'Configuration changes applied.');
 assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'notice' ]);
 assert.equal(state.hidden(), 0);
 state.advanceOne();
 assert.equal(state.hidden(), 1, 'success status must close automatically');
+assert.equal(state.operation._modalVisible, false);
 
 state.operation.success('saved, reload required');
 assert.equal(state.rendered.at(-1).child.text, 'saved, reload required');
@@ -126,6 +126,24 @@ assert.equal(state.rendered.at(-1).child.text, 'failed');
 assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'error' ]);
 state.advanceOne();
 assert.equal(state.hidden(), 3, 'failure status must close automatically');
+
+const staleTicket = state.operation.start();
+state.operation.success('first result', staleTicket);
+const staleClose = state.timers.values().next().value.callback;
+const currentTicket = state.operation.start();
+assert.equal(state.timers.size, 0,
+	'a new pending operation must cancel the previous result-close timer');
+const currentRenderCount = state.rendered.length;
+staleClose();
+state.operation.failure('obsolete result', staleTicket);
+assert.equal(state.rendered.length, currentRenderCount);
+assert.equal(state.hidden(), 3,
+	'an old result-close callback must not hide the current pending modal');
+assert.equal(state.operation._modalVisible, true);
+state.operation.failure('current result', currentTicket);
+assert.equal(state.rendered.at(-1).child.text, 'current result');
+state.advanceOne();
+assert.equal(state.hidden(), 4);
 
 const overview = fs.readFileSync(path.join(
 	packageRoot,
@@ -160,6 +178,8 @@ assert.doesNotMatch(overview,
 	/HTTP keeps the host used to access LuCI and uses the port from YAML http\.address/);
 const operationSource = fs.readFileSync(modulePath, 'utf8');
 assert.match(operationSource, /const JOB_POLL_LIMIT = 360;/);
+assert.doesNotMatch(operationSource, /APPLY_WAIT_SECONDS|Date\.now|remaining|%ds/,
+	'apply progress must be driven by the job result, not a guessed deadline');
 assert.match(overview, /operation\.waitForJob\(callGetYamlUpdate,/);
 assert.match(overview, /operation\.waitForJob\(callGetSettingsUpdate,/);
 assert.match(yaml, /operation\.waitForJob\(callGetYamlUpdate,/);

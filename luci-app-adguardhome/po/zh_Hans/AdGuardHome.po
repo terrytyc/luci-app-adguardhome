@@ -395,3 +395,6 @@ msgstr "设置更新已成功，但无法验证结果。再次应用设置前请
 
 msgid "The settings update finished, but the page could not reload its result: %s. Reload this page before applying settings again."
 msgstr "设置更新已结束，但页面无法重新载入结果：%s。再次应用设置前请重新加载此页面。"
+
+msgid "Applying configuration changes…"
+msgstr "正在应用配置…"

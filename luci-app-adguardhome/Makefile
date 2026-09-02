@@ -4,10 +4,11 @@
 ADGUARDHOME_SOURCE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(TOPDIR)/rules.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
+include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -20,8 +21,8 @@ LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
 define Build/Prepare/luci-app-adguardhome
 	for file in etc/init.d/AdGuardHome etc/uci-defaults/40_luci-AdGuardHome; do \
-		awk -v helper="$(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk" \
-			-f $(ADGUARDHOME_SOURCE_DIR)scripts/expand-bounded.awk \
+		awk -v helper_dir="$(ADGUARDHOME_SOURCE_DIR)scripts" \
+			-f $(ADGUARDHOME_SOURCE_DIR)scripts/expand-helpers.awk \
 			$(PKG_BUILD_DIR)/root/$$$$file >$(PKG_BUILD_DIR)/root/$$$$file.expanded && \
 			touch -r $(PKG_BUILD_DIR)/root/$$$$file $(PKG_BUILD_DIR)/root/$$$$file.expanded && \
 			mv $(PKG_BUILD_DIR)/root/$$$$file.expanded $(PKG_BUILD_DIR)/root/$$$$file || exit 1; \
@@ -51,30 +52,7 @@ define Package/$(PKG_NAME)/preinst
 
 $(AdGuardHome/RunBounded)
 
-entry_metadata() {
-	LC_ALL=C ls -ldn "$$1" 2>/dev/null
-}
-
-root_private_directory() {
-	local metadata mode owner group
-	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode _links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = drwx------ ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
-
-root_private_file() {
-	local metadata mode links owner group
-	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = -rw------- ] && [ "$$links" = 1 ] &&
-		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
+$(AdGuardHome/PrivateFiles)
 
 bounded_private_file() {
 	local size
@@ -236,9 +214,9 @@ fi
 
 source_version="$$(installed_source_version)" || source_version=""
 case "$$source_version" in
-	2.4.0-r1|2.4.0-r2|2.4.0-r3) ;;
+	2.4.0-r1|2.4.0-r2|2.4.0-r3|2.4.0-r4) ;;
 	*)
-		echo "Only luci-app-adguardhome 2.4.0-r1, r2 or r3 can be upgraded in place." >&2
+		echo "Only luci-app-adguardhome 2.4.0-r1, r2, r3 or r4 can be upgraded in place." >&2
 		exit 1
 		;;
 esac
@@ -299,28 +277,7 @@ define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
-entry_metadata() {
-	LC_ALL=C ls -ldn "$$1" 2>/dev/null
-}
-root_private_directory() {
-	local metadata mode owner group
-	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode _links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = drwx------ ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
-root_private_file() {
-	local metadata mode links owner group
-	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = -rw------- ] && [ "$$links" = 1 ] &&
-		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
+$(AdGuardHome/PrivateFiles)
 
 if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
    [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
@@ -334,7 +291,7 @@ if [ -e "$$upgrade_state" ] || [ -L "$$upgrade_state" ]; then
 	root_private_directory "$$runtime_dir" && root_private_file "$$upgrade_state" ||
 		exit 1
 	[ "$$(wc -l <"$$upgrade_state" 2>/dev/null)" = 2 ] || exit 1
-	grep -Eq '^source_version=2[.]4[.]0-r[123]$$' "$$upgrade_state" || exit 1
+	grep -Eq '^source_version=2[.]4[.]0-r[1234]$$' "$$upgrade_state" || exit 1
 	was_running="$$(sed -n 's/^was_running=//p' "$$upgrade_state")"
 	case "$$was_running" in
 		1)
@@ -374,28 +331,7 @@ esac
 
 $(AdGuardHome/RunBounded)
 
-entry_metadata() {
-	LC_ALL=C ls -ldn "$$1" 2>/dev/null
-}
-root_private_directory() {
-	local metadata mode owner group
-	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode _links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = drwx------ ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
-root_private_file() {
-	local metadata mode links owner group
-	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = -rw------- ] && [ "$$links" = 1 ] &&
-		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
+$(AdGuardHome/PrivateFiles)
 bounded_private_file() {
 	local size
 	root_private_file "$$1" || return 1
@@ -495,28 +431,7 @@ esac
 rm -f "$$IPKG_INSTROOT/lib/upgrade/keep.d/luci-app-adguardhome"
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
-entry_metadata() {
-	LC_ALL=C ls -ldn "$$1" 2>/dev/null
-}
-root_private_directory() {
-	local metadata mode owner group
-	[ -d "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode _links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = drwx------ ] && [ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
-root_private_file() {
-	local metadata mode links owner group
-	[ -f "$$1" ] && [ ! -L "$$1" ] || return 1
-	metadata="$$(entry_metadata "$$1")" || return 1
-	read -r mode links owner group _rest <<-EOF
-	$$metadata
-	EOF
-	[ "$$mode" = -rw------- ] && [ "$$links" = 1 ] &&
-		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
-}
+$(AdGuardHome/PrivateFiles)
 
 snapshot_dir=/root/.luci-app-adguardhome
 runtime_dir=/var/run/luci-app-adguardhome

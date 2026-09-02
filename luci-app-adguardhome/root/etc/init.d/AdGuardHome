@@ -663,8 +663,10 @@ load_settings() {
 		"$MEMORY_WRITEBACK_DEFAULT_MINUTES"
 	memory_writeback_interval="$(normalize_memory_writeback_interval \
 		"$memory_writeback_interval")" || return 1
-	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
-	official_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
+	# Reuse the package already loaded above instead of spawning two more UCI
+	# readers within the same settings snapshot.
+	config_get official_work "$OFFICIAL_SECTION" work_dir ""
+	config_get official_config "$OFFICIAL_SECTION" config_file ""
 	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
 	previous_work_dir="$official_work"
 	# config_file is never an independent YAML selector.  Validate the
@@ -3041,9 +3043,32 @@ memory_restore_official_persistent_paths() {
 	memory_commit_official_persistent_paths "$backing"
 }
 
+uci_guard_configs_unchanged() {
+	local directory="$1" snapshot target old_signature new_signature
+	snapshot="${directory}/${OFFICIAL_CONFIG}"
+	target="${UCI_GUARD_CONFIG_FD_PATH}/${OFFICIAL_CONFIG}"
+	uci_guard_snapshot_dir_valid "$directory" || return 1
+	if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+		old_signature="$(uci_guard_file_signature "$snapshot")" || return 1
+		new_signature="$(uci_guard_file_signature "$target")" || return 1
+		[ "$old_signature" = "$new_signature" ] && cmp -s "$snapshot" "$target"
+	else
+		[ -f "${directory}/.originally-absent" ] &&
+			[ ! -L "${directory}/.originally-absent" ] &&
+			[ "$(wc -c <"${directory}/.originally-absent")" = 0 ] &&
+			[ ! -e "$target" ] && [ ! -L "$target" ]
+	fi
+}
+
 memory_run_with_official_path_guard() (
-	local snapshot_ready=0 transaction_complete=0
-	local primary_rc=1 final_rc snapshot_directory=""
+	# This subshell already isolates state.  Do not make EXIT-trap state local:
+	# ash unwinds function locals before dispatching the subshell's EXIT trap.
+	snapshot_ready=0 transaction_complete=0
+	primary_rc=1 final_rc=1 snapshot_directory=""
+	uci_only=0
+	case "$1" in
+		settings_commit_persistent|normalize_managed_config_file_persistent) uci_only=1 ;;
+	esac
 	cleanup_memory_path_guard() {
 		final_rc=$?
 		# Disable recursive EXIT handling, then make the compensating restore
@@ -3081,7 +3106,12 @@ memory_run_with_official_path_guard() (
 	primary_rc=$?
 	[ "$primary_rc" = 0 ] || exit "$primary_rc"
 	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
-	memory_durability_barrier || exit 1
+	# Only these UCI-only actions may skip global sync when validated metadata
+	# and bytes match.  TLS/official sync can also repair certificate permissions
+	# and retains its barrier even if the UCI file itself has not changed.
+	{ [ "$uci_only" = 1 ] &&
+	  uci_guard_configs_unchanged "$snapshot_directory"; } ||
+		memory_durability_barrier || exit 1
 	snapshot_ready=0
 	transaction_complete=1
 	if ! uci_guard_discard_snapshot "$snapshot_directory"; then
@@ -3531,7 +3561,9 @@ clear_recorded_integration_locked() {
 
 runtime_settings_match() {
 	local expected_port="$1" expected_mode="$2" expected_work_dir="$3"
-	load_settings || return 1
+	# Readiness polling validates mount/state identities, not every data file.
+	# Copy/start/switch/removal entry points keep their full tree checks.
+	load_settings light || return 1
 	[ "$service_enabled" = 1 ] || return 1
 	load_runtime_dns_port || return 1
 	[ "$dns_port" = "$expected_port" ] &&
@@ -3548,7 +3580,7 @@ apply_integration_locked() {
 	dns_port="$expected_port"
 	redirect_mode="$expected_mode"
 	work_dir="$expected_work_dir"
-	if ! official_running || ! dns_port_listening; then
+	if ! dns_port_listening; then
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
 	fi
@@ -3567,7 +3599,7 @@ apply_integration_locked() {
 	# YAML may be rewritten by the official Web UI while the resolver reloads.
 	# Roll back immediately unless this exact port/mode/workdir is still current.
 	if ! runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir" ||
-	   ! official_running || ! dns_port_listening; then
+	   ! dns_port_listening; then
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
 	fi
@@ -3601,22 +3633,14 @@ official_running() {
 
 official_pid() {
 	ubus -S call service list '{"name":"adguardhome"}' 2>/dev/null |
-		jsonfilter -e '@.adguardhome.instances.*.pid' 2>/dev/null |
+		jsonfilter -e '@.adguardhome.instances[@.running=true].pid' 2>/dev/null |
 		awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
 }
 
 official_memory_data_mount_visible() {
-	local supervisor pid executable jail_data
+	local pid jail_data
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
-	supervisor="$(official_pid)" || return 1
-	case "$supervisor" in ""|*[!0-9]*) return 1 ;; esac
-	for pid in $(pidof AdGuardHome 2>/dev/null); do
-		pid_is_supervised_descendant "$pid" "$supervisor" || continue
-		executable="$(readlink "/proc/${pid}/exe" 2>/dev/null)" || continue
-		case "$executable" in
-			"$CORE_BINARY"|"$CORE_BINARY (deleted)") ;;
-			*) continue ;;
-		esac
+	for pid in $OFFICIAL_SOCKET_PIDS; do
 		jail_data="/proc/${pid}/root${MEMORY_BACKING_WORK_DIR}/data"
 		[ -d "$jail_data" ] && [ ! -L "$jail_data" ] &&
 			[ "$jail_data" -ef "$MEMORY_DATA_DIR" ] && return 0
@@ -3644,22 +3668,15 @@ pid_is_supervised_descendant() {
 	return 1
 }
 
-# Verify that a socket in the requested kernel table belongs to the PID
-# supervised by the official service.  An unrelated listener on the same port
-# must never trigger DNS takeover.  Address modes additionally restrict a
-# socket to a loopback-reachable or wildcard bind appropriate for the selected
-# integration mode.
-official_owns_socket() {
-	local table="$1" address_mode="$2" expected_state supervisor pid executable port_hex inode fd link
-	[ -r "$table" ] || return 1
-	case "$table" in
-		/proc/net/tcp|/proc/net/tcp6) expected_state=0A ;;
-		/proc/net/udp|/proc/net/udp6) expected_state=07 ;;
-		*) return 1 ;;
-	esac
+# One listening check owns one short-lived snapshot, scoped by its subshell.
+# Reuse the running service, authenticated core PIDs and their FD inodes across
+# UDP/TCP/IPv4/IPv6 checks; the next poll always rebuilds all of them.
+official_socket_snapshot() {
+	local supervisor pid executable fd link inode
+	OFFICIAL_SOCKET_PIDS=""
+	OFFICIAL_SOCKET_INODES=" "
 	supervisor="$(official_pid)"
 	case "$supervisor" in ""|*[!0-9]*) return 1 ;; esac
-	port_hex="$(printf '%04X' "$dns_port")" || return 1
 	# With procd_add_jail(), ubus reports the outer ujail PID.  Accept only an
 	# AdGuardHome process whose ancestor chain reaches that exact supervisor.
 	for pid in $(pidof AdGuardHome 2>/dev/null); do
@@ -3670,25 +3687,45 @@ official_owns_socket() {
 			*) continue ;;
 		esac
 		[ -d "/proc/${pid}/fd" ] || continue
-		for inode in $(awk -v wanted="$port_hex" -v mode="$address_mode" \
-			-v wanted_state="$expected_state" '
-			NR > 1 {
-				split($2,a,":")
-				address=toupper(a[1])
-				if (toupper(a[2]) != wanted) next
-				if (toupper($4) != wanted_state) next
-				if (mode == "ipv4-loopback" &&
-				    address != "00000000" && address != "0100007F") next
-				if (mode == "ipv4-wildcard" && address != "00000000") next
-				if (mode == "ipv6-wildcard" &&
-				    address != "00000000000000000000000000000000") next
-				print $10
-			}' "$table"); do
-			for fd in "/proc/${pid}/fd/"*; do
-				link="$(readlink "$fd" 2>/dev/null)" || continue
-				[ "$link" = "socket:[${inode}]" ] && return 0
-			done
+		OFFICIAL_SOCKET_PIDS="${OFFICIAL_SOCKET_PIDS} ${pid}"
+		for fd in "/proc/${pid}/fd/"*; do
+			link="$(readlink "$fd" 2>/dev/null)" || continue
+			case "$link" in socket:\[*\]) ;; *) continue ;; esac
+			inode="${link#socket:\[}"
+			inode="${inode%\]}"
+			case "$inode" in ""|*[!0-9]*) continue ;; esac
+			OFFICIAL_SOCKET_INODES="${OFFICIAL_SOCKET_INODES}${inode} "
 		done
+	done
+	[ -n "$OFFICIAL_SOCKET_PIDS" ] && [ "$OFFICIAL_SOCKET_INODES" != " " ]
+}
+
+# A foreign listener must never trigger takeover.  Require an inode from the
+# current official snapshot and an address reachable by the integration mode.
+official_owns_socket() {
+	local table="$1" address_mode="$2" expected_state port_hex inode
+	[ -r "$table" ] || return 1
+	case "$table" in
+		/proc/net/tcp|/proc/net/tcp6) expected_state=0A ;;
+		/proc/net/udp|/proc/net/udp6) expected_state=07 ;;
+		*) return 1 ;;
+	esac
+	port_hex="$(printf '%04X' "$dns_port")" || return 1
+	for inode in $(awk -v wanted="$port_hex" -v mode="$address_mode" \
+		-v wanted_state="$expected_state" '
+		NR > 1 {
+			split($2,a,":")
+			address=toupper(a[1])
+			if (toupper(a[2]) != wanted) next
+			if (toupper($4) != wanted_state) next
+			if (mode == "ipv4-loopback" &&
+			    address != "00000000" && address != "0100007F") next
+			if (mode == "ipv4-wildcard" && address != "00000000") next
+			if (mode == "ipv6-wildcard" &&
+			    address != "00000000000000000000000000000000") next
+			print $10
+		}' "$table"); do
+		case "$OFFICIAL_SOCKET_INODES" in *" ${inode} "*) return 0 ;; esac
 	done
 	return 1
 }
@@ -3703,7 +3740,9 @@ official_owns_ipv4_reachable_socket() {
 	official_owns_socket "$ipv6_table" ipv6-wildcard
 }
 
-dns_port_listening() {
+dns_port_listening() (
+	official_socket_snapshot || exit 1
+	official_memory_data_mount_visible || exit 1
 	if [ "$redirect_mode" = dnsmasq-upstream ]; then
 		# dnsmasq is configured with 127.0.0.1#port.  Require both UDP and
 		# TCP on an IPv4-reachable loopback/wildcard listener before
@@ -3727,25 +3766,26 @@ dns_port_listening() {
 		official_owns_socket /proc/net/udp6 any) &&
 		(official_owns_socket /proc/net/tcp any ||
 		official_owns_socket /proc/net/tcp6 any)
-}
+)
 
-dns_ipv6_listening() {
+dns_ipv6_listening() (
+	official_socket_snapshot || exit 1
 	# family=any redirects both UDP and TCP to every local IPv6 address.
 	official_owns_socket /proc/net/udp6 ipv6-wildcard &&
 		official_owns_socket /proc/net/tcp6 ipv6-wildcard
-}
+)
 
-web_listening() {
+web_listening() (
 	local port="$1"
 	is_valid_port "$port" || return 1
-	official_running || return 1
+	official_socket_snapshot || exit 1
 	dns_port="$port"
 	if official_owns_socket /proc/net/tcp any ||
 	   official_owns_socket /proc/net/tcp6 any; then
 		return 0
 	fi
 	return 1
-}
+)
 
 wait_for_core_ready() {
 	local expected_port="$1" expected_mode="$2" expected_work_dir="$3"
@@ -3761,11 +3801,10 @@ wait_for_core_ready() {
 		dns_port="$expected_port"
 		redirect_mode="$expected_mode"
 		work_dir="$expected_work_dir"
-		if official_running && official_memory_data_mount_visible && dns_port_listening; then
+		if dns_port_listening; then
 			stable=$((stable + 1))
 			if [ "$stable" -ge "$READY_STABLE_COUNT" ]; then
 				runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir" &&
-					official_memory_data_mount_visible &&
 					dns_port_listening
 				return
 			fi
@@ -4096,7 +4135,7 @@ yaml_update_locked() {
 		   [ "$TLS_DESIRED_MOUNTS" != "$committed_tls_mounts" ] ||
 		   ! runtime_settings_match "$committed_port" "$committed_mode" \
 			"$committed_work_dir" ||
-		   ! official_running || ! dns_port_listening; then
+		   ! dns_port_listening; then
 			log_error "The running core produced an unsafe YAML result; restoring the previous file"
 			attempt_yaml_rollback "$backup" "$was_running" ||
 				log_error "Failed to restore the previous YAML runtime"
@@ -4110,7 +4149,7 @@ yaml_update_locked() {
 		if [ "$verify_hash" != "$final_hash" ] ||
 		   ! runtime_settings_match "$committed_port" "$committed_mode" \
 			"$committed_work_dir" ||
-		   ! official_running || ! dns_port_listening; then
+		   ! dns_port_listening; then
 			log_error "The running core YAML did not reach a stable valid state; restoring the previous file"
 			attempt_yaml_rollback "$backup" "$was_running" ||
 				log_error "Failed to restore the previous YAML runtime"
@@ -4876,7 +4915,7 @@ reconcile_core_locked() {
 		clear_recorded_integration_locked || return 1
 		return 0
 	fi
-	if ! official_running || ! dns_port_listening; then
+	if ! dns_port_listening; then
 		clear_recorded_integration_locked || return 1
 		return 0
 	fi

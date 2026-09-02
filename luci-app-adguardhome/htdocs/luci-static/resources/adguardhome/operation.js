@@ -5,7 +5,6 @@
 'require baseclass';
 'require ui';
 
-const APPLY_WAIT_SECONDS = 90;
 const DEFAULT_RESULT_DISPLAY_SECONDS = 3;
 const ERROR_DISPLAY_SECONDS = 8;
 const JOB_POLL_INTERVAL = 1000;
@@ -13,6 +12,7 @@ const JOB_POLL_LIMIT = 360;
 
 return baseclass.extend({
 	_timer: null,
+	_modalVisible: false,
 	_generation: 0,
 	_scopeGeneration: 0,
 	_activeScope: null,
@@ -41,11 +41,10 @@ return baseclass.extend({
 		this._installPageShowGuard();
 
 		if (this._activeScope != null) {
-			const hadVisibleOperation = this._timer != null;
 			this._clearTimer();
 			this._generation++;
-			if (hadVisibleOperation)
-				ui.hideModal();
+			if (this._modalVisible)
+				this._hide();
 		}
 
 		const generation = ++this._scopeGeneration;
@@ -191,30 +190,20 @@ return baseclass.extend({
 			classes.push('spinning');
 
 		ui.showModal('', E('p', {}, message), ...classes);
+		this._modalVisible = true;
+	},
+
+	_hide() {
+		this._modalVisible = false;
+		ui.hideModal();
 	},
 
 	start() {
 		this._clearTimer();
 		const generation = ++this._generation;
 		const ticket = { generation, scope: this._activeScope };
-		const deadline = Date.now() + APPLY_WAIT_SECONDS * 1000;
-
-		const tick = () => {
-			if (!this._ticketActive(ticket))
-				return;
-
-			const remaining = Math.max(Math.ceil((deadline - Date.now()) / 1000), 0);
-			this._show(
-				'notice',
-				_('Applying configuration changes… %ds').format(remaining),
-				true,
-			);
-
-			if (remaining > 0)
-				this._timer = window.setTimeout(tick, 1000);
-		};
-
-		tick();
+		if (this._ticketActive(ticket))
+			this._show('notice', _('Applying configuration changes…'), true);
 		return ticket;
 	},
 
@@ -238,7 +227,7 @@ return baseclass.extend({
 		this._timer = window.setTimeout(() => {
 			if (generation === this._generation) {
 				this._timer = null;
-				ui.hideModal();
+				this._hide();
 			}
 		}, seconds * 1000);
 	},
@@ -254,7 +243,7 @@ return baseclass.extend({
 		this._timer = window.setTimeout(() => {
 			if (generation === this._generation) {
 				this._timer = null;
-				ui.hideModal();
+				this._hide();
 			}
 		}, ERROR_DISPLAY_SECONDS * 1000);
 	},

@@ -57,6 +57,7 @@ const functionNames = [
 	'same_inode',
 	'same_directory_inode',
 	'memory_state_active',
+	'configuration_state',
 	'config_path',
 	'service_running',
 	'service_status',

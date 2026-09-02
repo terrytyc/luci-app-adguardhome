@@ -294,19 +294,23 @@ function memory_state_active(persistent_work_dir) {
 	}
 }
 
-function config_path() {
+function configuration_state() {
 	let uci = null;
 	let work_dir = null;
+	let memory_requested = false;
 
 	try {
 		uci = cursor();
 		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
 		let configured_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		memory_requested = configured_boolean(
+			uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory')) === true;
 		if (configured_file == `${configured_work_dir}/${CONFIG_FILENAME}`)
 			work_dir = valid_work_dir(configured_work_dir);
 	}
 	catch (error) {
 		work_dir = null;
+		memory_requested = false;
 	}
 
 	if (uci) {
@@ -318,7 +322,15 @@ function config_path() {
 		}
 	}
 
-	return work_dir ? `${work_dir}/${CONFIG_FILENAME}` : null;
+	return {
+		work_dir,
+		path: work_dir ? `${work_dir}/${CONFIG_FILENAME}` : null,
+		memory_requested,
+	};
+}
+
+function config_path() {
+	return configuration_state().path;
 }
 
 function service_running() {
@@ -346,39 +358,22 @@ function service_running() {
 	return service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true;
 }
 
-function service_status() {
-	let requested = false;
+function service_status(configuration) {
+	configuration = configuration || configuration_state();
 	let active = false;
-	let uci = null;
-
 	try {
-		uci = cursor();
-		requested = configured_boolean(
-			uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory')) === true;
-		let work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
-		let config_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
-		active = !!valid_work_dir(work_dir) &&
-			config_file == `${work_dir}/${CONFIG_FILENAME}` &&
-			memory_state_active(work_dir);
+		active = !!configuration.work_dir && memory_state_active(configuration.work_dir);
 	}
-	catch (error) {
-		requested = false;
-		active = false;
-	}
-	if (uci) {
-		try { uci.unload(CONFIG_NAME); }
-		catch (error) { }
-	}
-
+	catch (error) { }
 	return {
 		running: service_running(),
-		memory_requested: requested,
+		memory_requested: configuration.memory_requested,
 		memory_active: active,
 	};
 }
 
-function read_yaml() {
-	let path = config_path();
+function read_yaml(configuration) {
+	let path = configuration ? configuration.path : config_path();
 	let file = null;
 	let content = null;
 	let digest = null;
@@ -507,8 +502,8 @@ function read_template() {
 	return valid ? content : null;
 }
 
-function read_config() {
-	let result = read_yaml();
+function read_config(configuration) {
+	let result = read_yaml(configuration);
 	return result ? replace(result.content, /\r\n?/g, '\n') : null;
 }
 
@@ -814,16 +809,17 @@ function yaml_job_active() {
 	return false;
 }
 
-function write_new_yaml_job(token, expected_hash, candidate_hash) {
+function write_yaml_job(token, content, create_only) {
 	let path = yaml_job_path(token);
 	let suffix = random_token();
 	let temporary = path && suffix ?
 		`${YAML_JOB_DIRECTORY}/.${token}.rpcd-${suffix}` : null;
-	let content = `pending:${expected_hash}:${candidate_hash}\n`;
 	let file = null;
 	let created = false;
 
-	if (!temporary || !ensure_yaml_job_directory())
+	if (!temporary || type(content) != 'string' || !parse_yaml_job_state(content) ||
+	    !(create_only ? ensure_yaml_job_directory() :
+	      root_private_directory(lstat(YAML_JOB_DIRECTORY))))
 		return false;
 
 	try {
@@ -844,7 +840,7 @@ function write_new_yaml_job(token, expected_hash, candidate_hash) {
 		file = null;
 		if (!root_private_file(lstat(temporary)) ||
 		    !parse_yaml_job_state(readfile(temporary, YAML_JOB_STATE_LIMIT + 1)) ||
-		    lstat(path) || !rename(temporary, path)) {
+		    (create_only && lstat(path)) || !rename(temporary, path)) {
 			unlink(temporary);
 			return false;
 		}
@@ -861,57 +857,18 @@ function write_new_yaml_job(token, expected_hash, candidate_hash) {
 
 	let valid = root_private_file(lstat(path)) &&
 		!!parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
-	if (!valid && root_private_file(lstat(path)))
+	if (create_only && !valid && root_private_file(lstat(path)))
 		unlink(path);
 
 	return valid;
 }
 
+function write_new_yaml_job(token, expected_hash, candidate_hash) {
+	return write_yaml_job(token, `pending:${expected_hash}:${candidate_hash}\n`, true);
+}
+
 function replace_yaml_job(token, content) {
-	let path = yaml_job_path(token);
-	let suffix = random_token();
-	let temporary = path && suffix ?
-		`${YAML_JOB_DIRECTORY}/.${token}.rpcd-${suffix}` : null;
-	let file = null;
-	let created = false;
-
-	if (!temporary || !root_private_directory(lstat(YAML_JOB_DIRECTORY)) ||
-	    type(content) != 'string' || !parse_yaml_job_state(content))
-		return false;
-
-	try {
-		file = open(temporary, 'wx', 0o600);
-		created = !!file;
-		if (!file || file.write(content) != length(content) || !file.flush()) {
-			if (file)
-				file.close();
-			if (created)
-				unlink(temporary);
-			return false;
-		}
-		if (!file.close()) {
-			file = null;
-			unlink(temporary);
-			return false;
-		}
-		file = null;
-		if (!root_private_file(lstat(temporary)) || !rename(temporary, path)) {
-			unlink(temporary);
-			return false;
-		}
-	}
-	catch (error) {
-		if (file) {
-			try { file.close(); }
-			catch (close_error) { }
-		}
-		if (created)
-			unlink(temporary);
-		return false;
-	}
-
-	return root_private_file(lstat(path)) &&
-		!!parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
+	return write_yaml_job(token, content, false);
 }
 
 function discard_yaml_job(token) {
@@ -1903,30 +1860,18 @@ function web_port_listening(port) {
 	if (type(port) != 'int')
 		return false;
 
-	// Serialize the entire status probe with YAML updates.  Checking the state
-	// before entering the init script leaves a race where a new worker can acquire
-	// rc.common's service lock first and block rpcd for the whole transaction.
-	let lock = open_yaml_job_lock();
-	if (!lock.file)
-		return false;
-
-	let listening = false;
+	// overview_info holds the transaction lock across every endpoint probe.
 	try {
-		if (!yaml_job_active() && service_running())
-			listening = system([
-				YAML_UPDATE_COMMAND, 'web_listening', `${port}`,
-			]) == 0;
+		return system([
+			YAML_UPDATE_COMMAND, 'web_listening', `${port}`,
+		]) == 0;
 	}
 	catch (error) {
-		listening = false;
+		return false;
 	}
-
-	let closed = close_yaml_job_lock(lock);
-	return closed && listening;
 }
 
-function config_info() {
-	let content = read_config();
+function config_info(content, can_probe) {
 	let result = { dns_port: null, web: null };
 	if (!content)
 		return result;
@@ -1945,7 +1890,8 @@ function config_info() {
 	if (tls_enabled) {
 		let host = valid_dns_name(yaml_section_value(config, 'tls', 'server_name'));
 		let port = valid_port(yaml_section_value(config, 'tls', 'port_https'));
-		if (host && port && tls_material_complete(config) && web_port_listening(port))
+		if (can_probe && host && port && tls_material_complete(config) &&
+		    web_port_listening(port))
 			result.web = { scheme: 'https', host, port };
 		if (result.web ||
 		    yaml_bool(yaml_section_value(config, 'tls', 'force_https')) === true)
@@ -1956,9 +1902,30 @@ function config_info() {
 	// its HTTP endpoint unless force_https is explicitly enabled.  The frontend
 	// intentionally reuses the LuCI page host for this result.
 	let port = http_port(config);
-	if (port && web_port_listening(port))
+	if (can_probe && port && web_port_listening(port))
 		result.web = { scheme: 'http', host: null, port };
 
+	return result;
+}
+
+function overview_info() {
+	// Take one UCI/service snapshot per request.  A non-blocking job lock keeps
+	// endpoint probes out of an apply transaction (and its rc.common lock).
+	// YAML is always freshly read; no state is cached between page polls.
+	let lock = open_yaml_job_lock();
+	let result = {
+		status: { running: false, memory_requested: false, memory_active: false },
+		config: { dns_port: null, web: null },
+	};
+	try {
+		let configuration = configuration_state();
+		result.status = service_status(configuration);
+		result.config = config_info(read_config(configuration),
+			!!lock.file && result.status.running && !yaml_job_active());
+	}
+	catch (error) { }
+	if (!close_yaml_job_lock(lock))
+		result.config.web = null;
 	return result;
 }
 
@@ -2000,6 +1967,11 @@ function core_version() {
 }
 
 const methods = {
+	get_overview: {
+		call: function() {
+			return overview_info();
+		},
+	},
 	get_status: {
 		call: function() {
 			return service_status();
@@ -2012,7 +1984,7 @@ const methods = {
 	},
 	get_config_info: {
 		call: function() {
-			return config_info();
+			return overview_info().config;
 		},
 	},
 	get_settings: {

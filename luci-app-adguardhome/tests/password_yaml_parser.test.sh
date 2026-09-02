@@ -47,14 +47,7 @@ trap 'exit 1' HUP INT TERM
 const TEST_CANDIDATE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 let mock_yaml = null;
 let updated_content = null;
-let mock_config = null;
-let config_reads = 0;
 let listening_ports = [];
-
-function read_config() {
-	config_reads++;
-	return mock_config;
-}
 
 function web_port_listening(port) {
 	for (let listening in listening_ports)
@@ -89,8 +82,8 @@ UCODE_STUBS
 		/^function yaml_simple_scalar\(value\)/ { copying = 0 }
 		/^function yaml_config_values\(content\)/ { copying = 1 }
 		/^function web_port_listening\(port\)/ { copying = 0 }
-		/^function config_info\(\)/ { copying = 1 }
-		/^function core_version\(\)/ { copying = 0 }
+		/^function config_info\(content, can_probe\)/ { copying = 1 }
+		/^function overview_info\(\)/ { copying = 0 }
 		copying { print }
 	' "$source_file"
 
@@ -348,12 +341,10 @@ print('ok - multi-user simultaneous update rejected\n');
 print('credential YAML parser fixture tests passed\n');
 
 function expect_config(name, content, ports, dns_port, scheme, host, port) {
-	mock_config = content;
 	listening_ports = ports;
-	config_reads = 0;
-	let result = config_info();
-	if (config_reads != 1 || result.dns_port !== dns_port)
-		fail(name, 'configuration was re-read or DNS port differs');
+	let result = config_info(content, true);
+	if (result.dns_port !== dns_port)
+		fail(name, 'DNS port differs');
 	if (scheme == null) {
 		if (result.web != null)
 			fail(name, 'ambiguous or unavailable web endpoint was exposed');

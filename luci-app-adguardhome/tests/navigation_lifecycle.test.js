@@ -38,6 +38,7 @@ function loadOperation() {
 	const onceListeners = new Map();
 	const rendered = [];
 	let reloads = 0;
+	let hidden = 0;
 
 	const fakeDocument = {
 		documentElement: {
@@ -70,7 +71,7 @@ function loadOperation() {
 	};
 	const fakeUi = {
 		showModal(_title, child) { rendered.push(child); },
-		hideModal() {},
+		hideModal() { hidden++; },
 	};
 	const LuCIClass = createLuCIClass();
 	const sandbox = {
@@ -102,6 +103,7 @@ function loadOperation() {
 			}
 		},
 		reloads: () => reloads,
+		hidden: () => hidden,
 	};
 }
 
@@ -308,6 +310,8 @@ async function main() {
 	const currentRoot = { isConnected: true };
 	const currentScope = state.operation.createPageScope();
 	currentScope.attach(currentRoot);
+	assert.equal(state.hidden(), 1,
+		'a new page scope must dismiss the old pending spinner even without a countdown timer');
 	await new Promise(resolve => setTimeout(resolve, 5));
 	state.operation.success('late result from old view', oldTicket);
 	assert.equal(state.rendered.length, afterOldStart,

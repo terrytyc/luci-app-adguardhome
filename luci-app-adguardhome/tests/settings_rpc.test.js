@@ -409,3 +409,131 @@ for (const settings of [ false, true ]) {
 }
 
 console.log('2.4 asynchronous RPC settings transaction tests passed');
+
+// The shared writer retains separate creation and replacement policies while
+// using one audited exclusive-create / flush / rename sequence.
+const writeFixture = {};
+const jobDirectory = '/var/run/luci-app-adguardhome-yaml';
+const jobPath = `${jobDirectory}/${token}`;
+const temporaryPath = `${jobDirectory}/.${token}.rpcd-${'4'.repeat(32)}`;
+const pending = `pending:${expectedHash}:${candidateHash}\n`;
+const terminal = `indeterminate:${expectedHash}:${candidateHash}\n`;
+function resetWrites() {
+	Object.assign(writeFixture, {
+		directory: true, entries: new Map(), ensureCalls: 0,
+		failure: null, unlinked: [], renamed: false,
+	});
+}
+function jobMetadata(name) {
+	if (name === jobDirectory)
+		return writeFixture.directory ? { type: 'directory', uid: 0, gid: 0, mode: 0o700 } : null;
+	const content = writeFixture.entries.get(name);
+	return content === undefined ? null : {
+		type: 'file', uid: 0, gid: 0, mode: 0o600, nlink: 1, size: content.length,
+	};
+}
+const writeSandbox = {
+	YAML_JOB_DIRECTORY: jobDirectory,
+	YAML_JOB_STATE_LIMIT: 256,
+	type: value => typeof value,
+	length: value => value.length,
+	match: (value, expression) => value.match(expression),
+	random_token: () => '4'.repeat(32),
+	lstat: jobMetadata,
+	ensure_yaml_job_directory() {
+		writeFixture.ensureCalls++;
+		writeFixture.directory = true;
+		return true;
+	},
+	readfile(name) {
+		return writeFixture.renamed && writeFixture.failure === 'post-validation'
+			? 'broken' : writeFixture.entries.get(name);
+	},
+	open(name, mode, permissions) {
+		assert.equal(mode, 'wx');
+		assert.equal(permissions, 0o600);
+		if (writeFixture.entries.has(name))
+			return null;
+		writeFixture.entries.set(name, '');
+		return {
+			write(content) {
+				if (writeFixture.failure === 'throw')
+					throw new Error('write failed');
+				writeFixture.entries.set(name, content);
+				return content.length - (writeFixture.failure === 'partial-write' ? 1 : 0);
+			},
+			flush: () => writeFixture.failure !== 'flush',
+			close: () => writeFixture.failure !== 'close',
+		};
+	},
+	rename(from, to) {
+		if (writeFixture.failure === 'rename')
+			return false;
+		writeFixture.entries.set(to, writeFixture.entries.get(from));
+		writeFixture.entries.delete(from);
+		writeFixture.renamed = true;
+		return true;
+	},
+	unlink(name) {
+		writeFixture.unlinked.push(name);
+		return writeFixture.entries.delete(name);
+	},
+};
+vm.createContext(writeSandbox);
+vm.runInContext([
+	'yaml_job_path', 'root_private_directory', 'root_private_file', 'parse_yaml_job_state',
+	'write_yaml_job', 'write_new_yaml_job', 'replace_yaml_job',
+].map(extractFunction).join('\n') + '\nthis.api = { write_new_yaml_job, replace_yaml_job };',
+writeSandbox, { filename: rpcPath });
+
+resetWrites();
+writeFixture.directory = false;
+assert.equal(writeSandbox.api.write_new_yaml_job(token, expectedHash, candidateHash), true);
+assert.equal(writeFixture.ensureCalls, 1, 'only creation may establish the private job directory');
+assert.equal(writeFixture.entries.get(jobPath), pending);
+assert.equal(writeFixture.entries.has(temporaryPath), false);
+assert.equal(writeSandbox.api.write_new_yaml_job(token, expectedHash, candidateHash), false,
+	'create-only must refuse an existing job record');
+assert.equal(writeFixture.entries.get(jobPath), pending);
+assert.equal(writeSandbox.api.replace_yaml_job(token, terminal), true);
+assert.equal(writeFixture.entries.get(jobPath), terminal);
+
+resetWrites();
+writeFixture.directory = false;
+assert.equal(writeSandbox.api.replace_yaml_job(token, terminal), false,
+	'replacement must not reconstruct a removed job directory');
+assert.equal(writeFixture.ensureCalls, 0);
+assert.equal(writeFixture.entries.size, 0);
+
+for (const operation of [ 'create', 'replace' ]) {
+	const write = () => operation === 'create'
+		? writeSandbox.api.write_new_yaml_job(token, expectedHash, candidateHash)
+		: writeSandbox.api.replace_yaml_job(token, terminal);
+	for (const failure of [ 'partial-write', 'flush', 'close', 'rename', 'throw' ]) {
+		resetWrites();
+		writeFixture.failure = failure;
+		if (operation === 'replace')
+			writeFixture.entries.set(jobPath, pending);
+		assert.equal(write(), false, `${operation}: ${failure} must fail`);
+		assert.equal(writeFixture.entries.has(temporaryPath), false,
+			`${operation}: ${failure} must remove its own temporary file`);
+		assert.equal(writeFixture.entries.get(jobPath), operation === 'replace' ? pending : undefined,
+			`${operation}: ${failure} must preserve the prior target`);
+	}
+	resetWrites();
+	writeFixture.entries.set(temporaryPath, 'owned-by-another-writer');
+	assert.equal(write(), false);
+	assert.equal(writeFixture.entries.get(temporaryPath), 'owned-by-another-writer',
+		'exclusive-create failure must never remove an unowned temporary file');
+
+	resetWrites();
+	writeFixture.failure = 'post-validation';
+	assert.equal(write(), false);
+	assert.equal(writeFixture.entries.has(jobPath), operation === 'replace',
+		'failed final validation may remove only a record created by this call');
+}
+
+resetWrites();
+assert.equal(writeSandbox.api.replace_yaml_job(token, 'invalid'), false);
+assert.equal(writeFixture.entries.size, 0, 'invalid state bytes must be rejected before staging');
+console.log('shared atomic job writer creation/replacement policy tests passed');

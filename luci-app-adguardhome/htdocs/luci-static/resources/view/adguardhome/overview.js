@@ -22,22 +22,16 @@ const POLL_INTERVAL = 5;
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_./+@%:,=-]+$/;
 const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 
-const callGetServiceStatus = rpc.declare({
+const callGetOverview = rpc.declare({
 	object: 'luci.adguardhome',
-	method: 'get_status',
-	expect: { '': { running: false, memory_requested: false, memory_active: false } },
+	method: 'get_overview',
+	expect: { '': { status: {}, config: {} } },
 });
 
 const callGetCoreVersion = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_version',
 	expect: { '': { version: null } },
-});
-
-const callGetConfigInfo = rpc.declare({
-	object: 'luci.adguardhome',
-	method: 'get_config_info',
-	expect: { '': { dns_port: null, web: null } },
 });
 
 const callGetSettings = rpc.declare({
@@ -120,19 +114,25 @@ function waitForSettingsUpdate(token, scope) {
 	}, uncertainSettingsUpdateError);
 }
 
-async function getServiceStatus(scope) {
+async function getOverview(scope) {
 	try {
-		const result = await operation.requestActive(callGetServiceStatus, scope);
+		const result = await operation.requestActive(callGetOverview, scope);
 		return {
-			running: result?.running === true,
-			memoryRequested: result?.memory_requested === true,
-			memoryActive: result?.memory_active === true,
+			status: {
+				running: result?.status?.running === true,
+				memoryRequested: result?.status?.memory_requested === true,
+				memoryActive: result?.status?.memory_active === true,
+			},
+			config: normalizeConfigInfo(result?.config),
 		};
 	} catch (error) {
 		if (operation.isPageInactiveError(error))
 			throw error;
-		console.error('Unable to query AdGuard Home service status:', error);
-		return { running: false, memoryRequested: false, memoryActive: false };
+		console.error('Unable to query the AdGuard Home overview:', error);
+		return {
+			status: { running: false, memoryRequested: false, memoryActive: false },
+			config: { dnsPort: null, web: null },
+		};
 	}
 }
 
@@ -170,17 +170,6 @@ function normalizeConfigInfo(result) {
 	}
 
 	return { dnsPort, web };
-}
-
-async function getConfigInfo(scope) {
-	try {
-		return normalizeConfigInfo(await operation.requestActive(callGetConfigInfo, scope));
-	} catch (error) {
-		if (operation.isPageInactiveError(error))
-			throw error;
-		console.error('Unable to query the AdGuard Home YAML configuration:', error);
-		return { dnsPort: null, web: null };
-	}
 }
 
 function renderServiceStatus(running) {
@@ -432,9 +421,8 @@ return view.extend({
 		try {
 			const result = await Promise.all([
 				getSettings(pageScope),
-				getServiceStatus(pageScope),
+				getOverview(pageScope),
 				getCoreVersion(pageScope),
-				getConfigInfo(pageScope),
 			]);
 			return [ ...result, pageScope ];
 		} catch (error) {
@@ -442,11 +430,12 @@ return view.extend({
 		}
 	},
 
-	async render([settings, serviceStatus, version, configInfo, pageScope]) {
+	async render([settings, overview, version, pageScope]) {
 		if (!operation.isPageActive(pageScope))
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
-		let running = serviceStatus.running;
+		const { status: serviceStatus, config: configInfo } = overview;
+		const running = serviceStatus.running;
 		const map = new form.JSONMap(
 			settingsMapData(settings),
 			_('AdGuard Home'),
@@ -604,13 +593,9 @@ return view.extend({
 				return;
 			}
 
-			let currentStatus = null;
-			let currentConfigInfo = null;
+			let current = null;
 			try {
-				[currentStatus, currentConfigInfo] = await Promise.all([
-					getServiceStatus(pageScope),
-					getConfigInfo(pageScope),
-				]);
+				current = await getOverview(pageScope);
 			} catch (error) {
 				if (operation.isPageInactiveError(error)) {
 					removeStatusPoll();
@@ -623,6 +608,7 @@ return view.extend({
 				return;
 			}
 
+			const { status: currentStatus, config: currentConfigInfo } = current;
 			dom.content(statusContainer, renderServiceStatus(currentStatus.running));
 			dom.content(storageContainer, renderStorageStatus(currentStatus));
 			dom.content(
