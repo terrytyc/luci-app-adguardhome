@@ -4,6 +4,11 @@ set -eu
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 defaults="$script_dir/../root/etc/uci-defaults/40_luci-AdGuardHome"
 
+if grep -Fq -- '-quit' "$defaults"; then
+	printf 'installer uses find -quit, which BusyBox 1.37 does not support\n' >&2
+	exit 1
+fi
+
 function_body() {
 	awk -v function_name="$2" '
 		$0 == function_name "() {" { copying = 1 }

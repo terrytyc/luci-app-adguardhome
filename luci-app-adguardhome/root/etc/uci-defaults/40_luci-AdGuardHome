@@ -424,7 +424,7 @@ plain_data_tree() {
 	[ -d "$1" ] && [ ! -L "$1" ] || return 1
 	unsafe="$(find "$1" -xdev \
 		\( -type l -o -type b -o -type c -o -type p -o -type s \) \
-		-print -quit 2>/dev/null)" || return 1
+		-print 2>/dev/null)" || return 1
 	[ -z "$unsafe" ]
 }
 
@@ -437,7 +437,7 @@ copy_official_data_if_needed() {
 	plain_data_tree "$source_data" || return 1
 	if [ -e "$target_data" ] || [ -L "$target_data" ]; then
 		[ -d "$target_data" ] && [ ! -L "$target_data" ] || return 1
-		existing="$(find "$target_data" -mindepth 1 -print -quit 2>/dev/null)" ||
+		existing="$(find "$target_data" -mindepth 1 -maxdepth 1 -print 2>/dev/null)" ||
 			return 1
 		[ -z "$existing" ] || {
 			echo "Existing managed data was kept; official data was not merged."
