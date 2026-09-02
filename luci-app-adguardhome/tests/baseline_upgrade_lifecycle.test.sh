@@ -27,7 +27,7 @@ for body in "$preinst" "$postinst" "$prerm" "$postrm"; do
 done
 
 version_line="$(printf '%s\n' "$preinst" |
-	grep -n 'installed_source_version.*2.4.0-r1' | cut -d: -f1)"
+	grep -n '^source_version="\$\$(installed_source_version)"' | cut -d: -f1)"
 state_line="$(printf '%s\n' "$preinst" |
 	grep -n '^ensure_runtime_dir && write_upgrade_state' | cut -d: -f1)"
 stop_line="$(printf '%s\n' "$preinst" |
@@ -58,7 +58,7 @@ for required in \
 done
 
 for required in \
-	"grep -qx 'source_version=2.4.0-r1'" \
+	"grep -Eq '^source_version=2[.]4[.]0-r[12]\$\$'" \
 	'case "$$was_running" in' \
 	'ADGUARDHOME_BASELINE_RESUME=1' \
 	'/etc/init.d/AdGuardHome start' \
@@ -127,4 +127,4 @@ if printf '%s\n' "$upgrade_defaults" |
 	exit 1
 fi
 
-printf 'ok - 2.4-r1 to 2.4-r2 baseline lifecycle\n'
+printf 'ok - 2.4.0-r1/r2 to 2.4.0-r3 baseline lifecycle\n'

@@ -554,17 +554,19 @@ async function main() {
 	const overviewView = loadOverview(overviewOperation, overviewUi);
 	let resolveSave;
 	const savePromise = new Promise(resolve => { resolveSave = resolve; });
-	const overviewContext = { handleSave() {
-		applyEvents.push('save');
+	const overviewContext = { settingsSubmission: null, submitSettings() {
+		applyEvents.push('apply');
 		return savePromise;
 	} };
 	const applyPromise = overviewView.handleSaveApply.call(overviewContext, null, '0');
-	assert.deepEqual(applyEvents, [ 'save' ],
-		'Save & Apply must delegate to the single RPC settings transaction');
+	assert.deepEqual(applyEvents, [ 'apply' ],
+		'Save & Apply must start the single RPC settings transaction');
 	resolveSave('settings-result');
 	assert.equal(await applyPromise, 'settings-result');
-	assert.deepEqual(applyEvents, [ 'save' ],
+	assert.deepEqual(applyEvents, [ 'apply' ],
 		'Save & Apply must not invoke a second global LuCI apply path');
+	assert.equal(overviewView.handleSave, null,
+		'the standalone Save action must remain hidden and must not commit settings');
 
 	for (const kind of [
 		'request-transport',
@@ -663,9 +665,11 @@ async function main() {
 	), 'utf8');
 	assert.match(
 		overview,
-		/handleSaveApply\(\)\s*\{\s*return this\.handleSave\(\);\s*\}/,
-		'Save & Apply must use only the RPC-backed save transaction',
+		/handleSave:\s*null,[\s\S]*?handleSaveApply\(\)\s*\{[\s\S]*?this\.submitSettings\(\)/,
+		'only Save & Apply may start the RPC-backed settings transaction',
 	);
+	assert.doesNotMatch(overview, /return this\.handleSave\(\)/,
+		'Save & Apply must not delegate to a standalone Save action');
 	assert.doesNotMatch(overview, /operation\.markApplyPending\(|ui\.changes\.apply\(/,
 		'the settings page must not enter LuCI global UCI apply');
 	assert.match(
@@ -680,8 +684,8 @@ async function main() {
 	);
 	assert.match(
 		overview,
-		/response\?\.unchanged !== true[\s\S]*?response\.token[\s\S]*?throw uncertainSettingsUpdateError\([\s\S]*?did not return a valid status token/,
-		'an accepted settings job without a valid token must be treated as an uncertain outcome',
+		/response\.token[\s\S]*?throw uncertainSettingsUpdateError\([\s\S]*?did not return a valid status token/,
+		'every accepted settings apply must return a valid coordinator status token',
 	);
 	assert.match(
 		overview,

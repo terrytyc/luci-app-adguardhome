@@ -1168,13 +1168,6 @@ function update_settings(enabled, work_dir, verbose, redirect,
 		return { error: 'Current settings are unavailable or invalid' };
 	if (current.revision != expected_revision)
 		return { error: 'Settings changed since the page was loaded' };
-	if (candidate.revision == current.revision)
-		return {
-			accepted: true,
-			unchanged: true,
-			revision: current.revision,
-		};
-
 	let token = random_token();
 	if (!token)
 		return { error: 'Unable to allocate a settings update token' };

@@ -5,7 +5,7 @@ include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -169,6 +169,7 @@ snapshot_stage=""
 upgrade_committed=0
 was_running=0
 is_upgrade=0
+source_version=""
 
 validate_original_snapshot() {
 	root_private_directory "$$snapshot_dir" &&
@@ -270,7 +271,7 @@ ensure_runtime_dir() {
 
 write_upgrade_state() {
 	(umask 077; {
-		printf 'source_version=2.4.0-r1\n'
+		printf 'source_version=%s\n' "$$source_version"
 		printf 'was_running=%s\n' "$$was_running"
 	} >"$$upgrade_state") || return 1
 	chown 0:0 "$$upgrade_state" && chmod 0600 "$$upgrade_state" &&
@@ -307,10 +308,14 @@ if [ "$$is_upgrade" != 1 ]; then
 	exit 0
 fi
 
-[ "$$(installed_source_version)" = 2.4.0-r1 ] || {
-	echo "Only luci-app-adguardhome 2.4.0-r1 can be upgraded in place." >&2
-	exit 1
-}
+source_version="$$(installed_source_version)" || source_version=""
+case "$$source_version" in
+	2.4.0-r1|2.4.0-r2) ;;
+	*)
+		echo "Only luci-app-adguardhome 2.4.0-r1 or 2.4.0-r2 can be upgraded in place." >&2
+		exit 1
+		;;
+esac
 validate_original_snapshot || {
 	echo "The original official adguardhome snapshot is unavailable or unsafe." >&2
 	exit 1
@@ -403,7 +408,7 @@ if [ -e "$$upgrade_state" ] || [ -L "$$upgrade_state" ]; then
 	root_private_directory "$$runtime_dir" && root_private_file "$$upgrade_state" ||
 		exit 1
 	[ "$$(wc -l <"$$upgrade_state" 2>/dev/null)" = 2 ] || exit 1
-	grep -qx 'source_version=2.4.0-r1' "$$upgrade_state" || exit 1
+	grep -Eq '^source_version=2[.]4[.]0-r[12]$$' "$$upgrade_state" || exit 1
 	was_running="$$(sed -n 's/^was_running=//p' "$$upgrade_state")"
 	case "$$was_running" in
 		1)

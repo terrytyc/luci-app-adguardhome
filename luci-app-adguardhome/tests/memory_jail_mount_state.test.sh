@@ -37,18 +37,14 @@ validate_managed_work_dir_namespace() {
 
 uci() {
 	[ "${1:-}" != -q ] || shift
-	local command="${1:-}" argument="${2:-}" value target found rebuilt
+	local command="${1:-}" argument="${2:-}" value target rebuilt
 	case "$command:$argument" in
 		del_list:${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=*)
 			target="${argument#*=}"
-			found=0
 			rebuilt=""
 			while IFS= read -r value; do
 				[ -n "$value" ] || continue
-				if [ "$found" = 0 ] && [ "$value" = "$target" ]; then
-					found=1
-					continue
-				fi
+				[ "$value" != "$target" ] || continue
 				if [ -n "$rebuilt" ]; then
 					rebuilt="${rebuilt}
 ${value}"
@@ -58,7 +54,9 @@ ${value}"
 			done <<-EOF
 			${TEST_RW}
 			EOF
-			[ "$found" = 1 ] || return 1
+			# libuci's del_list command succeeds even when the option or exact
+			# value is absent.  The production code must inspect the list before
+			# treating this return status as evidence of a change.
 			TEST_RW="$rebuilt"
 			;;
 		delete:${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw)
@@ -103,6 +101,16 @@ TEST_COMMITS=0
 sync_memory_data_jail_access_persistent
 assert_rw "$other"
 [ "$TEST_COMMITS" = 1 ]
+
+# A second disk-mode synchronization must not infer a change merely because
+# libuci del_list would return success while the unrelated RW list still exists.
+TEST_COMMITS=0
+sync_memory_data_jail_access_persistent
+assert_rw "$other"
+[ "$TEST_COMMITS" = 0 ] || {
+	printf 'an unchanged disk-mode RW mount list was committed again\n' >&2
+	exit 1
+}
 
 # RAM mode adds exactly one derived child mount and is idempotent.
 MEMORY_ACTIVE=1

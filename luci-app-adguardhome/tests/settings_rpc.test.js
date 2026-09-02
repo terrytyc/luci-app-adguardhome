@@ -168,6 +168,8 @@ const updateSource = extractFunction('update_settings');
 assert.match(updateSource,
 	/prepare_yaml_job\(token, expected_revision, candidate\.revision\)/,
 	'settings and YAML transactions must share one job lock');
+assert.doesNotMatch(updateSource, /candidate\.revision == current\.revision|unchanged/,
+	'every Save & Apply must reach the coordinator even when values are unchanged');
 assert.match(updateSource,
 	/let locked_current = settings_snapshot\(\);[\s\S]*?locked_current\.revision != expected_revision[\s\S]*?discard_yaml_job\(token\)[\s\S]*?close_yaml_job_lock\(\{ file: job\.lock \}\)/,
 	'the settings revision must be rechecked and stale job state removed while holding the shared lock');

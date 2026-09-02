@@ -943,28 +943,26 @@ return view.extend({
 			if (response?.accepted !== true)
 				throw new Error(_('The server did not accept the settings update job.'));
 
-			if (response?.unchanged !== true) {
-				if (typeof response.token !== 'string' ||
-				    !/^[0-9a-f]{32}$/.test(response.token))
-					throw uncertainSettingsUpdateError(
-						_('The server accepted the settings update job but did not return a valid status token. Reload this page before applying settings again.'),
-					);
-				const result = await waitForSettingsUpdate(response.token, scope);
-				if (result?.indeterminate === true)
-					throw uncertainSettingsUpdateError(typeof result?.error === 'string' && result.error
-						? result.error
-						: _('The settings update outcome is unknown. Reload this page before applying settings again.'));
-				if (result?.ok === true &&
-				    (typeof result.revision !== 'string' ||
-				     !/^[0-9a-f]{64}$/.test(result.revision)))
-					throw uncertainSettingsUpdateError(
-						_('The settings update succeeded, but its result could not be verified. Reload this page before applying settings again.'),
-					);
-				if (result?.ok !== true)
-					throw new Error(typeof result?.error === 'string' && result.error
-						? result.error
-						: _('The server rejected the settings update.'));
-			}
+			if (typeof response.token !== 'string' ||
+			    !/^[0-9a-f]{32}$/.test(response.token))
+				throw uncertainSettingsUpdateError(
+					_('The server accepted the settings update job but did not return a valid status token. Reload this page before applying settings again.'),
+				);
+			const result = await waitForSettingsUpdate(response.token, scope);
+			if (result?.indeterminate === true)
+				throw uncertainSettingsUpdateError(typeof result?.error === 'string' && result.error
+					? result.error
+					: _('The settings update outcome is unknown. Reload this page before applying settings again.'));
+			if (result?.ok === true &&
+			    (typeof result.revision !== 'string' ||
+			     !/^[0-9a-f]{64}$/.test(result.revision)))
+				throw uncertainSettingsUpdateError(
+					_('The settings update succeeded, but its result could not be verified. Reload this page before applying settings again.'),
+				);
+			if (result?.ok !== true)
+				throw new Error(typeof result?.error === 'string' && result.error
+					? result.error
+					: _('The server rejected the settings update.'));
 
 			let committed = null;
 			try {
@@ -1001,7 +999,9 @@ return view.extend({
 		}
 	},
 
-	handleSave() {
+	handleSave: null,
+
+	handleSaveApply() {
 		if (this.settingsSubmission)
 			return this.settingsSubmission;
 
@@ -1011,10 +1011,6 @@ return view.extend({
 			if (this.settingsSubmission === submission)
 				this.settingsSubmission = null;
 		});
-	},
-
-	handleSaveApply() {
-		return this.handleSave();
 	},
 
 	handleReset() {

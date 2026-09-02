@@ -292,7 +292,7 @@ upgrade_state_is_valid() {
 	root_private_directory "$RUNTIME_DIR" &&
 		root_private_file "$UPGRADE_STATE" &&
 		[ "$(wc -l <"$UPGRADE_STATE" 2>/dev/null)" = 2 ] &&
-		grep -qx 'source_version=2.4.0-r1' "$UPGRADE_STATE" &&
+		grep -Eq '^source_version=2[.]4[.]0-r[12]$' "$UPGRADE_STATE" &&
 		grep -Eq '^was_running=[01]$' "$UPGRADE_STATE"
 }
 

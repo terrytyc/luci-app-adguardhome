@@ -3308,11 +3308,12 @@ sync_memory_data_jail_access_persistent() {
 		[ -n "$backing" ] || continue
 		candidate="${backing%/}/data"
 		[ "$candidate" = "$desired" ] && continue
-		if uci -q del_list \
-		   "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${candidate}" \
-		   >/dev/null 2>&1; then
-			changed=1
-		fi
+		memory_data_jail_count "$candidate" || return 1
+		[ "$MEMORY_DATA_JAIL_COUNT" -gt 0 ] || continue
+		uci -q del_list \
+			"${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.jail_mount_rw=${candidate}" \
+			>/dev/null 2>&1 || return 1
+		changed=1
 	done
 	if [ -n "$desired" ]; then
 		memory_data_jail_count "$desired" || return 1
