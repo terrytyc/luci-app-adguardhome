@@ -66,6 +66,7 @@ done
 	exit 1
 }
 grep -Fq 'include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk' "$makefile"
+grep -Fq 'touch -r $(PKG_BUILD_DIR)/root/$$$$file $(PKG_BUILD_DIR)/root/$$$$file.expanded' "$makefile"
 
 [ -s "${temp_dir}/init.helper" ] || {
 	printf 'run_bounded was not found in the init script\n' >&2

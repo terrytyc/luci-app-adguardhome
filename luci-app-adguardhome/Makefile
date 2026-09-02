@@ -23,6 +23,7 @@ define Build/Prepare/luci-app-adguardhome
 		awk -v helper="$(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk" \
 			-f $(ADGUARDHOME_SOURCE_DIR)scripts/expand-bounded.awk \
 			$(PKG_BUILD_DIR)/root/$$$$file >$(PKG_BUILD_DIR)/root/$$$$file.expanded && \
+			touch -r $(PKG_BUILD_DIR)/root/$$$$file $(PKG_BUILD_DIR)/root/$$$$file.expanded && \
 			mv $(PKG_BUILD_DIR)/root/$$$$file.expanded $(PKG_BUILD_DIR)/root/$$$$file || exit 1; \
 	done
 	find $(PKG_BUILD_DIR)/root $(PKG_BUILD_DIR)/htdocs -type d -exec chmod 0755 {} +
