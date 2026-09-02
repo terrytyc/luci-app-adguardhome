@@ -4,19 +4,47 @@ set -eu
 
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 package_dir="${script_dir}/.."
-active_template="${package_dir}/root/etc/AdGuardHome/AdGuardHome.yaml"
-reset_template="${package_dir}/root/usr/share/luci-app-adguardhome/default.yaml"
+source_template="${package_dir}/root/usr/share/luci-app-adguardhome/default.yaml"
+makefile="${package_dir}/Makefile"
 rpc_source="${package_dir}/root/usr/share/rpcd/ucode/luci.adguardhome"
 yaml_view="${package_dir}/htdocs/luci-static/resources/view/adguardhome/yaml.js"
 expected_sha256=5cfed909100879796de2b9c6d5d75c855ffb2d271a814789a6db263867a9d6db
 
-for file in "$active_template" "$reset_template" "$rpc_source" "$yaml_view"; do
+for file in "$source_template" "$makefile" "$rpc_source" "$yaml_view"; do
 	if [ ! -f "$file" ] || [ -L "$file" ]; then
 		printf 'required template-reset source is missing or unsafe: %s\n' "$file" >&2
 		exit 1
 	fi
 done
 
+# Exercise the real preparation hook with the same two Make expansion layers
+# used by the SDK. Only the immutable reset template exists in the source tree.
+[ ! -e "${package_dir}/root/etc/AdGuardHome/AdGuardHome.yaml" ] || {
+	printf 'clean-install YAML is still maintained as a second source file\n' >&2
+	exit 1
+}
+temporary="$(mktemp -d /tmp/luci-agh-template-build.XXXXXX)"
+trap 'rm -rf "$temporary"' EXIT HUP INT TERM
+mkdir "$temporary/build"
+cp -R "$package_dir/root" "$temporary/build/root"
+cp -R "$package_dir/htdocs" "$temporary/build/htdocs"
+{
+	printf 'ADGUARDHOME_SOURCE_DIR := %s/\nPKG_BUILD_DIR := %s/build\n' \
+		"$package_dir" "$temporary"
+	awk '
+		/^define Build\/Prepare\/luci-app-adguardhome$/ { copying = 1 }
+		copying { print }
+		copying && /^endef$/ { exit }
+	' "$makefile"
+	printf '\ndefine test_rules\nall:\n\t$(Build/Prepare/luci-app-adguardhome)\nendef\n$(eval $(test_rules))\n'
+} >"$temporary/prepare.make"
+make --no-print-directory -s -f "$temporary/prepare.make"
+active_template="$temporary/build/root/etc/AdGuardHome/AdGuardHome.yaml"
+reset_template="$temporary/build/root/usr/share/luci-app-adguardhome/default.yaml"
+[ "$(busybox stat -c '%a' "$temporary/build/root/etc/AdGuardHome")" = 700 ]
+[ "$(busybox stat -c '%a' "$active_template")" = 600 ]
+[ "$(busybox stat -c '%a' "$reset_template")" = 644 ]
+cmp -s "$source_template" "$reset_template"
 cmp -s "$active_template" "$reset_template" || {
 	printf 'clean-install and reset YAML templates differ\n' >&2
 	exit 1
@@ -135,4 +163,4 @@ for forbidden in (
         raise SystemExit(f"template button still applies or discards editor state: {forbidden}")
 PY
 
-printf 'ok - v2.4 packaged template and reset safety contract\n'
+printf 'ok - single-source YAML build, installed permissions and reset safety contract\n'

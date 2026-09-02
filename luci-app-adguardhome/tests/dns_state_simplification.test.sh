@@ -56,7 +56,28 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 uci_log="${test_tmp}/uci.log"
 : >"$uci_log"
 
-config_load() { return 0; }
+config_context=adguardhome
+config_load() {
+	config_context="$1"
+	printf 'load:%s\n' "$1" >>"$uci_log"
+}
+config_get() {
+	local actual
+	case "$config_context:$2:$3" in
+		dhcp:cfg01411c:noresolv) actual="${TEST_NORESOLV:-}" ;;
+		"firewall:${FIREWALL_SECTION}:TYPE") actual="${TEST_FW_TYPE:-redirect}" ;;
+		"firewall:${FIREWALL_SECTION}:${FIREWALL_OWNER_OPTION}") actual="${TEST_FW_OWNER:-$FIREWALL_OWNER_VALUE}" ;;
+		"firewall:${FIREWALL_SECTION}:src") actual="${TEST_FW_SRC:-lan}" ;;
+		"firewall:${FIREWALL_SECTION}:proto") actual="${TEST_FW_PROTO:-tcp udp}" ;;
+		"firewall:${FIREWALL_SECTION}:src_dport") actual="${TEST_FW_SRC_PORT:-53}" ;;
+		"firewall:${FIREWALL_SECTION}:dest_port") actual="${TEST_FW_DEST_PORT:-53335}" ;;
+		"firewall:${FIREWALL_SECTION}:target") actual="${TEST_FW_TARGET:-DNAT}" ;;
+		"firewall:${FIREWALL_SECTION}:family") actual="${TEST_FW_FAMILY:-ipv4}" ;;
+		"firewall:${FIREWALL_SECTION}:reflection") actual="${TEST_FW_REFLECTION:-0}" ;;
+		*) printf 'unexpected config_get: %s:%s:%s\n' "$config_context" "$2" "$3" >&2; return 1 ;;
+	esac
+	eval "$1=\$actual"
+}
 config_foreach() {
 	[ "$2" = dnsmasq ] || return 1
 	"$1" cfg01411c
@@ -159,12 +180,45 @@ TEST_NORESOLV=1
 dns_port=53335
 TEST_SERVERS="/example.test/192.0.2.53
 127.0.0.1#53335"
+config_context=adguardhome
+: >"$uci_log"
 dnsmasq_integration_matches
+[ "$config_context" = adguardhome ]
+[ "$(grep -c '^load:dhcp$' "$uci_log")" = 1 ]
 TEST_SERVERS="${TEST_SERVERS}
 9.9.9.9"
 if dnsmasq_integration_matches; then
 	printf 'active DNS validation accepted a bypassing generic upstream\n' >&2
 	exit 1
 fi
+
+# Nine fields come from one firewall config snapshot.  Its temporary config
+# context must not replace the caller's already-loaded adguardhome context.
+dns_ipv6_listening() { [ "${TEST_IPV6:-0}" = 1 ]; }
+config_context=adguardhome
+: >"$uci_log"
+firewall_integration_matches
+[ "$config_context" = adguardhome ]
+[ "$(grep -c '^load:firewall$' "$uci_log")" = 1 ]
+if grep -q '^get:firewall[.]' "$uci_log"; then
+	printf 'firewall matching still forks individual UCI readers\n' >&2
+	exit 1
+fi
+for changed in TEST_FW_TYPE TEST_FW_OWNER TEST_FW_SRC TEST_FW_PROTO \
+	TEST_FW_SRC_PORT TEST_FW_DEST_PORT TEST_FW_TARGET TEST_FW_FAMILY TEST_FW_REFLECTION; do
+	eval "$changed=unexpected"
+	if firewall_integration_matches; then
+		printf 'firewall mismatch accepted: %s\n' "$changed" >&2
+		exit 1
+	fi
+	unset "$changed"
+done
+TEST_IPV6=1
+if firewall_integration_matches; then
+	printf 'IPv6 listener accepted without matching firewall family\n' >&2
+	exit 1
+fi
+TEST_FW_FAMILY=any
+firewall_integration_matches
 
 printf 'ok - simplified DNS ownership state and exact dnsmasq lifecycle\n'

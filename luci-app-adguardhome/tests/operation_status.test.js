@@ -177,7 +177,9 @@ assert.doesNotMatch(overview,
 assert.doesNotMatch(overview,
 	/HTTP keeps the host used to access LuCI and uses the port from YAML http\.address/);
 const operationSource = fs.readFileSync(modulePath, 'utf8');
-assert.match(operationSource, /const JOB_POLL_LIMIT = 360;/);
+assert.match(operationSource, /const JOB_POLL_INTERVAL = 2000;/);
+assert.match(operationSource, /const JOB_POLL_LIMIT = 180;/);
+assert.match(operationSource, /\+\+consecutiveErrors >= 6/);
 assert.doesNotMatch(operationSource, /APPLY_WAIT_SECONDS|Date\.now|remaining|%ds/,
 	'apply progress must be driven by the job result, not a guessed deadline');
 assert.match(overview, /operation\.waitForJob\(callGetYamlUpdate,/);

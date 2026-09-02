@@ -37,6 +37,7 @@ function loadOperation() {
 	const listeners = new Map();
 	const onceListeners = new Map();
 	const rendered = [];
+	const timerDelays = [];
 	let reloads = 0;
 	let hidden = 0;
 
@@ -63,7 +64,7 @@ function loadOperation() {
 	};
 	const fakeWindow = {
 		addEventListener: fakeDocument.addEventListener.bind(fakeDocument),
-		setTimeout(callback) { return setTimeout(callback, 0); },
+		setTimeout(callback, delay) { timerDelays.push(delay); return setTimeout(callback, 0); },
 		clearTimeout(id) { clearTimeout(id); },
 		location: {
 			reload() { reloads++; },
@@ -95,6 +96,8 @@ function loadOperation() {
 		operation: new ModuleClass(),
 		listeners,
 		rendered,
+		timerDelays,
+		document: fakeDocument,
 		dispatch(type, event = {}) {
 			for (const listener of [ ...(listeners.get(type) ?? []) ]) {
 				if (onceListeners.get(type)?.has(listener))
@@ -332,6 +335,8 @@ async function main() {
 	};
 	const jobEvents = [];
 	let jobReads = 0;
+	const beforeJobTimers = state.timerDelays.length;
+	state.document.hidden = true;
 	const completedJob = await state.operation.waitForJob(async (token, consume) => {
 		assert.equal(token, 'job-token');
 		jobEvents.push(consume ? 'consume' : 'read');
@@ -349,6 +354,9 @@ async function main() {
 	assert.equal(completedJob.ok, true);
 	assert.deepEqual(jobEvents, [ 'read', 'read', 'read', 'read', 'consume' ],
 		'terminal results must be consumed once, with best-effort cleanup');
+	assert.deepEqual(state.timerDelays.slice(beforeJobTimers), [ 2000, 2000, 2000 ],
+		'job polling must continue every two seconds even while the document is hidden');
+	state.document.hidden = false;
 
 	for (const result of [ null, {}, { state: 'invalid' } ]) {
 		await assert.rejects(
@@ -362,26 +370,29 @@ async function main() {
 	);
 
 	let pendingReads = 0;
+	const beforePendingTimers = state.timerDelays.length;
 	await assert.rejects(state.operation.waitForJob(async () => {
 		pendingReads++;
 		return { state: 'running' };
 	}, 'token', currentScope, jobMessages), /job still pending/);
-	assert.equal(pendingReads, 360, 'job polling must have a bounded total duration');
+	assert.equal(pendingReads, 180, 'job polling must have a bounded attempt count');
+	assert.equal(state.timerDelays.slice(beforePendingTimers).reduce((sum, delay) => sum + delay, 0), 360000,
+		'the retry-delay budget stays at six minutes, excluding RPC response times');
 
 	let resettingReads = 0;
 	const resetErrorCount = await state.operation.waitForJob(async (_token, consume) => {
 		if (consume)
 			return {};
 		resettingReads++;
-		if (resettingReads === 10)
+		if (resettingReads === 6)
 			return { state: 'running' };
-		if (resettingReads === 20)
+		if (resettingReads === 12)
 			return { state: 'done', ok: false, error: 'rejected' };
 		throw new Error('temporary status failure');
 	}, 'token', currentScope, jobMessages);
 	assert.equal(resetErrorCount.ok, false,
 		'a terminal failure belongs to the caller, not the transport error path');
-	assert.equal(resettingReads, 20,
+	assert.equal(resettingReads, 12,
 		'a successful status read must reset the consecutive failure counter');
 
 	let permanentAttempts = 0;
@@ -488,7 +499,7 @@ async function main() {
 	}
 
 	const statusTransport = await runSettingsSubmissionScenario('status-transport');
-	assert.equal(statusTransport.statusCalls, 10,
+	assert.equal(statusTransport.statusCalls, 6,
 		'settings status transport failures must be bounded before the form is locked');
 
 	const successfulSettings = await runSettingsSubmissionScenario('success');

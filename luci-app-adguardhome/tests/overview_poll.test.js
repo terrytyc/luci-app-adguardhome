@@ -14,6 +14,7 @@ function loadOverview() {
 	const updates = [];
 	const errors = [];
 	const polls = new Set();
+	const document = { hidden: false };
 	let active = true;
 	let overviewResult = {
 		status: { running: true, memory_requested: false, memory_active: false },
@@ -64,7 +65,7 @@ function loadOverview() {
 		form: { JSONMap },
 		poll: {
 			add(callback, interval) {
-				assert.equal(interval, 5);
+				assert.equal(interval, 10);
 				polls.add(callback);
 			},
 			remove(callback) { polls.delete(callback); },
@@ -87,12 +88,13 @@ function loadOverview() {
 		URL,
 		console: { error: (...args) => errors.push(args) },
 		window: { location: { href: 'https://router.example:8443/cgi-bin/luci/' } },
+		document,
 	};
 	vm.createContext(context);
 	const view = vm.runInContext('(function() {\n' + source + '\n})()', context,
 		{ filename: overviewPath });
 	return {
-		view, calls, updates, errors, polls, handlers,
+		view, calls, updates, errors, polls, handlers, document,
 		setActive: value => { active = value; },
 		setOverview: value => { overviewResult = value; },
 	};
@@ -112,6 +114,12 @@ async function main() {
 	draft.config.work_dir = '/mnt/storage/AdGuardHome-draft';
 
 	state.calls.length = 0;
+	state.document.hidden = true;
+	await callback();
+	assert.deepEqual(state.calls, [], 'hidden overview pages must skip routine RPC polling');
+	assert.equal(state.updates.length, 0);
+	assert.equal(state.polls.size, 1, 'visibility changes must retain the next scheduled poll');
+	state.document.hidden = false;
 	state.setOverview({
 		status: { running: true, memory_requested: true, memory_active: true },
 		config: { dns_port: '5353', web: { scheme: 'https', host: 'adg.example', port: 10443 } },
@@ -160,12 +168,15 @@ async function main() {
 	assert.equal(state.view.statusPollCallback, null);
 	assert.equal(state.errors.length, 1, 'discarded page responses must not be reported as XHR errors');
 	const beforeInactiveCalls = state.calls.length;
+	state.document.hidden = true;
 	await callback();
 	assert.equal(state.calls.length, beforeInactiveCalls,
 		'an inactive view must not start another overview request');
 
 	assert.doesNotMatch(source, /method:\s*'get_status'|method:\s*'get_config_info'/,
 		'the overview must no longer declare redundant status/config RPCs');
+	assert.doesNotMatch(source, /require adguardhome\.bcrypt/,
+		'loading the overview must not load the bcrypt dependency before it is needed');
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

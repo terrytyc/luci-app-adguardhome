@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -18,7 +19,8 @@ function extractFunction(name) {
 
 const functions = [
 	'configured_boolean', 'configuration_state', 'service_running', 'service_status',
-	'read_config', 'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
+	'read_yaml', 'read_config', 'credentials_info', 'update_credentials', 'reset_yaml',
+	'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
 	'valid_port', 'yaml_bool', 'valid_dns_name', 'http_port', 'yaml_material_value',
 	'tls_material_complete', 'web_port_listening', 'config_info', 'overview_info',
 ].map(extractFunction).join('\n')
@@ -32,15 +34,24 @@ function reset() {
 		busy: false, jobActive: false, closeSucceeds: true, throwRead: false,
 		yaml: 'dns:\n  port: 53335\nhttp:\n  address: 0.0.0.0:3000\n',
 		listening: [ 3000 ], reads: 0, cursors: 0, serviceCalls: 0,
-		jobChecks: 0, locks: 0, closes: 0, probes: [],
+		jobChecks: 0, locks: 0, closes: 0, probes: [], hashes: 0,
+		badInode: false, badDevice: false, badSize: false, fileCloseSucceeds: true,
+		hashUnavailable: false,
 	});
 }
 reset();
+
+function metadata() {
+	return { type: 'file', inode: 31, size: fixture.yaml.length, dev: { major: 8, minor: 1 } };
+}
+const digest = value => crypto.createHash('sha256').update(value).digest('hex');
+const template = 'users:\n  - name: admin\n    password: template-hash\ndns:\n  port: 53335\n';
 
 const sandbox = {
 	CONFIG_NAME: 'adguardhome', CONFIG_SECTION: 'config', LUCI_SECTION: 'luci',
 	CONFIG_FILENAME: 'AdGuardHome.yaml', SERVICE_NAME: 'adguardhome',
 	INSTANCE_NAME: 'adguardhome', YAML_UPDATE_COMMAND: '/etc/init.d/AdGuardHome',
+	MAX_CONFIG_LENGTH: 512 * 1024,
 	type: value => Number.isInteger(value) ? 'int' : typeof value,
 	lc: value => value.toLowerCase(), match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(Number(value)), length: value => value?.length ?? 0,
@@ -73,13 +84,40 @@ const sandbox = {
 			disconnect() {},
 		};
 	},
-	read_yaml(configuration) {
-		fixture.reads++;
-		if (fixture.throwRead)
-			throw new Error('read failed');
-		assert.equal(configuration.work_dir, configuration.path ? fixture.workDir : null);
-		return configuration.path ? { content: fixture.yaml } : null;
+	config_path: () => fixture.configFile,
+	lstat: pathname => pathname === fixture.configFile ? metadata() : null,
+	stat(pathname) {
+		assert.equal(pathname, '/proc/self/fd/42');
+		const value = metadata();
+		if (fixture.badInode)
+			value.inode++;
+		if (fixture.badDevice)
+			value.dev.minor++;
+		if (fixture.badSize)
+			value.size++;
+		return value;
 	},
+	open(pathname, mode) {
+		assert.equal(pathname, fixture.configFile);
+		assert.equal(mode, 'r');
+		return {
+			fileno: () => 42,
+			read(limit) {
+				assert.equal(limit, 512 * 1024 + 1);
+				fixture.reads++;
+				if (fixture.throwRead)
+					throw new Error('read failed');
+				return fixture.yaml;
+			},
+			close: () => fixture.fileCloseSucceeds,
+		};
+	},
+	sha256(content) {
+		fixture.hashes++;
+		return fixture.hashUnavailable ? null : digest(content);
+	},
+	credential_record: () => ({ username: 'admin' }),
+	read_template: () => template,
 	open_yaml_job_lock() {
 		fixture.locks++;
 		fixture.locked = !fixture.busy;
@@ -105,7 +143,10 @@ const sandbox = {
 	},
 };
 vm.createContext(sandbox);
-vm.runInContext(`${functions}\nthis.overview = overview_info;`, sandbox, { filename: rpcPath });
+const methodsSource = source.slice(source.indexOf('const methods = {'),
+	source.indexOf("\nreturn { 'luci.adguardhome': methods };"));
+vm.runInContext(`${functions}\n${methodsSource}\nthis.rpc = methods; this.overview = overview_info;`,
+	sandbox, { filename: rpcPath });
 
 let result = sandbox.overview();
 assert.equal(result.status.running, true);
@@ -118,6 +159,7 @@ assert.equal(result.config.web.port, 3000);
 assert.equal(fixture.cursors, 1, 'status and YAML path must share one UCI cursor');
 assert.equal(fixture.serviceCalls, 1, 'status and endpoint gate must share one service lookup');
 assert.equal(fixture.reads, 1, 'the YAML must be read once per request');
+assert.equal(fixture.hashes, 0, 'overview must not calculate an unused YAML revision');
 assert.equal(fixture.locks, 1);
 assert.equal(fixture.closes, 1);
 assert.equal(fixture.jobChecks, 1);
@@ -135,6 +177,7 @@ assert.equal(result.config.web.port, 3080);
 assert.equal(fixture.cursors, 2);
 assert.equal(fixture.serviceCalls, 2);
 assert.equal(fixture.reads, 2);
+assert.equal(fixture.hashes, 0, 'fresh polling must keep skipping the unused revision');
 
 reset();
 fixture.yaml += 'tls:\n  enabled: true\n  server_name: router.example.com\n' +
@@ -176,6 +219,57 @@ assert.equal(fixture.closes, 1, 'an exception must not leak the job lock');
 reset();
 fixture.closeSucceeds = false;
 assert.equal(sandbox.overview().config.web, null, 'failed lock cleanup must hide the endpoint');
+
+for (const failure of [ 'badInode', 'badDevice', 'badSize', 'fileCloseSucceeds' ]) {
+	reset();
+	fixture[failure] = failure !== 'fileCloseSucceeds';
+	assert.equal(sandbox.overview().config.dns_port, null,
+		`${failure}: hashless status reads must retain the checked-file boundary`);
+	assert.equal(sandbox.rpc.get_yaml.call().error, 'YAML configuration is unavailable',
+		`${failure}: editor reads must retain the same checked-file boundary`);
+}
+
+reset();
+assert.equal(sandbox.rpc.get_overview.call().config.dns_port, 53335);
+assert.equal(sandbox.rpc.get_config_info.call().dns_port, 53335);
+assert.equal(fixture.hashes, 0, 'both status RPC entry points must use the hashless reader');
+const editor = sandbox.rpc.get_yaml.call();
+const originalHash = digest(fixture.yaml);
+assert.equal(editor.sha256, originalHash, 'the editor must still receive its exact YAML revision');
+assert.equal(editor.content, fixture.yaml);
+assert.equal(fixture.hashes, 1);
+const credentials = sandbox.rpc.get_credentials.call();
+assert.equal(credentials.sha256, originalHash, 'credentials must retain a fresh CAS revision');
+assert.equal(credentials.username, 'admin');
+assert.equal(fixture.hashes, 2);
+const restored = sandbox.rpc.reset_yaml.call({ args: { sha256: originalHash } });
+assert.equal(restored.content, template);
+assert.equal(restored.sha256, digest(template), 'reset must still hash the returned packaged template');
+assert.equal(fixture.hashes, 4, 'reset verifies the active revision and hashes the template independently');
+assert.equal(fixture.yaml, editor.content, 'reset must remain an editor-only operation');
+
+fixture.yaml += '# external edit\n';
+assert.equal(sandbox.rpc.reset_yaml.call({ args: { sha256: originalHash } }).error,
+	'YAML changed since the page was loaded', 'reset must reject an outdated editor revision');
+assert.equal(sandbox.rpc.set_credentials.call({ args: {
+	username: 'operator', password_hash: '', sha256: originalHash,
+} }).error, 'YAML changed since the credential dialog was opened',
+'credential updates must reject the outdated revision before staging any write');
+assert.equal(sandbox.rpc.get_yaml.call().sha256, digest(fixture.yaml),
+	'the next editor read must return the new revision, not a cached hash');
+
+reset();
+fixture.hashUnavailable = true;
+assert.equal(sandbox.rpc.get_overview.call().config.dns_port, 53335,
+	'status must not depend on an unused digest');
+assert.equal(fixture.hashes, 0);
+assert.equal(sandbox.rpc.get_yaml.call().error, 'YAML configuration is unavailable',
+	'an editor read must still fail closed if its required digest is unavailable');
+
+const readConfigSource = extractFunction('read_config');
+assert.match(readConfigSource, /read_yaml\(configuration, false\)/);
+assert.equal((source.match(/read_yaml\([^)]*, false\)/g) ?? []).length, 1,
+	'only the status-only reader may suppress hashing; editor/CAS paths keep the default');
 
 const acl = JSON.parse(fs.readFileSync(path.join(packageRoot,
 	'root/usr/share/rpcd/acl.d/luci-app-adguardhome.json'), 'utf8'));

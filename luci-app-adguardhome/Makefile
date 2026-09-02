@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -20,6 +20,9 @@ LUCI_MAINTAINER:=terrytyc
 LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
 define Build/Prepare/luci-app-adguardhome
+	mkdir -p $(PKG_BUILD_DIR)/root/etc/AdGuardHome
+	cp -p $(PKG_BUILD_DIR)/root/usr/share/luci-app-adguardhome/default.yaml \
+		$(PKG_BUILD_DIR)/root/etc/AdGuardHome/AdGuardHome.yaml
 	for file in etc/init.d/AdGuardHome etc/uci-defaults/40_luci-AdGuardHome; do \
 		awk -v helper_dir="$(ADGUARDHOME_SOURCE_DIR)scripts" \
 			-f $(ADGUARDHOME_SOURCE_DIR)scripts/expand-helpers.awk \
@@ -214,9 +217,9 @@ fi
 
 source_version="$$(installed_source_version)" || source_version=""
 case "$$source_version" in
-	2.4.0-r1|2.4.0-r2|2.4.0-r3|2.4.0-r4) ;;
+	2.4.0-r1|2.4.0-r2|2.4.0-r3|2.4.0-r4|2.4.0-r5) ;;
 	*)
-		echo "Only luci-app-adguardhome 2.4.0-r1, r2, r3 or r4 can be upgraded in place." >&2
+		echo "Only luci-app-adguardhome 2.4.0-r1, r2, r3, r4 or r5 can be upgraded in place." >&2
 		exit 1
 		;;
 esac
@@ -291,7 +294,7 @@ if [ -e "$$upgrade_state" ] || [ -L "$$upgrade_state" ]; then
 	root_private_directory "$$runtime_dir" && root_private_file "$$upgrade_state" ||
 		exit 1
 	[ "$$(wc -l <"$$upgrade_state" 2>/dev/null)" = 2 ] || exit 1
-	grep -Eq '^source_version=2[.]4[.]0-r[1234]$$' "$$upgrade_state" || exit 1
+	grep -Eq '^source_version=2[.]4[.]0-r[12345]$$' "$$upgrade_state" || exit 1
 	was_running="$$(sed -n 's/^was_running=//p' "$$upgrade_state")"
 	case "$$was_running" in
 		1)

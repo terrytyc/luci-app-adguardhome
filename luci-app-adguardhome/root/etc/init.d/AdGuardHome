@@ -53,7 +53,7 @@ NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
 BASELINE_UPGRADE_STATE="${NORMALIZER_RUNTIME_DIR}/upgrade-state"
 YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
 YAML_MAINTENANCE_MARKER="${YAML_JOB_RUNTIME_DIR}/removing"
-MONITOR_INTERVAL=2
+MONITOR_INTERVAL=5
 # First boot can download and compile the packaged default filters before the
 # DNS sockets appear, especially on slower routers.  Keep takeover disabled
 # while allowing the official core enough time to become genuinely ready.
@@ -731,40 +731,84 @@ load_settings() {
 # packaged value 53335 is only present in the clean-install template; an
 # existing missing or invalid value must fail closed instead of being replaced.
 load_runtime_dns_port() {
-	local value address web_port directory snapshot
+	local ports web_port directory snapshot
 	if [ ! -f "$config_file" ] || [ -L "$config_file" ]; then
 		log_error "Config file is unavailable while reading the DNS port: ${config_file}"
 		return 1
 	fi
 	directory="$(mktemp -d /tmp/AdGuardHome-runtime.XXXXXX)" || return 1
 	snapshot="${directory}/AdGuardHome.yaml"
-	if ! snapshot_config_file "$config_file" "$snapshot" "" ""; then
+	if ! snapshot_config_file "$config_file" "$snapshot" "" "" "" skip-hash; then
 		rm -rf "$directory"
 		log_error "Unable to take a safe YAML snapshot: ${config_file}"
 		return 1
 	fi
-	value="$(yaml_get_section_value dns port "$snapshot")"
-	address="$(yaml_get_section_value http address "$snapshot")"
-	rm -rf "$directory" || return 1
-	is_valid_port "$value" || {
+	if ! ports="$(yaml_runtime_ports "$snapshot")"; then
+		rm -rf "$directory"
 		log_error "Invalid or ambiguous dns.port in ${config_file}"
 		return 1
-	}
-	dns_port="$(awk -v value="$value" 'BEGIN { printf "%d\n", value + 0 }')" || return 1
+	fi
+	rm -rf "$directory" || return 1
+	read -r dns_port web_port <<-EOF
+	$ports
+	EOF
 	if [ "$dns_port" -eq 53 ] 2>/dev/null && [ "$redirect_mode" != none ]; then
 		log_error "DNS port 53 is only supported when DNS integration mode is none"
 		return 1
 	fi
 
-	if [ -n "$address" ]; then
-		case "$address" in
-			*:*) web_port="${address##*:}" ;;
-		esac
-	fi
-	if is_valid_port "$web_port" && [ "$dns_port" -eq "$web_port" ] 2>/dev/null; then
+	if [ "$web_port" -gt 0 ] && [ "$dns_port" = "$web_port" ]; then
 		log_error "The YAML DNS and HTTP ports must be different: ${dns_port}"
 		return 1
 	fi
+}
+
+# Monitoring only needs these two scalars.  Scan both mappings once and emit
+# decimal output ports; optional/ambiguous HTTP is ignored as before.  Keep the
+# existing DNS awk-number conversion and HTTP shell-comparison semantics.
+yaml_runtime_ports() {
+	awk '
+		function port_number(s) {
+			if (s !~ /^[0-9]+$/) return 0
+			sub(/^0+/, "", s)
+			if (s == "" || length(s) > 5) return 0
+			return (s + 0 <= 65535 ? s + 0 : 0)
+		}
+		/^[^[:space:]#][^:]*:/ {
+			section = ""
+			if ($0 ~ /^dns:[[:space:]]*($|#)/) section = "dns"
+			if ($0 ~ /^http:[[:space:]]*($|#)/) section = "http"
+			if (section != "") sections[section]++
+			next
+		}
+		section != "" && /^ +/ && $0 !~ /^[[:space:]]*($|#)/ {
+			match($0, /^ */); d = RLENGTH
+			if (!depth[section] || d < depth[section]) {
+				depth[section] = d; matches[section] = 0; result[section] = ""
+			}
+			if (d != depth[section]) next
+			key = (section == "dns" ? "port" : "address")
+			value = substr($0, d + 1)
+			if (value !~ ("^" key ":[[:space:]]*")) next
+			matches[section]++
+			sub("^" key ":[[:space:]]*", "", value)
+			sub(/[[:space:]]+#.*$/, "", value)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+			if ((substr(value,1,1)=="\"" && substr(value,length(value),1)=="\"") ||
+			    (substr(value,1,1)=="\047" && substr(value,length(value),1)=="\047"))
+				value = substr(value, 2, length(value) - 2)
+			result[section] = value
+		}
+		END {
+			port = port_number(result["dns"])
+			if (sections["dns"] != 1 || matches["dns"] != 1 || !port) exit 1
+			web = 0
+			if (sections["http"] == 1 && matches["http"] == 1 && result["http"] ~ /:/) {
+				value = result["http"]; sub(/^.*:/, "", value)
+				web = port_number(value)
+			}
+			printf "%d %d\n", result["dns"] + 0, web
+		}' "$1"
 }
 
 # Locate a key at the section's actual shallowest indentation.  This accepts
@@ -1869,6 +1913,10 @@ snapshot_config_file() {
 	size="$(wc -c <"$target" 2>/dev/null)" || return 1
 	case "$size" in ""|*[!0-9]*) return 1 ;; esac
 	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || return 1
+	# Status polling consumes only the safely captured bytes.  All existing
+	# callers still hash by default, and an expected CAS hash cannot be skipped.
+	SNAPSHOT_CONFIG_HASH=""
+	[ "${6:-}" != skip-hash ] || [ -n "$expected_hash" ] || return 0
 	hash="$(yaml_file_hash "$target")" || return 1
 	if [ -n "$expected_hash" ]; then
 		[ "$hash" = "$expected_hash" ] || return 1
@@ -3486,7 +3534,8 @@ inspect_active_server() {
 	fi
 }
 
-dnsmasq_integration_matches() {
+dnsmasq_integration_matches() (
+	local noresolv
 	EXPECTED_UPSTREAM="127.0.0.1#${dns_port}"
 	EXPECTED_UPSTREAM_COUNT=0
 	UNEXPECTED_GENERIC_SERVER=0
@@ -3494,11 +3543,11 @@ dnsmasq_integration_matches() {
 		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}")" = \
 		"$dns_port" ] || return 1
 	load_dnsmasq_section || return 1
-	[ "$(uci -q get "${DNSMASQ_UCI}.noresolv")" = 1 ] || return 1
-	config_load dhcp || return 1
+	config_get noresolv "$DNSMASQ_SECTION" noresolv
+	[ "$noresolv" = 1 ] || return 1
 	config_list_foreach "$DNSMASQ_SECTION" server inspect_active_server
 	[ "$EXPECTED_UPSTREAM_COUNT" = 1 ] && [ "$UNEXPECTED_GENERIC_SERVER" = 0 ]
-}
+)
 
 set_firewall_redirect() {
 	local section="firewall.${FIREWALL_SECTION}" owner family=ipv4
@@ -3540,19 +3589,26 @@ clear_firewall_redirect() {
 	reload_service_if_present /etc/init.d/firewall reload
 }
 
-firewall_integration_matches() {
-	local section="firewall.${FIREWALL_SECTION}" expected_family=ipv4
+firewall_integration_matches() (
+	local section="$FIREWALL_SECTION" expected_family=ipv4
+	local type owner src proto src_dport dest_port target family reflection
+	config_load firewall || return 1
+	config_get type "$section" TYPE
+	config_get owner "$section" "$FIREWALL_OWNER_OPTION"
+	config_get src "$section" src
+	config_get proto "$section" proto
+	config_get src_dport "$section" src_dport
+	config_get dest_port "$section" dest_port
+	config_get target "$section" target
+	config_get family "$section" family
+	config_get reflection "$section" reflection
 	dns_ipv6_listening && expected_family=any
-	[ "$(uci -q get "$section")" = redirect ] &&
-		[ "$(uci -q get "${section}.${FIREWALL_OWNER_OPTION}")" = "$FIREWALL_OWNER_VALUE" ] &&
-		[ "$(uci -q get "${section}.src")" = lan ] &&
-		[ "$(uci -q get "${section}.proto")" = "tcp udp" ] &&
-		[ "$(uci -q get "${section}.src_dport")" = 53 ] &&
-		[ "$(uci -q get "${section}.dest_port")" = "$dns_port" ] &&
-		[ "$(uci -q get "${section}.target")" = DNAT ] &&
-		[ "$(uci -q get "${section}.family")" = "$expected_family" ] &&
-		[ "$(uci -q get "${section}.reflection")" = 0 ]
-}
+	[ "$type" = redirect ] && [ "$owner" = "$FIREWALL_OWNER_VALUE" ] &&
+		[ "$src" = lan ] && [ "$proto" = "tcp udp" ] &&
+		[ "$src_dport" = 53 ] && [ "$dest_port" = "$dns_port" ] &&
+		[ "$target" = DNAT ] && [ "$family" = "$expected_family" ] &&
+		[ "$reflection" = 0 ]
+)
 
 clear_recorded_integration_locked() {
 	clear_managed_dnsmasq_upstream || return 1
@@ -4885,7 +4941,7 @@ orchestrate_core_locked() {
 }
 
 reconcile_core_locked() {
-	# Two-second monitoring must not traverse every data file.  Any branch that
+	# Five-second monitoring must not traverse every data file.  Any branch that
 	# copies, starts, switches or removes RAM state reaches a full guarded entry.
 	if ! load_settings light; then
 		fail_safe_locked >/dev/null 2>&1 || true
@@ -4910,6 +4966,12 @@ reconcile_core_locked() {
 			memory_deactivate_locked 1 || return 1
 		fi
 		return 0
+	fi
+	if [ "$redirect_mode" = none ]; then
+		# No DNS takeover is desired.  Keep RAM/disable handling above, remove
+		# a previous mode once, and leave DNS readiness to start/apply checks.
+		clear_recorded_integration_locked
+		return
 	fi
 	if ! load_runtime_dns_port; then
 		clear_recorded_integration_locked || return 1
@@ -4980,35 +5042,39 @@ monitor() {
 			"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.memory_writeback_interval")"
 		interval="$(normalize_memory_writeback_interval \
 			"$configured_interval")" || interval=0
-		now="$(monotonic_seconds)" || now=0
-		if [ "$interval" != "$last_interval" ] ||
-		   { [ "$interval" -ne 0 ] 2>/dev/null &&
-		     [ "$now" -ne 0 ] 2>/dev/null &&
-		     [ "$next_writeback" -eq 0 ] 2>/dev/null; }; then
-			last_interval="$interval"
-			if [ "$interval" -eq 0 ] 2>/dev/null || [ "$now" -eq 0 ] 2>/dev/null; then
-				next_writeback=0
-			else
-				interval_seconds=$((interval * 60))
-				next_writeback=$((now + interval_seconds))
-			fi
-		fi
-		if [ "$interval" -ne 0 ] 2>/dev/null && [ "$now" -ne 0 ] 2>/dev/null &&
-		   [ "$next_writeback" -ne 0 ] 2>/dev/null &&
-		   [ "$now" -ge "$next_writeback" ] 2>/dev/null; then
-			writeback_rc=0
-			run_locked memory_writeback_locked_command >/dev/null 2>&1 || writeback_rc=$?
+		if [ "$interval" -eq 0 ] 2>/dev/null; then
+			last_interval=0
+			next_writeback=0
+		else
 			now="$(monotonic_seconds)" || now=0
-			if [ "$now" -ne 0 ] 2>/dev/null; then
-				case "$writeback_rc" in
-					0|2) next_writeback=$((now + interval_seconds)) ;;
-					*)
-						next_writeback=$((now + 60))
-						log_error "Scheduled AdGuard Home memory write-back failed; retrying in 60 seconds"
-						;;
-				esac
-			else
-				next_writeback=0
+			if [ "$interval" != "$last_interval" ] ||
+			   { [ "$now" -ne 0 ] 2>/dev/null &&
+			     [ "$next_writeback" -eq 0 ] 2>/dev/null; }; then
+				last_interval="$interval"
+				if [ "$now" -eq 0 ] 2>/dev/null; then
+					next_writeback=0
+				else
+					interval_seconds=$((interval * 60))
+					next_writeback=$((now + interval_seconds))
+				fi
+			fi
+			if [ "$now" -ne 0 ] 2>/dev/null &&
+			   [ "$next_writeback" -ne 0 ] 2>/dev/null &&
+			   [ "$now" -ge "$next_writeback" ] 2>/dev/null; then
+				writeback_rc=0
+				run_locked memory_writeback_locked_command >/dev/null 2>&1 || writeback_rc=$?
+				now="$(monotonic_seconds)" || now=0
+				if [ "$now" -ne 0 ] 2>/dev/null; then
+					case "$writeback_rc" in
+						0|2) next_writeback=$((now + interval_seconds)) ;;
+						*)
+							next_writeback=$((now + 60))
+							log_error "Scheduled AdGuard Home memory write-back failed; retrying in 60 seconds"
+							;;
+						esac
+				else
+					next_writeback=0
+				fi
 			fi
 		fi
 		sleep "$MONITOR_INTERVAL" &

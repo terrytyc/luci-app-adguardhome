@@ -372,7 +372,9 @@ function service_status(configuration) {
 	};
 }
 
-function read_yaml(configuration) {
+function read_yaml(configuration, include_hash) {
+	// Status only consumes parsed values; editing/CAS keeps the hash by default.
+	include_hash = include_hash !== false;
 	let path = configuration ? configuration.path : config_path();
 	let file = null;
 	let content = null;
@@ -398,7 +400,7 @@ function read_yaml(configuration) {
 			? stat(`/proc/self/fd/${descriptor}`)
 			: null;
 		content = file.read(MAX_CONFIG_LENGTH + 1);
-		digest = type(content) == 'string' ? sha256(content) : null;
+		digest = include_hash && type(content) == 'string' ? sha256(content) : null;
 		// Keep the descriptor open until the pathname has been checked again.
 		// This proves that the bytes read came from the same inode observed at
 		// both pathname checks, even if the uid-853 work directory is renamed.
@@ -412,7 +414,7 @@ function read_yaml(configuration) {
 			before.size == opened.size && before.size == after.size &&
 			type(content) == 'string' && length(content) > 0 &&
 			length(content) <= MAX_CONFIG_LENGTH &&
-			length(content) == opened.size && !!digest;
+			length(content) == opened.size && (!include_hash || !!digest);
 		if (!file.close())
 			valid = false;
 		file = null;
@@ -503,7 +505,7 @@ function read_template() {
 }
 
 function read_config(configuration) {
-	let result = read_yaml(configuration);
+	let result = read_yaml(configuration, false);
 	return result ? replace(result.content, /\r\n?/g, '\n') : null;
 }
 

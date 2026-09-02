@@ -2,7 +2,6 @@
 
 'use strict';
 
-'require adguardhome.bcrypt as bcrypt';
 'require adguardhome.operation as operation';
 'require dom';
 'require form';
@@ -18,7 +17,7 @@ const DEFAULT_WORK_DIR = '/etc/AdGuardHome';
 const DEFAULT_MEMORY_WRITEBACK_INTERVAL = 60;
 const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
 
-const POLL_INTERVAL = 5;
+const POLL_INTERVAL = 10;
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_./+@%:,=-]+$/;
 const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 
@@ -592,6 +591,8 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
+			if (document.hidden)
+				return;
 
 			let current = null;
 			try {
@@ -626,8 +627,12 @@ return view.extend({
 	async openCredentialsDialog() {
 		const scope = this.pageScope;
 		let info = null;
+		let bcrypt = null;
 		try {
-			info = await operation.requestActive(callGetCredentials, scope);
+			[info, bcrypt] = await operation.requestActive(() => Promise.all([
+				callGetCredentials(),
+				L.require('adguardhome.bcrypt'),
+			]), scope);
 			if (typeof info?.error === 'string' && info.error)
 				throw new Error(info.error);
 			if (info?.available !== true || typeof info.username !== 'string' ||
@@ -682,6 +687,7 @@ return view.extend({
 		}, _('Change Username and Password'));
 		submitButton.addEventListener('click', ui.createHandlerFn(this, async () => {
 			await this.changeCredentials(
+				bcrypt,
 				info,
 				usernameInput,
 				passwordInput,
@@ -708,10 +714,13 @@ return view.extend({
 				submitButton,
 			]),
 		]);
-		window.setTimeout(() => usernameInput.focus(), 0);
+		window.setTimeout(() => {
+			if (operation.isPageActive(scope))
+				usernameInput.focus();
+		}, 0);
 	},
 
-	async changeCredentials(info, usernameInput, passwordInput, confirmationInput, status, submitButton, cancelButton) {
+	async changeCredentials(bcrypt, info, usernameInput, passwordInput, confirmationInput, status, submitButton, cancelButton) {
 		const scope = this.pageScope;
 		let username = String(usernameInput.value ?? '');
 		let password = String(passwordInput.value ?? '');

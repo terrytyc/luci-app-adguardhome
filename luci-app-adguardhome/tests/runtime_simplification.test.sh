@@ -52,7 +52,7 @@ managed_body="$(function_body sync_yaml_managed_fields_checked)"
 # Dynamic DNS ports are intentionally read from a fresh snapshot each time.
 # There is no monitor-lifetime cache which can conceal an official Web UI edit.
 runtime_body="$(function_body load_runtime_dns_port)"
-parser_body="$(function_body yaml_get_section_value)"
+parser_body="$(function_body yaml_runtime_ports)"
 port_body="$(function_body is_valid_port)"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT

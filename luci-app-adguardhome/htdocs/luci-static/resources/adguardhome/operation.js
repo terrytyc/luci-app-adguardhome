@@ -7,8 +7,8 @@
 
 const DEFAULT_RESULT_DISPLAY_SECONDS = 3;
 const ERROR_DISPLAY_SECONDS = 8;
-const JOB_POLL_INTERVAL = 1000;
-const JOB_POLL_LIMIT = 360;
+const JOB_POLL_INTERVAL = 2000;
+const JOB_POLL_LIMIT = 180;
 
 return baseclass.extend({
 	_timer: null,
@@ -140,7 +140,7 @@ return baseclass.extend({
 				if (this.isPageInactiveError(error))
 					throw error;
 				lastError = error;
-				if (++consecutiveErrors >= 10)
+				if (++consecutiveErrors >= 6)
 					break;
 			}
 
