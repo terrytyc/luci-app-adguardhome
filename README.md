@@ -1,12 +1,12 @@
 # luci-app-adguardhome
 
-`luci-app-adguardhome` 2.4.0-r1，兼容基线为 ImmortalWrt 25.12.1。
+`luci-app-adguardhome` 2.4.0-r2，兼容基线为 ImmortalWrt 25.12.1。
 
 本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由 ImmortalWrt 的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
 
 ## 唯一 UCI 配置
 
-2.4.0-r1 的活动配置只使用一个 UCI 文件：`/etc/config/adguardhome`。运行时不再创建或使用 `/etc/config/AdGuardHome`，也不存在第二个 `enabled` 或第二个 `work_dir`；受支持的旧版升级过程中只会读取旧大写文件来完成一次性迁移，成功后即删除它。
+2.4.0-r2 的活动配置只使用一个 UCI 文件：`/etc/config/adguardhome`。运行时不创建或使用 `/etc/config/AdGuardHome`，也不存在第二个 `enabled` 或第二个 `work_dir`。
 
 标准配置格式如下：
 
@@ -41,7 +41,7 @@ config luci 'luci'
 - 官方 `work_dir` 及 UCI 中的 `work_dir` 始终保持持久路径；`AdGuardHome.yaml` 始终从 `<work_dir>/AdGuardHome.yaml` 读取和修改；主程序、YAML 和整个官方工作目录均不会复制到内存。
 - 默认每 60 分钟回写一次，可设置为 1–10080 分钟；设置为 `0` 可关闭周期回写。
 - 手动和周期回写直接用 `cp` 把 RAM 中 `data` 的内容写回持久 `data`，同名对象直接覆盖，不先清空目标目录，也不停止或重启核心、插件服务或 DNS 服务。
-- 内存模式不承诺并发快照一致性或极端断电可靠性；断电时可能丢失上次成功回写后的数据。
+- 内存模式不建立持久事务日志或回写快照，也不承诺并发快照一致性或极端断电可靠性；断电时可能丢失上次成功回写后的数据。启动准备若在发布活动状态前中断，下次启动只丢弃经过校验的插件专用临时目录并从持久 `data` 重新载入。
 - 内存模式使用系统已有的 tmpfs、挂载能力和 BusyBox 基础工具，不新增 `rsync`、cron、`coreutils-stat` 或 `coreutils-timeout` 等依赖。有界操作由插件自身的 shell 监控完成，不需要任何替代的 timeout 软件包。
 
 ## DNS 集成模式
@@ -50,9 +50,9 @@ config luci 'luci'
 
 - `none`：不修改 dnsmasq 或防火墙。AdGuard Home 可以直接监听 53 端口。
 - `redirect`：使用 fw4 将路由器收到的 53 端口 DNS 请求重定向到 YAML 中的实际 AdGuard Home DNS 端口。
-- `dnsmasq-upstream`：保留 dnsmasq 的 53 端口监听，并把 dnsmasq 上游指向 YAML 中的实际 AdGuard Home DNS 端口。此模式要求系统只有一个 dnsmasq UCI 实例；检测到多个实例时会拒绝接管。
+- `dnsmasq-upstream`：保留 dnsmasq 的 53 端口监听，并把 dnsmasq 上游指向 YAML 中的实际 AdGuard Home DNS 端口。此模式要求系统只有一个 dnsmasq UCI 实例；进入模式时保留条件转发，只添加精确的 `127.0.0.1#<dns.port>` 上游并设置 `noresolv=1`。检测到多个 dnsmasq 实例、既有普通上游或 `/#/` 通配上游时会拒绝接管。
 
-`redirect` 和 `dnsmasq-upstream` 要求 YAML 的 `dns.port` 不是 53；`none` 模式可使用 53。停用插件或切换模式时会撤销由插件记录并创建的 DNS 集成设置。
+`redirect` 和 `dnsmasq-upstream` 要求 YAML 的 `dns.port` 不是 53；`none` 模式可使用 53。停用插件或离开 `dnsmasq-upstream` 时会删除插件记录的精确上游并取消 `noresolv`，不修改 `resolvfile`；切换其他模式时只撤销插件自己创建的 DNS 或防火墙项。
 
 ## LuCI 页面
 
@@ -77,8 +77,8 @@ ACME 的 `issued`/`renewed` 事件会触发安全重载，使续期证书生效�
 ## 安装与升级
 
 - 没有既有 AdGuard Home 状态的洁净安装会创建上述唯一 UCI 布局，按样例默认启用服务，并在默认工作目录缺少 YAML 时安装默认模板；导入已存在的官方实例时会保留其启用和运行状态。若该官方状态尚未生成 YAML，插件会连同模板采用默认 `dnsmasq-upstream` 模式；若导入的是既有官方 YAML，则初始使用 `none`，避免擅自改变原 DNS 策略。
-- 可从正式版 `2.1.0-r1`、`2.2.0-r1`、`2.2.0-r2`、`2.3.0-r1` 或 `2.3.0-r2` 直接原位升级到 `2.4.0-r1`。升级会合并旧配置到唯一的 `/etc/config/adguardhome`，保留 YAML、HTTPS 配置、运行数据、DNS 状态和内存模式设置，并清理旧的大写 UCI 文件。
-- 从 1.x、2.0.x 或未知开发版原位升级不受支持；应先完整卸载旧 LuCI 插件，再安装 2.4.0-r1。官方 `adguardhome` 核心软件包无需卸载。
+- `2.4.0-r1` 是唯一支持原位升级到 `2.4.0-r2` 的版本。升级保留当前 UCI、YAML、HTTPS 配置、运行数据和内存模式设置；升级脚本不迁移或删除 2.4 基线以前的历史配置项。
+- 从 2.3 及更早版本或未知开发版升级不受支持；应先完整卸载旧 LuCI 插件，再安装 2.4.0-r2。官方 `adguardhome` 核心软件包无需卸载。
 - 导入既有官方配置时，如果官方 `work_dir` 位于 `/var/*` 或 `/tmp/*`，插件会把 YAML 和现有 `data` 迁移到持久的 `/etc/AdGuardHome`，并把官方 `config_file` 统一为 `/etc/AdGuardHome/AdGuardHome.yaml`；原易失目录保留，便于人工恢复。
 - 普通情况下更换已受管的持久工作目录不会搬移旧目录内容：新目录已有 YAML 时直接使用，没有 YAML 时写入默认模板，旧目录保持不动。
 

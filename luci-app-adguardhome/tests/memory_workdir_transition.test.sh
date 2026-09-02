@@ -16,7 +16,7 @@ function_body() {
 apply_body="$(function_body "$init_file" memory_apply_official_path_delta)"
 normalize_persistent_body="$(function_body "$init_file" normalize_managed_config_file_persistent)"
 normalize_body="$(function_body "$init_file" normalize_managed_config_file)"
-load_body="$(function_body "$init_file" load_legacy_settings)"
+load_body="$(function_body "$init_file" load_settings)"
 suspend_body="$(function_body "$init_file" memory_suspend_data_bindings)"
 restore_body="$(function_body "$init_file" memory_restore_data_bindings_after_suspend_failure)"
 deactivate_body="$(function_body "$init_file" memory_deactivate_locked)"
@@ -116,18 +116,15 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	persistent_config_file=/etc/AdGuardHome-new/AdGuardHome.yaml
 	UCI_WORK=""
 	UCI_CONFIG=""
-	UCI_LEGACY_WORK=""
-	UCI_LEGACY_CONFIG=""
+	UCI_DELTA=0
 	memory_state_binds_persistent() {
 		[ "$1" = /etc/AdGuardHome-old ]
 	}
-	uci_guard_no_delta() { return 0; }
+	uci_guard_no_delta() { [ "$UCI_DELTA" = 0 ]; }
 	uci() {
 		case "$3" in
 			adguardhome.config.work_dir) printf '%s\n' "$UCI_WORK" ;;
 			adguardhome.config.config_file) printf '%s\n' "$UCI_CONFIG" ;;
-			adguardhome.config.workdir) printf '%s\n' "$UCI_LEGACY_WORK" ;;
-			adguardhome.config.config) printf '%s\n' "$UCI_LEGACY_CONFIG" ;;
 			*) return 1 ;;
 		esac
 	}
@@ -144,9 +141,9 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		exit 1
 	fi
 	UCI_CONFIG=/etc/AdGuardHome-new/AdGuardHome.yaml
-	UCI_LEGACY_WORK=/tmp/foreign
+	UCI_DELTA=1
 	if memory_apply_official_path_delta; then
-		printf 'legacy runtime workdir field was accepted\n' >&2
+		printf 'pending official UCI delta was accepted\n' >&2
 		exit 1
 	fi
 )
@@ -276,22 +273,17 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	RUNTIME_ACTIVE=1
 	RUNTIME_BACKING="$OLD"
 	FAIL_NEW=1
-	UCI_LEGACY_WORK=""
-	UCI_LEGACY_CONFIG=""
-
 	uci() {
 		case "$3" in
 			adguardhome.config.work_dir) printf '%s\n' "$COMMITTED_WORK" ;;
 			adguardhome.config.config_file) printf '%s/AdGuardHome.yaml\n' "$COMMITTED_WORK" ;;
-			adguardhome.config.workdir) printf '%s\n' "$UCI_LEGACY_WORK" ;;
-			adguardhome.config.config) printf '%s\n' "$UCI_LEGACY_CONFIG" ;;
 			*) return 1 ;;
 		esac
 	}
 	uci_guard_no_delta() { return 0; }
 	memory_state_binds_persistent() { [ "$1" = "$RUNTIME_BACKING" ]; }
-	load_legacy_settings() {
-		legacy_enabled="$COMMITTED_ENABLED"
+	load_settings() {
+		service_enabled="$COMMITTED_ENABLED"
 		persistent_work_dir="$COMMITTED_WORK"
 		persistent_config_file="${COMMITTED_WORK}/AdGuardHome.yaml"
 		verbose="$COMMITTED_VERBOSE"
@@ -341,7 +333,7 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		work_dir="$persistent_work_dir"
 		config_file="$persistent_config_file"
 	}
-	memory_recover_journal_locked() { return 0; }
+	memory_discard_incomplete_runtime_locked() { return 0; }
 	ensure_config_file() {
 		printf 'ensure:%s\n' "$work_dir" >>"$events"
 		if [ "$work_dir" = "$NEW" ] && [ "$FAIL_NEW" = 1 ]; then
@@ -373,7 +365,7 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		printf 'integrated:%s\n' "$3" >>"$events"
 	}
 
-	load_legacy_settings || exit 1
+	load_settings || exit 1
 	expected_revision="$(settings_current_revision)" || exit 1
 	stale_revision=0000000000000000000000000000000000000000000000000000000000000000
 	if settings_update_locked 1 "$NEW" 0 dnsmasq-upstream 1 60 "$stale_revision"; then

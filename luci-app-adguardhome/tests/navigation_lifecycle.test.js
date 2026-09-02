@@ -206,6 +206,7 @@ async function runSettingsSubmissionScenario(kind) {
 	let setCalls = 0;
 	let statusCalls = 0;
 	let resetCalls = 0;
+	let setArguments = null;
 	let context = null;
 
 	const operation = {
@@ -218,8 +219,9 @@ async function runSettingsSubmissionScenario(kind) {
 		requestDuringApply: request => request(),
 	};
 	const rpcHandlers = {
-		set_settings: async () => {
+		set_settings: async (...args) => {
 			setCalls++;
+			setArguments = args;
 			if (kind === 'request-transport')
 				throw new Error('XHR request failed');
 			if (kind === 'bad-token')
@@ -244,7 +246,6 @@ async function runSettingsSubmissionScenario(kind) {
 				throw new Error('authoritative reload failed');
 			return {
 				enabled: false,
-				config_file: '/mnt/storage/AdGuardHome/AdGuardHome.yaml',
 				work_dir: '/mnt/storage/AdGuardHome',
 				verbose: true,
 				redirect: 'redirect',
@@ -290,6 +291,7 @@ async function runSettingsSubmissionScenario(kind) {
 		map,
 		resetCalls,
 		setCalls,
+		setArguments,
 		statusCalls,
 		successes,
 		values,
@@ -586,6 +588,15 @@ async function main() {
 		'a successful transaction must redraw the authoritative settings once');
 	assert.equal(successfulSettings.context.settingsRevision, 'c'.repeat(64));
 	assert.equal(successfulSettings.context.committedSettings.workDir, '/mnt/storage/AdGuardHome');
+	assert.deepEqual(successfulSettings.setArguments, [
+		true,
+		'/etc/AdGuardHome',
+		false,
+		'dnsmasq-upstream',
+		false,
+		60,
+		'a'.repeat(64),
+	], 'the frontend settings update must not submit the derived config_file');
 	assert.equal(successfulSettings.values.get('config.work_dir'), '/mnt/storage/AdGuardHome',
 		'the visible JSON model must contain the authoritative work directory');
 	assert.equal(successfulSettings.values.get('luci.memory_writeback_interval'), '77',

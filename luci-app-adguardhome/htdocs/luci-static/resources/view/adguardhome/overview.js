@@ -56,7 +56,6 @@ const callSetSettings = rpc.declare({
 	method: 'set_settings',
 	params: [
 		'enabled',
-		'config_file',
 		'work_dir',
 		'verbose',
 		'redirect',
@@ -420,7 +419,6 @@ function normalizeSettings(result) {
 	    typeof result?.verbose !== 'boolean' ||
 	    typeof result?.run_from_memory !== 'boolean' ||
 	    validateWorkDir(null, workDir) !== true ||
-	    result?.config_file !== `${workDir}/AdGuardHome.yaml` ||
 	    ![ 'none', 'dnsmasq-upstream', 'redirect' ].includes(result?.redirect) ||
 	    !Number.isInteger(interval) || interval < 0 ||
 	    interval > MAX_MEMORY_WRITEBACK_INTERVAL ||
@@ -430,7 +428,6 @@ function normalizeSettings(result) {
 
 	return {
 		enabled: result.enabled,
-		configFile: result.config_file,
 		workDir,
 		verbose: result.verbose,
 		redirect: result.redirect,
@@ -449,7 +446,6 @@ function settingsMapData(settings) {
 		_status: {},
 		config: {
 			enabled: settings.enabled ? '1' : '0',
-			config_file: settings.configFile,
 			work_dir: settings.workDir,
 			verbose: settings.verbose ? '1' : '0',
 		},
@@ -472,7 +468,6 @@ function settingsFromMap(map, revision, fallbackInterval) {
 
 	return {
 		enabled: get(CORE_SECTION_NAME, 'enabled') === '1',
-		configFile: `${workDir}/AdGuardHome.yaml`,
 		workDir,
 		verbose: get(CORE_SECTION_NAME, 'verbose') === '1',
 		redirect: String(get(LUCI_SECTION_NAME, 'redirect') ?? ''),
@@ -917,7 +912,6 @@ return view.extend({
 			try {
 				response = await operation.requestDuringApply(() => callSetSettings(
 					candidate.enabled,
-					candidate.configFile,
 					candidate.workDir,
 					candidate.verbose,
 					candidate.redirect,

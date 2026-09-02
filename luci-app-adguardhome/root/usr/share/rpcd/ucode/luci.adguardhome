@@ -111,7 +111,7 @@ function settings_revision(settings) {
 
 	return sha256(
 		`enabled=${settings.enabled ? 1 : 0}\n` +
-		`config_file=${settings.config_file}\n` +
+		`config_file=${settings.work_dir}/${CONFIG_FILENAME}\n` +
 		`work_dir=${settings.work_dir}\n` +
 		`verbose=${settings.verbose ? 1 : 0}\n` +
 		`redirect=${settings.redirect}\n` +
@@ -129,7 +129,7 @@ function settings_snapshot() {
 		let enabled = configured_boolean(
 			uci.get(CONFIG_NAME, CONFIG_SECTION, 'enabled'));
 		let work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
-		let config_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		let configured_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
 		let verbose = configured_boolean(
 			uci.get(CONFIG_NAME, CONFIG_SECTION, 'verbose'));
 		let redirect = uci.get(CONFIG_NAME, LUCI_SECTION, 'redirect');
@@ -139,12 +139,11 @@ function settings_snapshot() {
 			uci.get(CONFIG_NAME, LUCI_SECTION, 'memory_writeback_interval'));
 
 		if (enabled != null && valid_work_dir(work_dir) &&
-		    config_file == `${work_dir}/${CONFIG_FILENAME}` && verbose != null &&
+		    configured_file == `${work_dir}/${CONFIG_FILENAME}` && verbose != null &&
 		    (redirect == 'none' || redirect == 'dnsmasq-upstream' ||
 		     redirect == 'redirect') && run_from_memory != null && interval != null) {
 			settings = {
 				enabled,
-				config_file,
 				work_dir,
 				verbose,
 				redirect,
@@ -166,12 +165,10 @@ function settings_snapshot() {
 	return settings?.revision ? settings : null;
 }
 
-function settings_candidate(enabled, config_file, work_dir, verbose, redirect,
+function settings_candidate(enabled, work_dir, verbose, redirect,
 						run_from_memory, interval) {
 	if (type(enabled) != 'bool' || type(verbose) != 'bool' ||
-	    type(run_from_memory) != 'bool' || type(config_file) != 'string' ||
-	    !valid_work_dir(work_dir) ||
-	    config_file != `${work_dir}/${CONFIG_FILENAME}` ||
+	    type(run_from_memory) != 'bool' || !valid_work_dir(work_dir) ||
 	    (redirect != 'none' && redirect != 'dnsmasq-upstream' &&
 	     redirect != 'redirect') || type(interval) != 'int' || interval < 0 ||
 	    interval > MAX_MEMORY_WRITEBACK_INTERVAL)
@@ -179,7 +176,6 @@ function settings_candidate(enabled, config_file, work_dir, verbose, redirect,
 
 	let settings = {
 		enabled,
-		config_file,
 		work_dir,
 		verbose,
 		redirect,
@@ -1154,14 +1150,14 @@ function finish_settings_process(token, expected_hash, candidate_hash,
 	close_yaml_job_lock(lock);
 }
 
-function update_settings(enabled, config_file, work_dir, verbose, redirect,
+function update_settings(enabled, work_dir, verbose, redirect,
 					 run_from_memory, interval, expected_revision) {
 	if (type(expected_revision) != 'string' ||
 	    !match(expected_revision, /^[0-9a-f]{64}$/))
 		return { error: 'Invalid or missing settings revision' };
 
 	let candidate = settings_candidate(
-		enabled, config_file, work_dir, verbose, redirect,
+		enabled, work_dir, verbose, redirect,
 		run_from_memory, interval
 	);
 	if (!candidate)
@@ -2121,21 +2117,6 @@ const methods = {
 			return reset_yaml(request.args.sha256);
 		},
 	},
-	get_password_info: {
-		call: function() {
-			return credentials_info();
-		},
-	},
-	set_password: {
-		args: { password_hash: '', sha256: '' },
-		call: function(request) {
-			return update_credentials(
-				'',
-				request.args.password_hash,
-				request.args.sha256
-			);
-		},
-	},
 	get_credentials: {
 		call: function() {
 			return credentials_info();
@@ -2160,7 +2141,6 @@ const methods = {
 	set_settings: {
 		args: {
 			enabled: false,
-			config_file: '',
 			work_dir: '',
 			verbose: false,
 			redirect: '',
@@ -2171,7 +2151,6 @@ const methods = {
 		call: function(request) {
 			return update_settings(
 				request.args.enabled,
-				request.args.config_file,
 				request.args.work_dir,
 				request.args.verbose,
 				request.args.redirect,

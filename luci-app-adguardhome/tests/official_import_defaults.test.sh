@@ -2,7 +2,7 @@
 set -eu
 
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-defaults="${script_dir}/../root/etc/uci-defaults/40_luci-AdGuardHome"
+defaults="$script_dir/../root/etc/uci-defaults/40_luci-AdGuardHome"
 
 function_body() {
 	awk -v function_name="$2" '
@@ -12,186 +12,162 @@ function_body() {
 	' "$1"
 }
 
-initialize_body="$(function_body "$defaults" initialize_merged_options)"
-select_body="$(function_body "$defaults" select_migration_source)"
-[ -n "$initialize_body" ] && [ -n "$select_body" ] || {
-	printf '%s\n' 'unable to extract official import functions' >&2
+select_body="$(function_body "$defaults" select_clean_install_source)"
+initialize_body="$(function_body "$defaults" initialize_clean_options)"
+normalize_body="$(function_body "$defaults" normalize_bool)"
+[ -n "$select_body" ] && [ -n "$initialize_body" ] &&
+	[ -n "$normalize_body" ] || {
+	printf 'unable to extract clean-install source functions\n' >&2
 	exit 1
 }
 
-temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/luci-agh-import-defaults.XXXXXX")"
+temporary_dir="$(mktemp -d /tmp/luci-agh-import-defaults.XXXXXX)"
 cleanup() {
 	rm -rf "$temporary_dir"
 }
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$temporary_dir/target" "$temporary_dir/volatile"
-printf '%s\n' template >"$temporary_dir/packaged-default.yaml"
+printf '%s\n' template >"$temporary_dir/default.yaml"
 
 exercise_source_selection() (
-	mode=$1
+	mode="$1"
 	eval "$select_body"
-	LEGACY_CONFIG_PRESENT=0
-	IS_UPGRADE=0
-	IMPORT_OFFICIAL=0
-	IMPORT_OFFICIAL_USES_TEMPLATE=0
-	DATA_SOURCE_WORK_DIR=""
 	DEFAULT_WORK_DIR="$temporary_dir/target"
-	DEFAULT_CONFIG_FILE="$DEFAULT_WORK_DIR/AdGuardHome.yaml"
-	PACKAGED_CONFIG_TEMPLATE="$temporary_dir/packaged-default.yaml"
-	OFFICIAL_WORK_DIR="$temporary_dir/volatile"
-	OFFICIAL_CONFIG_FILE="$temporary_dir/official.yaml"
-	target_config="$DEFAULT_WORK_DIR/AdGuardHome.yaml"
-	rm -f "$OFFICIAL_CONFIG_FILE" "$target_config"
+	PACKAGED_CONFIG_TEMPLATE="$temporary_dir/default.yaml"
+	OFFICIAL_DEFAULT_CONFIG="$temporary_dir/missing-official.yaml"
+	OFFICIAL_DEFAULT_WORK_DIR="$temporary_dir/volatile"
+	UCI_CONFIG=adguardhome
+	OFFICIAL_SECTION=config
+	TARGET_WORK_DIR=""
+	TARGET_CONFIG_FILE=""
+	SOURCE_WORK_DIR=""
+	SOURCE_CONFIG_FILE=""
+	USING_TEMPLATE=0
+	fixture_work="$temporary_dir/volatile"
+	fixture_file="$temporary_dir/missing-official.yaml"
 	case "$mode" in
 		template)
-			cp "$PACKAGED_CONFIG_TEMPLATE" "$target_config"
-			expected_source=$target_config
+			cp "$PACKAGED_CONFIG_TEMPLATE" "$DEFAULT_WORK_DIR/AdGuardHome.yaml"
+			expected_source="$DEFAULT_WORK_DIR/AdGuardHome.yaml"
 			expected_template=1
 			;;
 		official)
-			printf '%s\n' official >"$OFFICIAL_CONFIG_FILE"
-			expected_source=$OFFICIAL_CONFIG_FILE
+			printf '%s\n' official >"$temporary_dir/official.yaml"
+			fixture_file="$temporary_dir/official.yaml"
+			expected_source="$fixture_file"
 			expected_template=0
 			;;
-		official-target-template)
-			OFFICIAL_CONFIG_FILE=$target_config
-			cp "$PACKAGED_CONFIG_TEMPLATE" "$target_config"
-			expected_source=$target_config
+		missing)
+			rm -f "$DEFAULT_WORK_DIR/AdGuardHome.yaml"
+			expected_source="$PACKAGED_CONFIG_TEMPLATE"
 			expected_template=1
 			;;
-		official-target-user)
-			OFFICIAL_CONFIG_FILE=$target_config
-			printf '%s\n' user >"$target_config"
-			expected_source=$target_config
+		managed)
+			fixture_work=/mnt/storage/AdGuardHome
+			printf '%s\n' managed >"$temporary_dir/managed.yaml"
+			fixture_file="$temporary_dir/managed.yaml"
+			expected_source="$fixture_file"
 			expected_template=0
-			;;
-		target)
-			printf '%s\n' target >"$target_config"
-			expected_source=$target_config
-			expected_template=0
-			;;
-		missing-target)
-			expected_source=$PACKAGED_CONFIG_TEMPLATE
-			expected_template=1
 			;;
 		*) return 1 ;;
 	esac
-	official_state_is_meaningful() { return 0; }
-	normalize_work_dir() { printf '%s\n' "$1"; }
-	is_safe_source_work_dir() { return 0; }
-	valid_yaml_source_path() { [ -f "$1" ] && [ ! -L "$1" ]; }
-	trusted_root_file_source() {
-		[ "$1" = "$PACKAGED_CONFIG_TEMPLATE" ] && [ -f "$1" ] && [ ! -L "$1" ]
+	uci() {
+		[ "$1:$2" = -q:get ] || return 1
+		case "$3" in
+			adguardhome.config.work_dir) printf '%s\n' "$fixture_work" ;;
+			adguardhome.config.config_file) printf '%s\n' "$fixture_file" ;;
+			*) return 1 ;;
+		esac
 	}
-	select_migration_source >/dev/null
-	[ "$IMPORT_OFFICIAL" = 1 ]
+	resolve_source_work_dir() {
+		printf '%s\n' "$1"
+	}
+	resolve_source_file() {
+		[ -f "$1" ] && [ ! -L "$1" ] || return 1
+		printf '%s\n' "$1"
+	}
+	valid_managed_work_dir() {
+		case "$1" in /mnt/*/AdGuardHome) return 0 ;; esac
+		return 1
+	}
+	trim_trailing_slashes() {
+		printf '%s\n' "$1" | sed 's:/*$::'
+	}
+	select_clean_install_source
+	[ "$TARGET_WORK_DIR" = "$DEFAULT_WORK_DIR" ] || [ "$mode" = managed ]
 	[ "$SOURCE_CONFIG_FILE" = "$expected_source" ]
-	[ "$IMPORT_OFFICIAL_USES_TEMPLATE" = "$expected_template" ]
+	[ "$USING_TEMPLATE" = "$expected_template" ]
+	if [ "$mode" = managed ]; then
+		[ "$TARGET_WORK_DIR" = /mnt/storage/AdGuardHome ]
+	fi
 )
 
-for source_mode in template official official-target-template \
-	official-target-user target missing-target; do
+for source_mode in template official missing managed; do
 	exercise_source_selection "$source_mode" || {
-		printf 'official import source selection failed: %s\n' "$source_mode" >&2
+		printf 'clean official source selection failed: %s\n' "$source_mode" >&2
 		exit 1
 	}
 done
 
-(
+exercise_defaults() (
+	mode="$1"
+	eval "$normalize_body"
 	eval "$initialize_body"
-	LEGACY_CONFIG_PRESENT=0
-	IMPORT_OFFICIAL=1
-	IMPORT_OFFICIAL_USES_TEMPLATE=1
-	OFFICIAL_ENABLED=1
-	OFFICIAL_VERBOSE=1
-	DEFAULT_CONFIG_FILE=/usr/share/luci-app-adguardhome/default.yaml
-	SOURCE_CONFIG_FILE=$DEFAULT_CONFIG_FILE
+	UCI_CONFIG=adguardhome
+	OFFICIAL_SECTION=config
+	TARGET_CONFIG_FILE=/etc/AdGuardHome/AdGuardHome.yaml
+	TARGET_WORK_DIR=/etc/AdGuardHome
+	case "$mode" in
+		template)
+			USING_TEMPLATE=1
+			configured_enabled=0
+			configured_verbose=1
+			expected=1:1:dnsmasq-upstream:0:60
+			;;
+		existing)
+			USING_TEMPLATE=0
+			configured_enabled=1
+			configured_verbose=0
+			expected=1:0:none:0:60
+			;;
+		*) return 1 ;;
+	esac
+	uci() {
+		[ "$1:$2" = -q:get ] || return 1
+		case "$3" in
+			adguardhome.config.enabled) printf '%s\n' "$configured_enabled" ;;
+			adguardhome.config.verbose) printf '%s\n' "$configured_verbose" ;;
+			*) return 1 ;;
+		esac
+	}
 	set_official_option() {
 		case "$1" in
-			enabled) official_enabled=$2 ;;
-			verbose) official_verbose=$2 ;;
+			enabled) result_enabled="$2" ;;
+			verbose) result_verbose="$2" ;;
+			config_file|work_dir) ;;
 			*) return 1 ;;
 		esac
 	}
 	set_luci_option() {
 		case "$1" in
-			redirect) luci_redirect=$2 ;;
-			run_from_memory) luci_run_from_memory=$2 ;;
-			memory_writeback_interval) luci_memory_writeback_interval=$2 ;;
+			redirect) result_redirect="$2" ;;
+			run_from_memory) result_memory="$2" ;;
+			memory_writeback_interval) result_interval="$2" ;;
 			*) return 1 ;;
 		esac
 	}
-	initialize_merged_options
-	[ "$official_enabled:$official_verbose" = 1:1 ]
-	[ "$luci_redirect:$luci_run_from_memory:$luci_memory_writeback_interval" = \
-		dnsmasq-upstream:0:60 ]
-) || {
-	printf '%s\n' 'official state without YAML did not receive the confirmed plugin defaults' >&2
+	initialize_clean_options
+	actual="$result_enabled:$result_verbose:$result_redirect:$result_memory:$result_interval"
+	[ "$actual" = "$expected" ]
+)
+
+exercise_defaults template || {
+	printf 'packaged template did not receive the confirmed defaults\n' >&2
+	exit 1
+}
+exercise_defaults existing || {
+	printf 'existing official YAML did not receive the non-invasive DNS default\n' >&2
 	exit 1
 }
 
-(
-	eval "$initialize_body"
-	LEGACY_CONFIG_PRESENT=0
-	IMPORT_OFFICIAL=1
-	IMPORT_OFFICIAL_USES_TEMPLATE=0
-	OFFICIAL_ENABLED=1
-	OFFICIAL_VERBOSE=0
-	DEFAULT_CONFIG_FILE=/usr/share/luci-app-adguardhome/default.yaml
-	SOURCE_CONFIG_FILE=/etc/adguardhome/adguardhome.yaml
-	set_official_option() {
-		case "$1" in
-			enabled) official_enabled=$2 ;;
-			verbose) official_verbose=$2 ;;
-			*) return 1 ;;
-		esac
-	}
-	set_luci_option() {
-		case "$1" in
-			redirect) luci_redirect=$2 ;;
-			run_from_memory) luci_run_from_memory=$2 ;;
-			memory_writeback_interval) luci_memory_writeback_interval=$2 ;;
-			*) return 1 ;;
-		esac
-	}
-	initialize_merged_options
-	[ "$official_enabled:$official_verbose" = 1:0 ]
-	[ "$luci_redirect:$luci_run_from_memory:$luci_memory_writeback_interval" = \
-		none:0:60 ]
-) || {
-	printf '%s\n' 'existing official YAML did not retain a non-invasive DNS policy' >&2
-	exit 1
-}
-
-(
-	eval "$initialize_body"
-	LEGACY_CONFIG_PRESENT=0
-	IMPORT_OFFICIAL=1
-	IMPORT_OFFICIAL_USES_TEMPLATE=0
-	OFFICIAL_ENABLED=1
-	OFFICIAL_VERBOSE=0
-	DEFAULT_CONFIG_FILE=/etc/AdGuardHome/AdGuardHome.yaml
-	SOURCE_CONFIG_FILE=$DEFAULT_CONFIG_FILE
-	set_official_option() {
-		case "$1" in
-			enabled) official_enabled=$2 ;;
-			verbose) official_verbose=$2 ;;
-			*) return 1 ;;
-		esac
-	}
-	set_luci_option() {
-		case "$1" in
-			redirect) luci_redirect=$2 ;;
-			run_from_memory) luci_run_from_memory=$2 ;;
-			memory_writeback_interval) luci_memory_writeback_interval=$2 ;;
-			*) return 1 ;;
-		esac
-	}
-	initialize_merged_options
-	[ "$luci_redirect" = none ]
-) || {
-	printf '%s\n' 'existing official YAML at the target path was mistaken for the package template' >&2
-	exit 1
-}
-
-printf '%s\n' 'ok - official import DNS defaults follow YAML ownership'
+printf 'ok - clean official import and DNS defaults\n'

@@ -112,17 +112,21 @@ vm.runInContext(`${constants}\n${functions}\nthis.api = {
 
 const snapshot = sandbox.api.settings_snapshot();
 assert.equal(snapshot.enabled, true);
-assert.equal(snapshot.config_file, fixture.configFile);
+assert.equal(snapshot.config_file, undefined,
+	'config_file must remain an internal value derived from work_dir');
 assert.equal(snapshot.work_dir, fixture.workDir);
 assert.equal(snapshot.verbose, false);
 assert.equal(snapshot.redirect, fixture.redirect);
 assert.equal(snapshot.run_from_memory, false);
 assert.equal(snapshot.memory_writeback_interval, 60);
 assert.match(snapshot.revision, /^[0-9a-f]{64}$/);
+fixture.configFile = '/etc/AdGuardHome/other.yaml';
+assert.equal(sandbox.api.settings_snapshot(), null,
+	'a hand-edited official config_file inconsistent with work_dir must fail closed');
+fixture.configFile = '/etc/AdGuardHome/AdGuardHome.yaml';
 
 const candidate = sandbox.api.settings_candidate(
 	true,
-	fixture.configFile,
 	fixture.workDir,
 	false,
 	fixture.redirect,
@@ -132,18 +136,19 @@ const candidate = sandbox.api.settings_candidate(
 assert.equal(candidate.run_from_memory, true);
 assert.equal(candidate.memory_writeback_interval, 120);
 assert.match(candidate.revision, /^[0-9a-f]{64}$/);
+assert.equal(candidate.config_file, undefined,
+	'the settings candidate must not accept or expose config_file');
+assert.equal(candidate.revision, crypto.createHash('sha256').update(
+	`enabled=1\n` +
+	`config_file=${fixture.workDir}/AdGuardHome.yaml\n` +
+	`work_dir=${fixture.workDir}\n` +
+	`verbose=0\n` +
+	`redirect=${fixture.redirect}\n` +
+	`run_from_memory=1\n` +
+	`memory_writeback_interval=120\n`
+).digest('hex'), 'the revision must derive config_file from work_dir');
 assert.equal(sandbox.api.settings_candidate(
 	true,
-	'/etc/AdGuardHome/other.yaml',
-	fixture.workDir,
-	false,
-	fixture.redirect,
-	false,
-	60
-), null, 'config_file must be derived exactly from work_dir');
-assert.equal(sandbox.api.settings_candidate(
-	true,
-	'/tmp/AdGuardHome/AdGuardHome.yaml',
 	'/tmp/AdGuardHome',
 	false,
 	fixture.redirect,
@@ -152,7 +157,6 @@ assert.equal(sandbox.api.settings_candidate(
 ), null, 'volatile work_dir values must fail closed');
 assert.equal(sandbox.api.settings_candidate(
 	true,
-	fixture.configFile,
 	fixture.workDir,
 	false,
 	fixture.redirect,
@@ -182,6 +186,20 @@ assert.doesNotMatch(source, /uci\.(?:set|commit)\(/,
 	'the RPC backend must remain read-only with respect to UCI');
 assert.doesNotMatch(source, /function settings_process_succeeded\(/,
 	'raw wait status must never be treated as settings convergence proof');
+
+assert.match(source,
+	/function update_settings\(enabled, work_dir, verbose, redirect,\s*run_from_memory, interval, expected_revision\)/,
+	'the settings update API must derive config_file instead of accepting it');
+const setSettingsStart = source.indexOf('\tset_settings: {');
+const setSettingsEnd = source.indexOf('\tget_settings_update: {', setSettingsStart);
+assert.ok(setSettingsStart >= 0 && setSettingsEnd > setSettingsStart);
+const setSettingsMethod = source.slice(setSettingsStart, setSettingsEnd);
+assert.doesNotMatch(setSettingsMethod, /config_file/,
+	'the set_settings RPC schema and call must not expose config_file');
+assert.doesNotMatch(source, /\bget_password_info\s*:/,
+	'the unused legacy password information RPC must be removed');
+assert.doesNotMatch(source, /\bset_password\s*:/,
+	'the unused legacy password update RPC must be removed');
 
 const finishSettingsSource = extractFunction('finish_settings_process');
 assert.doesNotMatch(finishSettingsSource,

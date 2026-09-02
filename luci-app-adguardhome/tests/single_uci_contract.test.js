@@ -164,6 +164,11 @@ assert.match(overview, /method: 'set_settings'/,
 	'the settings page must submit its local model through one RPC transaction');
 assert.match(overview, /method: 'get_settings_update'/,
 	'the settings page must poll the asynchronous transaction through RPC');
+const setDeclarationStart = overview.indexOf('const callSetSettings = rpc.declare({');
+const setDeclarationEnd = overview.indexOf('const callGetSettingsUpdate', setDeclarationStart);
+assert.ok(setDeclarationStart >= 0 && setDeclarationEnd > setDeclarationStart);
+assert.doesNotMatch(overview.slice(setDeclarationStart, setDeclarationEnd), /config_file/,
+	'the frontend settings RPC must not submit the workdir-derived config_file');
 assert.doesNotMatch(overview, /ui\.changes\.apply\(|operation\.markApplyPending\(/,
 	'the settings page must not invoke a second global LuCI apply');
 
@@ -195,6 +200,9 @@ assert.match(luciBlock, /option\.retain = true;[\s\S]*?option\.depends\('run_fro
 	'the hidden write-back interval must remain in the JSON model while RAM is disabled');
 
 const settingsFromMapSource = extractFunction(overview, 'settingsFromMap');
+const settingsMapDataSource = extractFunction(overview, 'settingsMapData');
+assert.doesNotMatch(settingsMapDataSource, /config_file|configFile/,
+	'the frontend JSON model must not carry the derived config_file');
 const settingsSandbox = {
 	CORE_SECTION_NAME: 'config',
 	LUCI_SECTION_NAME: 'luci',
@@ -252,6 +260,10 @@ assert.ok(permission.write.ubus['luci.adguardhome'].includes('set_settings'),
 	'the write ACL must expose the settings transaction RPC');
 assert.ok(permission.write.ubus['luci.adguardhome'].includes('get_settings_update'),
 	'the write ACL must expose settings job polling');
+for (const legacyMethod of [ 'get_password_info', 'set_password' ]) {
+	assert.ok(!permission.write.ubus['luci.adguardhome'].includes(legacyMethod),
+		`the write ACL must not expose removed legacy RPC ${legacyMethod}`);
+}
 assert.deepEqual(
 	menu['admin/services/adguardhome'].depends.uci,
 	{ adguardhome: true },

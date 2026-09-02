@@ -20,11 +20,12 @@ for required_file in \
 	}
 done
 
-# Exercise the exact dependency-free normalizers used during installation and
-# at runtime.  Keeping both paths identical avoids octal interpretation of a
-# manually-entered leading-zero value in the monitor's shell arithmetic.
+# Exercise the runtime's dependency-free normalizer.  The 2.4 baseline
+# installer preserves a valid existing interval and writes the literal default
+# on a clean install; runtime remains the single normalization boundary for
+# manually-entered leading zeros and invalid values.
 run_normalizer() (
-	local source_file="$1" input="$2" normalizer_source
+	local source_file="$init_file" input="$1" normalizer_source
 	# The production function extracted below consumes these globals through
 	# eval, which ShellCheck cannot follow statically.
 	# shellcheck disable=SC2034
@@ -46,15 +47,13 @@ run_normalizer() (
 )
 
 expect_normalized() {
-	local input="$1" expected="$2" actual source_file
-	for source_file in "$defaults_file" "$init_file"; do
-		actual="$(run_normalizer "$source_file" "$input")"
-		[ "$actual" = "$expected" ] || {
-			printf "normalization failed in %s for '%s': expected '%s', got '%s'\n" \
-				"$source_file" "$input" "$expected" "$actual" >&2
-			exit 1
-		}
-	done
+	local input="$1" expected="$2" actual
+	actual="$(run_normalizer "$input")"
+	[ "$actual" = "$expected" ] || {
+		printf "normalization failed in %s for '%s': expected '%s', got '%s'\n" \
+			"$init_file" "$input" "$expected" "$actual" >&2
+		exit 1
+	}
 }
 
 expect_normalized '' 60
@@ -80,7 +79,7 @@ require_text() {
 
 # Literal shell variables are the source contract under inspection.
 # shellcheck disable=SC2016
-require_text "$defaults_file" 'set_luci_option memory_writeback_interval "$memory_writeback_interval"'
+require_text "$defaults_file" 'set_luci_option memory_writeback_interval 60'
 require_text "$init_file" 'memory_writeback_locked_command() {'
 require_text "$init_file" 'memory_copy_live_data_locked() ('
 require_text "$init_file" 'uid853_tree_is_writable() {'
@@ -112,12 +111,14 @@ function_body() {
 
 writeback_body="$(function_body "$init_file" memory_writeback_locked_command)"
 copy_body="$(function_body "$init_file" memory_copy_live_data_locked)"
+prepare_body="$(function_body "$init_file" memory_prepare_runtime_locked)"
 writable_body="$(function_body "$init_file" uid853_mounted_tree_is_writable)"
 ensure_body="$(function_body "$init_file" ensure_config_file)"
 orchestrate_body="$(function_body "$init_file" orchestrate_core_locked)"
 stop_body="$(function_body "$init_file" stop_wrapper_locked)"
 
-if [ -z "$writeback_body" ] || [ -z "$copy_body" ] || [ -z "$writable_body" ] || [ -z "$ensure_body" ] ||
+if [ -z "$writeback_body" ] || [ -z "$copy_body" ] || [ -z "$prepare_body" ] ||
+   [ -z "$writable_body" ] || [ -z "$ensure_body" ] ||
    [ -z "$orchestrate_body" ] || [ -z "$stop_body" ]; then
 	printf 'unable to extract the memory/write-directory implementation contract\n' >&2
 	exit 1
@@ -153,6 +154,25 @@ for forbidden in \
 		exit 1
 	fi
 done
+
+# RAM mode moves only the data directory.  The core's YAML path must remain the
+# authoritative file under the persistent workdir throughout preparation.
+# shellcheck disable=SC2016
+for required in \
+	'data_source="${persistent_work_dir}/data"' \
+	'data_target="$MEMORY_DATA_DIR"' \
+	'config_file="$persistent_config_file"'; do
+	if ! printf '%s\n' "$prepare_body" | grep -Fq -- "$required"; then
+		printf 'RAM preparation does not preserve the data-only contract: %s\n' \
+			"$required" >&2
+		exit 1
+	fi
+done
+if printf '%s\n' "$prepare_body" |
+	grep -E '(^|[[:space:]])(/bin/)?cp([[:space:]]|.*AdGuardHome[.]yaml)' >/dev/null; then
+	printf 'RAM preparation still copies the persistent YAML into memory\n' >&2
+	exit 1
+fi
 
 # The persistent workdir is also the live YAML directory in v2.4.  A periodic
 # data copy must never change ownership or mode
@@ -235,7 +255,7 @@ if grep -Fq -- 'migrate_work_data' "$init_file"; then
 	exit 1
 fi
 if grep -Fq -- 'memory_begin_live_checkpoint' "$init_file"; then
-	printf '2.3 runtime still contains a path that can create a live checkpoint marker\n' >&2
+	printf 'v2.4 runtime still contains a path that can create a live checkpoint marker\n' >&2
 	exit 1
 fi
 # A normal wrapper restart directly copies to the persistent alias without
@@ -248,9 +268,20 @@ printf '%s\n' "$stop_body" | grep -Fq -- 'memory_deactivate_locked 1 || return 1
 	printf 'normal stop no longer checkpoints and deactivates the RAM workdir\n' >&2
 	exit 1
 }
-require_text "$init_file" 'memory_restore_live_checkpoint_locked() {'
-require_text "$init_file" 'memory_live_marker_load || marker_rc=$?'
-require_text "$init_file" 'memory_clear_live_checkpoint || return 1'
+for obsolete in \
+	'MEMORY_JOURNAL' \
+	'memory_write_journal' \
+	'memory_recover_journal' \
+	'memory_restore_live_checkpoint' \
+	'memory_live_marker_load' \
+	'memory_clear_live_checkpoint' \
+	'MEMORY_LIVE_MARKER'; do
+	if grep -Fq -- "$obsolete" "$init_file"; then
+		printf 'removed RAM history mechanism remains in init: %s\n' "$obsolete" >&2
+		exit 1
+	fi
+done
+require_text "$init_file" 'memory_discard_incomplete_runtime_locked() {'
 
 if grep -Eq '^LUCI_DEPENDS:=.*\+coreutils-stat([[:space:]]|$)' "$makefile"; then
 	printf 'RAM mode must not add a coreutils-stat package dependency\n' >&2

@@ -12,6 +12,13 @@ require() {
 	}
 }
 
+reject() {
+	if grep -Fq -- "$2" "$1"; then
+		printf 'obsolete v2.4 init mechanism remains: %s\n' "$2" >&2
+		exit 1
+	fi
+}
+
 function_body() {
 	awk -v function_name="$2" '
 		$0 == function_name "() {" || $0 == function_name "() (" { copying = 1 }
@@ -20,9 +27,9 @@ function_body() {
 	' "$1"
 }
 
-require "$init_file" 'LEGACY_CONFIG="adguardhome"'
+require "$init_file" 'PLUGIN_CONFIG="adguardhome"'
 require "$init_file" 'OFFICIAL_CONFIG="adguardhome"'
-require "$init_file" 'LEGACY_SECTION="luci"'
+require "$init_file" 'PLUGIN_SECTION="luci"'
 require "$init_file" 'OFFICIAL_SECTION="config"'
 require "$init_file" 'version=4\npersistent_work_dir=%s\nbacking_device=%s\nbacking_inode=%s\npersistent_data_device=%s\npersistent_data_inode=%s\nmemory_data_device=%s\nmemory_data_inode=%s\n'
 require "$init_file" 'settings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate>'
@@ -84,8 +91,8 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 		printf '%s\n' "$2" >>"$states"
 	}
 	settings_update_locked() { return 0; }
-	load_legacy_settings() {
-		legacy_enabled=1
+	load_settings() {
+		service_enabled=1
 		persistent_work_dir="$work_dir"
 		verbose=0
 		redirect_mode=dnsmasq-upstream
@@ -93,7 +100,7 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 		memory_writeback_interval=60
 	}
 	settings_current_revision() {
-		settings_values_revision "$legacy_enabled" "$persistent_work_dir" \
+		settings_values_revision "$service_enabled" "$persistent_work_dir" \
 			"$verbose" "$redirect_mode" "$memory_requested" \
 			"$memory_writeback_interval"
 	}
@@ -184,59 +191,20 @@ if printf '%s\n' "$monitor_term_body" | grep -Fq 'clear_recorded_integration_loc
 	exit 1
 fi
 
-start_body="$(function_body "$init_file" start_service)"
-require "$init_file" 'upgrade_stopped_marker_is_valid() ('
-if grep -Fq 'consume_upgrade_stopped_marker' "$init_file" ||
-   ! printf '%s\n' "$start_body" |
-	grep -Fq 'upgrade_stopped_marker_is_valid || marker_rc=$?'; then
-	printf 'init still consumes the durable cold-upgrade stop barrier\n' >&2
-	exit 1
-fi
-start_tmp="$(mktemp -d)"
-trap 'rm -rf "$start_tmp"' EXIT
-(
-	eval "$start_body"
-	UPGRADE_STOPPED_MARKER="${start_tmp}/upgrade-was-stopped"
-	MAINTENANCE_UPGRADE_MARKER="${start_tmp}/maintenance-upgrade"
-	YAML_MAINTENANCE_MARKER="${start_tmp}/removing"
-	PKG_UPGRADE=1
-	initscript=/etc/init.d/AdGuardHome
-	: >"$UPGRADE_STOPPED_MARKER"
-	prepare_yaml_job_runtime() { return 0; }
-	upgrade_stopped_marker_is_valid() {
-		VALIDATIONS=$((VALIDATIONS + 1))
-		return 0
-	}
-	prepare_wrapper_locked() {
-		PREPARE_CALLED=$((PREPARE_CALLED + 1))
-		return 0
-	}
-	run_locked() { "$@"; }
-	log_error() { :; }
-	procd_open_instance() { PROCD_CALLED=$((PROCD_CALLED + 1)); }
-	procd_set_param() { PROCD_CALLED=$((PROCD_CALLED + 1)); }
-	procd_close_instance() { PROCD_CALLED=$((PROCD_CALLED + 1)); }
-	PREPARE_CALLED=0
-	PROCD_CALLED=0
-	VALIDATIONS=0
-	start_service || exit 1
-	start_service || exit 1
-	[ "$VALIDATIONS:$PREPARE_CALLED:$PROCD_CALLED" = 2:0:0 ] || exit 1
-	[ "$START_PREPARED:$START_DISABLED" = 1:1 ] || exit 1
-	[ -e "$UPGRADE_STOPPED_MARKER" ] || exit 1
-	PKG_UPGRADE=0
-	if start_service; then
-		exit 1
-	fi
-	[ "$VALIDATIONS:$PREPARE_CALLED:$PROCD_CALLED" = 3:0:0 ] || exit 1
-	[ "$START_PREPARED:$START_DISABLED" = 1:1 ] || exit 1
-	[ -e "$UPGRADE_STOPPED_MARKER" ] || exit 1
-) || {
-	printf 'cold-upgrade stop barrier did not suppress repeated starts fail-closed\n' >&2
-	exit 1
-}
-rm -rf "$start_tmp"
-trap - EXIT
+for obsolete in \
+	'LEGACY_CONFIG=' \
+	'LEGACY_SECTION=' \
+	'load_legacy_settings()' \
+	'MEMORY_JOURNAL' \
+	'memory_recover_journal' \
+	'memory_restore_live_checkpoint' \
+	'memory_live_marker_load' \
+	'MAINTENANCE_UPGRADE' \
+	'UPGRADE_STOPPED'; do
+	reject "$init_file" "$obsolete"
+done
+require "$init_file" 'memory_discard_incomplete_runtime_locked() {'
+require "$init_file" 'memory_discard_incomplete_runtime_locked "$configured_work_dir" || return 1'
 
 require "$init_file" 'refresh_managed_config_snapshot || return 1'
 require "$init_file" 'official_memory_data_mount_visible'
