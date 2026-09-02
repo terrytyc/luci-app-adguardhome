@@ -52,11 +52,11 @@ const constants = [
 
 const functionNames = [
 	'valid_work_dir',
+	'configured_boolean',
 	'encoded_device',
 	'same_inode',
 	'same_directory_inode',
 	'memory_state_active',
-	'memory_active',
 	'config_path',
 	'service_running',
 	'service_status',
@@ -81,6 +81,7 @@ const PERSISTENT_DATA_DEVICE = 2049;
 const MEMORY_DATA_DEVICE = 23;
 
 const fixture = {
+	cursorReads: 0,
 	requested: '0',
 	serviceRunning: true,
 	workDir: PERSISTENT_WORK_DIR,
@@ -155,6 +156,7 @@ function metadata(pathname) {
 }
 
 function uciCursor() {
+	fixture.cursorReads++;
 	return {
 		get(config, section, option) {
 			const key = `${config}.${section}.${option}`;
@@ -215,7 +217,6 @@ const sandbox = {
 vm.createContext(sandbox);
 vm.runInContext(`${constants}\n${functions}\nthis.memoryApi = {
 	memory_state_active,
-	memory_active,
 	config_path,
 	service_status,
 };`, sandbox, { filename: rpcPath });
@@ -251,7 +252,7 @@ assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), true,
 	'a valid version=4 data-only RAM generation and both bind aliases should be active');
 assert.equal(api.config_path(), PERSISTENT_CONFIG,
 	'valid RAM mode must keep YAML in the persistent work directory');
-assert.equal(api.memory_active(), true,
+assert.equal(api.service_status().memory_active, true,
 	'the independent RAM state validator should report the active generation');
 
 fixture.visibleDataInode = 53;
@@ -270,7 +271,10 @@ assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
 fixture.stateMemoryDataInode = fixture.memoryDataInode;
 
 fixture.requested = '0';
+fixture.cursorReads = 0;
 let status = api.service_status();
+assert.equal(fixture.cursorReads, 1,
+	'each status request must use one UCI cursor for requested and active state');
 assert.equal(status.memory_requested, false);
 assert.equal(status.memory_active, true,
 	'memory_active must not be derived from the requested checkbox');
@@ -296,7 +300,7 @@ assert.equal(api.config_path(), PERSISTENT_CONFIG,
 fixture.configFile = `${PERSISTENT_WORK_DIR}/other.yaml`;
 assert.equal(api.config_path(), null,
 	'a mismatched config_file must fail closed');
-assert.equal(api.memory_active(), false,
+assert.equal(api.service_status().memory_active, false,
 	'a mismatched config_file must not report RAM mode active');
 
 fixture.configFile = `${MEMORY_WORK_DIR}/AdGuardHome.yaml`;
@@ -335,5 +339,20 @@ fixture.workDir = MEMORY_WORK_DIR;
 fixture.configFile = `${MEMORY_WORK_DIR}/AdGuardHome.yaml`;
 assert.equal(api.config_path(), null,
 	'the internal RAM directory must never become the configured work_dir');
+assert.equal(api.service_status().memory_active, false,
+	'an invalid work_dir must return boolean false, not null');
+
+fixture.workDir = PERSISTENT_WORK_DIR;
+fixture.configFile = PERSISTENT_CONFIG;
+for (const value of [ '1', 'ON', 'true', 'Yes', 'enabled' ]) {
+	fixture.requested = value;
+	assert.equal(api.service_status().memory_requested, true,
+		`status must reuse the settings boolean parser for ${value}`);
+}
+for (const value of [ '0', 'OFF', 'false', 'No', 'disabled', '', undefined ]) {
+	fixture.requested = value;
+	assert.equal(api.service_status().memory_requested, false,
+		`status must reject a disabled or invalid memory request: ${value}`);
+}
 
 console.log('2.4 single-UCI data-only RPC memory layout contract tests passed');

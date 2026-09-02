@@ -32,55 +32,14 @@ function translated(value) {
 	return result;
 }
 
-function loadOperation(sharedStorage) {
+function loadOperation() {
 	const source = fs.readFileSync(operationPath, 'utf8');
 	const listeners = new Map();
 	const onceListeners = new Map();
-	const storage = sharedStorage ?? new Map();
 	const rendered = [];
-	const bodyClasses = new Set();
-	const mutationObservers = new Set();
 	let reloads = 0;
 
-	const notifyBodyMutation = () => {
-		for (const observer of [ ...mutationObservers ])
-			observer.callback([], observer);
-	};
-	const addBodyClass = bodyClasses.add.bind(bodyClasses);
-	const deleteBodyClass = bodyClasses.delete.bind(bodyClasses);
-	bodyClasses.add = name => {
-		const changed = !bodyClasses.has(name);
-		addBodyClass(name);
-		if (changed)
-			notifyBodyMutation();
-		return bodyClasses;
-	};
-	bodyClasses.delete = name => {
-		const changed = deleteBodyClass(name);
-		if (changed)
-			notifyBodyMutation();
-		return changed;
-	};
-
-	class FakeMutationObserver {
-		constructor(callback) {
-			this.callback = callback;
-		}
-
-		observe() {
-			mutationObservers.add(this);
-		}
-
-		disconnect() {
-			mutationObservers.delete(this);
-		}
-	}
 	const fakeDocument = {
-		body: {
-			classList: {
-				contains(name) { return bodyClasses.has(name); },
-			},
-		},
 		documentElement: {
 			contains(node) { return node.isConnected === true; },
 		},
@@ -105,14 +64,8 @@ function loadOperation(sharedStorage) {
 		addEventListener: fakeDocument.addEventListener.bind(fakeDocument),
 		setTimeout(callback) { return setTimeout(callback, 0); },
 		clearTimeout(id) { clearTimeout(id); },
-		MutationObserver: FakeMutationObserver,
 		location: {
 			reload() { reloads++; },
-		},
-		sessionStorage: {
-			getItem(key) { return storage.has(key) ? storage.get(key) : null; },
-			setItem(key, value) { storage.set(key, String(value)); },
-			removeItem(key) { storage.delete(key); },
 		},
 	};
 	const fakeUi = {
@@ -139,10 +92,8 @@ function loadOperation(sharedStorage) {
 
 	return {
 		operation: new ModuleClass(),
-		bodyClasses,
 		listeners,
 		rendered,
-		storage,
 		dispatch(type, event = {}) {
 			for (const listener of [ ...(listeners.get(type) ?? []) ]) {
 				if (onceListeners.get(type)?.has(listener))
@@ -150,7 +101,6 @@ function loadOperation(sharedStorage) {
 				listener(event);
 			}
 		},
-		observedMutations: () => mutationObservers.size,
 		reloads: () => reloads,
 	};
 }
@@ -212,15 +162,15 @@ async function runSettingsSubmissionScenario(kind) {
 	const optionCache = new Map(values);
 	const visibleValues = new Map(optionCache);
 
-	const operation = {
+	const operation = Object.assign(loadOperation().operation, {
 		isPageActive: () => true,
 		pageInactiveError: () => Object.assign(new Error('inactive'), { pageInactive: true }),
 		isPageInactiveError: error => error?.pageInactive === true,
 		start: () => ({}),
 		failure: message => failures.push(String(message)),
 		success: () => { successes++; },
-		requestDuringApply: request => request(),
-	};
+		requestActive: request => request(),
+	});
 	const rpcHandlers = {
 		set_settings: async (...args) => {
 			setCalls++;
@@ -275,7 +225,7 @@ async function runSettingsSubmissionScenario(kind) {
 			for (const [ key, value ] of optionCache)
 				visibleValues.set(key, value);
 			if (kind === 'success') {
-				assert.equal(context.settingsRevision, oldRevision,
+				assert.equal(context.committedSettings?.revision, oldRevision,
 					'the authoritative revision must not be adopted before the visible form resets');
 				assert.equal(context.committedSettings.memoryWritebackInterval, 60);
 			}
@@ -292,8 +242,7 @@ async function runSettingsSubmissionScenario(kind) {
 	context = {
 		pageScope: {},
 		settingsMap: map,
-		settingsRevision: oldRevision,
-		committedSettings: { memoryWritebackInterval: 60 },
+		committedSettings: { revision: oldRevision, memoryWritebackInterval: 60 },
 	};
 
 	await view.submitSettings.call(context);
@@ -364,123 +313,76 @@ async function main() {
 	assert.equal(state.rendered.length, afterOldStart,
 		'creating a new scope must cancel the old timer and reject its late result');
 
-	state.operation.markApplyPending();
-	assert.equal(state.operation.applyPending(), true);
-	assert.equal(state.observedMutations(), 1,
-		'marking an apply must watch its modal lifecycle');
-	assert.equal(state.operation.applyPending(), true,
-		'the marker must survive the synchronous gap before the modal appears');
-	state.bodyClasses.add('modal-overlay-active');
-	assert.equal(state.operation.applyPending(), true,
-		'the marker must remain active while the LuCI apply modal is visible');
-	const modalButtonClick = {
-		target: {
-			closest: selector => selector === 'button' ? {} : null,
-		},
-		prevented: false,
-		preventDefault() { this.prevented = true; },
-		stopPropagation() {},
-	};
-	for (const listener of state.listeners.get('click') ?? [])
-		listener(modalButtonClick);
-	assert.equal(modalButtonClick.prevented, false,
-		'LuCI apply and connectivity-warning buttons must remain usable');
-
-	const linkedButtonClick = {
-		target: {
-			closest: selector => selector === 'button' || selector === 'a[href]'
-				? {}
-				: null,
-		},
-		prevented: false,
-		preventDefault() { this.prevented = true; },
-		stopPropagation() {},
-		stopImmediatePropagation() {},
-	};
-	for (const listener of state.listeners.get('click') ?? [])
-		listener(linkedButtonClick);
-	assert.equal(linkedButtonClick.prevented, true,
-		'a button nested in a link must not bypass the navigation guard');
-
-	const guardedClick = {
-		target: { closest: selector => selector === 'a[href]' ? {} : null },
-		prevented: false,
-		stopped: false,
-		immediate: false,
-		preventDefault() { this.prevented = true; },
-		stopPropagation() { this.stopped = true; },
-		stopImmediatePropagation() { this.immediate = true; },
-	};
-	for (const listener of state.listeners.get('click') ?? [])
-		listener(guardedClick);
-	assert.equal(guardedClick.prevented, true,
-		'an exposed theme link must not leave a checked apply confirmation page');
-	assert.equal(guardedClick.stopped, true);
-	assert.equal(guardedClick.immediate, true);
-
-	state.bodyClasses.delete('modal-overlay-active');
-	assert.equal(state.operation.applyPending(), false,
-		'closing or cancelling the observed apply modal must clear the retry marker immediately');
-	assert.equal(state.observedMutations(), 0,
-		'clearing the retry marker must disconnect its modal observer');
-	assert.equal((state.listeners.get('uci-applied') ?? []).length, 0,
-		'clearing the retry marker must remove its apply event listener');
-	assert.equal((state.listeners.get('uci-reverted') ?? []).length, 0,
-		'clearing the retry marker must remove its revert event listener');
-	const releasedClick = {
-		target: { closest: selector => selector === 'a[href]' ? {} : null },
-		prevented: false,
-		preventDefault() { this.prevented = true; },
-		stopPropagation() {},
-	};
-	for (const listener of [ ...(state.listeners.get('click') ?? []) ])
-		listener(releasedClick);
-	assert.equal(releasedClick.prevented, false,
-		'navigation must be released as soon as LuCI closes its apply modal');
-	assert.equal(state.operation.applyPending(), false);
-
-	state.operation.markApplyPending();
-	state.bodyClasses.add('modal-overlay-active');
-	state.dispatch('uci-applied');
-	assert.equal(state.operation.applyPending(), false,
-		'a successful checked apply must clear its marker immediately');
-	assert.equal(state.observedMutations(), 0);
-	state.bodyClasses.delete('modal-overlay-active');
-
-	state.operation.markApplyPending();
-	state.bodyClasses.add('modal-overlay-active');
-	state.dispatch('uci-reverted');
-	assert.equal(state.operation.applyPending(), false,
-		'a reverted checked apply must clear its marker immediately');
-	assert.equal(state.observedMutations(), 0);
-	state.bodyClasses.delete('modal-overlay-active');
-
-	state.operation.markApplyPending();
-	state.operation._applyPendingUntil = Date.now() - 1;
-	state.storage.set('luci.adguardhome.applyPendingUntil', String(Date.now() - 1));
-	assert.equal(state.operation.applyPending(), false,
-		'an expired marker must clear its observer and navigation guard');
-	assert.equal(state.observedMutations(), 0);
-
-	state.operation.markApplyPending();
-
 	let attempts = 0;
-	const recovered = await state.operation.requestDuringApply(async () => {
+	await assert.rejects(state.operation.requestActive(async () => {
 		attempts++;
-		if (attempts === 1) {
-			const error = new Error('XHR request timed out');
-			error.name = 'RequestError';
-			throw error;
-		}
-		return 'ready';
-	}, currentScope);
-	assert.equal(recovered, 'ready');
-	assert.equal(attempts, 2,
-		'a transient request failure is retried only during a marked apply');
+		throw new Error('XHR request timed out');
+	}, currentScope), /XHR request timed out/);
+	assert.equal(attempts, 1,
+		'ordinary requests must not be replayed after a transport failure');
+
+	const jobMessages = {
+		unknown: translated('unknown job state'),
+		unavailable: translated('job unavailable: %s'),
+		pending: translated('job still pending'),
+	};
+	const jobEvents = [];
+	let jobReads = 0;
+	const completedJob = await state.operation.waitForJob(async (token, consume) => {
+		assert.equal(token, 'job-token');
+		jobEvents.push(consume ? 'consume' : 'read');
+		if (consume)
+			throw new Error('cleanup unavailable');
+		jobReads++;
+		if (jobReads === 1)
+			return { state: 'pending' };
+		if (jobReads === 2)
+			throw new Error('temporary status failure');
+		if (jobReads === 3)
+			return { state: 'running' };
+		return { state: 'done', ok: true };
+	}, 'job-token', currentScope, jobMessages);
+	assert.equal(completedJob.ok, true);
+	assert.deepEqual(jobEvents, [ 'read', 'read', 'read', 'read', 'consume' ],
+		'terminal results must be consumed once, with best-effort cleanup');
+
+	for (const result of [ null, {}, { state: 'invalid' } ]) {
+		await assert.rejects(
+			state.operation.waitForJob(async () => result, 'token', currentScope, jobMessages),
+			/unknown job state/,
+		);
+	}
+	await assert.rejects(
+		state.operation.waitForJob(async () => ({ error: 'expired job' }), 'token', currentScope, jobMessages),
+		/expired job/,
+	);
+
+	let pendingReads = 0;
+	await assert.rejects(state.operation.waitForJob(async () => {
+		pendingReads++;
+		return { state: 'running' };
+	}, 'token', currentScope, jobMessages), /job still pending/);
+	assert.equal(pendingReads, 360, 'job polling must have a bounded total duration');
+
+	let resettingReads = 0;
+	const resetErrorCount = await state.operation.waitForJob(async (_token, consume) => {
+		if (consume)
+			return {};
+		resettingReads++;
+		if (resettingReads === 10)
+			return { state: 'running' };
+		if (resettingReads === 20)
+			return { state: 'done', ok: false, error: 'rejected' };
+		throw new Error('temporary status failure');
+	}, 'token', currentScope, jobMessages);
+	assert.equal(resetErrorCount.ok, false,
+		'a terminal failure belongs to the caller, not the transport error path');
+	assert.equal(resettingReads, 20,
+		'a successful status read must reset the consecutive failure counter');
 
 	let permanentAttempts = 0;
 	await assert.rejects(
-		state.operation.requestDuringApply(async () => {
+		state.operation.requestActive(async () => {
 			permanentAttempts++;
 			const error = new Error('invalid YAML');
 			error.name = 'RPCError';
@@ -491,7 +393,7 @@ async function main() {
 	assert.equal(permanentAttempts, 1,
 		'a real method failure must remain visible without retry masking');
 
-	const pending = state.operation.requestDuringApply(
+	const pending = state.operation.requestActive(
 		() => Promise.resolve('late reply'),
 		currentScope,
 	);
@@ -510,43 +412,31 @@ async function main() {
 	assert.equal(obsoleteLoadSettled, false,
 		'an obsolete LuCI load chain must remain pending instead of rendering an empty old view');
 
-	const sharedStorage = new Map();
-	const origin = loadOperation(sharedStorage);
-	const originScope = origin.operation.createPageScope();
-	originScope.attach({ isConnected: true });
-	origin.operation.markApplyPending();
-	origin.bodyClasses.add('modal-overlay-active');
-	origin.dispatch('pagehide', { persisted: true });
-	assert.equal(origin.operation.applyPending(), true,
-		'leaving during an active apply must retain the cross-document retry marker');
+	let inactiveCalls = 0;
+	await assert.rejects(state.operation.requestActive(async () => {
+		inactiveCalls++;
+	}, currentScope), error => error?.pageInactive === true);
+	assert.equal(inactiveCalls, 0,
+		'an inactive page must not start another request');
 
-	const destination = loadOperation(sharedStorage);
-	const destinationScope = destination.operation.createPageScope();
-	destinationScope.attach({ isConnected: true });
-	assert.equal(destination.operation.applyPending(), true,
-		'a YAML or log page must inherit an in-progress apply marker');
-	let destinationAttempts = 0;
-	const destinationResult = await destination.operation.requestDuringApply(async () => {
-		destinationAttempts++;
-		if (destinationAttempts === 1) {
-			const error = new Error('XHR request timed out');
-			error.name = 'RequestError';
-			throw error;
-		}
-		return 'loaded';
-	}, destinationScope);
-	assert.equal(destinationResult, 'loaded');
-	assert.equal(destinationAttempts, 2,
-		'the destination tab must retry a transient initial RPC failure during apply');
+	const jobState = loadOperation();
+	const jobScope = jobState.operation.createPageScope();
+	const jobRoot = { isConnected: true };
+	jobScope.attach(jobRoot);
+	let consumeCalls = 0;
+	await assert.rejects(jobState.operation.waitForJob(async (_token, consume) => {
+		if (consume)
+			consumeCalls++;
+		jobRoot.isConnected = false;
+		return { state: 'done', ok: true };
+	}, 'token', jobScope, jobMessages), error => error?.pageInactive === true);
+	assert.equal(consumeCalls, 0,
+		'a terminal response owned by an inactive page must not continue its load chain');
 
-	const completedStorage = new Map();
-	const completedOrigin = loadOperation(completedStorage);
-	completedOrigin.operation.markApplyPending();
-	completedOrigin.bodyClasses.add('modal-overlay-active');
-	completedOrigin.bodyClasses.delete('modal-overlay-active');
-	const completedDestination = loadOperation(completedStorage);
-	assert.equal(completedDestination.operation.applyPending(), false,
-		'a cancelled or failed apply must not leak retry state into a later tab');
+	const operationSource = fs.readFileSync(operationPath, 'utf8');
+	assert.doesNotMatch(operationSource,
+		/markApplyPending|sessionStorage|MutationObserver|uci-applied|uci-reverted|requestDuringApply/,
+		'the RPC-only frontend must not retain the old global UCI apply mechanism');
 
 	const applyEvents = [];
 	const overviewOperation = { isPageActive: () => true };
@@ -576,8 +466,6 @@ async function main() {
 		'bad-token',
 	]) {
 		const result = await runSettingsSubmissionScenario(kind);
-		assert.equal(result.context.settingsRevision, null,
-			`${kind} must invalidate the stale settings revision`);
 		assert.equal(result.context.committedSettings, null,
 			`${kind} must discard the stale committed snapshot`);
 		assert.equal(result.map.readonly, true,
@@ -606,7 +494,7 @@ async function main() {
 		'a successful transaction must redraw the authoritative settings once');
 	assert.equal(successfulSettings.loadCalls, 1,
 		'a successful transaction must reload JSONMap option caches once');
-	assert.equal(successfulSettings.context.settingsRevision, 'c'.repeat(64));
+	assert.equal(successfulSettings.context.committedSettings?.revision, 'c'.repeat(64));
 	assert.equal(successfulSettings.context.committedSettings.workDir, '/mnt/storage/AdGuardHome');
 	assert.deepEqual(successfulSettings.setArguments, [
 		true,
@@ -651,6 +539,8 @@ async function main() {
 			`${name} must guard asynchronous DOM updates`);
 		assert.match(source, /operation\.abandonInactiveLoad\(/,
 			`${name} must prevent an obsolete load continuation from rendering`);
+		if (name === 'log')
+			continue;
 		assert.match(source, /const operationTicket = operation\.start\(\)/,
 			`${name} must retain the operation ticket for its long request`);
 		assert.match(source, /operation\.success\([\s\S]*?operationTicket[\s\S]*?\)/,
@@ -674,13 +564,13 @@ async function main() {
 		'the settings page must not enter LuCI global UCI apply');
 	assert.match(
 		overview,
-		/result\?\.indeterminate === true[\s\S]*?throw uncertainSettingsUpdateError[\s\S]*?error\?\.settingsUpdateUncertain === true[\s\S]*?this\.settingsRevision = null;[\s\S]*?this\.committedSettings = null;[\s\S]*?map\.readonly = true;[\s\S]*?await map\.reset\(\);/,
+		/result\?\.indeterminate === true[\s\S]*?throw uncertainSettingsUpdateError[\s\S]*?error\?\.settingsUpdateUncertain === true[\s\S]*?this\.committedSettings = null;[\s\S]*?map\.readonly = true;[\s\S]*?await map\.reset\(\);/,
 		'an indeterminate settings update must invalidate the stale CAS state and lock the form until reload',
 	);
 	assert.match(
 		overview,
-		/throw uncertainSettingsUpdateError\(lastError[\s\S]*?The settings update is still running/,
-		'a lost settings status response must also invalidate the form because the job may still commit',
+		/operation\.waitForJob\(callGetSettingsUpdate,[\s\S]*?uncertainSettingsUpdateError\);/,
+		'lost settings job status must preserve the uncertain update error semantics',
 	);
 	assert.match(
 		overview,
@@ -689,7 +579,7 @@ async function main() {
 	);
 	assert.match(
 		overview,
-		/committed = await getSettings\(scope\);\s*await reloadSettingsMap\(map, committed\);[\s\S]*?this\.settingsRevision = committed\.revision;/,
+		/committed = await getSettings\(scope\);\s*await reloadSettingsMap\(map, committed\);[\s\S]*?this\.committedSettings = committed;/,
 		'the visible settings form must be reset to the authoritative snapshot before adopting its revision',
 	);
 	assert.match(
@@ -699,7 +589,7 @@ async function main() {
 	);
 	assert.match(
 		overview,
-		/if \(typeof this\.settingsRevision !== 'string' \|\|[\s\S]*?!\/\^\[0-9a-f\]\{64\}\$\/\.test\(this\.settingsRevision\)\)[\s\S]*?Reload this page before applying settings again/,
+		/const revision = this\.committedSettings\?\.revision;[\s\S]*?typeof revision !== 'string'[\s\S]*?Reload this page before applying settings again/,
 		'a settings form whose reconciliation failed must reject another submission locally',
 	);
 	assert.doesNotMatch(overview, /require uci|uci\.load\(|new form\.Map\(/,
@@ -730,7 +620,7 @@ async function main() {
 	assert.doesNotMatch(yaml, /inactive:\s*true/,
 		'an inactive YAML load must not render an empty editor');
 
-	console.log('navigation lifecycle and apply retry tests passed');
+	console.log('navigation lifecycle, shared job polling and settings reconciliation tests passed');
 }
 
 main().catch(error => {

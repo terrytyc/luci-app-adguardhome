@@ -38,9 +38,6 @@ const callGetYamlUpdate = rpc.declare({
 	reject: true,
 });
 
-const YAML_POLL_INTERVAL = 1000;
-const YAML_POLL_LIMIT = 360;
-
 function normalizeYaml(result) {
 	return {
 		content: typeof result?.content === 'string' ? result.content : '',
@@ -60,16 +57,12 @@ function uncertainYamlUpdateError(message) {
 	return error;
 }
 
-function delay(milliseconds) {
-	return new Promise(resolve => window.setTimeout(resolve, milliseconds));
-}
-
 return view.extend({
 	async load() {
 		const pageScope = operation.createPageScope();
 		this.pageScope = pageScope;
 		try {
-			const result = normalizeYaml(await operation.requestDuringApply(
+			const result = normalizeYaml(await operation.requestActive(
 				callGetYaml,
 				pageScope,
 			));
@@ -89,7 +82,6 @@ return view.extend({
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
 		this.yamlHash = result.sha256;
-		this.yamlPath = result.path;
 		this.yamlEditor = E('textarea', {
 			class: 'cbi-input-textarea',
 			rows: 32,
@@ -152,19 +144,14 @@ return view.extend({
 		if (this.operationBusy || !operation.isPageActive(scope))
 			return;
 		this.setBusy(true);
-		const operationTicket = operation.start();
-
 		try {
 			await this.reloadYaml();
-			operation.success(undefined, operationTicket);
 		} catch (error) {
 			if (operation.isPageInactiveError(error))
 				return;
 			this.invalidateYamlEditor();
-			operation.failure(
-				_('Unable to read the YAML configuration: %s').format(errorMessage(error)),
-				operationTicket,
-			);
+			ui.addNotification(null, E('p', {},
+				_('Unable to read the YAML configuration: %s').format(errorMessage(error))), 'error');
 		} finally {
 			if (operation.isPageActive(scope))
 				this.setBusy(false);
@@ -172,7 +159,7 @@ return view.extend({
 	},
 
 	async reloadYaml() {
-		const result = normalizeYaml(await operation.requestDuringApply(
+		const result = normalizeYaml(await operation.requestActive(
 			callGetYaml,
 			this.pageScope,
 		));
@@ -183,7 +170,6 @@ return view.extend({
 
 		this.yamlEditor.value = result.content;
 		this.yamlHash = result.sha256;
-		this.yamlPath = result.path;
 		this.pathValue.textContent = result.path || _('Unavailable');
 		this.yamlEditor.readOnly = this.operationBusy || !this.yamlHash || !L.hasViewPermission();
 	},
@@ -338,50 +324,11 @@ return view.extend({
 	},
 
 	async waitForYamlUpdate(token, scope) {
-		let consecutiveErrors = 0;
-		let lastError = null;
-
-		for (let attempt = 0; attempt < YAML_POLL_LIMIT; attempt++) {
-			if (!operation.isPageActive(scope))
-				throw operation.pageInactiveError();
-
-			let result = null;
-			try {
-				result = await callGetYamlUpdate(token, false);
-				if (!operation.isPageActive(scope))
-					throw operation.pageInactiveError();
-				consecutiveErrors = 0;
-				lastError = null;
-			} catch (error) {
-				if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
-					throw operation.pageInactiveError();
-				lastError = error;
-				consecutiveErrors++;
-				if (consecutiveErrors >= 10)
-					break;
-				await delay(YAML_POLL_INTERVAL);
-				continue;
-			}
-
-			if (result?.state == 'done') {
-				try {
-					await callGetYamlUpdate(token, true);
-				} catch (error) {
-					// The terminal result is already known; cleanup is best effort.
-				}
-				return result;
-			}
-			if (typeof result?.error === 'string' && result.error)
-				throw uncertainYamlUpdateError(result.error);
-			if (result?.state != 'pending' && result?.state != 'running')
-				throw uncertainYamlUpdateError(_('The YAML update returned an unknown job state.'));
-
-			await delay(YAML_POLL_INTERVAL);
-		}
-
-		throw uncertainYamlUpdateError(lastError
-			? _('The YAML update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
-			: _('The YAML update is still running. Do not submit it again; reload this page later.'));
+		return operation.waitForJob(callGetYamlUpdate, token, scope, {
+			unknown: _('The YAML update returned an unknown job state.'),
+			unavailable: _('The YAML update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.'),
+			pending: _('The YAML update is still running. Do not submit it again; reload this page later.'),
+		}, uncertainYamlUpdateError);
 	},
 
 	handleSaveApply: null,

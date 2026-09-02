@@ -294,31 +294,6 @@ function memory_state_active(persistent_work_dir) {
 	}
 }
 
-function memory_active() {
-	let uci = null;
-	let active = false;
-
-	try {
-		uci = cursor();
-		let work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
-		let config_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
-		active = valid_work_dir(work_dir) &&
-			config_file == `${work_dir}/${CONFIG_FILENAME}` &&
-			memory_state_active(work_dir);
-	}
-	catch (error) {
-		active = false;
-	}
-	if (uci) {
-		try {
-			uci.unload(CONFIG_NAME);
-		}
-		catch (error) { }
-	}
-
-	return active;
-}
-
 function config_path() {
 	let uci = null;
 	let work_dir = null;
@@ -373,17 +348,22 @@ function service_running() {
 
 function service_status() {
 	let requested = false;
-	let active = memory_active();
+	let active = false;
 	let uci = null;
 
 	try {
 		uci = cursor();
-		let value = lc(`${uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory') || ''}`);
-		requested = value == '1' || value == 'on' || value == 'true' ||
-			value == 'yes' || value == 'enabled';
+		requested = configured_boolean(
+			uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory')) === true;
+		let work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
+		let config_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		active = !!valid_work_dir(work_dir) &&
+			config_file == `${work_dir}/${CONFIG_FILENAME}` &&
+			memory_state_active(work_dir);
 	}
 	catch (error) {
 		requested = false;
+		active = false;
 	}
 	if (uci) {
 		try { uci.unload(CONFIG_NAME); }
@@ -525,18 +505,6 @@ function read_template() {
 	}
 
 	return valid ? content : null;
-}
-
-function template_for_path(path) {
-	if (type(path) != 'string' ||
-	    !match(path, /^\/[A-Za-z0-9_./+@%:,=-]+\/AdGuardHome\.yaml$/))
-		return null;
-
-	let suffix = `/${CONFIG_FILENAME}`;
-	if (substr(path, length(path) - length(suffix), length(suffix)) != suffix)
-		return null;
-
-	return read_template();
 }
 
 function read_config() {
@@ -1402,10 +1370,12 @@ function update_yaml(content, expected_hash) {
 	return { accepted: true, token, reused: false };
 }
 
-function yaml_job_status(token, consume) {
+function update_job_status(token, consume, settings) {
+	let title = settings ? 'Settings' : 'YAML';
+	let label = settings ? 'settings' : 'YAML';
 	let record = read_yaml_job(token);
 	if (!record)
-		return { error: 'YAML update job is unavailable' };
+		return { error: `${title} update job is unavailable` };
 
 	// Serialize terminal observation and consumption with both the worker and
 	// set_yaml() directory scans.  A worker publishes its terminal bytes just
@@ -1421,18 +1391,22 @@ function yaml_job_status(token, consume) {
 	record = read_yaml_job(token);
 	if (!record) {
 		close_yaml_job_lock(lock);
-		return { error: 'YAML update job is unavailable' };
+		return { error: `${title} update job is unavailable` };
 	}
 	if (record.state == 'pending' || record.state == 'running') {
-		let item = { token, record };
-		if (!mark_yaml_job_indeterminate(item)) {
+		// YAML recovery also removes its staged file; settings have no stage.
+		let recovered = settings
+			? replace_yaml_job(token,
+				`indeterminate:${record.expected_hash}:${record.candidate_hash}\n`)
+			: mark_yaml_job_indeterminate({ token, record });
+		if (!recovered) {
 			close_yaml_job_lock(lock);
-			return { error: 'Unable to recover interrupted YAML update state' };
+			return { error: `Unable to recover interrupted ${label} update state` };
 		}
 		record = read_yaml_job(token);
 		if (!record) {
 			close_yaml_job_lock(lock);
-			return { error: 'YAML update job is unavailable' };
+			return { error: `${title} update job is unavailable` };
 		}
 	}
 
@@ -1440,7 +1414,6 @@ function yaml_job_status(token, consume) {
 		? {
 			state: 'done',
 			ok: true,
-			sha256: record.sha256,
 			restarted: record.restarted,
 		}
 		: record.state == 'indeterminate'
@@ -1448,82 +1421,36 @@ function yaml_job_status(token, consume) {
 			state: 'done',
 			ok: false,
 			indeterminate: true,
-			error: 'The YAML update was interrupted; reload the current YAML before editing it again',
+			error: settings
+				? 'The settings update was interrupted; reload the current settings before editing them again'
+				: 'The YAML update was interrupted; reload the current YAML before editing it again',
 		}
 		: {
 			state: 'done',
 			ok: false,
-			error: 'YAML was rejected or changed concurrently',
+			error: settings
+				? 'Settings were rejected or changed concurrently'
+				: 'YAML was rejected or changed concurrently',
 		};
+	if (result.ok)
+		result[settings ? 'revision' : 'sha256'] = record.sha256;
 
 	if (consume === true && !discard_yaml_job(token)) {
 		close_yaml_job_lock(lock);
-		return { error: 'Unable to consume YAML update result' };
+		return { error: `Unable to consume ${label} update result` };
 	}
 	if (!close_yaml_job_lock(lock))
-		return { error: 'Unable to release YAML update lock' };
+		return { error: `Unable to release ${label} update lock` };
 
 	return result;
 }
 
+function yaml_job_status(token, consume) {
+	return update_job_status(token, consume, false);
+}
+
 function settings_job_status(token, consume) {
-	let record = read_yaml_job(token);
-	if (!record)
-		return { error: 'Settings update job is unavailable' };
-
-	let lock = open_yaml_job_lock();
-	if (!lock.file) {
-		if (lock.error)
-			return { error: lock.error };
-		return { state: record.state == 'pending' ? 'pending' : 'running' };
-	}
-
-	record = read_yaml_job(token);
-	if (!record) {
-		close_yaml_job_lock(lock);
-		return { error: 'Settings update job is unavailable' };
-	}
-	if (record.state == 'pending' || record.state == 'running') {
-		if (!replace_yaml_job(token,
-		    `indeterminate:${record.expected_hash}:${record.candidate_hash}\n`)) {
-			close_yaml_job_lock(lock);
-			return { error: 'Unable to recover interrupted settings update state' };
-		}
-		record = read_yaml_job(token);
-		if (!record) {
-			close_yaml_job_lock(lock);
-			return { error: 'Settings update job is unavailable' };
-		}
-	}
-
-	let result = record.state == 'success'
-		? {
-			state: 'done',
-			ok: true,
-			revision: record.sha256,
-			restarted: record.restarted,
-		}
-		: record.state == 'indeterminate'
-		? {
-			state: 'done',
-			ok: false,
-			indeterminate: true,
-			error: 'The settings update was interrupted; reload the current settings before editing them again',
-		}
-		: {
-			state: 'done',
-			ok: false,
-			error: 'Settings were rejected or changed concurrently',
-		};
-
-	if (consume === true && !discard_yaml_job(token)) {
-		close_yaml_job_lock(lock);
-		return { error: 'Unable to consume settings update result' };
-	}
-	if (!close_yaml_job_lock(lock))
-		return { error: 'Unable to release settings update lock' };
-
-	return result;
+	return update_job_status(token, consume, true);
 }
 
 function yaml_scalar(value) {
@@ -1808,7 +1735,7 @@ function reset_yaml(expected_hash) {
 	if (yaml.sha256 != expected_hash)
 		return { error: 'YAML changed since the page was loaded' };
 
-	let content = template_for_path(yaml.path);
+	let content = read_template();
 	if (!content)
 		return { error: 'The packaged YAML template is unavailable or unsafe' };
 
@@ -1818,54 +1745,61 @@ function reset_yaml(expected_hash) {
 	return { content, sha256: sha256(content) };
 }
 
-function yaml_section_value(content, section, key) {
-	let lines = split(content, '\n');
-	let first = -1;
-	let last = length(lines);
-	let depth = 0;
-	let sections = 0;
+function yaml_config_values(content) {
+	let sections = {};
+	let current = null;
 
-	for (let i = 0; i < length(lines); i++) {
-		let line = lines[i];
-		if (match(line, /^[^ \t#]/) &&
-		    trim(replace(line, /[ \t]+#.*$/, '')) == `${section}:`) {
-			if (first < 0)
-				first = i;
-			sections++;
+	// Scan only the three mappings needed by the status link.  This is not a
+	// general YAML parser: the core still validates the complete configuration.
+	for (let line in split(content, '\n')) {
+		if (match(line, /^[ \t]*($|#)/))
+			continue;
+		if (match(line, /^[^ \t#][^:]*:/)) {
+			current = null;
+			let header = match(trim(replace(line, /[ \t]+#.*$/, '')),
+				/^(dns|http|tls):$/);
+			if (header) {
+				let name = header[1];
+				current = sections[name];
+				if (current)
+					current.count++;
+				else {
+					current = { count: 1, depth: 0, values: {}, counts: {} };
+					sections[name] = current;
+				}
+			}
+			continue;
 		}
-	}
-
-	if (sections != 1)
-		return null;
-
-	for (let i = first + 1; i < length(lines); i++) {
-		if (match(lines[i], /^[^ \t#][^:]*:/)) {
-			last = i;
-			break;
-		}
-	}
-
-	for (let i = first + 1; i < last; i++) {
-		let indent = match(lines[i], /^( +)\S/);
-		if (indent && (!depth || length(indent[1]) < depth))
-			depth = length(indent[1]);
-	}
-
-	if (!depth)
-		return null;
-
-	let found = null;
-	let count = 0;
-	for (let i = first + 1; i < last; i++) {
-		let item = match(lines[i], /^( +)([^:]+):[ \t]*(.*)$/);
-		if (!item || length(item[1]) != depth || trim(item[2]) != key)
+		if (!current || current.count != 1)
 			continue;
 
-		found = yaml_scalar(item[3]);
-		count++;
+		let indent = match(line, /^( +)\S/);
+		if (!indent)
+			continue;
+		let depth = length(indent[1]);
+		if (!current.depth || depth < current.depth) {
+			current.depth = depth;
+			current.values = {};
+			current.counts = {};
+		}
+		if (depth != current.depth)
+			continue;
+
+		let item = match(line, /^( +)([^:]+):[ \t]*(.*)$/);
+		let key = item ? trim(item[2]) : null;
+		if (!key || !match(key, /^(port|address|enabled|server_name|port_https|force_https|certificate_path|private_key_path|certificate_chain|private_key)$/))
+			continue;
+		current.values[key] = yaml_scalar(item[3]);
+		current.counts[key] = (current.counts[key] || 0) + 1;
 	}
 
-	return count == 1 && length(found) ? found : null;
+	return sections;
+}
+
+function yaml_section_value(config, section, key) {
+	let record = config[section];
+	return record?.count == 1 && record.counts[key] == 1 &&
+		length(record.values[key]) ? record.values[key] : null;
 }
 
 function valid_port(value, allow_dns_port_53) {
@@ -1933,8 +1867,8 @@ function valid_dns_name(value) {
 	return value;
 }
 
-function http_port(content) {
-	let address = yaml_section_value(content, 'http', 'address');
+function http_port(config) {
+	let address = yaml_section_value(config, 'http', 'address');
 	let matched = address ? match(address, /:([0-9]+)$/) : null;
 	if (address && (match(address, /^127(\.[0-9]+){3}:/) ||
 	                match(address, /^\[::1\]:/)))
@@ -1942,16 +1876,16 @@ function http_port(content) {
 	return matched ? valid_port(matched[1]) : null;
 }
 
-function yaml_material_value(content, key) {
-	let value = yaml_section_value(content, 'tls', key);
+function yaml_material_value(config, key) {
+	let value = yaml_section_value(config, 'tls', key);
 	if (!value || value == '~' || lc(value) == 'null')
 		return null;
 	return value;
 }
 
-function tls_material_complete(content) {
-	let certificate_path = yaml_material_value(content, 'certificate_path');
-	let private_key_path = yaml_material_value(content, 'private_key_path');
+function tls_material_complete(config) {
+	let certificate_path = yaml_material_value(config, 'certificate_path');
+	let private_key_path = yaml_material_value(config, 'private_key_path');
 
 	// Explicit file paths take precedence.  Do not silently fall back to stale
 	// inline material when a user has configured only one half of a path pair.
@@ -1961,8 +1895,8 @@ function tls_material_complete(content) {
 	// AdGuard Home also supports embedded PEM values.  A YAML block scalar is
 	// represented by its non-empty "|"/">" marker here, which is sufficient
 	// for this completeness gate; the core remains the authoritative parser.
-	return !!yaml_material_value(content, 'certificate_chain') &&
-	       !!yaml_material_value(content, 'private_key');
+	return !!yaml_material_value(config, 'certificate_chain') &&
+	       !!yaml_material_value(config, 'private_key');
 }
 
 function web_port_listening(port) {
@@ -1997,30 +1931,31 @@ function config_info() {
 	if (!content)
 		return result;
 
+	let config = yaml_config_values(content);
 	result.dns_port = valid_port(
-		yaml_section_value(content, 'dns', 'port'),
+		yaml_section_value(config, 'dns', 'port'),
 		true
 	);
 
-	let tls_value = yaml_section_value(content, 'tls', 'enabled');
+	let tls_value = yaml_section_value(config, 'tls', 'enabled');
 	let tls_enabled = tls_value == null ? false : yaml_bool(tls_value);
 	if (tls_enabled == null)
 		return result;
 
 	if (tls_enabled) {
-		let host = valid_dns_name(yaml_section_value(content, 'tls', 'server_name'));
-		let port = valid_port(yaml_section_value(content, 'tls', 'port_https'));
-		if (host && port && tls_material_complete(content) && web_port_listening(port))
+		let host = valid_dns_name(yaml_section_value(config, 'tls', 'server_name'));
+		let port = valid_port(yaml_section_value(config, 'tls', 'port_https'));
+		if (host && port && tls_material_complete(config) && web_port_listening(port))
 			result.web = { scheme: 'https', host, port };
 		if (result.web ||
-		    yaml_bool(yaml_section_value(content, 'tls', 'force_https')) === true)
+		    yaml_bool(yaml_section_value(config, 'tls', 'force_https')) === true)
 			return result;
 	}
 
 	// When HTTPS is incomplete or not listening, AdGuard Home may still expose
 	// its HTTP endpoint unless force_https is explicitly enabled.  The frontend
 	// intentionally reuses the LuCI page host for this result.
-	let port = http_port(content);
+	let port = http_port(config);
 	if (port && web_port_listening(port))
 		result.web = { scheme: 'http', host: null, port };
 

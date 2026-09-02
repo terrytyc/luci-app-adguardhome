@@ -1,11 +1,13 @@
 # This is free software, licensed under the Apache License, Version 2.0 .
 #
 
+ADGUARDHOME_SOURCE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(TOPDIR)/rules.mk
+include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -17,6 +19,12 @@ LUCI_MAINTAINER:=terrytyc
 LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
 define Build/Prepare/luci-app-adguardhome
+	for file in etc/init.d/AdGuardHome etc/uci-defaults/40_luci-AdGuardHome; do \
+		awk -v helper="$(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk" \
+			-f $(ADGUARDHOME_SOURCE_DIR)scripts/expand-bounded.awk \
+			$(PKG_BUILD_DIR)/root/$$$$file >$(PKG_BUILD_DIR)/root/$$$$file.expanded && \
+			mv $(PKG_BUILD_DIR)/root/$$$$file.expanded $(PKG_BUILD_DIR)/root/$$$$file || exit 1; \
+	done
 	find $(PKG_BUILD_DIR)/root $(PKG_BUILD_DIR)/htdocs -type d -exec chmod 0755 {} +
 	find $(PKG_BUILD_DIR)/root $(PKG_BUILD_DIR)/htdocs -type f -exec chmod 0644 {} +
 	chmod 0755 $(PKG_BUILD_DIR)/root/etc/init.d/AdGuardHome
@@ -40,83 +48,7 @@ define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
-run_bounded() (
-	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0
-	shift 2
-	case "$$limit" in ""|*[!0-9]*) exit 125 ;; esac
-	case "$$grace" in ""|*[!0-9]*) exit 125 ;; esac
-	[ "$$#" -gt 0 ] || exit 125
-	[ -x /usr/bin/setsid ] || exit 125
-	marker="$$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
-	chmod 0600 "$$marker" || {
-		rm -f "$$marker"
-		exit 125
-	}
-	printf '0\n' >"$$marker" || {
-		rm -f "$$marker"
-		exit 125
-	}
-	bounded_signal_session() {
-		/bin/kill "-$$1" -- "-$$child" 2>/dev/null ||
-			/bin/kill "-$$1" "$$child" 2>/dev/null || true
-	}
-	bounded_abort() {
-		trap - HUP INT QUIT TERM
-		[ -z "$$watchdog" ] || /bin/kill -TERM "$$watchdog" 2>/dev/null || true
-		[ -z "$$watchdog" ] || wait "$$watchdog" 2>/dev/null || true
-		if [ -n "$$child" ]; then
-			bounded_signal_session TERM
-			sleep "$$grace" 2>/dev/null || true
-			bounded_signal_session KILL
-			wait "$$child" 2>/dev/null || true
-		fi
-		rm -f "$$marker"
-		exit 125
-	}
-	trap bounded_abort HUP INT QUIT TERM
-	[ ! -e /proc/self/fd/187 ] || bounded_abort
-	exec 187<&0 || bounded_abort
-	/usr/bin/setsid "$$@" <&187 187<&- &
-	child=$$!
-	exec 187<&-
-	(
-		bounded_sleeper=""
-		bounded_watchdog_abort() {
-			trap - HUP INT QUIT TERM
-			[ -z "$$bounded_sleeper" ] || /bin/kill -TERM "$$bounded_sleeper" 2>/dev/null || true
-			[ -z "$$bounded_sleeper" ] || wait "$$bounded_sleeper" 2>/dev/null || true
-			exit 1
-		}
-		bounded_watchdog_sleep() {
-			sleep "$$1" &
-			bounded_sleeper=$$!
-			wait "$$bounded_sleeper"
-			bounded_sleep_rc=$$?
-			bounded_sleeper=""
-			return "$$bounded_sleep_rc"
-		}
-		trap bounded_watchdog_abort HUP INT QUIT TERM
-		bounded_watchdog_sleep "$$limit" || exit 1
-		/bin/kill -0 -- "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
-		printf '1\n' >"$$marker" || exit 1
-		bounded_signal_session TERM
-		bounded_watchdog_sleep "$$grace" || exit 0
-		bounded_signal_session KILL
-	) &
-	watchdog=$$!
-	wait "$$child" 2>/dev/null || rc=$$?
-	read -r expired <"$$marker" 2>/dev/null || expired=0
-	if [ "$$expired" = 1 ]; then
-		wait "$$watchdog" 2>/dev/null || true
-	else
-		/bin/kill -TERM "$$watchdog" 2>/dev/null || true
-		wait "$$watchdog" 2>/dev/null || true
-	fi
-	trap - HUP INT QUIT TERM
-	rm -f "$$marker"
-	[ "$$expired" = 1 ] && exit 124
-	exit "$$rc"
-)
+$(AdGuardHome/RunBounded)
 
 entry_metadata() {
 	LC_ALL=C ls -ldn "$$1" 2>/dev/null
@@ -225,16 +157,10 @@ create_original_snapshot() {
 
 installed_source_version() {
 	local record count
-	if [ -f /lib/apk/packages/luci-app-adguardhome.list ]; then
-		command -v apk >/dev/null 2>&1 || return 1
-		record="$$(apk list --installed luci-app-adguardhome 2>/dev/null |
-			sed -n 's/^luci-app-adguardhome-\([^ ][^ ]*\).*/\1/p')" || return 1
-	else
-		[ -f /usr/lib/opkg/info/luci-app-adguardhome.list ] || return 1
-		command -v opkg >/dev/null 2>&1 || return 1
-		record="$$(opkg status luci-app-adguardhome 2>/dev/null |
-			sed -n 's/^Version:[[:space:]]*//p')" || return 1
-	fi
+	[ -f /lib/apk/packages/luci-app-adguardhome.list ] || return 1
+	command -v apk >/dev/null 2>&1 || return 1
+	record="$$(apk list --installed luci-app-adguardhome 2>/dev/null |
+		sed -n 's/^luci-app-adguardhome-\([^ ][^ ]*\).*/\1/p')" || return 1
 	count="$$(printf '%s\n' "$$record" | sed '/^$$/d' | wc -l)" || return 1
 	[ "$$count" = 1 ] || return 1
 	printf '%s\n' "$$record"
@@ -296,7 +222,6 @@ trap 'exit 1' HUP INT TERM
 case "$$PKG_UPGRADE:$$1" in
 	1:*|*:upgrade) is_upgrade=1 ;;
 esac
-[ -f /usr/lib/opkg/info/luci-app-adguardhome.list ] && is_upgrade=1
 [ -f /lib/apk/packages/luci-app-adguardhome.list ] && is_upgrade=1
 
 if [ "$$is_upgrade" != 1 ]; then
@@ -310,9 +235,9 @@ fi
 
 source_version="$$(installed_source_version)" || source_version=""
 case "$$source_version" in
-	2.4.0-r1|2.4.0-r2) ;;
+	2.4.0-r1|2.4.0-r2|2.4.0-r3) ;;
 	*)
-		echo "Only luci-app-adguardhome 2.4.0-r1 or 2.4.0-r2 can be upgraded in place." >&2
+		echo "Only luci-app-adguardhome 2.4.0-r1, r2 or r3 can be upgraded in place." >&2
 		exit 1
 		;;
 esac
@@ -408,7 +333,7 @@ if [ -e "$$upgrade_state" ] || [ -L "$$upgrade_state" ]; then
 	root_private_directory "$$runtime_dir" && root_private_file "$$upgrade_state" ||
 		exit 1
 	[ "$$(wc -l <"$$upgrade_state" 2>/dev/null)" = 2 ] || exit 1
-	grep -Eq '^source_version=2[.]4[.]0-r[12]$$' "$$upgrade_state" || exit 1
+	grep -Eq '^source_version=2[.]4[.]0-r[123]$$' "$$upgrade_state" || exit 1
 	was_running="$$(sed -n 's/^was_running=//p' "$$upgrade_state")"
 	case "$$was_running" in
 		1)
@@ -446,83 +371,7 @@ case "$$PKG_UPGRADE:$$1" in
 	1:*|*:upgrade) exit 0 ;;
 esac
 
-run_bounded() (
-	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0
-	shift 2
-	case "$$limit" in ""|*[!0-9]*) exit 125 ;; esac
-	case "$$grace" in ""|*[!0-9]*) exit 125 ;; esac
-	[ "$$#" -gt 0 ] || exit 125
-	[ -x /usr/bin/setsid ] || exit 125
-	marker="$$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
-	chmod 0600 "$$marker" || {
-		rm -f "$$marker"
-		exit 125
-	}
-	printf '0\n' >"$$marker" || {
-		rm -f "$$marker"
-		exit 125
-	}
-	bounded_signal_session() {
-		/bin/kill "-$$1" -- "-$$child" 2>/dev/null ||
-			/bin/kill "-$$1" "$$child" 2>/dev/null || true
-	}
-	bounded_abort() {
-		trap - HUP INT QUIT TERM
-		[ -z "$$watchdog" ] || /bin/kill -TERM "$$watchdog" 2>/dev/null || true
-		[ -z "$$watchdog" ] || wait "$$watchdog" 2>/dev/null || true
-		if [ -n "$$child" ]; then
-			bounded_signal_session TERM
-			sleep "$$grace" 2>/dev/null || true
-			bounded_signal_session KILL
-			wait "$$child" 2>/dev/null || true
-		fi
-		rm -f "$$marker"
-		exit 125
-	}
-	trap bounded_abort HUP INT QUIT TERM
-	[ ! -e /proc/self/fd/187 ] || bounded_abort
-	exec 187<&0 || bounded_abort
-	/usr/bin/setsid "$$@" <&187 187<&- &
-	child=$$!
-	exec 187<&-
-	(
-		bounded_sleeper=""
-		bounded_watchdog_abort() {
-			trap - HUP INT QUIT TERM
-			[ -z "$$bounded_sleeper" ] || /bin/kill -TERM "$$bounded_sleeper" 2>/dev/null || true
-			[ -z "$$bounded_sleeper" ] || wait "$$bounded_sleeper" 2>/dev/null || true
-			exit 1
-		}
-		bounded_watchdog_sleep() {
-			sleep "$$1" &
-			bounded_sleeper=$$!
-			wait "$$bounded_sleeper"
-			bounded_sleep_rc=$$?
-			bounded_sleeper=""
-			return "$$bounded_sleep_rc"
-		}
-		trap bounded_watchdog_abort HUP INT QUIT TERM
-		bounded_watchdog_sleep "$$limit" || exit 1
-		/bin/kill -0 -- "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
-		printf '1\n' >"$$marker" || exit 1
-		bounded_signal_session TERM
-		bounded_watchdog_sleep "$$grace" || exit 0
-		bounded_signal_session KILL
-	) &
-	watchdog=$$!
-	wait "$$child" 2>/dev/null || rc=$$?
-	read -r expired <"$$marker" 2>/dev/null || expired=0
-	if [ "$$expired" = 1 ]; then
-		wait "$$watchdog" 2>/dev/null || true
-	else
-		/bin/kill -TERM "$$watchdog" 2>/dev/null || true
-		wait "$$watchdog" 2>/dev/null || true
-	fi
-	trap - HUP INT QUIT TERM
-	rm -f "$$marker"
-	[ "$$expired" = 1 ] && exit 124
-	exit "$$rc"
-)
+$(AdGuardHome/RunBounded)
 
 entry_metadata() {
 	LC_ALL=C ls -ldn "$$1" 2>/dev/null

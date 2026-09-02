@@ -143,6 +143,8 @@ const log = fs.readFileSync(path.join(
 for (const [ name, source ] of [ [ 'overview', overview ], [ 'yaml', yaml ], [ 'log', log ] ]) {
 	assert.match(source, /require adguardhome\.operation as operation/,
 		`${name} view must use the shared operation status`);
+	if (name === 'log')
+		continue;
 	assert.match(source, /operation\.start\(\)/,
 		`${name} view must show operation progress`);
 	assert.match(source, /operation\.success\(/,
@@ -156,7 +158,23 @@ assert.doesNotMatch(overview,
 	/Changes the password for the admin account stored in AdGuardHome\.yaml/);
 assert.doesNotMatch(overview,
 	/HTTP keeps the host used to access LuCI and uses the port from YAML http\.address/);
-assert.match(overview, /const YAML_POLL_LIMIT = 360;/);
-assert.match(yaml, /const YAML_POLL_LIMIT = 360;/);
+const operationSource = fs.readFileSync(modulePath, 'utf8');
+assert.match(operationSource, /const JOB_POLL_LIMIT = 360;/);
+assert.match(overview, /operation\.waitForJob\(callGetYamlUpdate,/);
+assert.match(overview, /operation\.waitForJob\(callGetSettingsUpdate,/);
+assert.match(yaml, /operation\.waitForJob\(callGetYamlUpdate,/);
+assert.doesNotMatch(overview + yaml, /POLL_LIMIT|consecutiveErrors/,
+	'all three update flows must share the bounded job polling implementation');
+assert.doesNotMatch(log, /operation\.(?:start|success|failure)\(/,
+	'read-only log refreshes must not show an apply countdown or apply result');
+const reloadBody = yaml.slice(yaml.indexOf('\tasync handleReload()'), yaml.indexOf('\tasync reloadYaml()'));
+assert.doesNotMatch(reloadBody, /operation\.(?:start|success|failure)\(/,
+	'reloading YAML from disk must not claim configuration changes were applied');
+assert.doesNotMatch(overview, /this\.settingsRevision/,
+	'the authoritative settings snapshot must own its revision');
+assert.doesNotMatch(yaml, /this\.yamlPath/,
+	'the displayed YAML path must not have an unused mirrored property');
+assert.doesNotMatch(log, /this\.logLines/,
+	'the selected line count must come directly from the select control');
 
 console.log('operation status and view integration tests passed');

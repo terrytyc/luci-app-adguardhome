@@ -83,7 +83,7 @@ for fragment in (
     if fragment not in directory_guard:
         raise SystemExit(f"template directory guard omits: {fragment}")
 
-reader = between("function read_template()", "function template_for_path(")
+reader = between("function read_template()", "function read_config()")
 for fragment in (
     "for (let directory in [ '/usr', '/usr/share' ])",
     "safe_template_directory(directory, true)",
@@ -102,17 +102,12 @@ for fragment in (
     if fragment not in reader:
         raise SystemExit(f"packaged template reader omits: {fragment}")
 
-path_adapter = between("function template_for_path(", "function read_config()")
-if path_adapter.count("return read_template();") != 1:
-    raise SystemExit("template_for_path does not return the packaged template exactly once")
-for forbidden in ("TEMPLATE_FILTER_PATTERN", "TEMPLATE_WORK_DIR"):
+for forbidden in ("template_for_path", "TEMPLATE_FILTER_PATTERN", "TEMPLATE_WORK_DIR"):
     if forbidden in rpc:
         raise SystemExit(f"reset backend still rewrites packaged template content: {forbidden}")
-for forbidden in ("split(content", "work_dir", "/data/userfilters/*"):
-    if forbidden in path_adapter:
-        raise SystemExit(f"template_for_path still rewrites packaged content: {forbidden}")
-
-reset_backend = between("function reset_yaml(expected_hash)", "function yaml_section_value(")
+reset_backend = between("function reset_yaml(expected_hash)", "function yaml_config_values(")
+if reset_backend.count("let content = read_template();") != 1:
+    raise SystemExit("reset_yaml does not read the packaged template directly")
 if "return { content, sha256: sha256(content) };" not in reset_backend:
     raise SystemExit("reset_yaml does not return the packaged template to the editor")
 for forbidden in ("update_yaml(", "write(", "yaml_update_job"):

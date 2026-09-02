@@ -54,7 +54,7 @@ function loadLogView(handler) {
 		isPageInactiveError: error => error?.pageInactive === true,
 		pageInactiveError: () => Object.assign(new Error('inactive'), { pageInactive: true }),
 		abandonInactiveLoad: error => { throw error; },
-		requestDuringApply: request => request(),
+		requestActive: request => request(),
 		start: () => ({}),
 		failure: message => failures.push(String(message)),
 		success: message => successes.push(String(message)),
@@ -137,8 +137,11 @@ async function testLogErrorPresentation() {
 		'a failed core refresh must preserve the previously displayed core log');
 	assert.equal(partialFailure.definition.logOutputs.plugin.value, 'plugin-new',
 		'a successful plugin refresh must still update independently');
-	assert.equal(partialFailure.failures.length, 1);
-	assert.match(partialFailure.failures[0], /Unable to read the AdGuard Home core log: core refresh failed/);
+	assert.equal(partialFailure.failures.length, 0,
+		'a read-only refresh must not open an application failure modal');
+	assert.equal(partialFailure.notifications.length, 1);
+	assert.equal(partialFailure.notifications[0].level, 'error');
+	assert.match(partialFailure.notifications[0].text, /Unable to read the AdGuard Home core log: core refresh failed/);
 	assert.equal(partialFailure.successes.length, 0,
 		'a partial refresh failure must not be reported as a successful refresh');
 }

@@ -19,10 +19,6 @@ const DEFAULT_MEMORY_WRITEBACK_INTERVAL = 60;
 const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
 
 const POLL_INTERVAL = 5;
-const YAML_POLL_INTERVAL = 1000;
-const YAML_POLL_LIMIT = 360;
-const SETTINGS_POLL_INTERVAL = 1000;
-const SETTINGS_POLL_LIMIT = 360;
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_./+@%:,=-]+$/;
 const USERNAME_RE = /^[A-Za-z0-9][A-Za-z0-9._@+-]{0,63}$/;
 
@@ -108,101 +104,25 @@ function uncertainSettingsUpdateError(message) {
 	return error;
 }
 
-function delay(milliseconds) {
-	return new Promise(resolve => window.setTimeout(resolve, milliseconds));
+function waitForYamlUpdate(token, scope) {
+	return operation.waitForJob(callGetYamlUpdate, token, scope, {
+		unknown: _('The credential update returned an unknown job state.'),
+		unavailable: _('The credential update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.'),
+		pending: _('The credential update is still running. Do not submit it again; reload this page later.'),
+	});
 }
 
-async function waitForYamlUpdate(token, scope) {
-	let consecutiveErrors = 0;
-	let lastError = null;
-
-	for (let attempt = 0; attempt < YAML_POLL_LIMIT; attempt++) {
-		if (!operation.isPageActive(scope))
-			throw operation.pageInactiveError();
-
-		let result = null;
-		try {
-			result = await callGetYamlUpdate(token, false);
-			if (!operation.isPageActive(scope))
-				throw operation.pageInactiveError();
-			consecutiveErrors = 0;
-			lastError = null;
-		} catch (error) {
-			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
-				throw operation.pageInactiveError();
-			lastError = error;
-			consecutiveErrors++;
-			if (consecutiveErrors >= 10)
-				break;
-			await delay(YAML_POLL_INTERVAL);
-			continue;
-		}
-
-		if (result?.state == 'done') {
-			try { await callGetYamlUpdate(token, true); }
-			catch (error) { }
-			return result;
-		}
-		if (typeof result?.error === 'string' && result.error)
-			throw new Error(result.error);
-		if (result?.state != 'pending' && result?.state != 'running')
-			throw new Error(_('The credential update returned an unknown job state.'));
-
-		await delay(YAML_POLL_INTERVAL);
-	}
-
-	throw new Error(lastError
-		? _('The credential update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
-		: _('The credential update is still running. Do not submit it again; reload this page later.'));
-}
-
-async function waitForSettingsUpdate(token, scope) {
-	let consecutiveErrors = 0;
-	let lastError = null;
-
-	for (let attempt = 0; attempt < SETTINGS_POLL_LIMIT; attempt++) {
-		if (!operation.isPageActive(scope))
-			throw operation.pageInactiveError();
-
-		let result = null;
-		try {
-			result = await callGetSettingsUpdate(token, false);
-			if (!operation.isPageActive(scope))
-				throw operation.pageInactiveError();
-			consecutiveErrors = 0;
-			lastError = null;
-		} catch (error) {
-			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
-				throw operation.pageInactiveError();
-			lastError = error;
-			consecutiveErrors++;
-			if (consecutiveErrors >= 10)
-				break;
-			await delay(SETTINGS_POLL_INTERVAL);
-			continue;
-		}
-
-		if (result?.state == 'done') {
-			try { await callGetSettingsUpdate(token, true); }
-			catch (error) { }
-			return result;
-		}
-		if (typeof result?.error === 'string' && result.error)
-			throw uncertainSettingsUpdateError(result.error);
-		if (result?.state != 'pending' && result?.state != 'running')
-			throw uncertainSettingsUpdateError(_('The settings update returned an unknown job state.'));
-
-		await delay(SETTINGS_POLL_INTERVAL);
-	}
-
-	throw uncertainSettingsUpdateError(lastError
-		? _('The settings update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.').format(errorMessage(lastError))
-		: _('The settings update is still running. Do not submit it again; reload this page later.'));
+function waitForSettingsUpdate(token, scope) {
+	return operation.waitForJob(callGetSettingsUpdate, token, scope, {
+		unknown: _('The settings update returned an unknown job state.'),
+		unavailable: _('The settings update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.'),
+		pending: _('The settings update is still running. Do not submit it again; reload this page later.'),
+	}, uncertainSettingsUpdateError);
 }
 
 async function getServiceStatus(scope) {
 	try {
-		const result = await operation.requestDuringApply(callGetServiceStatus, scope);
+		const result = await operation.requestActive(callGetServiceStatus, scope);
 		return {
 			running: result?.running === true,
 			memoryRequested: result?.memory_requested === true,
@@ -218,7 +138,7 @@ async function getServiceStatus(scope) {
 
 async function getCoreVersion(scope) {
 	try {
-		const result = await operation.requestDuringApply(callGetCoreVersion, scope);
+		const result = await operation.requestActive(callGetCoreVersion, scope);
 		return String(result?.version ?? '').trim() || _('Unknown');
 	} catch (error) {
 		if (operation.isPageInactiveError(error))
@@ -254,7 +174,7 @@ function normalizeConfigInfo(result) {
 
 async function getConfigInfo(scope) {
 	try {
-		return normalizeConfigInfo(await operation.requestDuringApply(callGetConfigInfo, scope));
+		return normalizeConfigInfo(await operation.requestActive(callGetConfigInfo, scope));
 	} catch (error) {
 		if (operation.isPageInactiveError(error))
 			throw error;
@@ -438,7 +358,7 @@ function normalizeSettings(result) {
 }
 
 async function getSettings(scope) {
-	return normalizeSettings(await operation.requestDuringApply(callGetSettings, scope));
+	return normalizeSettings(await operation.requestActive(callGetSettings, scope));
 }
 
 function settingsMapData(settings) {
@@ -665,7 +585,6 @@ return view.extend({
 
 		this.settingsMap = map;
 		this.committedSettings = settings;
-		this.settingsRevision = settings.revision;
 
 		const rendered = await map.render();
 		if (!operation.isPageActive(pageScope))
@@ -722,7 +641,7 @@ return view.extend({
 		const scope = this.pageScope;
 		let info = null;
 		try {
-			info = await operation.requestDuringApply(callGetCredentials, scope);
+			info = await operation.requestActive(callGetCredentials, scope);
 			if (typeof info?.error === 'string' && info.error)
 				throw new Error(info.error);
 			if (info?.available !== true || typeof info.username !== 'string' ||
@@ -894,8 +813,8 @@ return view.extend({
 		const map = this.settingsMap;
 		if (!map || !operation.isPageActive(scope))
 			return;
-		if (typeof this.settingsRevision !== 'string' ||
-		    !/^[0-9a-f]{64}$/.test(this.settingsRevision)) {
+		const revision = this.committedSettings?.revision;
+		if (typeof revision !== 'string' || !/^[0-9a-f]{64}$/.test(revision)) {
 			const operationTicket = operation.start();
 			operation.failure(
 				_('The current settings state is unknown. Reload this page before applying settings again.'),
@@ -917,12 +836,12 @@ return view.extend({
 		try {
 			const candidate = settingsFromMap(
 				map,
-				this.settingsRevision,
+				revision,
 				this.committedSettings?.memoryWritebackInterval,
 			);
 			let response = null;
 			try {
-				response = await operation.requestDuringApply(() => callSetSettings(
+				response = await operation.requestActive(() => callSetSettings(
 					candidate.enabled,
 					candidate.workDir,
 					candidate.verbose,
@@ -978,13 +897,11 @@ return view.extend({
 				);
 			}
 			this.committedSettings = committed;
-			this.settingsRevision = committed.revision;
 			operation.success(undefined, operationTicket);
 		} catch (error) {
 			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
 				return;
 			if (error?.settingsUpdateUncertain === true) {
-				this.settingsRevision = null;
 				this.committedSettings = null;
 				map.readonly = true;
 				try { await map.reset(); }

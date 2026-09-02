@@ -3,6 +3,8 @@
 *.json text eol=lf
 *.po text eol=lf
 *.sh text eol=lf
+*.mk text eol=lf
+*.awk text eol=lf
 *.yaml text eol=lf
 Makefile text eol=lf
 README.md text eol=lf

@@ -59,7 +59,7 @@ async function testYamlViewPermissionGuard() {
 		isPageInactiveError: () => false,
 		pageInactiveError: () => Object.assign(new Error('inactive'), { pageInactive: true }),
 		abandonInactiveLoad: error => { throw error; },
-		requestDuringApply: request => request(),
+		requestActive: request => request(),
 		start: () => ({}),
 		success: () => { successes++; },
 		failure: message => { throw new Error(String(message)); },
@@ -119,7 +119,8 @@ async function testYamlViewPermissionGuard() {
 		'the YAML page must load once and permit one explicit reload');
 	assert.equal(writeCalls, 0,
 		'the permission guard must not invoke a YAML mutation RPC');
-	assert.equal(successes, 1);
+	assert.equal(successes, 0,
+		'reading YAML must not display a configuration-applied success message');
 	assert.equal(definition.yamlEditor.readOnly, true);
 	assert.equal(definition.saveButton.disabled, true);
 	assert.equal(definition.resetButton.disabled, true);

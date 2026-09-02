@@ -207,83 +207,7 @@ validate_loaded_merged_sections() {
 
 # Run one command in its own session with a self-contained wall-clock guard.
 # Descriptor 187 preserves pipeline input before ash starts the async child.
-run_bounded() (
-	local limit="$1" grace="$2" marker="" child="" watchdog="" rc=0 expired=0
-	shift 2
-	case "$limit" in ""|*[!0-9]*) exit 125 ;; esac
-	case "$grace" in ""|*[!0-9]*) exit 125 ;; esac
-	[ "$#" -gt 0 ] || exit 125
-	[ -x /usr/bin/setsid ] || exit 125
-	marker="$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
-	chmod 0600 "$marker" || {
-		rm -f "$marker"
-		exit 125
-	}
-	printf '0\n' >"$marker" || {
-		rm -f "$marker"
-		exit 125
-	}
-	bounded_signal_session() {
-		/bin/kill "-$1" -- "-$child" 2>/dev/null ||
-			/bin/kill "-$1" "$child" 2>/dev/null || true
-	}
-	bounded_abort() {
-		trap - HUP INT QUIT TERM
-		[ -z "$watchdog" ] || /bin/kill -TERM "$watchdog" 2>/dev/null || true
-		[ -z "$watchdog" ] || wait "$watchdog" 2>/dev/null || true
-		if [ -n "$child" ]; then
-			bounded_signal_session TERM
-			sleep "$grace" 2>/dev/null || true
-			bounded_signal_session KILL
-			wait "$child" 2>/dev/null || true
-		fi
-		rm -f "$marker"
-		exit 125
-	}
-	trap bounded_abort HUP INT QUIT TERM
-	[ ! -e /proc/self/fd/187 ] || bounded_abort
-	exec 187<&0 || bounded_abort
-	/usr/bin/setsid "$@" <&187 187<&- &
-	child=$!
-	exec 187<&-
-	(
-		bounded_sleeper=""
-		bounded_watchdog_abort() {
-			trap - HUP INT QUIT TERM
-			[ -z "$bounded_sleeper" ] || /bin/kill -TERM "$bounded_sleeper" 2>/dev/null || true
-			[ -z "$bounded_sleeper" ] || wait "$bounded_sleeper" 2>/dev/null || true
-			exit 1
-		}
-		bounded_watchdog_sleep() {
-			sleep "$1" &
-			bounded_sleeper=$!
-			wait "$bounded_sleeper"
-			bounded_sleep_rc=$?
-			bounded_sleeper=""
-			return "$bounded_sleep_rc"
-		}
-		trap bounded_watchdog_abort HUP INT QUIT TERM
-		bounded_watchdog_sleep "$limit" || exit 1
-		/bin/kill -0 -- "-$child" 2>/dev/null || /bin/kill -0 "$child" 2>/dev/null || exit 1
-		printf '1\n' >"$marker" || exit 1
-		bounded_signal_session TERM
-		bounded_watchdog_sleep "$grace" || exit 0
-		bounded_signal_session KILL
-	) &
-	watchdog=$!
-	wait "$child" 2>/dev/null || rc=$?
-	read -r expired <"$marker" 2>/dev/null || expired=0
-	if [ "$expired" = 1 ]; then
-		wait "$watchdog" 2>/dev/null || true
-	else
-		/bin/kill -TERM "$watchdog" 2>/dev/null || true
-		wait "$watchdog" 2>/dev/null || true
-	fi
-	trap - HUP INT QUIT TERM
-	rm -f "$marker"
-	[ "$expired" = 1 ] && exit 124
-	exit "$rc"
-)
+# @include run-bounded
 
 open_integration_lock_descriptor() {
 	case "$1" in
@@ -602,7 +526,9 @@ memory_private_state_file() {
 	[ "$size" -gt 0 ] && [ "$size" -le 1024 ]
 }
 
-memory_active_tree_valid() {
+# Status polling checks only the fixed layout, mount table and inode identities.
+# Recursive content scans belong at the copy/start/removal boundaries below.
+memory_active_layout_valid() {
 	local backing="${1:-${MEMORY_BACKING_WORK_DIR:-}}"
 	local metadata mode links owner group remainder entry found=0
 	memory_runtime_dir_valid || return 1
@@ -631,18 +557,21 @@ memory_active_tree_valid() {
 		found=1
 	done
 	[ "$found" = 1 ] || return 1
-	# The top-level shape alone cannot expose a same-device bind mount or a
-	# special file nested below data/.  Reuse the bounded uid-853 tree scan and
-	# its mountinfo checks before treating this RAM generation as active.
-	uid853_tree_is_plain "$MEMORY_WORK_DIR" || return 1
+	tree_is_mount_free "$MEMORY_WORK_DIR" || return 1
 	[ "${MEMORY_MOUNTS_SUSPENDED:-0}" = 1 ] || memory_bindings_valid "$backing"
+}
+
+memory_active_tree_valid() {
+	memory_active_layout_valid "${1:-}" || return 1
+	uid853_tree_is_plain "$MEMORY_WORK_DIR"
 }
 
 # Return 0 for a complete state, 1 when no memory state exists, and 2 for an
 # unsafe/incomplete namespace.  Callers must never delete a status-2 object.
 memory_state_load() {
-	local version backing device inode persistent_data_device persistent_data_inode
-	local memory_data_device memory_data_inode line_count numeric
+	local version="" backing="" device="" inode=""
+	local persistent_data_device="" persistent_data_inode=""
+	local memory_data_device="" memory_data_inode="" key value seen=" " numeric
 	MEMORY_STATE_VALIDATED=0
 	MEMORY_STATE_PERSISTENT_WORK_DIR=""
 	MEMORY_STATE_BACKING_DEVICE=""
@@ -656,25 +585,22 @@ memory_state_load() {
 	fi
 	memory_runtime_dir_valid || return 2
 	memory_private_state_file "$MEMORY_STATE_FILE" || return 2
-	line_count="$(wc -l <"$MEMORY_STATE_FILE" 2>/dev/null)" || return 2
-	[ "$line_count" = 8 ] || return 2
-	version="$(sed -n 's/^version=//p' "$MEMORY_STATE_FILE")"
-	backing="$(sed -n 's/^persistent_work_dir=//p' "$MEMORY_STATE_FILE")"
-	device="$(sed -n 's/^backing_device=//p' "$MEMORY_STATE_FILE")"
-	inode="$(sed -n 's/^backing_inode=//p' "$MEMORY_STATE_FILE")"
-	persistent_data_device="$(sed -n 's/^persistent_data_device=//p' "$MEMORY_STATE_FILE")"
-	persistent_data_inode="$(sed -n 's/^persistent_data_inode=//p' "$MEMORY_STATE_FILE")"
-	memory_data_device="$(sed -n 's/^memory_data_device=//p' "$MEMORY_STATE_FILE")"
-	memory_data_inode="$(sed -n 's/^memory_data_inode=//p' "$MEMORY_STATE_FILE")"
+	while IFS='=' read -r key value || [ -n "$key$value" ]; do
+		case "$seen" in *" $key "*) return 2 ;; esac
+		seen="$seen$key "
+		case "$key" in
+			version) version="$value" ;;
+			persistent_work_dir) backing="$value" ;;
+			backing_device) device="$value" ;;
+			backing_inode) inode="$value" ;;
+			persistent_data_device) persistent_data_device="$value" ;;
+			persistent_data_inode) persistent_data_inode="$value" ;;
+			memory_data_device) memory_data_device="$value" ;;
+			memory_data_inode) memory_data_inode="$value" ;;
+			*) return 2 ;;
+		esac
+	done <"$MEMORY_STATE_FILE"
 	[ "$version" = 4 ] || return 2
-	[ "$(grep -c '^version=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^persistent_work_dir=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^backing_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^backing_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^persistent_data_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^persistent_data_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^memory_data_device=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
-	[ "$(grep -c '^memory_data_inode=' "$MEMORY_STATE_FILE" 2>/dev/null)" = 1 ] || return 2
 	for numeric in "$device" "$inode" "$persistent_data_device" \
 		"$persistent_data_inode" "$memory_data_device" "$memory_data_inode"; do
 		case "$numeric" in ""|*[!0-9]*) return 2 ;; esac
@@ -683,7 +609,11 @@ memory_state_load() {
 	memory_backing_identity "$backing" || return 2
 	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = "$device:$inode" ] || return 2
 	MEMORY_STATE_PERSISTENT_WORK_DIR="${backing%/}"
-	memory_active_tree_valid "$backing" || return 2
+	if [ "${1:-full}" = light ]; then
+		memory_active_layout_valid "$backing" || return 2
+	else
+		memory_active_tree_valid "$backing" || return 2
+	fi
 	if [ "${MEMORY_MOUNTS_SUSPENDED:-0}" = 1 ]; then
 		memory_suspended_identities_match "$backing" \
 			"$persistent_data_device" "$persistent_data_inode" \
@@ -710,13 +640,14 @@ memory_state_binds_persistent() {
 	   [ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$requested" ]; then
 		return 0
 	fi
-	memory_state_load || state_rc=$?
+	memory_state_load "${MEMORY_STATE_CHECK:-full}" || state_rc=$?
 	[ "$state_rc" = 0 ] &&
 		[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$requested" ]
 }
 
 load_settings() {
 	local configured_work_dir official_work official_config state_rc=0
+	local MEMORY_STATE_CHECK="${1:-full}"
 	ensure_managed_config_present || return 1
 	config_load "$PLUGIN_CONFIG" || return 1
 	validate_loaded_merged_sections || {
@@ -749,7 +680,7 @@ load_settings() {
 
 	MEMORY_ACTIVE=0
 	MEMORY_BACKING_WORK_DIR=""
-	memory_state_load || state_rc=$?
+	memory_state_load "$MEMORY_STATE_CHECK" || state_rc=$?
 	case "$state_rc" in
 		0)
 			;;
@@ -1523,32 +1454,6 @@ sync_yaml_workdir_pattern() {
 	esac
 }
 
-sync_yaml_stale_memory_pattern() {
-	local target_file="${1:-$config_file}"
-	# A power loss removes the volatile generation and its state record but can
-	# leave the exact RAM user-filter allowlist in the persistent YAML.  Before
-	# any disk-backed launch, normalize that one managed value back to the
-	# current persistent workdir.  Active RAM mode deliberately keeps it.
-	[ "${work_dir%/}" != "$MEMORY_WORK_DIR" ] || return 0
-	memory_rewrite_workdir_pattern "$MEMORY_WORK_DIR" "$work_dir" "$target_file"
-}
-
-sync_yaml_managed_fields() {
-	sync_yaml_stale_memory_pattern "$1" || return 1
-	sync_yaml_workdir_pattern "$1"
-}
-
-memory_rewrite_workdir_pattern() {
-	local old_value="$1" new_value="$2" target="$3" rewrite_rc=0
-	yaml_replace_section_list_item filtering safe_fs_patterns \
-		"${old_value%/}/data/userfilters/*" \
-		"${new_value%/}/data/userfilters/*" "$target" || rewrite_rc=$?
-	case "$rewrite_rc" in
-		0|3) return 0 ;;
-		*) return 1 ;;
-	esac
-}
-
 root_held_tree_is_plain() {
 	local descriptor="$1" original="$2"
 	case "$descriptor" in /proc/self/fd/[0-9]*|/proc/[0-9]*/fd/[0-9]*) ;; *) return 1 ;; esac
@@ -1768,20 +1673,7 @@ memory_prepare_runtime_locked() {
 	previous_work_dir="$persistent_work_dir"
 	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
-	# The official workdir and YAML remain persistent; only its data child is a
-	# managed RAM bind mount.
-	if ! sync_yaml_managed_fields_checked; then
-		log_error "Unable to activate the persistent YAML for the RAM data workdir"
-		# No core has used this freshly copied generation yet.  If the ordinary
-		# deactivation path can restore the persistent managed field and remove
-		# the v4 state, let the caller fall back to disk for this start.  Preserve
-		# the generation only when cleanup itself cannot be proven complete.
-		if memory_deactivate_locked 0; then
-			log_error "Discarded the unused RAM generation after YAML activation failed"
-			return 1
-		fi
-		return 2
-	fi
+	# Only the data child is bound into RAM; the persistent YAML needs no rewrite.
 	log_error "AdGuard Home data directory prepared in memory from ${persistent_work_dir}/data"
 }
 
@@ -1863,11 +1755,9 @@ memory_copy_live_data_locked() (
 	local backing_device backing_inode core_pid="" require_live="${1:-1}"
 	[ "$MEMORY_ACTIVE" = 1 ] || exit 2
 	[ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
-	memory_active_tree_valid || exit 1
-	[ -d "$source" ] && [ ! -L "$source" ] || exit 1
-	uid853_tree_is_plain "$source" || exit 1
 	memory_state_load || exit 1
 	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	# The full state load above scans source data once before this copy.
 	[ -d "$MEMORY_BACKING_WORK_DIR" ] &&
 		[ ! -L "$MEMORY_BACKING_WORK_DIR" ] || exit 1
 	exec 9<"$MEMORY_BACKING_WORK_DIR" || exit 1
@@ -1909,7 +1799,7 @@ memory_copy_live_data_locked() (
 	run_bounded 5 1 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHDataMode -x /bin/chmod -- 0700 "$target" || exit 1
-	uid853_mounted_tree_is_writable "$target" || exit 1
+	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
 	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
 	metadata="$(LC_ALL=C ls -ldnL "$backing_fd" 2>/dev/null)" || exit 1
 	read -r mode links original_owner original_group remainder <<-EOF
@@ -2429,6 +2319,9 @@ install_config_candidate() {
 sync_yaml_managed_fields_checked() {
 	local directory backup candidate replacement_marker
 	local expected_hash candidate_hash current_hash
+	# Since v2.4 only a real persistent workdir move can change this field.
+	[ -n "$previous_work_dir" ] &&
+		[ "${previous_work_dir%/}" != "$work_dir" ] || return 0
 	directory="$(mktemp -d /tmp/AdGuardHome-managed.XXXXXX)" || return 1
 	backup="${directory}/original.yaml"
 	candidate="${directory}/AdGuardHome.yaml"
@@ -2440,7 +2333,7 @@ sync_yaml_managed_fields_checked() {
 	if ! snapshot_config_file "$config_file" "$backup" "$expected_hash" "" ||
 	   ! /bin/cp "$backup" "$candidate" ||
 	   ! chmod 0600 "$candidate" ||
-	   ! sync_yaml_managed_fields "$candidate"; then
+	   ! sync_yaml_workdir_pattern "$candidate"; then
 		rm -rf "$directory"
 		log_error "Unable to update the managed YAML fields"
 		return 1
@@ -3119,12 +3012,6 @@ memory_commit_official_persistent_paths() {
 		refresh_managed_config_snapshot
 }
 
-memory_clear_official_path_delta() {
-	# v2.4 never stores a runtime workdir override in /tmp/.uci.  Refuse every
-	# pending package delta before a coordinator-owned commit.
-	uci_guard_no_delta "$OFFICIAL_CONFIG"
-}
-
 memory_apply_official_path_delta() {
 	local backing effective_config effective_work
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
@@ -3187,8 +3074,6 @@ memory_run_with_official_path_guard() (
 		[ "$UCI_GUARD_CONFIG_FD_PATH" -ef "$UCI_CONFIG_DIRECTORY" ] || exit 1
 	# Plugin and official sections share one file.  Reject every pending delta so
 	# a coordinator commit can never absorb a concurrent LuCI edit.
-	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
-	memory_clear_official_path_delta || exit 1
 	uci_guard_no_delta "$OFFICIAL_CONFIG" || exit 1
 	snapshot_directory="$(uci_guard_snapshot_configs)" || exit 1
 	snapshot_ready=1
@@ -3452,16 +3337,6 @@ settings_current_revision() {
 	settings_values_revision "$service_enabled" "$persistent_work_dir" \
 		"$verbose" "$redirect_mode" "$memory_requested" \
 		"$memory_writeback_interval"
-}
-
-disable_official_autostart_persistent() {
-	# Stopping a service must not rewrite its only authoritative enabled option.
-	# The official process is stopped explicitly by the caller.
-	return 0
-}
-
-disable_official_autostart() {
-	memory_run_with_official_path_guard disable_official_autostart_persistent
 }
 
 reload_service_if_present() {
@@ -4544,7 +4419,6 @@ fail_safe_locked() {
 		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || rc=1
 		wait_for_core_stopped >/dev/null 2>&1 || rc=1
 	fi
-	disable_official_autostart || rc=1
 	return "$rc"
 }
 
@@ -4584,15 +4458,6 @@ memory_deactivate_locked() {
 		memory_reactivate_after_deactivation_failure "$old_backing" >/dev/null 2>&1 || true
 		return 1
 	fi
-	# The persistent YAML may contain a safe_fs_patterns item rewritten for the
-	# RAM workdir.  Restore that managed item before removing the RAM generation.
-	previous_work_dir="$old_backing"
-	work_dir="$old_backing"
-	config_file="${old_backing}/AdGuardHome.yaml"
-	if ! sync_yaml_managed_fields_checked; then
-		memory_reactivate_after_deactivation_failure "$old_backing" >/dev/null 2>&1 || true
-		return 1
-	fi
 	memory_remove_active_tree || return 1
 	memory_private_state_file "$MEMORY_STATE_FILE" || return 1
 	rm -f "$MEMORY_STATE_FILE" || return 1
@@ -4629,19 +4494,10 @@ memory_reconcile_requested_storage_locked() {
 }
 
 memory_prepare_or_fallback_locked() {
-	local prepare_rc=0
 	[ "$service_enabled" = 1 ] || return 0
 	[ "$memory_requested" = 1 ] || return 0
 	[ "$MEMORY_ACTIVE" != 1 ] || return 0
-	memory_prepare_runtime_locked || prepare_rc=$?
-	case "$prepare_rc" in
-		0) return 0 ;;
-		2)
-			# The RAM generation is already committed and bound to the backing
-			# inode.  Keep it for a safe retry rather than pretending disk fallback.
-			return 1
-			;;
-	esac
+	memory_prepare_runtime_locked && return 0
 	# Preparation has not changed authoritative UCI and has cleaned only objects created
 	# by this attempt.  Preserve availability by using the validated persistent
 	# tree for this start, while leaving the requested checkbox set for retry.
@@ -4664,7 +4520,7 @@ memory_cleanup_locked_command() {
 	load_settings || return 1
 	[ "$MEMORY_ACTIVE" = 1 ] || {
 		memory_discard_incomplete_runtime_locked "$persistent_work_dir" || return 1
-		memory_clear_official_path_delta
+		uci_guard_no_delta "$OFFICIAL_CONFIG"
 		return
 	}
 	official_running && return 1
@@ -4689,7 +4545,8 @@ memory_prepare_locked_command() {
 # a journal or restart any service.  Return 2 when RAM mode is not currently
 # active and eligible for a live copy.
 memory_writeback_locked_command() {
-	load_settings || return 1
+	# The copy boundary performs one full scan; settings only need identity here.
+	load_settings light || return 1
 	[ "$service_enabled" = 1 ] && [ "$memory_requested" = 1 ] &&
 		[ "$MEMORY_ACTIVE" = 1 ] &&
 		[ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ] || return 2
@@ -4716,7 +4573,7 @@ memory_prepare() {
 
 memory_status() {
 	local load_rc=0
-	load_settings || load_rc=$?
+	load_settings light || load_rc=$?
 	if [ "$load_rc" != 0 ]; then
 		printf 'requested=unknown\nactive=invalid\n'
 		return 1
@@ -4989,7 +4846,9 @@ orchestrate_core_locked() {
 }
 
 reconcile_core_locked() {
-	if ! load_settings; then
+	# Two-second monitoring must not traverse every data file.  Any branch that
+	# copies, starts, switches or removes RAM state reaches a full guarded entry.
+	if ! load_settings light; then
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	fi
@@ -5208,7 +5067,6 @@ stop_wrapper_locked() {
 		memory_deactivate_locked 1 || return 1
 	fi
 	if [ "$shutdown_mode" != 1 ]; then
-		disable_official_autostart || return 1
 		if official_running; then
 			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 			wait_for_core_stopped || return 1

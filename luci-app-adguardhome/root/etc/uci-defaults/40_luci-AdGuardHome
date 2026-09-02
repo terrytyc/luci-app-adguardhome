@@ -5,7 +5,6 @@ UCI_CONFIG="adguardhome"
 OFFICIAL_SECTION="config"
 LUCI_SECTION="luci"
 DEFAULT_WORK_DIR="/etc/AdGuardHome"
-DEFAULT_CONFIG_FILE="$DEFAULT_WORK_DIR/AdGuardHome.yaml"
 PACKAGED_CONFIG_TEMPLATE="/usr/share/luci-app-adguardhome/default.yaml"
 OFFICIAL_DEFAULT_CONFIG="/etc/adguardhome/adguardhome.yaml"
 OFFICIAL_DEFAULT_WORK_DIR="/var/lib/adguardhome"
@@ -27,90 +26,12 @@ TARGET_CONFIG_FILE=""
 SOURCE_WORK_DIR=""
 SOURCE_CONFIG_FILE=""
 USING_TEMPLATE=0
-OFFICIAL_ENABLED=1
-OFFICIAL_VERBOSE=0
 UCI_CHANGED=0
 INSTALL_COMMITTED=0
 SNAPSHOT_STAGE=""
 YAML_STAGE=""
 
-run_bounded() (
-	local limit="$1" grace="$2" marker="" child="" watchdog="" rc=0 expired=0
-	shift 2
-	case "$limit" in ""|*[!0-9]*) exit 125 ;; esac
-	case "$grace" in ""|*[!0-9]*) exit 125 ;; esac
-	[ "$#" -gt 0 ] || exit 125
-	[ -x /usr/bin/setsid ] || exit 125
-	marker="$(mktemp /tmp/luci-app-adguardhome-bounded.XXXXXX)" || exit 125
-	chmod 0600 "$marker" || {
-		rm -f "$marker"
-		exit 125
-	}
-	printf '0\n' >"$marker" || {
-		rm -f "$marker"
-		exit 125
-	}
-	bounded_signal_session() {
-		/bin/kill "-$1" -- "-$child" 2>/dev/null ||
-			/bin/kill "-$1" "$child" 2>/dev/null || true
-	}
-	bounded_abort() {
-		trap - HUP INT QUIT TERM
-		[ -z "$watchdog" ] || /bin/kill -TERM "$watchdog" 2>/dev/null || true
-		[ -z "$watchdog" ] || wait "$watchdog" 2>/dev/null || true
-		if [ -n "$child" ]; then
-			bounded_signal_session TERM
-			sleep "$grace" 2>/dev/null || true
-			bounded_signal_session KILL
-			wait "$child" 2>/dev/null || true
-		fi
-		rm -f "$marker"
-		exit 125
-	}
-	trap bounded_abort HUP INT QUIT TERM
-	[ ! -e /proc/self/fd/187 ] || bounded_abort
-	exec 187<&0 || bounded_abort
-	/usr/bin/setsid "$@" <&187 187<&- &
-	child=$!
-	exec 187<&-
-	(
-		bounded_sleeper=""
-		bounded_watchdog_abort() {
-			trap - HUP INT QUIT TERM
-			[ -z "$bounded_sleeper" ] || /bin/kill -TERM "$bounded_sleeper" 2>/dev/null || true
-			[ -z "$bounded_sleeper" ] || wait "$bounded_sleeper" 2>/dev/null || true
-			exit 1
-		}
-		bounded_watchdog_sleep() {
-			sleep "$1" &
-			bounded_sleeper=$!
-			wait "$bounded_sleeper"
-			bounded_sleep_rc=$?
-			bounded_sleeper=""
-			return "$bounded_sleep_rc"
-		}
-		trap bounded_watchdog_abort HUP INT QUIT TERM
-		bounded_watchdog_sleep "$limit" || exit 1
-		/bin/kill -0 -- "-$child" 2>/dev/null || /bin/kill -0 "$child" 2>/dev/null || exit 1
-		printf '1\n' >"$marker" || exit 1
-		bounded_signal_session TERM
-		bounded_watchdog_sleep "$grace" || exit 0
-		bounded_signal_session KILL
-	) &
-	watchdog=$!
-	wait "$child" 2>/dev/null || rc=$?
-	read -r expired <"$marker" 2>/dev/null || expired=0
-	if [ "$expired" = 1 ]; then
-		wait "$watchdog" 2>/dev/null || true
-	else
-		/bin/kill -TERM "$watchdog" 2>/dev/null || true
-		wait "$watchdog" 2>/dev/null || true
-	fi
-	trap - HUP INT QUIT TERM
-	rm -f "$marker"
-	[ "$expired" = 1 ] && exit 124
-	exit "$rc"
-)
+# @include run-bounded
 
 entry_metadata() {
 	LC_ALL=C ls -ldn "$1" 2>/dev/null
@@ -292,7 +213,7 @@ upgrade_state_is_valid() {
 	root_private_directory "$RUNTIME_DIR" &&
 		root_private_file "$UPGRADE_STATE" &&
 		[ "$(wc -l <"$UPGRADE_STATE" 2>/dev/null)" = 2 ] &&
-		grep -Eq '^source_version=2[.]4[.]0-r[12]$' "$UPGRADE_STATE" &&
+		grep -Eq '^source_version=2[.]4[.]0-r[123]$' "$UPGRADE_STATE" &&
 		grep -Eq '^was_running=[01]$' "$UPGRADE_STATE"
 }
 
@@ -376,8 +297,6 @@ initialize_clean_options() {
 	else
 		redirect=none
 	fi
-	OFFICIAL_ENABLED="$enabled"
-	OFFICIAL_VERBOSE="$verbose"
 	set_official_option enabled "$enabled" &&
 		set_official_option verbose "$verbose" &&
 		set_official_option config_file "$TARGET_CONFIG_FILE" &&

@@ -8,19 +8,14 @@
 const APPLY_WAIT_SECONDS = 90;
 const DEFAULT_RESULT_DISPLAY_SECONDS = 3;
 const ERROR_DISPLAY_SECONDS = 8;
-const APPLY_STORAGE_KEY = 'luci.adguardhome.applyPendingUntil';
-const APPLY_RETRY_INTERVAL = 1000;
+const JOB_POLL_INTERVAL = 1000;
+const JOB_POLL_LIMIT = 360;
 
 return baseclass.extend({
 	_timer: null,
 	_generation: 0,
 	_scopeGeneration: 0,
 	_activeScope: null,
-	_applyPendingUntil: 0,
-	_applyNavigationGuard: null,
-	_applyModalObserver: null,
-	_applyModalSeen: false,
-	_applyEventClear: null,
 	_pageShowGuard: null,
 	_bfcacheReloading: false,
 
@@ -116,163 +111,64 @@ return baseclass.extend({
 		return new Promise(() => { });
 	},
 
-	markApplyPending() {
-		const rollback = Number(L.env?.apply_rollback);
-		const holdoff = Number(L.env?.apply_holdoff);
-		const display = Number(L.env?.apply_display);
-		const seconds = Math.max(
-			APPLY_WAIT_SECONDS,
-			(Number.isFinite(rollback) && rollback > 0 ? rollback : 0) +
-			(Number.isFinite(holdoff) && holdoff > 0 ? holdoff : 0) +
-			(Number.isFinite(display) && display > 0 ? display : 0) + 15,
-		);
+	async requestActive(requestFn, scope) {
+		if (!this.isPageActive(scope))
+			throw this.pageInactiveError();
 
-		this._applyPendingUntil = Date.now() + seconds * 1000;
 		try {
-			window.sessionStorage.setItem(
-				APPLY_STORAGE_KEY,
-				String(this._applyPendingUntil),
-			);
-		} catch (error) { }
-		this._installApplyNavigationGuard();
-		this._watchApplyModal();
-		this._installApplyEventGuards();
-	},
-
-	clearApplyPending() {
-		this._applyPendingUntil = 0;
-		try { window.sessionStorage.removeItem(APPLY_STORAGE_KEY); }
-		catch (error) { }
-		this._stopApplyModalWatch();
-		this._removeApplyEventGuards();
-		this._removeApplyNavigationGuard();
-	},
-
-	_installApplyEventGuards() {
-		this._removeApplyEventGuards();
-		this._applyEventClear = () => this.clearApplyPending();
-		document.addEventListener('uci-applied', this._applyEventClear, { once: true });
-		document.addEventListener('uci-reverted', this._applyEventClear, { once: true });
-	},
-
-	_removeApplyEventGuards() {
-		if (this._applyEventClear == null)
-			return;
-		document.removeEventListener('uci-applied', this._applyEventClear);
-		document.removeEventListener('uci-reverted', this._applyEventClear);
-		this._applyEventClear = null;
-	},
-
-	_watchApplyModal() {
-		this._stopApplyModalWatch();
-
-		const body = document.body;
-		const Observer = window.MutationObserver;
-		if (body == null || typeof Observer !== 'function')
-			return;
-
-		this._applyModalSeen =
-			body.classList?.contains('modal-overlay-active') === true;
-		this._applyModalObserver = new Observer(() => {
-			const active =
-				body.classList?.contains('modal-overlay-active') === true;
-			if (active) {
-				this._applyModalSeen = true;
-				return;
-			}
-
-			// Do not clear a marker merely because a newly loaded document has
-			// no modal.  Only the document which observed its own apply modal
-			// may retire the marker when that modal closes or is cancelled.
-			if (this._applyModalSeen)
-				this.clearApplyPending();
-		});
-		this._applyModalObserver.observe(body, {
-			attributes: true,
-			attributeFilter: [ 'class' ],
-		});
-	},
-
-	_stopApplyModalWatch() {
-		if (this._applyModalObserver != null)
-			this._applyModalObserver.disconnect();
-		this._applyModalObserver = null;
-		this._applyModalSeen = false;
-	},
-
-	applyPending() {
-		let deadline = this._applyPendingUntil;
-		try {
-			const stored = Number(window.sessionStorage.getItem(APPLY_STORAGE_KEY));
-			if (Number.isFinite(stored) && stored > deadline)
-				deadline = stored;
-		} catch (error) { }
-		if (Number.isFinite(deadline) && deadline > Date.now())
-			return true;
-		this.clearApplyPending();
-		return false;
-	},
-
-	_installApplyNavigationGuard() {
-		if (this._applyNavigationGuard != null)
-			return;
-
-		this._applyNavigationGuard = event => {
-			const anchor = event.target?.closest?.('a[href]');
-			if (anchor == null)
-				return;
-			if (!this.applyPending())
-				return;
-
-			// A checked LuCI apply is confirmed by the JavaScript running in this
-			// document.  Some themes expose navigation links above the modal; a
-			// full-page switch would destroy that confirmer and force a rollback.
-			// Reinforce the standard modal boundary only while it is visibly active.
-			if (document.body?.classList?.contains('modal-overlay-active') !== true) {
-				this.clearApplyPending();
-				return;
-			}
-
-			event.preventDefault();
-			event.stopPropagation();
-			event.stopImmediatePropagation?.();
-		};
-		document.addEventListener('click', this._applyNavigationGuard, true);
-	},
-
-	_removeApplyNavigationGuard() {
-		if (this._applyNavigationGuard == null)
-			return;
-		document.removeEventListener('click', this._applyNavigationGuard, true);
-		this._applyNavigationGuard = null;
-	},
-
-	isTransientApplyError(error) {
-		const name = String(error?.name ?? '');
-		const message = String(error?.message ?? error ?? '');
-		return name === 'RequestError' || name === 'TimeoutError' ||
-			/(?:XHR|network|failed to fetch|load failed|timed?\s*out|HTTP error)/i.test(message);
-	},
-
-	async requestDuringApply(requestFn, scope) {
-		for (;;) {
+			const result = await requestFn();
 			if (!this.isPageActive(scope))
 				throw this.pageInactiveError();
+			return result;
+		} catch (error) {
+			if (!this.isPageActive(scope))
+				throw this.pageInactiveError();
+			throw error;
+		}
+	},
 
+	async waitForJob(statusFn, token, scope, messages, makeError = message => new Error(message)) {
+		let consecutiveErrors = 0;
+		let lastError = null;
+
+		for (let attempt = 0; attempt < JOB_POLL_LIMIT; attempt++) {
+			let result = null;
 			try {
-				const result = await requestFn();
-				if (!this.isPageActive(scope))
-					throw this.pageInactiveError();
-				return result;
+				result = await this.requestActive(() => statusFn(token, false), scope);
+				consecutiveErrors = 0;
+				lastError = null;
 			} catch (error) {
-				if (this.isPageInactiveError(error) || !this.isPageActive(scope))
-					throw this.pageInactiveError();
-				if (!this.applyPending() || !this.isTransientApplyError(error))
+				if (this.isPageInactiveError(error))
 					throw error;
+				lastError = error;
+				if (++consecutiveErrors >= 10)
+					break;
 			}
 
-			await new Promise(resolve => window.setTimeout(resolve, APPLY_RETRY_INTERVAL));
+			if (result != null) {
+				if (result.state === 'done') {
+					try { await this.requestActive(() => statusFn(token, true), scope); }
+					catch (error) {
+						// The terminal result is known; only page invalidation matters here.
+						if (this.isPageInactiveError(error))
+							throw error;
+					}
+					return result;
+				}
+				if (typeof result.error === 'string' && result.error)
+					throw makeError(result.error);
+				if (result.state !== 'pending' && result.state !== 'running')
+					throw makeError(messages.unknown);
+			} else if (lastError == null) {
+				throw makeError(messages.unknown);
+			}
+
+			await new Promise(resolve => window.setTimeout(resolve, JOB_POLL_INTERVAL));
 		}
+
+		throw makeError(lastError
+			? messages.unavailable.format(String(lastError?.message ?? lastError))
+			: messages.pending);
 	},
 
 	_clearTimer() {

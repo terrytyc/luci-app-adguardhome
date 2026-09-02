@@ -272,4 +272,140 @@ assert.match(source, /get_settings:\s*\{/);
 assert.match(source, /set_settings:\s*\{/);
 assert.match(source, /get_settings_update:\s*\{/);
 
+const jobFixture = {
+	record: null,
+	lockAvailable: true,
+	lockError: null,
+	recoverySucceeds: true,
+	consumeSucceeds: true,
+	closeSucceeds: true,
+	reads: 0,
+	closes: 0,
+	consumes: 0,
+	yamlRecoveries: 0,
+	settingsRecoveries: 0,
+};
+const jobSandbox = {
+	read_yaml_job() {
+		jobFixture.reads++;
+		return jobFixture.record;
+	},
+	open_yaml_job_lock() {
+		return {
+			file: jobFixture.lockAvailable ? {} : null,
+			error: jobFixture.lockError,
+		};
+	},
+	close_yaml_job_lock() {
+		jobFixture.closes++;
+		return jobFixture.closeSucceeds;
+	},
+	discard_yaml_job() {
+		jobFixture.consumes++;
+		return jobFixture.consumeSucceeds;
+	},
+	mark_yaml_job_indeterminate(item) {
+		assert.equal(item.token, token);
+		jobFixture.yamlRecoveries++;
+		if (jobFixture.recoverySucceeds)
+			jobFixture.record = { ...item.record, state: 'indeterminate' };
+		return jobFixture.recoverySucceeds;
+	},
+	replace_yaml_job(jobToken, content) {
+		assert.equal(jobToken, token);
+		assert.equal(content, `indeterminate:${expectedHash}:${candidateHash}\n`);
+		jobFixture.settingsRecoveries++;
+		if (jobFixture.recoverySucceeds)
+			jobFixture.record = { ...jobFixture.record, state: 'indeterminate' };
+		return jobFixture.recoverySucceeds;
+	},
+};
+vm.createContext(jobSandbox);
+vm.runInContext([
+	'update_job_status', 'yaml_job_status', 'settings_job_status',
+].map(extractFunction).join('\n') + '\nthis.api = { yaml_job_status, settings_job_status };',
+jobSandbox, { filename: rpcPath });
+
+function resetJob(state) {
+	Object.assign(jobFixture, {
+		record: state ? {
+			state, expected_hash: expectedHash, candidate_hash: candidateHash,
+			sha256: candidateHash, restarted: true,
+		} : null,
+		lockAvailable: true, lockError: null, recoverySucceeds: true,
+		consumeSucceeds: true, closeSucceeds: true,
+		reads: 0, closes: 0, consumes: 0,
+		yamlRecoveries: 0, settingsRecoveries: 0,
+	});
+}
+
+for (const settings of [ false, true ]) {
+	const query = settings ? jobSandbox.api.settings_job_status : jobSandbox.api.yaml_job_status;
+	const label = settings ? 'settings' : 'YAML';
+	const title = settings ? 'Settings' : 'YAML';
+	resetJob(null);
+	assert.equal(query(token, false).error, `${title} update job is unavailable`);
+	assert.equal(jobFixture.closes, 0, 'an unavailable job must not acquire or close a lock');
+
+	for (const state of [ 'pending', 'running', 'success' ]) {
+		resetJob(state);
+		jobFixture.lockAvailable = false;
+		assert.equal(query(token, true).state, state === 'pending' ? 'pending' : 'running',
+			'a busy worker must hide terminal bytes until its lock is released');
+		assert.equal(jobFixture.consumes, 0, 'a busy result must never be consumed');
+		assert.equal(jobFixture.closes, 0);
+	}
+
+	resetJob('running');
+	jobFixture.lockAvailable = false;
+	jobFixture.lockError = 'unsafe lock';
+	assert.equal(query(token, false).error, 'unsafe lock');
+
+	for (const state of [ 'pending', 'running' ]) {
+		resetJob(state);
+		let result = query(token, false);
+		assert.equal(result.state, 'done');
+		assert.equal(result.ok, false);
+		assert.equal(result.indeterminate, true);
+		assert.equal(jobFixture.yamlRecoveries, settings ? 0 : 1,
+			'only an interrupted YAML transaction must enter stage cleanup');
+		assert.equal(jobFixture.settingsRecoveries, settings ? 1 : 0,
+			'interrupted settings must recover without a YAML stage');
+		assert.equal(jobFixture.reads, 3, 'recovery must re-read the authenticated terminal record');
+		assert.equal(jobFixture.closes, 1);
+		assert.equal(jobFixture.consumes, 0);
+	}
+
+	resetJob('running');
+	jobFixture.recoverySucceeds = false;
+	assert.equal(query(token, true).error, `Unable to recover interrupted ${label} update state`);
+	assert.equal(jobFixture.closes, 1);
+	assert.equal(jobFixture.consumes, 0);
+
+	resetJob('success');
+	let result = query(token, true);
+	assert.equal(result.ok, true);
+	assert.equal(result.restarted, true);
+	assert.equal(result[settings ? 'revision' : 'sha256'], candidateHash,
+		'the two public result shapes must retain their distinct revision field');
+	assert.equal(result[settings ? 'sha256' : 'revision'], undefined);
+	assert.equal(jobFixture.consumes, 1);
+	assert.equal(jobFixture.closes, 1);
+
+	resetJob('failure');
+	result = query(token, false);
+	assert.equal(result.ok, false);
+	assert.equal(result.error, settings ? 'Settings were rejected or changed concurrently' :
+		'YAML was rejected or changed concurrently');
+
+	resetJob('success');
+	jobFixture.consumeSucceeds = false;
+	assert.equal(query(token, true).error, `Unable to consume ${label} update result`);
+	assert.equal(jobFixture.closes, 1);
+
+	resetJob('success');
+	jobFixture.closeSucceeds = false;
+	assert.equal(query(token, false).error, `Unable to release ${label} update lock`);
+}
+
 console.log('2.4 asynchronous RPC settings transaction tests passed');

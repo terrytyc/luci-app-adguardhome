@@ -49,7 +49,7 @@ function sourceErrorMessage(source, error) {
 
 async function fetchLog(source, lines, scope) {
 	try {
-		const result = normalizeLog(await operation.requestDuringApply(
+		const result = normalizeLog(await operation.requestActive(
 			() => callGetLog(source, lines),
 			scope,
 		));
@@ -99,7 +99,6 @@ return view.extend({
 		if (!operation.isPageActive(pageScope))
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
-		this.logLines = DEFAULT_LINES;
 		this.logOutputs = {
 			core: logOutput(result.core),
 			plugin: logOutput(result.plugin),
@@ -110,9 +109,6 @@ return view.extend({
 		};
 		this.lineSelect = E('select', {
 			class: 'cbi-input-select',
-			change: (event) => {
-				this.logLines = normalizeLineCount(event.target.value);
-			},
 		}, VALID_LINE_COUNTS.map((lines) => E('option', {
 			value: String(lines),
 			selected: lines === DEFAULT_LINES ? 'selected' : null,
@@ -164,10 +160,8 @@ return view.extend({
 		if (!operation.isPageActive(scope))
 			return;
 
-		const lines = normalizeLineCount(this.lineSelect?.value ?? this.logLines);
-		this.logLines = lines;
+		const lines = normalizeLineCount(this.lineSelect.value);
 		this.refreshButton.disabled = true;
-		const operationTicket = operation.start();
 
 		try {
 			const [ core, plugin ] = await Promise.all([
@@ -194,13 +188,11 @@ return view.extend({
 			}
 
 			if (failures.length)
-				operation.failure(failures.join(' '), operationTicket);
-			else
-				operation.success(_('Logs refreshed.'), operationTicket);
+				ui.addNotification(null, E('p', {}, failures.join(' ')), 'error');
 		} catch (error) {
 			if (operation.isPageInactiveError(error))
 				return;
-			operation.failure(errorMessage(error), operationTicket);
+			ui.addNotification(null, E('p', {}, errorMessage(error)), 'error');
 		} finally {
 			if (operation.isPageActive(scope))
 				this.refreshButton.disabled = false;

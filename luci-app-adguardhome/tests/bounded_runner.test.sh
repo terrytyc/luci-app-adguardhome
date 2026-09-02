@@ -17,8 +17,10 @@ package_dir="${script_dir}/.."
 init_file="${package_dir}/root/etc/init.d/AdGuardHome"
 defaults_file="${package_dir}/root/etc/uci-defaults/40_luci-AdGuardHome"
 makefile="${package_dir}/Makefile"
+helper_source="${package_dir}/scripts/run-bounded.mk"
+expander="${package_dir}/scripts/expand-bounded.awk"
 
-for required_file in "$init_file" "$defaults_file" "$makefile"; do
+for required_file in "$init_file" "$defaults_file" "$makefile" "$helper_source" "$expander"; do
 	[ -f "$required_file" ] || {
 		printf 'required product file not found: %s\n' "$required_file" >&2
 		exit 1
@@ -42,30 +44,28 @@ extract_helper() {
 	' "$1"
 }
 
-extract_makefile_helper() {
-	awk -v wanted="$1" '
-		/^run_bounded\(\) \($/ {
-			seen++
-			copying = (seen == wanted)
-		}
-		copying {
-			gsub(/\$\$/, "$")
-			print
-		}
-		copying && /^\)$/ { exit }
-	' "$makefile"
-}
-
 temp_dir="$(mktemp -d /tmp/luci-app-adguardhome-bounded-test.XXXXXX)"
 cleanup() {
 	rm -rf "$temp_dir"
 }
 trap cleanup EXIT HUP INT QUIT TERM
 
-extract_helper "$init_file" >"${temp_dir}/init.helper"
-extract_helper "$defaults_file" >"${temp_dir}/defaults.helper"
-extract_makefile_helper 1 >"${temp_dir}/preinst.helper"
-extract_makefile_helper 2 >"${temp_dir}/prerm.helper"
+awk -v helper="$helper_source" -f "$expander" "$init_file" >"${temp_dir}/init.expanded"
+awk -v helper="$helper_source" -f "$expander" "$defaults_file" >"${temp_dir}/defaults.expanded"
+extract_helper "${temp_dir}/init.expanded" >"${temp_dir}/init.helper"
+extract_helper "${temp_dir}/defaults.expanded" >"${temp_dir}/defaults.helper"
+for expanded in "${temp_dir}/init.expanded" "${temp_dir}/defaults.expanded"; do
+	busybox ash -n "$expanded"
+	if grep -Fq '# @include run-bounded' "$expanded"; then
+		printf 'shared helper was not expanded\n' >&2
+		exit 1
+	fi
+done
+[ "$(grep -Fc '$(AdGuardHome/RunBounded)' "$makefile")" = 2 ] || {
+	printf 'preinst and prerm must embed the shared helper\n' >&2
+	exit 1
+}
+grep -Fq 'include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk' "$makefile"
 
 [ -s "${temp_dir}/init.helper" ] || {
 	printf 'run_bounded was not found in the init script\n' >&2
@@ -75,16 +75,7 @@ cmp -s "${temp_dir}/init.helper" "${temp_dir}/defaults.helper" || {
 	printf 'init and uci-defaults run_bounded implementations differ\n' >&2
 	exit 1
 }
-cmp -s "${temp_dir}/init.helper" "${temp_dir}/preinst.helper" || {
-	printf 'init and pre-install run_bounded implementations differ\n' >&2
-	exit 1
-}
-cmp -s "${temp_dir}/init.helper" "${temp_dir}/prerm.helper" || {
-	printf 'init and pre-remove run_bounded implementations differ\n' >&2
-	exit 1
-}
-
-if grep -Fq '/usr/bin/timeout' "$init_file" "$defaults_file" "$makefile" ||
+if grep -Fq '/usr/bin/timeout' "$init_file" "$defaults_file" "$makefile" "$helper_source" ||
 	grep -Fq 'coreutils-timeout' "$makefile"; then
 	printf 'external timeout implementation is still referenced by the package\n' >&2
 	exit 1

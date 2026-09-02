@@ -1,12 +1,12 @@
 # luci-app-adguardhome
 
-`luci-app-adguardhome` 2.4.0-r3，兼容基线为 ImmortalWrt 25.12.1。
+`luci-app-adguardhome` 2.4.0-r4，兼容基线为 ImmortalWrt 25.12.1（APK）。
 
 本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由 ImmortalWrt 的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
 
 ## 唯一 UCI 配置
 
-2.4.0-r3 的活动配置只使用一个 UCI 文件：`/etc/config/adguardhome`。运行时不创建或使用 `/etc/config/AdGuardHome`，也不存在第二个 `enabled` 或第二个 `work_dir`。
+2.4.0-r4 的活动配置只使用一个 UCI 文件：`/etc/config/adguardhome`。运行时不创建或使用 `/etc/config/AdGuardHome`，也不存在第二个 `enabled` 或第二个 `work_dir`。
 
 标准配置格式如下：
 
@@ -77,9 +77,17 @@ ACME 的 `issued`/`renewed` 事件会触发安全重载，使续期证书生效�
 ## 安装与升级
 
 - 没有既有 AdGuard Home 状态的洁净安装会创建上述唯一 UCI 布局，按样例默认启用服务，并在默认工作目录缺少 YAML 时安装默认模板；导入已存在的官方实例时会保留其启用和运行状态。若该官方状态尚未生成 YAML，插件会连同模板采用默认 `dnsmasq-upstream` 模式；若导入的是既有官方 YAML，则初始使用 `none`，避免擅自改变原 DNS 策略。
-- `2.4.0-r1` 和已发布的 `2.4.0-r2` 均支持原位升级到 `2.4.0-r3`。升级保留当前 UCI、YAML、HTTPS 配置、运行数据和内存模式设置；升级脚本不迁移或删除 2.4 基线以前的历史配置项。
-- 从 2.3 及更早版本或未知开发版升级不受支持；应先完整卸载旧 LuCI 插件，再安装 2.4.0-r3。官方 `adguardhome` 核心软件包无需卸载。
+- `2.4.0-r1`、`2.4.0-r2` 和 `2.4.0-r3` 均支持原位升级到 `2.4.0-r4`。升级保留当前 UCI、YAML、HTTPS 配置、运行数据和内存模式设置；升级脚本不迁移或删除 2.4 基线以前的历史配置项。
+- 从 2.3 及更早版本或未知开发版升级不受支持；应先完整卸载旧 LuCI 插件，再安装 2.4.0-r4。官方 `adguardhome` 核心软件包无需卸载。
 - 导入既有官方配置时，如果官方 `work_dir` 位于 `/var/*` 或 `/tmp/*`，插件会把 YAML 和现有 `data` 迁移到持久的 `/etc/AdGuardHome`，并把官方 `config_file` 统一为 `/etc/AdGuardHome/AdGuardHome.yaml`；原易失目录保留，便于人工恢复。
 - 普通情况下更换已受管的持久工作目录不会搬移旧目录内容：新目录已有 YAML 时直接使用，没有 YAML 时写入默认模板，旧目录保持不动。
 
 核心更新完全交由 ImmortalWrt APK 软件包管理。插件不包含核心下载或更新功能，也不修改官方 APK 的二进制、服务名、UCI 主配置名和包载荷。旧版核心更新器、UPX 与 GFW 列表相关功能均已移除。
+
+## r4 精简
+
+- 设置、YAML、账号修改共用轻量异步任务轮询；移除不再使用的全局 UCI 应用标记。每次“保存并应用”仍统一协调重启，服务停用时保持停用，完成后重新加载所有设置值。
+- 日志刷新和 YAML 磁盘重读只显示读取忙碌状态，不再显示“应用配置”倒计时。
+- 日常监控保留进程、监听端口和挂载身份检查，不再递归扫描整个内存 data；完整树检查保留在启动、复制和清理边界。
+- 删除空操作事务、重复 UCI 检查及 2.4 以前的 RAM YAML 路径修复；合并内存状态、RPC 配置与 YAML 字段的重复解析。
+- 超时辅助代码由 `scripts/run-bounded.mk` 单一源码在构建时展开，生成的安装钩子和服务脚本自包含，不新增运行依赖。

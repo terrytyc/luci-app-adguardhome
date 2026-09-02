@@ -47,6 +47,21 @@ trap 'exit 1' HUP INT TERM
 const TEST_CANDIDATE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 let mock_yaml = null;
 let updated_content = null;
+let mock_config = null;
+let config_reads = 0;
+let listening_ports = [];
+
+function read_config() {
+	config_reads++;
+	return mock_config;
+}
+
+function web_port_listening(port) {
+	for (let listening in listening_ports)
+		if (listening == port)
+			return true;
+	return false;
+}
 
 function read_yaml() {
 	return mock_yaml;
@@ -67,6 +82,15 @@ UCODE_STUBS
 	awk '
 		/^function yaml_simple_scalar\(value\)/ { copying = 1 }
 		copying && /^function reset_yaml\(expected_hash\)/ { exit }
+		copying { print }
+	' "$source_file"
+	awk '
+		/^function yaml_scalar\(value\)/ { copying = 1 }
+		/^function yaml_simple_scalar\(value\)/ { copying = 0 }
+		/^function yaml_config_values\(content\)/ { copying = 1 }
+		/^function web_port_listening\(port\)/ { copying = 0 }
+		/^function config_info\(\)/ { copying = 1 }
+		/^function core_version\(\)/ { copying = 0 }
 		copying { print }
 	' "$source_file"
 
@@ -322,6 +346,82 @@ if (multi_rename?.error !=
 print('ok - multi-user simultaneous update rejected\n');
 
 print('credential YAML parser fixture tests passed\n');
+
+function expect_config(name, content, ports, dns_port, scheme, host, port) {
+	mock_config = content;
+	listening_ports = ports;
+	config_reads = 0;
+	let result = config_info();
+	if (config_reads != 1 || result.dns_port !== dns_port)
+		fail(name, 'configuration was re-read or DNS port differs');
+	if (scheme == null) {
+		if (result.web != null)
+			fail(name, 'ambiguous or unavailable web endpoint was exposed');
+	}
+	else if (result.web?.scheme !== scheme || result.web?.host !== host ||
+	         result.web?.port !== port)
+		fail(name, 'web endpoint differs from the expected YAML values');
+	print(`ok - ${name}\n`);
+}
+
+const HTTP = 'http:\n  address: 0.0.0.0:3000\n';
+const DNS = 'dns:\n  port: 53335\n';
+const TLS_PATHS = '  certificate_path: /etc/ssl/cert.pem\n  private_key_path: /etc/ssl/key.pem\n';
+const TLS = 'tls:\n  enabled: true\n  server_name: router.example.com\n  port_https: 1029\n';
+
+expect_config('one-pass HTTP and dynamic DNS port', HTTP + 'dns:\n  port: 5353\n',
+	[ 3000 ], 5353, 'http', null, 3000);
+expect_config('TLS file pair and configured domain', HTTP + DNS + TLS + TLS_PATHS,
+	[ 3000, 1029 ], 53335, 'https', 'router.example.com', 1029);
+expect_config('TLS embedded material', HTTP + DNS + TLS +
+	'  certificate_chain: |\n    CERTIFICATE\n  private_key: |\n    KEY\n',
+	[ 1029 ], 53335, 'https', 'router.example.com', 1029);
+expect_config('incomplete explicit TLS paths forbid inline fallback', HTTP + DNS + TLS +
+	'  certificate_path: /etc/ssl/cert.pem\n  certificate_chain: |\n    CERTIFICATE\n  private_key: |\n    KEY\n',
+	[ 3000, 1029 ], 53335, 'http', null, 3000);
+expect_config('non-listening HTTPS falls back to HTTP', HTTP + DNS + TLS + TLS_PATHS,
+	[ 3000 ], 53335, 'http', null, 3000);
+expect_config('forced HTTPS never falls back', HTTP + DNS + TLS + TLS_PATHS + '  force_https: true\n',
+	[ 3000 ], 53335, null, null, null);
+expect_config('HTTPS numeric host remains rejected', HTTP + DNS +
+	'tls:\n  enabled: true\n  server_name: 127.1\n  port_https: 1029\n' + TLS_PATHS,
+	[ 3000, 1029 ], 53335, 'http', null, 3000);
+expect_config('loopback HTTP remains unavailable', 'http:\n  address: 127.0.0.1:3000\n' + DNS,
+	[ 3000 ], 53335, null, null, null);
+expect_config('IPv6 HTTP bind uses LuCI host', 'http:\n  address: "[::]:3000"\n' + DNS,
+	[ 3000 ], 53335, 'http', null, 3000);
+expect_config('duplicate DNS section stays ambiguous', HTTP + DNS + 'dns: # duplicate\n  port: 5353\n',
+	[ 3000 ], null, 'http', null, 3000);
+expect_config('duplicate DNS key stays ambiguous', HTTP + DNS + '  port: 5353\n',
+	[ 3000 ], null, 'http', null, 3000);
+expect_config('duplicate HTTP section stays ambiguous', HTTP + DNS + HTTP,
+	[ 3000 ], 53335, null, null, null);
+expect_config('duplicate HTTP key stays ambiguous', HTTP + '  address: 0.0.0.0:3001\n' + DNS,
+	[ 3000, 3001 ], 53335, null, null, null);
+expect_config('nested values cannot override direct keys',
+	HTTP + DNS + '  nested:\n    port: 5353\n',
+	[ 3000 ], 53335, 'http', null, 3000);
+expect_config('later shallower mapping rejects earlier nested key',
+	HTTP + 'dns:\n    port: 5353\n  nested: value\n',
+	[ 3000 ], null, 'http', null, 3000);
+expect_config('comments and quoted scalars preserve mapping depth',
+	'http: # endpoint\n # explanation\n  address: "0.0.0.0:3000" # bind\n' +
+	'dns: # DNS\n  # ignored: 53\n  port: "53335" # port\n',
+	[ 3000 ], 53335, 'http', null, 3000);
+expect_config('tab-indented key is not a supported mapping', HTTP + 'dns:\n\tport: 53335\n',
+	[ 3000 ], null, 'http', null, 3000);
+expect_config('invalid TLS boolean hides ambiguous endpoint', HTTP + DNS + 'tls:\n  enabled: perhaps\n',
+	[ 3000 ], 53335, null, null, null);
+
+let duplicate_tls = yaml_config_values(TLS + TLS_PATHS + TLS + TLS_PATHS);
+if (yaml_section_value(duplicate_tls, 'tls', 'enabled') != null ||
+		yaml_section_value(duplicate_tls, 'tls', 'certificate_path') != null)
+	fail('duplicate TLS section', 'duplicate section exposed values');
+let duplicate_key = yaml_config_values(TLS + TLS_PATHS + '  port_https: 1030\n');
+if (yaml_section_value(duplicate_key, 'tls', 'port_https') != null)
+	fail('duplicate TLS key', 'duplicate key exposed a value');
+print('ok - duplicate TLS sections and keys remain ambiguous\n');
+print('one-pass status YAML parser fixture tests passed\n');
 UCODE_TESTS
 } >"$test_file"
 
