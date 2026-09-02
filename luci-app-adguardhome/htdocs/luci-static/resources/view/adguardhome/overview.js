@@ -177,12 +177,12 @@ function renderServiceStatus(running) {
 	}, running ? _('Running') : _('Not running'));
 }
 
-function renderStorageStatus(status) {
-	if (status.memoryActive)
+function renderStorageStatus(mode) {
+	if (mode === 'memory')
 		return E('span', { style: 'color: var(--success-color-high, #2e7d32); font-weight: bold' }, _('Memory'));
-	if (status.memoryRequested && status.running)
+	if (mode === 'fallback')
 		return E('span', { style: 'color: var(--warning-color-high, #b26a00); font-weight: bold' }, _('Persistent storage (memory fallback)'));
-	if (status.memoryRequested)
+	if (mode === 'pending')
 		return E('span', {}, _('Persistent storage (memory on next start)'));
 	return E('span', {}, _('Persistent storage'));
 }
@@ -219,6 +219,16 @@ function buildManagementURL(endpoint) {
 	url.hash = '';
 
 	return url.toString();
+}
+
+function overviewDisplayValues({ status, config }) {
+	return {
+		running: status.running,
+		storage: status.memoryActive ? 'memory'
+			: status.memoryRequested ? (status.running ? 'fallback' : 'pending') : 'persistent',
+		dnsPort: String(config.dnsPort ?? _('Unavailable')),
+		management: status.running ? buildManagementURL(config.web) : false,
+	};
 }
 
 function renderManagementLink(endpoint, running) {
@@ -433,8 +443,7 @@ return view.extend({
 		if (!operation.isPageActive(pageScope))
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
-		const { status: serviceStatus, config: configInfo } = overview;
-		const running = serviceStatus.running;
+		let displayed = overviewDisplayValues(overview);
 		const map = new form.JSONMap(
 			settingsMapData(settings),
 			_('AdGuard Home'),
@@ -445,10 +454,10 @@ return view.extend({
 		// not receive editable controls or enabled page action buttons.
 		map.readonly = !L.hasViewPermission();
 
-		const statusContainer = E('span', {}, renderServiceStatus(running));
-		const storageContainer = E('span', {}, renderStorageStatus(serviceStatus));
-		const dnsPortContainer = E('span', {}, String(configInfo.dnsPort ?? _('Unavailable')));
-		const managementContainer = E('span', {}, renderManagementLink(configInfo.web, running));
+		const statusContainer = E('span', {}, renderServiceStatus(displayed.running));
+		const storageContainer = E('span', {}, renderStorageStatus(displayed.storage));
+		const dnsPortContainer = E('span', {}, displayed.dnsPort);
+		const managementContainer = E('span', {}, renderManagementLink(overview.config.web, displayed.running));
 
 		const statusSection = map.section(form.TypedSection, '_status', _('Overview'));
 		statusSection.anonymous = true;
@@ -609,14 +618,16 @@ return view.extend({
 				return;
 			}
 
-			const { status: currentStatus, config: currentConfigInfo } = current;
-			dom.content(statusContainer, renderServiceStatus(currentStatus.running));
-			dom.content(storageContainer, renderStorageStatus(currentStatus));
-			dom.content(
-				dnsPortContainer,
-				String(currentConfigInfo.dnsPort ?? _('Unavailable')),
-			);
-			dom.content(managementContainer, renderManagementLink(currentConfigInfo.web, currentStatus.running));
+			const next = overviewDisplayValues(current);
+			if (next.running !== displayed.running)
+				dom.content(statusContainer, renderServiceStatus(next.running));
+			if (next.storage !== displayed.storage)
+				dom.content(storageContainer, renderStorageStatus(next.storage));
+			if (next.dnsPort !== displayed.dnsPort)
+				dom.content(dnsPortContainer, next.dnsPort);
+			if (next.management !== displayed.management)
+				dom.content(managementContainer, renderManagementLink(current.config.web, next.running));
+			displayed = next;
 		};
 		this.statusPollCallback = statusPollCallback;
 		poll.add(statusPollCallback, POLL_INTERVAL);

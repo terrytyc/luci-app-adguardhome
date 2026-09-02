@@ -5,10 +5,11 @@ ADGUARDHOME_SOURCE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(TOPDIR)/rules.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
+include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -56,6 +57,8 @@ define Package/$(PKG_NAME)/preinst
 $(AdGuardHome/RunBounded)
 
 $(AdGuardHome/PrivateFiles)
+
+$(AdGuardHome/UpgradePolicy)
 
 bounded_private_file() {
 	local size
@@ -216,13 +219,7 @@ if [ "$$is_upgrade" != 1 ]; then
 fi
 
 source_version="$$(installed_source_version)" || source_version=""
-case "$$source_version" in
-	2.4.0-r1|2.4.0-r2|2.4.0-r3|2.4.0-r4|2.4.0-r5) ;;
-	*)
-		echo "Only luci-app-adguardhome 2.4.0-r1, r2, r3, r4 or r5 can be upgraded in place." >&2
-		exit 1
-		;;
-esac
+upgrade_source_allowed "$$source_version" || exit 1
 validate_original_snapshot || {
 	echo "The original official adguardhome snapshot is unavailable or unsafe." >&2
 	exit 1
@@ -282,6 +279,8 @@ define Package/$(PKG_NAME)/postinst
 
 $(AdGuardHome/PrivateFiles)
 
+$(AdGuardHome/UpgradePolicy)
+
 if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
    [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
 	echo "AdGuard Home initialization failed; package installation aborted." >&2
@@ -294,7 +293,7 @@ if [ -e "$$upgrade_state" ] || [ -L "$$upgrade_state" ]; then
 	root_private_directory "$$runtime_dir" && root_private_file "$$upgrade_state" ||
 		exit 1
 	[ "$$(wc -l <"$$upgrade_state" 2>/dev/null)" = 2 ] || exit 1
-	grep -Eq '^source_version=2[.]4[.]0-r[12345]$$' "$$upgrade_state" || exit 1
+	upgrade_state_source_allowed "$$upgrade_state" || exit 1
 	was_running="$$(sed -n 's/^was_running=//p' "$$upgrade_state")"
 	case "$$was_running" in
 		1)

@@ -217,6 +217,9 @@ function memory_state_active(persistent_work_dir) {
 		return false;
 
 	let runtime = lstat(MEMORY_RUNTIME_DIRECTORY);
+	if (runtime == null)
+		return false;
+
 	let active = lstat(MEMORY_WORK_DIRECTORY);
 	let data = lstat(`${MEMORY_WORK_DIRECTORY}/data`);
 	let backing = lstat(persistent_work_dir);

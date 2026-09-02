@@ -14,7 +14,8 @@ function loadOverview() {
 	const updates = [];
 	const errors = [];
 	const polls = new Set();
-	const document = { hidden: false };
+	const elements = [];
+	const document = { hidden: false, activeElement: null };
 	let active = true;
 	let overviewResult = {
 		status: { running: true, memory_requested: false, memory_active: false },
@@ -79,10 +80,19 @@ function loadOverview() {
 				};
 			},
 		},
-		dom: { content(node, value) { updates.push({ node, value }); } },
+		dom: { content(node, value) {
+			if (document.activeElement === node.child)
+				document.activeElement = null;
+			node.child = value;
+			updates.push({ node, value });
+		} },
 		ui: { createHandlerFn: () => () => {} },
 		view: { extend: definition => definition },
-		E: (tag, attrs, child) => ({ tag, attrs, child }),
+		E(tag, attrs, child) {
+			const node = { tag, attrs, child };
+			elements.push(node);
+			return node;
+		},
 		_: value => value,
 		L: { hasViewPermission: () => true },
 		URL,
@@ -94,7 +104,7 @@ function loadOverview() {
 	const view = vm.runInContext('(function() {\n' + source + '\n})()', context,
 		{ filename: overviewPath });
 	return {
-		view, calls, updates, errors, polls, handlers, document,
+		view, calls, updates, errors, polls, handlers, document, elements,
 		setActive: value => { active = value; },
 		setOverview: value => { overviewResult = value; },
 	};
@@ -112,6 +122,16 @@ async function main() {
 	const committed = state.view.committedSettings;
 	const draft = state.view.settingsMap.initialData;
 	draft.config.work_dir = '/mnt/storage/AdGuardHome-draft';
+	const management = state.elements.find(node => node.tag === 'span' && node.child?.tag === 'a');
+	assert.ok(management);
+	const initialLink = management.child;
+	state.document.activeElement = initialLink;
+	state.calls.length = 0;
+	await callback();
+	assert.deepEqual(state.calls, [ 'get_overview' ], 'unchanged displays must still query fresh RPC state');
+	assert.equal(state.updates.length, 0, 'the initial display must seed the per-field comparison');
+	assert.equal(management.child, initialLink);
+	assert.equal(state.document.activeElement, initialLink, 'unchanged management links must retain keyboard focus');
 
 	state.calls.length = 0;
 	state.document.hidden = true;
@@ -127,32 +147,90 @@ async function main() {
 	await callback();
 	assert.deepEqual(state.calls, [ 'get_overview' ],
 		'each overview poll must issue only one combined status/config RPC');
-	assert.equal(state.updates.length, 4);
-	assert.equal(state.updates[0].value.child, 'Running');
-	assert.equal(state.updates[1].value.child, 'Memory');
-	assert.equal(state.updates[2].value, '5353', 'DNS display must use the current YAML value');
-	assert.equal(state.updates[3].value.attrs.href, 'https://adg.example:10443/');
+	assert.equal(state.updates.length, 3, 'the unchanged running status must retain its node');
+	assert.equal(state.updates[0].value.child, 'Memory');
+	assert.equal(state.updates[1].value, '5353', 'DNS display must use the current YAML value');
+	assert.equal(state.updates[2].value.attrs.href, 'https://adg.example:10443/');
 	assert.equal(state.view.committedSettings, committed,
 		'polling must not replace the authoritative settings revision snapshot');
 	assert.equal(state.view.settingsMap.initialData, draft);
 	assert.equal(draft.config.work_dir, '/mnt/storage/AdGuardHome-draft',
 		'polling must leave unsaved work directory edits intact');
+	const activeLink = management.child;
+	state.document.activeElement = activeLink;
+	state.updates.length = 0;
+	state.calls.length = 0;
+	state.setOverview({
+		status: { running: true, memory_requested: false, memory_active: true },
+		config: { dns_port: 5353, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
+	});
+	await callback();
+	assert.deepEqual(state.calls, [ 'get_overview' ], 'display comparison must not cache RPC responses');
+	assert.equal(state.updates.length, 0, 'raw flag/type changes with identical display values must not redraw');
+	assert.equal(management.child, activeLink);
+	assert.equal(state.document.activeElement, activeLink);
+	state.setOverview({
+		status: { running: true, memory_requested: false, memory_active: true },
+		config: { dns_port: 5354, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
+	});
+	await callback();
+	assert.equal(state.updates.length, 1, 'changing only DNS must update only the DNS container');
+	assert.equal(state.updates[0].value, '5354');
+	assert.equal(management.child, activeLink);
+	assert.equal(state.document.activeElement, activeLink, 'unrelated status changes must preserve link focus');
+	for (const web of [
+		{ scheme: 'https', host: 'new-adg.example', port: 10443 },
+		{ scheme: 'https', host: 'new-adg.example', port: 10444 },
+		{ scheme: 'http', host: null, port: 10444 },
+	]) {
+		state.updates.length = 0;
+		state.setOverview({
+			status: { running: true, memory_requested: false, memory_active: true },
+			config: { dns_port: 5354, web },
+		});
+		await callback();
+		assert.equal(state.updates.length, 1, 'each changed management URL must update only its own container');
+		assert.equal(state.updates[0].node, management);
+		assert.equal(management.child.attrs.href,
+			`${web.scheme}://${web.host ?? 'router.example'}:${web.port}/`);
+	}
+	for (const [status, text, updateCount] of [
+		[{ running: true, memory_requested: true, memory_active: false }, 'Persistent storage (memory fallback)', 1],
+		[{ running: false, memory_requested: true, memory_active: false }, 'Persistent storage (memory on next start)', 3],
+		[{ running: false, memory_requested: false, memory_active: false }, 'Persistent storage', 1],
+	]) {
+		state.updates.length = 0;
+		state.setOverview({
+			status,
+			config: { dns_port: 5354, web: { scheme: 'http', host: null, port: 10444 } },
+		});
+		await callback();
+		assert.equal(state.updates.length, updateCount, 'only changed display fields may update');
+		assert.ok(state.updates.some(update => update.value.child === text),
+			'every memory fallback/pending/persistent transition must remain visible');
+	}
 
+	state.updates.length = 0;
 	state.setOverview({
 		status: { running: 'true', memory_requested: 1, memory_active: null },
 		config: { dns_port: 65536, web: { scheme: 'https', host: 'bad/host', port: 443 } },
 	});
 	await callback();
-	assert.equal(state.updates.at(-4).value.child, 'Not running');
-	assert.equal(state.updates.at(-3).value.child, 'Persistent storage');
-	assert.equal(state.updates.at(-2).value, 'Unavailable');
-	assert.equal(state.updates.at(-1).value.tag, 'span');
+	assert.equal(state.updates.length, 1, 'already stopped persistent status must not redraw');
+	assert.equal(state.updates[0].value, 'Unavailable');
+	assert.equal(management.child.tag, 'span');
+	state.updates.length = 0;
+	state.setOverview({
+		status: { running: false, memory_requested: false, memory_active: false },
+		config: { dns_port: null, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
+	});
+	await callback();
+	assert.equal(state.updates.length, 0, 'endpoint changes while stopped must not rebuild the disabled button');
 
 	state.handlers.get_overview = () => { throw new Error('temporary RPC failure'); };
 	await callback();
 	assert.equal(state.errors.length, 1, 'real RPC failures must remain diagnosable');
-	assert.equal(state.updates.at(-4).value.child, 'Not running');
-	assert.equal(state.updates.at(-2).value, 'Unavailable');
+	assert.equal(state.updates.length, 0, 'an unchanged unavailable display must not redraw on RPC failure');
 	assert.equal(state.polls.size, 1, 'a transient failure must not permanently stop status polling');
 
 	let resolveReply;

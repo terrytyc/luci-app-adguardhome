@@ -87,6 +87,8 @@ const fixture = {
 	serviceRunning: true,
 	workDir: PERSISTENT_WORK_DIR,
 	configFile: PERSISTENT_CONFIG,
+	runtimePresent: true,
+	runtimeType: 'directory',
 	dataPresent: true,
 	entries: [ 'data' ],
 	version: 4,
@@ -97,6 +99,9 @@ const fixture = {
 	stateMemoryDataInode: 52,
 	symlinkPath: null,
 	writablePath: null,
+	lstatPaths: [],
+	lsdirPaths: [],
+	openPaths: [],
 };
 
 const directory = (uid, gid, mode, inode, major = 8, minor = 1) => ({
@@ -138,7 +143,9 @@ function metadata(pathname) {
 	if (pathname === CUSTOM_WORK_DIR)
 		return directory(853, 853, 0o700, BACKING_INODE);
 	if (pathname === MEMORY_RUNTIME_DIR)
-		return directory(0, 853, 0o710, 50, 0, 23);
+		return fixture.runtimePresent
+			? { ...directory(0, 853, 0o710, 50, 0, 23), type: fixture.runtimeType }
+			: null;
 	if (pathname === MEMORY_WORK_DIR)
 		return directory(853, 853, 0o700, 51, 0, 23);
 	if (pathname === `${MEMORY_WORK_DIR}/data`)
@@ -187,12 +194,17 @@ const sandbox = {
 	match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(value),
 	lc: value => value.toLowerCase(),
-	lstat: metadata,
+	lstat(pathname) {
+		fixture.lstatPaths.push(pathname);
+		return metadata(pathname);
+	},
 	stat: metadata,
 	lsdir(pathname) {
+		fixture.lsdirPaths.push(pathname);
 		return pathname === MEMORY_WORK_DIR ? [ ...fixture.entries ] : null;
 	},
 	open(pathname) {
+		fixture.openPaths.push(pathname);
 		if (pathname !== STATE_PATH)
 			return null;
 		return {
@@ -255,6 +267,41 @@ assert.equal(api.config_path(), PERSISTENT_CONFIG,
 	'valid RAM mode must keep YAML in the persistent work directory');
 assert.equal(api.service_status().memory_active, true,
 	'the independent RAM state validator should report the active generation');
+
+fixture.runtimePresent = false;
+fixture.lstatPaths.length = 0;
+fixture.lsdirPaths.length = 0;
+fixture.openPaths.length = 0;
+assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
+	'an absent RAM namespace cannot be active');
+assert.deepEqual(fixture.lstatPaths, [ '/etc', PERSISTENT_WORK_DIR, MEMORY_RUNTIME_DIR ],
+	'an absent runtime directory must stop before querying RAM work/data or bind aliases');
+assert.deepEqual(fixture.lsdirPaths, [], 'persistent mode must not enumerate an absent RAM work directory');
+assert.deepEqual(fixture.openPaths, [], 'persistent mode must not try opening an absent RAM state record');
+fixture.requested = '1';
+assert.equal(api.service_status().memory_active, false,
+	'a checked memory request must not bypass the absent-runtime fast path');
+fixture.runtimePresent = true;
+fixture.requested = '0';
+for (const invalid of [ 'symlinkPath', 'writablePath' ]) {
+	fixture[invalid] = MEMORY_RUNTIME_DIR;
+	fixture.lstatPaths.length = 0;
+	fixture.lsdirPaths.length = 0;
+	assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
+		`${invalid}: an existing abnormal runtime object must retain validation`);
+	assert.ok(fixture.lstatPaths.includes(MEMORY_WORK_DIR),
+		'an abnormal but existing runtime must not be mistaken for the absent-directory fast path');
+	assert.deepEqual(fixture.lsdirPaths, [ MEMORY_WORK_DIR ]);
+	fixture[invalid] = null;
+}
+fixture.runtimeType = 'file';
+fixture.lstatPaths.length = 0;
+assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
+	'a regular file at the runtime path must not be treated as an absent namespace');
+assert.ok(fixture.lstatPaths.includes(MEMORY_WORK_DIR));
+fixture.runtimeType = 'directory';
+assert.equal(api.service_status().memory_active, true,
+	'an existing authenticated RAM generation remains active even when memory was unchecked');
 
 fixture.visibleDataInode = 53;
 assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,

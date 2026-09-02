@@ -18,7 +18,7 @@ function_body() {
 	' "$init_file"
 }
 grep -qx MONITOR_INTERVAL=5 "$init_file"
-for name in reconcile_core_locked monitor wait_for_core_ready \
+for name in reconcile_core_locked monitor_interval_locked monitor wait_for_core_ready \
 	normalize_memory_writeback_interval; do
 	eval "$(function_body "$name")"
 done
@@ -35,6 +35,8 @@ load_settings() {
 	persistent_work_dir=/etc/AdGuardHome
 	work_dir="$persistent_work_dir"
 	redirect_mode="$TEST_MODE"
+	memory_writeback_interval="${TEST_INTERVAL:-60}"
+	MONITOR_SETTINGS_READY=1
 }
 clear_recorded_integration_locked() { record cleanup; }
 orchestrate_core_locked() { record orchestrate; }
@@ -88,24 +90,71 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 [ "$(grep -c '^sleep:1$' "$events")" = 2 ]
 [ "$(grep -c '^socket$' "$events")" = 4 ]
 
+# The scheduling result must survive command substitution without relying on
+# variable changes escaping run_locked's subshell.  Only an active, matching
+# RAM generation gets a nonzero interval, and reconciliation output is private.
+(
+	TEST_MODE=none
+	TEST_ENABLED=1
+	TEST_MEMORY_ACTIVE=1
+	TEST_MEMORY_REQUESTED=1
+	TEST_BACKING=/etc/AdGuardHome
+	TEST_INTERVAL=60
+	clear_recorded_integration_locked() { printf 'unrelated reconcile output\n'; }
+	[ "$(monitor_interval_locked)" = 60 ]
+	TEST_MEMORY_ACTIVE=0
+	[ "$(monitor_interval_locked)" = 0 ]
+	TEST_MEMORY_ACTIVE=1
+	TEST_MEMORY_REQUESTED=0
+	[ "$(monitor_interval_locked)" = 0 ]
+	TEST_MEMORY_REQUESTED=1
+	TEST_ENABLED=0
+	[ "$(monitor_interval_locked)" = 0 ]
+	TEST_ENABLED=1
+	TEST_BACKING=/etc/AdGuardHome-old
+	[ "$(monitor_interval_locked)" = 0 ]
+	TEST_BACKING=/etc/AdGuardHome
+	TEST_INTERVAL=0
+	[ "$(monitor_interval_locked)" = 0 ]
+	load_settings() { return 1; }
+	[ "$(monitor_interval_locked)" = 0 ]
+)
+
 # Drive real monitor control flow with deterministic clock/interval fixtures.
 # These test rounds never enter production code as a loop counter or scheduler.
 events="${test_tmp}/monitor"
 (
 	ROUND=0
 	MONITOR_INTERVAL=5
-	MEMORY_WRITEBACK_DEFAULT_MINUTES=60
-	MEMORY_WRITEBACK_MAX_MINUTES=10080
-	PLUGIN_CONFIG=adguardhome
-	PLUGIN_SECTION=luci
+	# Only bound the otherwise-infinite loop; all production scheduling branches
+	# and the real lock-result wrapper are executed unchanged.
+	eval "$(function_body monitor | sed 's/while :; do/while monitor_next_round; do/')"
+	monitor_next_round() {
+		ROUND=$((ROUND + 1))
+		[ "$ROUND" -le 16 ]
+	}
 	monitor_terminate() { exit 0; }
+	reconcile_core_locked() {
+		record "reconcile:$ROUND"
+		MONITOR_SETTINGS_READY=1
+		service_enabled=1
+		memory_requested=1
+		MEMORY_ACTIVE=1
+		MEMORY_BACKING_WORK_DIR=/etc/AdGuardHome
+		persistent_work_dir=/etc/AdGuardHome
+		memory_writeback_interval=1
+		case "$ROUND" in
+			1) MEMORY_ACTIVE=0; memory_writeback_interval=60 ;;
+			2) service_enabled=0; memory_writeback_interval=60 ;;
+			5) memory_writeback_interval=0 ;;
+			13|14|15) memory_writeback_interval=60 ;;
+			9) record dns-reconcile-failed; return 1 ;;
+			16) MONITOR_SETTINGS_READY=0; record settings-failed; return 1 ;;
+		esac
+	}
 	run_locked() {
 		case "$1" in
-			reconcile_core_locked)
-				ROUND=$((ROUND + 1))
-				[ "$ROUND" -le 16 ] || exit 0
-				record "reconcile:$ROUND"
-				;;
+			monitor_interval_locked) "$1" ;;
 			memory_writeback_locked_command)
 				record "writeback:$ROUND"
 				case "$ROUND" in 8) return 1 ;; 12) return 2 ;; esac
@@ -114,12 +163,12 @@ events="${test_tmp}/monitor"
 		esac
 	}
 	uci() {
-		record "interval:$ROUND"
-		case "$ROUND" in
-			1|2|5|16) printf '0\n' ;;
-			13|14|15) printf '60\n' ;;
-			*) printf '1\n' ;;
-		esac
+		record unexpected-uci
+		return 1
+	}
+	normalize_memory_writeback_interval() {
+		record unexpected-normalization
+		return 1
 	}
 	monotonic_seconds() {
 		local previous=0
@@ -143,17 +192,19 @@ events="${test_tmp}/monitor"
 	}
 	monitor
 )
-[ "$(grep -c '^interval:' "$events")" = 16 ]
+[ "$(grep -c '^reconcile:' "$events")" = 16 ]
 [ "$(grep -c '^clock:' "$events")" = 16 ]
-if grep -Eq '^clock:(1|2|5|16)$|^unexpected-clock$' "$events"; then
-	printf 'disabled write-back still reads the clock or scheduling leaked\n' >&2
+if grep -Eq '^clock:(1|2|5|16)$|^unexpected-(clock|uci|normalization)$' "$events"; then
+	printf 'inactive write-back still reads the clock/UCI or scheduling leaked\n' >&2
 	exit 1
 fi
 [ "$(grep '^writeback:' "$events")" = "$(printf 'writeback:8\nwriteback:10\nwriteback:12\nwriteback:15')" ]
-for expected in state:3:160:1 state:5:0:0 state:6:260:1 state:8:325:1 \
+for expected in state:3:160:1 state:5:0:0 state:6:260:1 state:8:325:1 state:9:325:1 \
 	state:10:390:1 state:12:455:1 state:13:4000:60 state:15:7605:60 state:16:0:0; do
 	grep -qx "$expected" "$events"
 done
 grep -q 'retrying in 60 seconds' "$events"
+grep -qx dns-reconcile-failed "$events"
+grep -qx settings-failed "$events"
 
-printf 'ok - five-second monitoring, none-mode cleanup and zero-interval clock bypass\n'
+printf 'ok - live lock-result scheduling, inactive RAM bypass and unchanged retry timing\n'

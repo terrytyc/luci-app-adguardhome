@@ -58,7 +58,7 @@ for required in \
 done
 
 for required in \
-	"grep -Eq '^source_version=2[.]4[.]0-r[12345]\$\$'" \
+	'upgrade_state_source_allowed "$$upgrade_state" || exit 1' \
 	'case "$$was_running" in' \
 	'ADGUARDHOME_BASELINE_RESUME=1' \
 	'/etc/init.d/AdGuardHome start' \
@@ -127,4 +127,4 @@ if printf '%s\n' "$upgrade_defaults" |
 	exit 1
 fi
 
-printf 'ok - 2.4.0-r1/r2/r3/r4/r5 to 2.4.0-r6 baseline lifecycle\n'
+printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6 to 2.4.0-r7 baseline lifecycle\n'

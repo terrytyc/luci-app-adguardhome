@@ -35,6 +35,8 @@ YAML_STAGE=""
 
 # @include private-files
 
+# @include upgrade-policy
+
 bounded_private_file() {
 	local size
 	root_private_file "$1" || return 1
@@ -190,7 +192,7 @@ upgrade_state_is_valid() {
 	root_private_directory "$RUNTIME_DIR" &&
 		root_private_file "$UPGRADE_STATE" &&
 		[ "$(wc -l <"$UPGRADE_STATE" 2>/dev/null)" = 2 ] &&
-		grep -Eq '^source_version=2[.]4[.]0-r[12345]$' "$UPGRADE_STATE" &&
+		upgrade_state_source_allowed "$UPGRADE_STATE" &&
 		grep -Eq '^was_running=[01]$' "$UPGRADE_STATE"
 }
 

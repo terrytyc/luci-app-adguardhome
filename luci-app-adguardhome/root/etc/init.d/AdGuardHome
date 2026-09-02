@@ -225,7 +225,7 @@ open_integration_lock_descriptor() {
 
 run_locked() (
 	local lock_fd="" candidate
-	mkdir -p "${INTEGRATION_LOCK%/*}" || exit 1
+	[ -d "${INTEGRATION_LOCK%/*}" ] || mkdir -p "${INTEGRATION_LOCK%/*}" || exit 1
 	# Pick an unused descriptor instead of clobbering a read-only staged YAML or
 	# the update lock inherited by an asynchronous worker.  The descriptor is
 	# owned by this subshell, so SIGKILL/OOM releases the kernel flock directly.
@@ -648,6 +648,7 @@ memory_state_binds_persistent() {
 load_settings() {
 	local configured_work_dir official_work official_config state_rc=0
 	local MEMORY_STATE_CHECK="${1:-full}"
+	MONITOR_SETTINGS_READY=0
 	ensure_managed_config_present || return 1
 	config_load "$PLUGIN_CONFIG" || return 1
 	validate_loaded_merged_sections || {
@@ -725,6 +726,7 @@ load_settings() {
 			redirect_mode="none"
 			;;
 	esac
+	MONITOR_SETTINGS_READY=1
 }
 
 # The official YAML is the sole runtime authority for the DNS listener.  The
@@ -1744,29 +1746,29 @@ memory_backing_identity() {
 	# encoding.  This keeps the volatile state identity compatible with the ucode
 	# fs metadata without adding a runtime package dependency.
 	value="$(
-		local fd_identity mount_id inode mount_device major minor device fd_extra
+		local fd_identity inode mount_device major minor device fd_extra
 		[ ! -e /proc/self/fd/189 ] || exit 1
 		exec 189<"$target" || exit 1
 		[ -d /proc/self/fd/189 ] && [ /proc/self/fd/189 -ef "$target" ] || exit 1
 		fd_identity="$(awk '
-			$1 == "mnt_id:" { mounts++; mount_id=$2 }
-			$1 == "ino:" { inodes++; inode=$2 }
+			FNR == NR {
+				if ($1 == "mnt_id:") { mounts++; mount_id=$2 }
+				if ($1 == "ino:") { inodes++; inode=$2 }
+				next
+			}
+			$1 == mount_id { matches++; device=$3 }
 			END {
 				if (mounts == 1 && inodes == 1 &&
-				    mount_id ~ /^[0-9]+$/ && inode ~ /^[0-9]+$/)
-					print mount_id, inode
+				    mount_id ~ /^[0-9]+$/ && inode ~ /^[0-9]+$/ && matches == 1)
+					print device, inode
 				else
 					exit 1
 			}
-		' /proc/self/fdinfo/189)" || exit 1
-		read -r mount_id inode fd_extra <<-EOF
+		' /proc/self/fdinfo/189 /proc/self/mountinfo)" || exit 1
+		read -r mount_device inode fd_extra <<-EOF
 		$fd_identity
 		EOF
 		[ -z "$fd_extra" ] || exit 1
-		mount_device="$(awk -v wanted="$mount_id" '
-			$1 == wanted { matches++; device=$3 }
-			END { if (matches == 1) print device; else exit 1 }
-		' /proc/self/mountinfo)" || exit 1
 		case "$mount_device" in
 			[0-9]*:[0-9]*) ;;
 			*) exit 1 ;;
@@ -5027,8 +5029,24 @@ monitor_terminate() {
 	exit 0
 }
 
+monitor_interval_locked() {
+	local MONITOR_SETTINGS_READY=0
+	# Return only this round's normalized scheduling value across run_locked's
+	# subshell.  A DNS-only reconciliation failure must not reset a valid RAM
+	# deadline; failed settings/RAM loading leaves this local flag unset.
+	reconcile_core_locked >/dev/null || true
+	if [ "$MONITOR_SETTINGS_READY" = 1 ] &&
+	   [ "$service_enabled" = 1 ] && [ "$memory_requested" = 1 ] &&
+	   [ "$MEMORY_ACTIVE" = 1 ] &&
+	   [ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ]; then
+		printf '%s\n' "$memory_writeback_interval"
+	else
+		printf '0\n'
+	fi
+}
+
 monitor() {
-	local configured_interval interval last_interval="" interval_seconds=0
+	local interval last_interval="" interval_seconds=0
 	local now=0 next_writeback=0 writeback_rc=0
 	# rc.common serializes init commands with fd 1000.  This long-running
 	# procd command enters through rc.common as well, so release the inherited
@@ -5037,11 +5055,7 @@ monitor() {
 	exec 1000>&-
 	trap monitor_terminate TERM INT
 	while :; do
-		run_locked reconcile_core_locked >/dev/null 2>&1 || true
-		configured_interval="$(uci -q get \
-			"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.memory_writeback_interval")"
-		interval="$(normalize_memory_writeback_interval \
-			"$configured_interval")" || interval=0
+		interval="$(run_locked monitor_interval_locked 2>/dev/null)" || interval=0
 		if [ "$interval" -eq 0 ] 2>/dev/null; then
 			last_interval=0
 			next_writeback=0
