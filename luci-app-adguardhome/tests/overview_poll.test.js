@@ -74,6 +74,8 @@ function loadOverview() {
 		},
 		rpc: {
 			declare(specification) {
+				if (specification.method === 'get_overview')
+					assert.equal(specification.reject, true, 'RPC failures must not become an empty successful overview');
 				return async (...args) => {
 					calls.push(specification.method);
 					assert.ok(handlers[specification.method], 'unexpected RPC ' + specification.method);
@@ -117,6 +119,74 @@ function deferred() {
 	let resolve, reject;
 	const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
 	return { promise, resolve, reject };
+}
+
+async function testUnavailableStatus() {
+	for (const initial of [ 'running', 'stopped', 'request-failure', 'invalid-response' ]) {
+		const state = loadOverview();
+		const failedRequest = () => { throw new Error('temporary RPC failure'); };
+		if (initial === 'request-failure')
+			state.handlers.get_overview = failedRequest;
+		else if (initial === 'invalid-response')
+			state.setOverview({});
+		else
+			state.setOverview({
+				status: { running: initial === 'running', memory_requested: true, memory_active: initial === 'running' },
+				config: { dns_port: 53335, web: { scheme: 'http', host: null, port: 3000 } },
+			});
+		await state.view.render(await state.view.load());
+		const [ service, storage, management ] = state.elements.filter(node =>
+			node.tag === 'span' && [ 'span', 'a' ].includes(node.child?.tag));
+		if (initial === 'request-failure' || initial === 'invalid-response') {
+			assert.equal(service.child.child, 'Unavailable', 'the initial render must not invent a stopped state');
+			assert.equal(storage.child.child, 'Unavailable');
+		}
+		const committed = state.view.committedSettings;
+		const draft = state.view.settingsMap.initialData;
+		draft.config.work_dir = '/etc/AdGuardHome-draft';
+		state.handlers.get_overview = failedRequest;
+		await state.view.statusPollCallback();
+		assert.equal(service.child.child, 'Unavailable', `${initial}: a failed query is not a stopped core`);
+		assert.equal(storage.child.child, 'Unavailable', `${initial}: a failed query cannot report persistent storage`);
+		assert.equal(management.child.child[0].attrs.disabled, 'disabled');
+		assert.equal(management.child.child[2].child, 'Service status: Unavailable');
+		state.updates.length = 0;
+		await state.view.statusPollCallback();
+		assert.equal(state.updates.length, 0, 'repeated failures must not redraw an unchanged unknown state');
+		state.handlers.get_overview = () => ({
+			status: { running: true, memory_requested: true, memory_active: true },
+			config: { dns_port: 5354, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
+		});
+		await state.view.statusPollCallback();
+		assert.equal(service.child.child, 'Running');
+		assert.equal(storage.child.child, 'Memory');
+		assert.equal(management.child.attrs.href, 'https://adg.example:10443/');
+		assert.equal(state.polls.size, 1, 'the existing timer must recover without another polling mechanism');
+		assert.equal(state.view.committedSettings, committed);
+		assert.equal(draft.config.work_dir, '/etc/AdGuardHome-draft', 'status failure/recovery must preserve unsaved settings');
+	}
+}
+
+async function testManagementURLValidation() {
+	const state = loadOverview();
+	await state.view.render(await state.view.load());
+	const management = state.elements.find(node => node.tag === 'span' && node.child?.tag === 'a');
+	for (const web of [
+		{ scheme: 'javascript', host: null, port: 3000 },
+		{ scheme: 'http', host: null, port: 0 },
+		{ scheme: 'http', host: null, port: 65536 },
+		{ scheme: 'http', host: 'another.example', port: 3000 },
+		{ scheme: 'https', host: null, port: 443 },
+		...[ 'bad/host', 'a..b', '127.1', '0177.1', '0x7f000001' ].map(host => ({ scheme: 'https', host, port: 443 })),
+	]) {
+		state.setOverview({ status: { running: true }, config: { web } });
+		await state.view.statusPollCallback();
+		assert.equal(management.child.child[0].attrs.disabled, 'disabled', JSON.stringify(web));
+	}
+	state.setOverview({ status: { running: true }, config: { web: { scheme: 'https', host: 'ADG.EXAMPLE.', port: '443' } } });
+	await state.view.statusPollCallback();
+	assert.equal(management.child.attrs.href, 'https://adg.example./',
+		'normalized endpoints must retain URL assignment checks and valid default ports');
 }
 
 async function testApplyRefresh() {
@@ -361,14 +431,17 @@ async function main() {
 		config: { dns_port: 65536, web: { scheme: 'https', host: 'bad/host', port: 443 } },
 	});
 	await callback();
-	assert.equal(state.updates.length, 1, 'already stopped persistent status must not redraw');
-	assert.equal(state.updates[0].value, 'Unavailable');
+	assert.equal(state.updates.length, 4, 'an invalid running flag must produce unknown status, storage and endpoint state');
+	assert.equal(state.updates[2].value, 'Unavailable');
 	assert.equal(management.child.tag, 'span');
 	state.updates.length = 0;
 	state.setOverview({
 		status: { running: false, memory_requested: false, memory_active: false },
 		config: { dns_port: null, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
 	});
+	await callback();
+	assert.equal(state.updates.length, 3, 'a confirmed stopped response must replace the unknown-state messages');
+	state.updates.length = 0;
 	await callback();
 	assert.equal(state.updates.length, 0, 'endpoint changes while stopped must not rebuild the disabled button');
 	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
@@ -391,7 +464,7 @@ async function main() {
 	state.handlers.get_overview = () => { throw new Error('temporary RPC failure'); };
 	await callback();
 	assert.equal(state.errors.length, 1, 'real RPC failures must remain diagnosable');
-	assert.equal(state.updates.length, 0, 'an unchanged unavailable display must not redraw on RPC failure');
+	assert.equal(state.updates.length, 3, 'a failed status query must not continue to claim that the core is stopped');
 	assert.equal(state.polls.size, 1, 'a transient failure must not permanently stop status polling');
 
 	let resolveReply;
@@ -417,6 +490,8 @@ async function main() {
 	assert.doesNotMatch(source, /require adguardhome\.bcrypt/,
 		'loading the overview must not load the bcrypt dependency before it is needed');
 	await testApplyRefresh();
+	await testUnavailableStatus();
+	await testManagementURLValidation();
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

@@ -66,6 +66,7 @@ async function fetchLog(source, lines, scope) {
 function logOutput(result) {
 	return E('textarea', {
 		class: 'cbi-input-textarea',
+		'aria-label': result.source === 'plugin' ? _('Plugin Runtime Log') : _('AdGuard Home Core Log'),
 		readonly: 'readonly',
 		rows: 20,
 		spellcheck: 'false',

@@ -281,6 +281,43 @@ async function runSettingsSubmissionScenario(kind) {
 	};
 }
 
+async function testYamlTemplateReset() {
+	for (const accepted of [ true, false ]) {
+		const state = loadOperation();
+		const scope = state.operation.createPageScope();
+		const oldHash = 'a'.repeat(64), draft = '# unsaved draft\n', template = 'dns:\n  port: 53335\n';
+		const calls = [];
+		const view = loadView('yaml', state.operation, {}, {
+			async reset_yaml(hash) {
+				calls.push([ 'template', hash ]);
+				return accepted ? { content: template } : { error: 'YAML changed since the page was loaded' };
+			},
+			async set_yaml(content, hash) {
+				calls.push([ 'save', content, hash ]);
+				return { error: 'YAML changed since the page was loaded' };
+			},
+		});
+		Object.assign(view, {
+			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
+			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
+		});
+		await view.resetYaml();
+		assert.deepEqual(calls, [[ 'template', oldHash ]], 'loading the template must not save, apply or poll a job');
+		assert.equal(view.yamlEditor.value, accepted ? template : draft);
+		assert.equal(view.yamlHash, oldHash, 'a template response without SHA must retain the active file revision');
+		assert.equal(view.yamlEditor.readOnly, false);
+		if (accepted) {
+			view.yamlEditor.value += '# edited before save\n';
+			await view.saveYaml();
+			assert.deepEqual(calls[1], [ 'save', view.yamlEditor.value, oldHash ],
+				'saving an edited template must still compare against the originally loaded active YAML');
+			assert.equal(view.yamlEditor.value, template + '# edited before save\n', 'a CAS rejection must retain the edited template');
+		}
+		assert.match(state.rendered.at(-1).text, /YAML changed since the page was loaded/);
+		state.operation._clearTimer();
+	}
+}
+
 async function testYamlSubmissions() {
 	for (const kind of [ 'success', 'cas-rejected', 'response-lost', 'bad-token', 'leave-request', 'leave-status' ]) {
 		const state = loadOperation();
@@ -731,6 +768,7 @@ async function main() {
 	assert.doesNotMatch(yaml, /inactive:\s*true/,
 		'an inactive YAML load must not render an empty editor');
 
+	await testYamlTemplateReset();
 	await testYamlSubmissions();
 	console.log('navigation lifecycle, shared job polling and settings/YAML reconciliation tests passed');
 }

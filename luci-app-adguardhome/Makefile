@@ -9,7 +9,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=9
+PKG_RELEASE:=10
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -75,7 +75,6 @@ official_delta_is_clean() {
 }
 
 snapshot_dir=/root/.luci-app-adguardhome
-snapshot_uci="$$snapshot_dir/official-adguardhome.uci"
 snapshot_config="$$snapshot_dir/official-adguardhome.config"
 snapshot_state="$$snapshot_dir/official-adguardhome.state"
 snapshot_version="$$snapshot_dir/snapshot-version"
@@ -90,11 +89,9 @@ source_version=""
 
 validate_original_snapshot() {
 	root_private_directory "$$snapshot_dir" &&
-		bounded_private_file "$$snapshot_uci" &&
 		bounded_private_file "$$snapshot_config" &&
 		root_private_file "$$snapshot_state" &&
 		root_private_file "$$snapshot_version" &&
-		grep -qx 'package adguardhome' "$$snapshot_uci" &&
 		grep -Eq '^was_running=[01]$$' "$$snapshot_state" &&
 		[ "$$(wc -l <"$$snapshot_state" 2>/dev/null)" = 1 ] &&
 		grep -qx '1' "$$snapshot_version"
@@ -102,8 +99,7 @@ validate_original_snapshot() {
 
 cleanup_snapshot_stage() {
 	[ -n "$$snapshot_stage" ] || return 0
-	rm -f "$$snapshot_stage/official-adguardhome.uci" \
-		"$$snapshot_stage/official-adguardhome.config" \
+	rm -f "$$snapshot_stage/official-adguardhome.config" \
 		"$$snapshot_stage/official-adguardhome.state" \
 		"$$snapshot_stage/snapshot-version" 2>/dev/null || true
 	rmdir "$$snapshot_stage" 2>/dev/null || true
@@ -120,8 +116,7 @@ create_original_snapshot() {
 	run_bounded 5 1 /bin/dd if=/etc/config/adguardhome \
 		of="$$snapshot_stage/official-adguardhome.config" bs=4096 count=129 \
 		2>/dev/null || return 1
-	run_bounded 5 1 uci -q export adguardhome \
-		>"$$snapshot_stage/official-adguardhome.uci" || return 1
+	run_bounded 5 1 uci -q export adguardhome >/dev/null || return 1
 	if [ -x /etc/init.d/adguardhome ]; then
 		run_bounded 5 1 /etc/init.d/adguardhome running \
 			>/dev/null 2>&1 || running_rc=$$?
@@ -345,7 +340,6 @@ bounded_private_file() {
 
 snapshot_dir=/root/.luci-app-adguardhome
 snapshot_config="$$snapshot_dir/official-adguardhome.config"
-snapshot_uci="$$snapshot_dir/official-adguardhome.uci"
 snapshot_state="$$snapshot_dir/official-adguardhome.state"
 snapshot_version="$$snapshot_dir/snapshot-version"
 managed_snapshot="$$snapshot_dir/managed-adguardhome.config"
@@ -354,7 +348,6 @@ remove_state="$$runtime_dir/remove-ok"
 
 root_private_directory "$$snapshot_dir" &&
 	bounded_private_file "$$snapshot_config" &&
-	bounded_private_file "$$snapshot_uci" &&
 	root_private_file "$$snapshot_state" &&
 	root_private_file "$$snapshot_version" &&
 	bounded_private_file "$$managed_snapshot" &&
@@ -448,6 +441,10 @@ root_private_directory "$$snapshot_dir" || exit 1
 for snapshot_file in \
 	official-adguardhome.uci official-adguardhome.config \
 	official-adguardhome.state snapshot-version managed-adguardhome.config; do
+	if [ "$$snapshot_file" = official-adguardhome.uci ] &&
+	   [ ! -e "$$snapshot_dir/$$snapshot_file" ] && [ ! -L "$$snapshot_dir/$$snapshot_file" ]; then
+		continue
+	fi
 	root_private_file "$$snapshot_dir/$$snapshot_file" || exit 1
 	rm -f "$$snapshot_dir/$$snapshot_file" || exit 1
 done

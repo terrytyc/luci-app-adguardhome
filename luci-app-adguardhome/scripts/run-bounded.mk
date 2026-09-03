@@ -1,6 +1,6 @@
 define AdGuardHome/RunBounded
 run_bounded() (
-	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0
+	local limit="$$1" grace="$$2" marker="" child="" watchdog="" rc=0 expired=0 stdin_fd=187
 	shift 2
 	case "$$limit" in ""|*[!0-9]*) exit 125 ;; esac
 	case "$$grace" in ""|*[!0-9]*) exit 125 ;; esac
@@ -33,11 +33,14 @@ run_bounded() (
 		exit 125
 	}
 	trap bounded_abort HUP INT QUIT TERM
-	[ ! -e /proc/self/fd/187 ] || bounded_abort
-	exec 187<&0 || bounded_abort
-	/usr/bin/setsid "$$@" <&187 187<&- &
+	while [ -L "/proc/self/fd/$$stdin_fd" ]; do stdin_fd=$$((stdin_fd + 1)); done
+	eval "exec $${stdin_fd}<&0" || bounded_abort
+	(
+		eval "exec 0<&$${stdin_fd} $${stdin_fd}<&-" || exit 125
+		exec /usr/bin/setsid "$$@"
+	) &
 	child=$$!
-	exec 187<&-
+	eval "exec $${stdin_fd}<&-"
 	(
 		bounded_sleeper=""
 		bounded_watchdog_abort() {

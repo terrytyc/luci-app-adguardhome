@@ -25,6 +25,7 @@ const callGetOverview = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_overview',
 	expect: { '': { status: {}, config: {} } },
+	reject: true,
 });
 
 const callGetCoreVersion = rpc.declare({
@@ -118,7 +119,7 @@ async function getOverview(scope) {
 		const result = await operation.requestActive(callGetOverview, scope);
 		return {
 			status: {
-				running: result?.status?.running === true,
+				running: typeof result?.status?.running === 'boolean' ? result.status.running : null,
 				memoryRequested: result?.status?.memory_requested === true,
 				memoryActive: result?.status?.memory_active === true,
 			},
@@ -129,7 +130,7 @@ async function getOverview(scope) {
 			throw error;
 		console.error('Unable to query the AdGuard Home overview:', error);
 		return {
-			status: { running: false, memoryRequested: false, memoryActive: false },
+			status: { running: null, memoryRequested: false, memoryActive: false },
 			config: { dnsPort: null, web: null },
 		};
 	}
@@ -172,12 +173,16 @@ function normalizeConfigInfo(result) {
 }
 
 function renderServiceStatus(running) {
+	if (running == null)
+		return E('span', {}, _('Unavailable'));
 	return E('span', {
 		style: `color: var(${running ? '--success-color-high, #2e7d32' : '--error-color-high, #c62828'}); font-weight: bold`,
 	}, running ? _('Running') : _('Not running'));
 }
 
 function renderStorageStatus(mode) {
+	if (mode === 'unknown')
+		return E('span', {}, _('Unavailable'));
 	if (mode === 'memory')
 		return E('span', { style: 'color: var(--success-color-high, #2e7d32); font-weight: bold' }, _('Memory'));
 	if (mode === 'fallback')
@@ -191,18 +196,11 @@ function buildManagementURL(endpoint) {
 	if (!endpoint)
 		return null;
 
-	const port = normalizePort(endpoint.port);
-	if (port == null || (endpoint.scheme !== 'http' && endpoint.scheme !== 'https'))
-		return null;
-
 	const url = new URL(window.location.href);
 	url.protocol = `${endpoint.scheme}:`;
 	url.username = '';
 	url.password = '';
 	if (endpoint.scheme === 'https') {
-		if (typeof endpoint.host !== 'string' || !/^[A-Za-z0-9.-]+$/.test(endpoint.host))
-			return null;
-
 		const expectedHost = endpoint.host.toLowerCase().replace(/\.$/, '');
 		try {
 			url.hostname = endpoint.host;
@@ -213,7 +211,7 @@ function buildManagementURL(endpoint) {
 		if (assignedHost !== expectedHost)
 			return null;
 	}
-	url.port = String(port);
+	url.port = String(endpoint.port);
 	url.pathname = '/';
 	url.search = '';
 	url.hash = '';
@@ -224,7 +222,7 @@ function buildManagementURL(endpoint) {
 function overviewDisplayValues({ status, config }) {
 	return {
 		running: status.running,
-		storage: status.memoryActive ? 'memory'
+		storage: status.running == null ? 'unknown' : status.memoryActive ? 'memory'
 			: status.memoryRequested ? (status.running ? 'fallback' : 'pending') : 'persistent',
 		dnsPort: String(config.dnsPort ?? _('Unavailable')),
 		management: status.running ? buildManagementURL(config.web) : false,
@@ -240,7 +238,7 @@ function renderManagementLink(url, running) {
 				disabled: 'disabled',
 			}, _('Open Web Interface')),
 			' ',
-			E('em', {}, running
+			E('em', {}, running == null ? `${_('Service status')}: ${_('Unavailable')}` : running
 				? _('The YAML management endpoint is unavailable or invalid.')
 				: _('Enable AdGuard Home and click Save & Apply; the management interface becomes available after the service is running.')),
 		]);
@@ -618,7 +616,7 @@ return view.extend({
 				dom.content(storageContainer, renderStorageStatus(next.storage));
 			if (next.dnsPort !== displayed.dnsPort)
 				dom.content(dnsPortContainer, next.dnsPort);
-			if (next.management !== displayed.management)
+			if (next.management !== displayed.management || next.running !== displayed.running)
 				dom.content(managementContainer, renderManagementLink(next.management, next.running));
 			displayed = next;
 		};

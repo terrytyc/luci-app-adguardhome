@@ -136,8 +136,12 @@ for forbidden in ("template_for_path", "TEMPLATE_FILTER_PATTERN", "TEMPLATE_WORK
 reset_backend = between("function reset_yaml(expected_hash)", "function yaml_config_values(")
 if reset_backend.count("let content = read_template();") != 1:
     raise SystemExit("reset_yaml does not read the packaged template directly")
-if "return { content, sha256: sha256(content) };" not in reset_backend:
+if "return { content };" not in reset_backend:
     raise SystemExit("reset_yaml does not return the packaged template to the editor")
+if "sha256(content)" in reset_backend:
+    raise SystemExit("reset_yaml still computes an unused template revision")
+if "yaml.sha256 != expected_hash" not in reset_backend:
+    raise SystemExit("reset_yaml no longer checks the active YAML revision")
 for forbidden in ("update_yaml(", "write(", "yaml_update_job"):
     if forbidden in reset_backend:
         raise SystemExit(f"reset_yaml still applies the template directly: {forbidden}")

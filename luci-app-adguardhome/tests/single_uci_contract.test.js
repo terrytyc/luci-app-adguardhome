@@ -105,6 +105,7 @@ async function testYamlViewPermissionGuard() {
 
 	const loaded = await definition.load.call(definition);
 	definition.render.call(definition, loaded);
+	assert.equal(String(definition.yamlEditor.attrs['aria-label']), 'YAML Configuration');
 	assert.equal(definition.yamlEditor.readOnly, true,
 		'the frontend must keep the YAML editor read-only without write permission');
 	assert.equal(definition.saveButton.disabled, true,

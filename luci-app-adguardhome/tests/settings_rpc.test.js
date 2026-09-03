@@ -567,3 +567,24 @@ resetWrites();
 assert.equal(writeSandbox.api.replace_yaml_job(token, 'invalid'), false);
 assert.equal(writeFixture.entries.size, 0, 'invalid state bytes must be rejected before staging');
 console.log('shared atomic job writer creation/replacement policy tests passed');
+
+let randomBytes;
+const randomSandbox = {
+	type: value => typeof value,
+	length: value => value.length,
+	hexenc: value => Buffer.from(value, 'latin1').toString('hex'),
+	readfile(filename, limit) {
+		assert.equal(filename, '/dev/urandom');
+		assert.equal(limit, 16, 'random reads must remain bounded to 128 bits');
+		return randomBytes;
+	},
+};
+vm.createContext(randomSandbox);
+vm.runInContext(extractFunction('random_token') + '\nthis.token = random_token;', randomSandbox);
+for (const bytes of [ null, '', 'a'.repeat(15), 'a'.repeat(17) ]) {
+	randomBytes = bytes;
+	assert.equal(randomSandbox.token(), null, 'failed or short random reads must be rejected');
+}
+randomBytes = '\x00\xff'.repeat(8);
+assert.equal(randomSandbox.token(), '00ff'.repeat(8), 'binary random bytes must survive hex encoding');
+console.log('bounded native random-token read contract tests passed');

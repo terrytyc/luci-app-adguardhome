@@ -10,7 +10,6 @@ OFFICIAL_DEFAULT_CONFIG="/etc/adguardhome/adguardhome.yaml"
 OFFICIAL_DEFAULT_WORK_DIR="/var/lib/adguardhome"
 KEEP_FILE="/lib/upgrade/keep.d/luci-app-adguardhome"
 SNAPSHOT_DIR="/root/.luci-app-adguardhome"
-SNAPSHOT_UCI="$SNAPSHOT_DIR/official-adguardhome.uci"
 SNAPSHOT_CONFIG="$SNAPSHOT_DIR/official-adguardhome.config"
 SNAPSHOT_STATE="$SNAPSHOT_DIR/official-adguardhome.state"
 SNAPSHOT_VERSION="$SNAPSHOT_DIR/snapshot-version"
@@ -28,6 +27,7 @@ SOURCE_CONFIG_FILE=""
 USING_TEMPLATE=0
 UCI_CHANGED=0
 INSTALL_COMMITTED=0
+INSTALL_STARTED=0
 SNAPSHOT_STAGE=""
 YAML_STAGE=""
 
@@ -130,11 +130,9 @@ official_delta_is_clean() {
 
 validate_original_snapshot() {
 	root_private_directory "$SNAPSHOT_DIR" &&
-		bounded_private_file "$SNAPSHOT_UCI" &&
 		bounded_private_file "$SNAPSHOT_CONFIG" &&
 		root_private_file "$SNAPSHOT_STATE" &&
 		root_private_file "$SNAPSHOT_VERSION" &&
-		grep -qx 'package adguardhome' "$SNAPSHOT_UCI" &&
 		grep -Eq '^was_running=[01]$' "$SNAPSHOT_STATE" &&
 		[ "$(wc -l <"$SNAPSHOT_STATE" 2>/dev/null)" = 1 ] &&
 		grep -qx '1' "$SNAPSHOT_VERSION"
@@ -142,8 +140,7 @@ validate_original_snapshot() {
 
 cleanup_snapshot_stage() {
 	[ -n "$SNAPSHOT_STAGE" ] || return 0
-	rm -f "$SNAPSHOT_STAGE/official-adguardhome.uci" \
-		"$SNAPSHOT_STAGE/official-adguardhome.config" \
+	rm -f "$SNAPSHOT_STAGE/official-adguardhome.config" \
 		"$SNAPSHOT_STAGE/official-adguardhome.state" \
 		"$SNAPSHOT_STAGE/snapshot-version" 2>/dev/null || true
 	rmdir "$SNAPSHOT_STAGE" 2>/dev/null || true
@@ -160,8 +157,7 @@ create_original_snapshot() {
 	run_bounded 5 1 /bin/dd if=/etc/config/adguardhome \
 		of="$SNAPSHOT_STAGE/official-adguardhome.config" bs=4096 count=129 \
 		2>/dev/null || return 1
-	run_bounded 5 1 uci -q export adguardhome \
-		>"$SNAPSHOT_STAGE/official-adguardhome.uci" || return 1
+	run_bounded 5 1 uci -q export adguardhome >/dev/null || return 1
 	if [ -x /etc/init.d/adguardhome ]; then
 		run_bounded 5 1 /etc/init.d/adguardhome running \
 			>/dev/null 2>&1 || running_rc=$?
@@ -380,11 +376,13 @@ refresh_managed_config_snapshot() {
 	root_private_directory "$SNAPSHOT_DIR" || return 1
 	temporary="$(mktemp "$SNAPSHOT_DIR/.managed-adguardhome.config.XXXXXX")" ||
 		return 1
-	chown 0:0 "$temporary" && chmod 0600 "$temporary" || return 1
-	run_bounded 5 1 /bin/dd if=/etc/config/adguardhome of="$temporary" \
-		bs=4096 count=129 2>/dev/null || return 1
-	bounded_private_file "$temporary" || return 1
-	mv -f "$temporary" "$MANAGED_CONFIG_SNAPSHOT" || return 1
+	if ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! run_bounded 5 1 /bin/dd if=/etc/config/adguardhome of="$temporary" \
+		bs=4096 count=129 2>/dev/null || ! bounded_private_file "$temporary" ||
+	   ! mv -f "$temporary" "$MANAGED_CONFIG_SNAPSHOT"; then
+		rm -f "$temporary"
+		return 1
+	fi
 	bounded_private_file "$MANAGED_CONFIG_SNAPSHOT" &&
 		cmp -s /etc/config/adguardhome "$MANAGED_CONFIG_SNAPSHOT"
 }
@@ -411,7 +409,7 @@ cleanup_install() {
 	local rc=$?
 	cleanup_snapshot_stage
 	[ -z "$YAML_STAGE" ] || rm -f "$YAML_STAGE" 2>/dev/null || true
-	if [ "$INSTALL_COMMITTED" != 1 ]; then
+	if [ "$INSTALL_STARTED" = 1 ] && [ "$INSTALL_COMMITTED" != 1 ]; then
 		restore_original_config >/dev/null 2>&1 || true
 	fi
 	exit "$rc"
@@ -450,6 +448,7 @@ select_clean_install_source || {
 	echo "The official AdGuard Home source paths are outside the supported layout." >&2
 	exit 1
 }
+INSTALL_STARTED=1
 run_bounded 20 2 /etc/init.d/adguardhome stop >/dev/null 2>&1 || {
 	echo "Unable to stop the official AdGuard Home service for initialization." >&2
 	exit 1

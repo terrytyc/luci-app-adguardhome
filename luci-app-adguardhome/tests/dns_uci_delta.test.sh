@@ -104,4 +104,43 @@ uci set firewall.defaults.forward=ACCEPT
 before="$(uci changes firewall)"
 clear_firewall_redirect || exit 1
 [ "$(uci changes firewall)" = "$before" ]
+
+# The real settings loader must tell monitoring that an ordinary pending edit
+# is busy, without stopping a healthy core or touching DNS/the user's delta.
+printf "config adguardhome 'config'\n option enabled '1'\n option work_dir '/etc/AdGuardHome'\nconfig luci 'luci'\n option redirect 'none'\n" | uci import adguardhome
+UCI_CONFIG_DIRECTORY="$test_tmp/config"
+UCI_DELTA_DIRECTORY="$test_tmp/delta"
+OFFICIAL_SERVICE=/bin/true
+CORE_RUNNING=1
+CORE_STOPS=0
+DNS_CLEANUPS=0
+clear_recorded_integration_locked() { DNS_CLEANUPS=$((DNS_CLEANUPS + 1)); }
+wait_for_core_stopped() { CORE_RUNNING=0; CORE_STOPS=$((CORE_STOPS + 1)); }
+uci set adguardhome.luci.memory_writeback_interval=120
+before="$(uci changes adguardhome)"
+committed="$(cksum <"$test_tmp/config/adguardhome")"
+rc=0
+load_settings light || rc=$?
+[ "$rc:$MONITOR_SETTINGS_READY" = 2:0 ]
+reconcile_core_locked
+[ "$CORE_RUNNING:$CORE_STOPS:$DNS_CLEANUPS" = 1:0:0 ]
+[ "$(uci changes adguardhome)" = "$before" ]
+[ "$(cksum <"$test_tmp/config/adguardhome")" = "$committed" ]
+uci revert adguardhome
+ensure_managed_config_present
+[ "$CORE_RUNNING:$CORE_STOPS:$DNS_CLEANUPS" = 1:0:0 ]
+
+# A pending edit must not hide an unsafe committed file, and malformed UCI
+# must still fail closed rather than being treated as a harmless busy round.
+uci set adguardhome.luci.memory_writeback_interval=120
+chmod 0666 "$test_tmp/config/adguardhome"
+rc=0
+reconcile_core_locked || rc=$?
+[ "$rc:$CORE_RUNNING:$CORE_STOPS:$DNS_CLEANUPS" = 1:0:1:1 ]
+chmod 0600 "$test_tmp/config/adguardhome"
+uci revert adguardhome
+printf "config 'unterminated\n" >"$test_tmp/config/adguardhome"
+rc=0
+reconcile_core_locked || rc=$?
+[ "$rc:$CORE_STOPS:$DNS_CLEANUPS" = 1:2:2 ]
 printf 'ok - real UCI rejects existing CLI deltas without committing or reverting them\n'

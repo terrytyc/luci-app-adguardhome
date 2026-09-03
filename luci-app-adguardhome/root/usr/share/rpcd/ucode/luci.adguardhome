@@ -525,13 +525,9 @@ function newest_first_log(output, source) {
 		if (length(line))
 			push(records, line);
 
-	let newest_first = [];
-	for (let i = length(records) - 1; i >= 0; i--)
-		push(newest_first, records[i]);
-
 	return {
-		log: join('\n', newest_first),
-		lines: length(newest_first),
+		log: join('\n', reverse(records)),
+		lines: length(records),
 		source,
 	};
 }
@@ -589,31 +585,7 @@ function read_log(value, requested_source) {
 }
 
 function random_token() {
-	let file = null;
-	let bytes = null;
-
-	try {
-		file = open('/dev/urandom', 'r');
-		if (!file)
-			return null;
-
-		bytes = file.read(16);
-		file.close();
-		file = null;
-	}
-	catch (error) {
-		if (file) {
-			try {
-				file.close();
-			}
-			catch (close_error) {
-				// Ignore cleanup errors and report random generation failure.
-			}
-		}
-
-		return null;
-	}
-
+	let bytes = readfile('/dev/urandom', 16);
 	return type(bytes) == 'string' && length(bytes) == 16 ? hexenc(bytes) : null;
 }
 
@@ -1694,7 +1666,7 @@ function reset_yaml(expected_hash) {
 	// Restoring the template is an editor-only operation.  Return the audited
 	// packaged bytes without queueing an update or touching the active YAML;
 	// set_yaml remains the sole validate/save/apply boundary.
-	return { content, sha256: sha256(content) };
+	return { content };
 }
 
 function yaml_config_values(content) {

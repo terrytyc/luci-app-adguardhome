@@ -123,6 +123,21 @@ cmp -s "${temp_dir}/stdin.expected" "${temp_dir}/stdin.actual" || {
 	exit 1
 }
 
+# The inherited job/staging descriptor may legitimately be 187. Keep it and
+# every occupied neighbor intact while capturing actual pipeline input.
+(
+	exec 187<"${temp_dir}/stdin.expected"
+	for inherited_fd in 188 189 190 191 192 193 194 195 196 197 198 199; do
+		eval "exec ${inherited_fd}</dev/null"
+	done
+	printf 'alpha\nbeta\n' | run_bounded 30 1 /bin/dd of="${temp_dir}/stdin.occupied" 2>/dev/null
+	[ /proc/self/fd/187 -ef "${temp_dir}/stdin.expected" ]
+	for inherited_fd in 188 189 190 191 192 193 194 195 196 197 198 199; do
+		[ /proc/self/fd/"$inherited_fd" -ef /dev/null ]
+	done
+	cmp -s "${temp_dir}/stdin.expected" "${temp_dir}/stdin.occupied"
+)
+
 # A successful short command must cancel both the watchdog and its long sleep.
 run_bounded 913 1 /bin/true
 # Exact argv matching also catches an orphaned sleep.

@@ -87,6 +87,7 @@ log_error() {
 }
 
 # @include keep-active-config
+# @include private-files
 
 prepare_managed_config_snapshot_dir() {
 	if [ ! -e "$MANAGED_CONFIG_SNAPSHOT_DIR" ] &&
@@ -149,13 +150,14 @@ restore_managed_config_snapshot() {
 
 ensure_managed_config_present() {
 	local target="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}"
-	# A missing committed file plus a pending delta is ambiguous.  Never restore
-	# a snapshot underneath an unrelated LuCI/CLI edit.
-	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
 	if [ -e "$target" ] || [ -L "$target" ]; then
-		uci_guard_config_file_valid "$target"
+		uci_guard_config_file_valid "$target" || return 1
+		uci_guard_no_delta "$OFFICIAL_CONFIG"
 		return
 	fi
+	# A pending edit is busy (2), not a broken active configuration.  Never
+	# restore a missing committed file underneath that edit.
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return $?
 	# A settings CAS must remain read-only until its locked revision comparison.
 	[ "${SETTINGS_CAS_GUARD:-0}" != 1 ] || return 1
 	restore_managed_config_snapshot || {
@@ -200,7 +202,7 @@ validate_loaded_merged_sections() {
 }
 
 # Run one command in its own session with a self-contained wall-clock guard.
-# Descriptor 187 preserves pipeline input before ash starts the async child.
+# An unused descriptor preserves pipeline input before ash starts the child.
 # @include run-bounded
 
 open_integration_lock_descriptor() {
@@ -401,17 +403,17 @@ validate_managed_work_dir() {
 	validate_managed_work_dir_namespace "$1" || return 1
 	[ "$value" = "$DEFAULT_WORK_DIR" ] && return 0
 	[ -e "$value" ] || [ -L "$value" ] || return 0
-	# An active v4 state record authenticates the existing custom backing even
-	# while the authoritative settings contain a validated next-workdir request.
-	if memory_state_binds_persistent "$value"; then
-		return 0
-	fi
 	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
 	[ -n "$official_work" ] ||
 		official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
 	# config_file is derived from this authoritative work_dir and is normalized
 	# separately.  It must never be required as a second custom-directory anchor.
 	if [ "${official_work%/}" = "$value" ]; then
+		return 0
+	fi
+	# Only a previous backing needs the RAM-state fallback.  The current UCI
+	# workdir is already anchored above; load_settings validates RAM state once.
+	if memory_state_binds_persistent "$value"; then
 		return 0
 	fi
 	log_error "Refusing an existing custom work directory not anchored by official adguardhome UCI: '$value'"
@@ -643,7 +645,7 @@ load_settings() {
 	local configured_work_dir official_work official_config state_rc=0
 	local MEMORY_STATE_CHECK="${1:-full}"
 	MONITOR_SETTINGS_READY=0
-	ensure_managed_config_present || return 1
+	ensure_managed_config_present || return $?
 	config_load "$PLUGIN_CONFIG" || return 1
 	validate_loaded_merged_sections || {
 		log_error "Merged AdGuard Home UCI must contain exactly the named config and luci sections"
@@ -662,7 +664,7 @@ load_settings() {
 	# readers within the same settings snapshot.
 	config_get official_work "$OFFICIAL_SECTION" work_dir ""
 	config_get official_config "$OFFICIAL_SECTION" config_file ""
-	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return $?
 	previous_work_dir="$official_work"
 	# config_file is never an independent YAML selector.  Validate the
 	# authoritative workdir first, then repair its derived field before any
@@ -1537,33 +1539,19 @@ memory_source_size_kib() (
 	printf '%s\n' "$data_size"
 )
 
-memory_copy_data_to_runtime() (
-	local source="$1" target="$2" metadata mode links original_owner original_group remainder
-	[ -d "$source" ] && [ ! -L "$source" ] || exit 1
-	[ ! -e "$target" ] && [ ! -L "$target" ] || exit 1
-	metadata="$(LC_ALL=C ls -ldn "$persistent_work_dir" 2>/dev/null)" || exit 1
-	read -r mode links original_owner original_group remainder <<-EOF
-	$metadata
-	EOF
-	case "$original_owner:$original_group:$mode" in
-		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
-		*) exit 1 ;;
-	esac
-	trap 'restore_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
-	chown "0:${ADGUARD_GID}" "$persistent_work_dir" &&
-		chmod 0710 "$persistent_work_dir" || exit 1
-	uid853_tree_is_plain "$source" || exit 1
-	mkdir -m 0700 "$target" || exit 1
-	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" || exit 1
+memory_copy_data_to_runtime() {
+	local source="$1" target="$2"
+	[ -d "$source" ] && [ ! -L "$source" ] || return 1
+	[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
+	uid853_tree_is_plain "$source" || return 1
+	mkdir -m 0700 "$target" || return 1
+	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" || return 1
 	run_bounded 120 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-		-n AGHMemoryCopy -x /bin/cp -- -pR "${source}/." "$target/" || exit 1
-	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" && chmod 0700 "$target" || exit 1
-	uid853_tree_is_plain "$target" || exit 1
-	restore_workdir_access "$persistent_work_dir" \
-		"$original_owner" "$original_group" || exit 1
-	trap - EXIT
-)
+		-n AGHMemoryCopy -x /bin/cp -- -pR "${source}/." "$target/" || return 1
+	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" && chmod 0700 "$target" || return 1
+	uid853_tree_is_plain "$target"
+}
 
 memory_capacity_available() {
 	local source_size reserve required tmp_available memory_available
@@ -1670,41 +1658,55 @@ memory_prepare_runtime_locked() {
 	adguard_uid_process_exists && return 1
 	memory_capacity_available || return 1
 	memory_discard_incomplete_runtime_locked "$persistent_work_dir" || return 1
-	if ! memory_create_runtime_parent; then
-		return 1
-	fi
-	if ! mkdir -m 0700 "$MEMORY_WORK_DIR" ||
-	   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$MEMORY_WORK_DIR"; then
-		memory_discard_incomplete_runtime_locked "$persistent_work_dir" >/dev/null 2>&1 || true
-		return 1
-	fi
 	data_source="${persistent_work_dir}/data"
 	data_target="$MEMORY_DATA_DIR"
-	if [ -e "$data_source" ] || [ -L "$data_source" ]; then
-		if ! memory_copy_data_to_runtime "$data_source" "$data_target"; then
-			memory_discard_incomplete_runtime_locked "$persistent_work_dir" >/dev/null 2>&1 || true
-			return 1
+	if ! (
+		# Keep EXIT-trap state in this subshell, not ash function locals.
+		original_owner="" original_group=""
+		metadata="$(LC_ALL=C ls -ldn "$persistent_work_dir" 2>/dev/null)" || exit 1
+		read -r mode links original_owner original_group remainder <<-EOF
+		$metadata
+		EOF
+		case "$original_owner:$original_group:$mode" in
+			0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
+			*) exit 1 ;;
+		esac
+		# A fresh workdir is root-private until the official core first starts.
+		# Give uid 853 traversal only for the complete stopped copy/bind boundary,
+		# not just the copy: both empty-data and activation scans need this access.
+		trap 'restore_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
+		trap 'exit 1' HUP INT QUIT TERM
+		chown "0:${ADGUARD_GID}" "$persistent_work_dir" &&
+			chmod 0710 "$persistent_work_dir" || exit 1
+		memory_create_runtime_parent || exit 1
+		mkdir -m 0700 "$MEMORY_WORK_DIR" &&
+			chown "${ADGUARD_UID}:${ADGUARD_GID}" "$MEMORY_WORK_DIR" || exit 1
+		if [ -e "$data_source" ] || [ -L "$data_source" ]; then
+			memory_copy_data_to_runtime "$data_source" "$data_target" || exit 1
+		else
+			mkdir -m 0700 "$data_source" &&
+				chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_source" &&
+				mkdir -m 0700 "$data_target" &&
+				chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_target" &&
+				uid853_tree_is_plain "$data_source" &&
+				uid853_tree_is_plain "$data_target" || exit 1
 		fi
-	else
-		if ! mkdir -m 0700 "$data_source" ||
-		   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_source" ||
-		   ! mkdir -m 0700 "$data_target" ||
-		   ! chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_target" ||
-		   ! uid853_tree_is_plain "$data_source" ||
-		   ! uid853_tree_is_plain "$data_target"; then
-			memory_discard_incomplete_runtime_locked "$persistent_work_dir" >/dev/null 2>&1 || true
-			return 1
-		fi
-	fi
-	MEMORY_MOUNTS_SUSPENDED=1
-	if ! chmod 0700 "$MEMORY_WORK_DIR" ||
-	   ! memory_active_tree_valid "$persistent_work_dir" ||
-	   ! memory_activate_data_bindings "$persistent_work_dir" ||
-	   ! memory_write_state "$persistent_work_dir"; then
-		memory_remove_incomplete_bindings "$persistent_work_dir" >/dev/null 2>&1 || true
+		MEMORY_MOUNTS_SUSPENDED=1
+		chmod 0700 "$MEMORY_WORK_DIR" &&
+			memory_active_tree_valid "$persistent_work_dir" &&
+			memory_activate_data_bindings "$persistent_work_dir" || exit 1
+		restore_workdir_access "$persistent_work_dir" \
+			"$original_owner" "$original_group" || exit 1
+		trap - EXIT HUP INT QUIT TERM
+		memory_write_state "$persistent_work_dir"
+	); then
 		memory_discard_incomplete_runtime_locked "$persistent_work_dir" >/dev/null 2>&1 || true
 		return 1
 	fi
+	# The preparation subshell keeps its permission trap local; load the state
+	# it published so the caller retains the verified mount/inode identities.
+	MEMORY_MOUNTS_SUSPENDED=0
+	memory_state_load light || return 1
 	MEMORY_ACTIVE=1
 	MEMORY_BACKING_WORK_DIR="$persistent_work_dir"
 	previous_work_dir="$persistent_work_dir"
@@ -2009,25 +2011,12 @@ valid_config_candidate_path() {
 }
 
 normalizer_lock_directory_is_private() {
-	local directory="${NORMALIZER_LOCK%/*}" metadata mode links owner group remainder
-	[ -d "$directory" ] && [ ! -L "$directory" ] || return 1
-	path_contains_symlink "$directory" && return 1
-	metadata="$(LC_ALL=C ls -ldn "$directory" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$owner:$group:$mode" = "0:0:drwx------" ]
+	local directory="${NORMALIZER_LOCK%/*}"
+	root_private_directory "$directory" && ! path_contains_symlink "$directory"
 }
 
 normalizer_lock_is_private() {
-	local metadata mode links owner group remainder
-	[ -d "$NORMALIZER_LOCK" ] && [ ! -L "$NORMALIZER_LOCK" ] || return 1
-	path_contains_symlink "$NORMALIZER_LOCK" && return 1
-	metadata="$(LC_ALL=C ls -ldn "$NORMALIZER_LOCK" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$owner:$group:$mode" = "0:0:drwx------" ]
+	root_private_directory "$NORMALIZER_LOCK" && ! path_contains_symlink "$NORMALIZER_LOCK"
 }
 
 # The writable normalizer child may start only while uid 853 is otherwise
@@ -2922,7 +2911,8 @@ uci_guard_no_delta() {
 			[ ! -e "$delta" ] && [ ! -L "$delta" ]
 		return
 	fi
-	[ -z "$changes" ]
+	# Distinguish a valid but pending CLI edit from a malformed/unreadable UCI.
+	[ -z "$changes" ] || return 2
 }
 
 uci_guard_delta_dir_valid() {
@@ -4250,23 +4240,12 @@ yaml_job_hash_valid() {
 }
 
 yaml_job_runtime_is_private() {
-	local metadata mode links owner group remainder
-	[ -d "$YAML_JOB_RUNTIME_DIR" ] && [ ! -L "$YAML_JOB_RUNTIME_DIR" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$YAML_JOB_RUNTIME_DIR" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$owner:$group:$mode" = "0:0:drwx------" ]
+	root_private_directory "$YAML_JOB_RUNTIME_DIR"
 }
 
 yaml_job_file_is_private() {
-	local target="$1" metadata mode links owner group remainder size
-	[ -f "$target" ] && [ ! -L "$target" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || return 1
+	local target="$1" size
+	root_private_file "$target" || return 1
 	size="$(wc -c <"$target" 2>/dev/null)" || return 1
 	case "$size" in ""|*[!0-9]*) return 1 ;; esac
 	[ "$size" -gt 0 ] && [ "$size" -le 256 ]
@@ -4274,13 +4253,8 @@ yaml_job_file_is_private() {
 
 yaml_job_lock_file_is_private() {
 	local target="${YAML_JOB_RUNTIME_DIR}/update.lock"
-	local metadata mode links owner group remainder size
-	[ -f "$target" ] && [ ! -L "$target" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || return 1
+	local size
+	root_private_file "$target" || return 1
 	size="$(wc -c <"$target" 2>/dev/null)" || return 1
 	[ "$size" = 0 ]
 }
@@ -4933,9 +4907,12 @@ orchestrate_core_locked() {
 }
 
 reconcile_core_locked() {
+	local settings_rc=0
 	# Five-second monitoring must not traverse every data file.  Any branch that
 	# copies, starts, switches or removes RAM state reaches a full guarded entry.
-	if ! load_settings light; then
+	load_settings light || settings_rc=$?
+	[ "$settings_rc" != 2 ] || return 0
+	if [ "$settings_rc" != 0 ]; then
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	fi

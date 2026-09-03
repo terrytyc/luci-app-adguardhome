@@ -26,7 +26,7 @@ const callResetYaml = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'reset_yaml',
 	params: [ 'sha256' ],
-	expect: { '': { content: '', sha256: '' } },
+	expect: { '': { content: '' } },
 	reject: true,
 });
 
@@ -84,6 +84,7 @@ return view.extend({
 		this.yamlHash = result.sha256;
 		this.yamlEditor = E('textarea', {
 			class: 'cbi-input-textarea',
+			'aria-label': _('YAML Configuration'),
 			rows: 32,
 			spellcheck: 'false',
 			wrap: 'off',
@@ -308,9 +309,7 @@ return view.extend({
 				return;
 			if (typeof template?.error === 'string' && template.error)
 				throw new Error(template.error);
-			if (typeof template?.content !== 'string' || !template.content ||
-			    typeof template.sha256 !== 'string' ||
-			    !/^[0-9a-f]{64}$/.test(template.sha256))
+			if (typeof template?.content !== 'string' || !template.content)
 				throw new Error(_('The packaged YAML template is unavailable.'));
 
 			// Keep yamlHash unchanged: it still represents the active file revision

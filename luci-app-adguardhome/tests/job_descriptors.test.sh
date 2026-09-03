@@ -15,10 +15,13 @@ INTEGRATION_LOCK="$test_tmp/integration.lock"
 touch "$test_tmp/update.lock"
 chmod 0600 "$test_tmp/update.lock"
 printf 'staged YAML\n' >"$test_tmp/stage"
-for name in yaml_job_lock_file_is_private yaml_job_lock_fd_valid \
+awk -v helper_dir="$script_dir/../scripts" \
+	-f "$script_dir/../scripts/expand-helpers.awk" "$init_file" >"$test_tmp/init.expanded"
+for name in entry_metadata root_private_directory root_private_file run_bounded \
+	yaml_job_lock_file_is_private yaml_job_lock_fd_valid \
 	prepare_job_descriptors open_integration_lock_descriptor run_locked \
 	settings_update; do
-	eval "$(function_body "$init_file" "$name")"
+	eval "$(function_body "$test_tmp/init.expanded" "$name")"
 done
 
 occupy_descriptors() {
@@ -27,7 +30,7 @@ occupy_descriptors() {
 	done
 }
 
-for held_fd in 3 197; do
+for held_fd in 3 187 197; do
 	(
 		occupy_descriptors
 		if run_locked true; then
@@ -39,7 +42,7 @@ for held_fd in 3 197; do
 		exec 1000<"$test_tmp/stage"
 		settings_update_job_locked() {
 			[ "$#:$1:$9" = 9:1:candidate ]
-			[ ! -e /proc/self/fd/187 ]
+			[ "$held_fd" = 187 ] || [ ! -e /proc/self/fd/187 ]
 			[ -e /proc/self/fd/1000 ]
 			yaml_job_lock_fd_valid "" "$held_fd"
 			# The child must retain the inherited task lock, not merely leave
@@ -47,6 +50,10 @@ for held_fd in 3 197; do
 			if /usr/bin/flock -n "$test_tmp/update.lock" true; then
 				return 1
 			fi
+			run_bounded 10 1 /bin/dd of="$test_tmp/held-lock-input" <&1000 2>/dev/null
+			cmp -s "$test_tmp/stage" "$test_tmp/held-lock-input"
+			yaml_job_lock_fd_valid "" "$held_fd"
+			if /usr/bin/flock -n "$test_tmp/update.lock" true; then return 1; fi
 			printf 'applied\n' >"$test_tmp/applied"
 		}
 		settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate "$held_fd"
@@ -54,16 +61,21 @@ for held_fd in 3 197; do
 	)
 done
 
-# YAML keeps its pinned read-only staging file as well as the shared job lock.
-(
+# YAML keeps its pinned read-only staging file, even at 187, and the task lock.
+for stage_fd in 187 193; do (
 	occupy_descriptors
-	exec 3<>"$test_tmp/update.lock" 193<"$test_tmp/stage"
-	prepare_job_descriptors 193 3
-	[ /proc/self/fd/193 -ef "$test_tmp/stage" ]
-	[ ! -e /proc/self/fd/187 ]
+	exec 3<>"$test_tmp/update.lock"
+	eval "exec ${stage_fd}<\"$test_tmp/stage\""
+	prepare_job_descriptors "$stage_fd" 3
+	[ /proc/self/fd/"$stage_fd" -ef "$test_tmp/stage" ]
+	[ "$stage_fd" = 187 ] || [ ! -e /proc/self/fd/187 ]
 	[ ! -e /proc/self/fd/199 ]
 	run_locked true
-)
+	run_bounded 10 1 /bin/dd of="$test_tmp/held-stage-input" <&"$stage_fd" 2>/dev/null
+	cmp -s "$test_tmp/stage" "$test_tmp/held-stage-input"
+	yaml_job_lock_fd_valid "$stage_fd" 3
+	if /usr/bin/flock -n "$test_tmp/update.lock" true; then exit 1; fi
+); done
 
 # Never clean up arbitrary inherited descriptors or run a settings job before
 # authenticating that the supplied descriptor belongs to the private lock.

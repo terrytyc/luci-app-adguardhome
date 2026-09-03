@@ -133,4 +133,105 @@ if printf '%s\n' "$postinst" | grep -Fq '/etc/init.d/rpcd restart' ||
    grep -Fq '/etc/init.d/rpcd restart' "$init_file"; then exit 1; fi
 printf '%s\n' "$postinst" | grep -Fq '[ -z "$$IPKG_INSTROOT" ] || exit 0'
 
-printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7/r8 to 2.4.0-r9 lifecycle and final rpcd reload\n'
+# A failed upgrade or clean-install preflight must not restore the first-ever
+# official config or revert someone else's CLI delta. Exercise real cleanup,
+# snapshot validation and UCI against paths confined to this temporary tree.
+real_uci="$(command -v uci || true)"
+uci_root="${ADGUARDHOME_TEST_UCI_ROOT:-}"
+if [ -n "$real_uci" ] || [ -n "$uci_root" ]; then
+	rollback_dir="$(mktemp -d /tmp/luci-agh-defaults-rollback.XXXXXX)"
+	trap 'rm -rf "$rollback_dir"' EXIT HUP INT TERM
+	mkdir "$rollback_dir/config" "$rollback_dir/delta" "$rollback_dir/snapshot"
+	chmod 0700 "$rollback_dir/snapshot"
+	uci() {
+		if [ -n "$uci_root" ]; then
+			"$uci_root/lib/ld-musl-x86_64.so.1" --library-path "$uci_root/lib:$uci_root/usr/lib" \
+				"$uci_root/sbin/uci" -c "$rollback_dir/config" -t "$rollback_dir/delta" "$@"
+		else
+			"$real_uci" -c "$rollback_dir/config" -t "$rollback_dir/delta" "$@"
+		fi
+	}
+	awk -v helper_dir="$package_dir/scripts" -f "$package_dir/scripts/expand-helpers.awk" \
+		"$defaults" >"$rollback_dir/defaults.expanded"
+	for name in entry_metadata root_private_directory root_private_file run_bounded \
+		bounded_private_file validate_original_snapshot cleanup_snapshot_stage cleanup_install; do
+		eval "$(function_body "$rollback_dir/defaults.expanded" "$name")"
+	done
+	eval "$(function_body "$rollback_dir/defaults.expanded" restore_original_config |
+		sed "s|/etc/config/|$rollback_dir/config/|g")"
+	UCI_CONFIG=adguardhome
+	MAX_FILE_SIZE=524288
+	SNAPSHOT_DIR="$rollback_dir/snapshot"
+	SNAPSHOT_CONFIG="$SNAPSHOT_DIR/official-adguardhome.config"
+	SNAPSHOT_STATE="$SNAPSHOT_DIR/official-adguardhome.state"
+	SNAPSHOT_VERSION="$SNAPSHOT_DIR/snapshot-version"
+	SNAPSHOT_STAGE=""
+	printf "config adguardhome 'config'\n option enabled '0'\n option work_dir '/var/lib/adguardhome'\n" | uci import adguardhome
+	uci commit adguardhome
+	cp "$rollback_dir/config/adguardhome" "$SNAPSHOT_CONFIG"
+	printf 'was_running=0\n' >"$SNAPSHOT_STATE"
+	printf '1\n' >"$SNAPSHOT_VERSION"
+	chmod 0600 "$SNAPSHOT_CONFIG" "$SNAPSHOT_STATE" "$SNAPSHOT_VERSION"
+	validate_original_snapshot
+	for install_state in 0:0 1:0 1:1; do
+		printf "config adguardhome 'config'\n option enabled '1'\n option work_dir '/etc/AdGuardHome'\nconfig luci 'luci'\n option redirect 'none'\n" | uci import adguardhome
+		uci commit adguardhome
+		uci set adguardhome.luci.redirect=dnsmasq-upstream
+		before="$(cksum <"$rollback_dir/config/adguardhome")"
+		delta_before="$(uci changes adguardhome)"
+		INSTALL_STARTED="${install_state%:*}"
+		INSTALL_COMMITTED="${install_state#*:}"
+		YAML_STAGE="$rollback_dir/staged-yaml"
+		printf 'temporary\n' >"$YAML_STAGE"
+		rc=0
+		(trap cleanup_install EXIT; exit 1) || rc=$?
+		[ "$rc" = 1 ] && [ ! -e "$YAML_STAGE" ]
+		if [ "$install_state" = 1:0 ]; then
+			cmp -s "$SNAPSHOT_CONFIG" "$rollback_dir/config/adguardhome"
+			[ -z "$(uci changes adguardhome)" ]
+		else
+			[ "$(cksum <"$rollback_dir/config/adguardhome")" = "$before" ]
+			[ "$(uci changes adguardhome)" = "$delta_before" ]
+		fi
+		uci revert adguardhome
+	done
+	# The marker must be absent from the upgrade branch and set before the
+	# first clean-install mutation (stopping the official service).
+	! printf '%s\n' "$upgrade_defaults" | grep -Fq 'INSTALL_STARTED=1'
+	[ "$(grep -Fc 'INSTALL_STARTED=1' "$defaults")" = 1 ]
+	[ "$(grep -n '^INSTALL_STARTED=1' "$defaults" | cut -d: -f1)" -lt \
+	  "$(grep -n '^run_bounded 20 2 /etc/init.d/adguardhome stop' "$defaults" | cut -d: -f1)" ]
+
+	# New installations no longer create the unused .uci export. Old r9
+	# installations still remove that optional file only after private-file checks.
+	removal_body="$(printf '%s\n' "$postrm" | awk '
+		/^for snapshot_file in/ { copying = 1 }
+		copying { gsub(/\$\$/, "$"); print }
+		copying && /^rmdir / { exit }
+	')"
+	for old_export in absent present unsafe; do
+		snapshot_dir="$rollback_dir/remove-$old_export"
+		mkdir -m 0700 "$snapshot_dir"
+		for file in official-adguardhome.config official-adguardhome.state snapshot-version managed-adguardhome.config; do
+			printf 'preserved\n' >"$snapshot_dir/$file"
+			chmod 0600 "$snapshot_dir/$file"
+		done
+		case "$old_export" in
+			present) printf 'package adguardhome\n' >"$snapshot_dir/official-adguardhome.uci";
+				chmod 0600 "$snapshot_dir/official-adguardhome.uci" ;;
+			unsafe) ln -s /dev/null "$snapshot_dir/official-adguardhome.uci" ;;
+		esac
+		if [ "$old_export" = unsafe ]; then
+			if (eval "$removal_body"); then exit 1; fi
+			[ -f "$snapshot_dir/official-adguardhome.config" ]
+		else
+			(eval "$removal_body")
+			[ ! -e "$snapshot_dir" ]
+		fi
+	done
+	printf 'ok - defaults rollback is mutation-scoped; optional legacy export cleanup is safe\n'
+else
+	printf 'skip - defaults rollback requires real UCI or ADGUARDHOME_TEST_UCI_ROOT\n'
+fi
+
+printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7/r8/r9 to 2.4.0-r10 lifecycle and final rpcd reload\n'

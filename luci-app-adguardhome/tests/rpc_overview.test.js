@@ -247,8 +247,8 @@ assert.equal(credentials.username, 'admin');
 assert.equal(fixture.hashes, 2);
 const restored = sandbox.rpc.reset_yaml.call({ args: { sha256: originalHash } });
 assert.equal(restored.content, template);
-assert.equal(restored.sha256, digest(template), 'reset must still hash the returned packaged template');
-assert.equal(fixture.hashes, 4, 'reset verifies the active revision and hashes the template independently');
+assert.equal(restored.sha256, undefined, 'reset must not return an unused template revision');
+assert.equal(fixture.hashes, 3, 'reset verifies only the active revision; it does not hash the template');
 assert.equal(fixture.yaml, editor.content, 'reset must remain an editor-only operation');
 
 fixture.yaml += '# external edit\n';

@@ -112,6 +112,8 @@ async function testLogErrorPresentation() {
 	});
 	const failedLoad = await initialFailure.definition.load.call(initialFailure.definition);
 	initialFailure.definition.render.call(initialFailure.definition, failedLoad);
+	assert.equal(String(initialFailure.definition.logOutputs.core.attrs['aria-label']), 'AdGuard Home Core Log');
+	assert.equal(String(initialFailure.definition.logOutputs.plugin.attrs['aria-label']), 'Plugin Runtime Log');
 	assert.equal(initialFailure.notifications.length, 2,
 		'initial core and plugin reader failures must each produce a visible notification');
 	assert.deepEqual(initialFailure.notifications.map(item => item.level), [ 'error', 'error' ]);
@@ -165,6 +167,7 @@ const sandbox = {
 	length: value => value.length,
 	split: (value, separator) => value.split(separator),
 	push: (array, value) => array.push(value),
+	reverse: array => Array.from(array).reverse(),
 	join: (separator, array) => array.join(separator),
 };
 vm.createContext(sandbox);
