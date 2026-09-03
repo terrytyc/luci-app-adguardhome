@@ -122,13 +122,31 @@ exercise_defaults() (
 			USING_TEMPLATE=1
 			configured_enabled=0
 			configured_verbose=1
-			expected=1:1:dnsmasq-upstream:0:60
+			expected=0:1:dnsmasq-upstream:0:60
+			;;
+		template-enabled)
+			USING_TEMPLATE=1
+			configured_enabled=1
+			configured_verbose=0
+			expected=1:0:dnsmasq-upstream:0:60
+			;;
+		missing-enabled)
+			USING_TEMPLATE=1
+			configured_enabled=''
+			configured_verbose=0
+			expected=0:0:dnsmasq-upstream:0:60
 			;;
 		existing)
 			USING_TEMPLATE=0
 			configured_enabled=1
 			configured_verbose=0
 			expected=1:0:none:0:60
+			;;
+		existing-disabled)
+			USING_TEMPLATE=0
+			configured_enabled=0
+			configured_verbose=0
+			expected=0:0:none:0:60
 			;;
 		*) return 1 ;;
 	esac
@@ -161,13 +179,11 @@ exercise_defaults() (
 	[ "$actual" = "$expected" ]
 )
 
-exercise_defaults template || {
-	printf 'packaged template did not receive the confirmed defaults\n' >&2
-	exit 1
-}
-exercise_defaults existing || {
-	printf 'existing official YAML did not receive the non-invasive DNS default\n' >&2
-	exit 1
-}
+for defaults_mode in template template-enabled missing-enabled existing existing-disabled; do
+	exercise_defaults "$defaults_mode" || {
+		printf 'clean-install enabled state or DNS default failed: %s\n' "$defaults_mode" >&2
+		exit 1
+	}
+done
 
 printf 'ok - clean official import and DNS defaults\n'

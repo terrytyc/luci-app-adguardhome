@@ -263,11 +263,10 @@ select_clean_install_source() {
 initialize_clean_options() {
 	local enabled verbose redirect
 	enabled="$(normalize_bool "$(uci -q get "$UCI_CONFIG.$OFFICIAL_SECTION.enabled")")" ||
-		enabled=1
+		enabled=0
 	verbose="$(normalize_bool "$(uci -q get "$UCI_CONFIG.$OFFICIAL_SECTION.verbose")")" ||
 		verbose=0
 	if [ "$USING_TEMPLATE" = 1 ]; then
-		enabled=1
 		redirect=dnsmasq-upstream
 	else
 		redirect=none
