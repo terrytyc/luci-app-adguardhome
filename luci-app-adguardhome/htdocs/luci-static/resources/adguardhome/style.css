@@ -4,7 +4,7 @@
 	display: grid;
 	grid-template-columns: repeat(2, minmax(0, 1fr));
 	gap: 1rem 2rem;
-	margin: 0;
+	margin: 0 1.25rem;
 }
 
 .adguardhome-view .adguardhome-status-grid > div {
@@ -24,7 +24,8 @@
 }
 
 .adguardhome-view .adguardhome-version {
-	margin: 1rem 0 0;
+	margin: 1rem 1.25rem;
+	padding: 0;
 }
 
 .adguardhome-view .adguardhome-management {
@@ -57,16 +58,22 @@
 .adguardhome-view .adguardhome-log-output {
 	box-sizing: border-box;
 	width: 100%;
+	min-width: 0;
 	padding: .75em;
 	font-family: monospace;
 	font-size: 14px;
 	line-height: 1.5;
+	color: inherit;
 	resize: vertical;
 }
 
 .adguardhome-view .adguardhome-editor {
 	min-height: 18rem;
 	max-height: 65vh;
+}
+
+.adguardhome-view .adguardhome-log-output {
+	min-height: 0;
 }
 
 .adguardhome-view .adguardhome-help,

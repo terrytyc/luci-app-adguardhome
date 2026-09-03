@@ -62,13 +62,22 @@ for (const match of css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{/g)
 }
 assert.doesNotMatch(css, /!important/);
 assert.match(css, /grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
+assert.match(css, /\.adguardhome-status-grid\s*\{[^}]*margin:\s*0 1\.25rem/);
+assert.match(css, /\.adguardhome-version\s*\{[^}]*margin:\s*1rem 1\.25rem;[^}]*padding:\s*0/,
+	'overview values and version text must align with the native section heading');
 assert.match(css, /@media\s*\(max-width:\s*700px\)[\s\S]*grid-template-columns:\s*1fr/);
 assert.match(css, /\.adguardhome-management-button\s*\{[^}]*min-height:\s*40px/);
 assert.match(css, /\.adguardhome-management-button\s*\{[^}]*padding-block:\s*0;[^}]*line-height:\s*1\.5/,
 	'the link must not retain oversized theme padding or an inherited form-row line height');
 assert.match(css, /\.adguardhome-log-output\s*\{[^}]*font-size:\s*14px;[^}]*line-height:\s*1\.5/);
+assert.match(css, /\.adguardhome-editor,\s*\.adguardhome-view \.adguardhome-log-output\s*\{[^}]*min-width:\s*0/,
+	'both textareas must override the theme minimum width on narrow screens');
+assert.match(css, /\.adguardhome-editor,\s*\.adguardhome-view \.adguardhome-log-output\s*\{[^}]*color:\s*inherit/,
+	'editor and log text must follow the theme body color instead of a fixed pale input color');
 assert.doesNotMatch(css.match(/\.adguardhome-log-output\s*\{([^}]*)\}/)[1], /^\s*(?:min-|max-)?height\s*:/m,
 	'empty one-row logs must not be forced into a tall viewport');
+assert.match(css, /\.adguardhome-view \.adguardhome-log-output\s*\{\s*min-height:\s*0;\s*\}/,
+	'empty logs must override the theme textarea minimum height so rows=1 works');
 assert.match(css, /\.adguardhome-actions\s*\{[^}]*flex-wrap:\s*wrap/);
 assert.match(css, /\.cbi-value-description\s*\{[^}]*font-size:\s*13px;[^}]*line-height:\s*1\.5;[^}]*color:\s*inherit;[^}]*opacity:\s*1/,
 	'help must remain readable without overriding light or dark theme text colors');
