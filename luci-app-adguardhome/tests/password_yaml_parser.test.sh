@@ -362,6 +362,10 @@ const TLS = 'tls:\n  enabled: true\n  server_name: router.example.com\n  port_ht
 
 expect_config('one-pass HTTP and dynamic DNS port', HTTP + 'dns:\n  port: 5353\n',
 	[ 3000 ], 5353, 'http', null, 3000);
+expect_config('DNS port 53 remains supported', HTTP + 'dns:\n  port: 53\n',
+	[ 3000 ], 53, 'http', null, 3000);
+expect_config('HTTP port 53 remains supported', 'http:\n  address: 0.0.0.0:53\n' + DNS,
+	[ 53 ], 53335, 'http', null, 53);
 expect_config('TLS file pair and configured domain', HTTP + DNS + TLS + TLS_PATHS,
 	[ 3000, 1029 ], 53335, 'https', 'router.example.com', 1029);
 expect_config('TLS embedded material', HTTP + DNS + TLS +
@@ -379,8 +383,27 @@ expect_config('HTTPS numeric host remains rejected', HTTP + DNS +
 	[ 3000, 1029 ], 53335, 'http', null, 3000);
 expect_config('loopback HTTP remains unavailable', 'http:\n  address: 127.0.0.1:3000\n' + DNS,
 	[ 3000 ], 53335, null, null, null);
+for (let address in [
+	'127.1.2.3:3000', '[::1]:3000', '[0:0:0:0:0:0:0:1]:3000',
+	'[::ffff:127.0.0.1]:3000', '[0:0:0:0:0:ffff:7f01:203]:3000',
+	'[::1%lo]:3000', '[::ffff:127.0.0.1%lo]:3000',
+])
+	expect_config(`loopback HTTP ${address}`, `http:\n  address: "${address}"\n` + DNS,
+		[ 3000 ], 53335, null, null, null);
+expect_config('non-loopback IPv4-mapped HTTP remains available',
+	'http:\n  address: "[::ffff:192.168.1.1]:3000"\n' + DNS,
+	[ 3000 ], 53335, 'http', null, 3000);
+expect_config('scoped non-loopback IPv6 HTTP remains available',
+	'http:\n  address: "[fe80::1%eth0]:3000"\n' + DNS,
+	[ 3000 ], 53335, 'http', null, 3000);
 expect_config('IPv6 HTTP bind uses LuCI host', 'http:\n  address: "[::]:3000"\n' + DNS,
 	[ 3000 ], 53335, 'http', null, 3000);
+if (valid_port('1') !== 1 || valid_port('53') !== 53 ||
+	valid_port('65535') !== 65535 || valid_port('0') != null ||
+	valid_port('65536') != null || valid_port('-1') != null ||
+	valid_port('53x') != null)
+	fail('shared port validation', 'port bounds or port 53 support changed');
+print('ok - shared port validation preserves port 53\n');
 expect_config('duplicate DNS section stays ambiguous', HTTP + DNS + 'dns: # duplicate\n  port: 5353\n',
 	[ 3000 ], null, 'http', null, 3000);
 expect_config('duplicate DNS key stays ambiguous', HTTP + DNS + '  port: 5353\n',

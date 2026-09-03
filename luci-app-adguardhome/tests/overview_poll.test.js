@@ -13,6 +13,7 @@ function loadOverview() {
 	const calls = [];
 	const updates = [];
 	const errors = [];
+	const urlBuilds = [];
 	const polls = new Set();
 	const elements = [];
 	const document = { hidden: false, activeElement: null };
@@ -95,7 +96,9 @@ function loadOverview() {
 		},
 		_: value => value,
 		L: { hasViewPermission: () => true },
-		URL,
+		URL: class extends URL {
+			constructor(value) { super(value); urlBuilds.push(value); }
+		},
 		console: { error: (...args) => errors.push(args) },
 		window: { location: { href: 'https://router.example:8443/cgi-bin/luci/' } },
 		document,
@@ -104,7 +107,7 @@ function loadOverview() {
 	const view = vm.runInContext('(function() {\n' + source + '\n})()', context,
 		{ filename: overviewPath });
 	return {
-		view, calls, updates, errors, polls, handlers, document, elements,
+		view, calls, updates, errors, urlBuilds, polls, handlers, document, elements,
 		setActive: value => { active = value; },
 		setOverview: value => { overviewResult = value; },
 	};
@@ -258,6 +261,7 @@ async function main() {
 	assert.equal(initial[1].status.running, true);
 	assert.equal(initial[1].config.dnsPort, 53335);
 	await state.view.render(initial);
+	assert.equal(state.urlBuilds.length, 1, 'rendering must reuse the already validated management URL');
 	assert.equal(state.polls.size, 1);
 	const callback = state.view.statusPollCallback;
 	const committed = state.view.committedSettings;
@@ -367,6 +371,22 @@ async function main() {
 	});
 	await callback();
 	assert.equal(state.updates.length, 0, 'endpoint changes while stopped must not rebuild the disabled button');
+	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
+	assert.match(management.child.child[2].child, /Enable AdGuard Home/);
+	state.setOverview({ status: { running: true }, config: {} });
+	await callback();
+	assert.equal(state.updates.filter(update => update.node === management).length, 1,
+		'false (stopped) to null (invalid endpoint) must repaint the disabled-button explanation');
+	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
+	assert.match(management.child.child[2].child, /YAML management endpoint is unavailable/);
+	state.updates.length = 0;
+	state.setOverview({ status: { running: false }, config: {} });
+	await callback();
+	assert.equal(state.updates.filter(update => update.node === management).length, 1,
+		'null (invalid endpoint) to false (stopped) must repaint the disabled-button explanation');
+	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
+	assert.match(management.child.child[2].child, /Enable AdGuard Home/);
+	state.updates.length = 0;
 
 	state.handlers.get_overview = () => { throw new Error('temporary RPC failure'); };
 	await callback();

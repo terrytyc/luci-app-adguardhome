@@ -32,6 +32,7 @@ UCI_CONFIG_DIRECTORY="/etc/config"
 UCI_DELTA_DIRECTORY="/tmp/.uci"
 MANAGED_CONFIG_SNAPSHOT_DIR="/root/.luci-app-adguardhome"
 MANAGED_CONFIG_SNAPSHOT="${MANAGED_CONFIG_SNAPSHOT_DIR}/managed-adguardhome.config"
+KEEP_FILE="/lib/upgrade/keep.d/luci-app-adguardhome"
 
 # The configured workdir is always the persistent backing store.  Memory mode
 # mirrors only its data tree into this fixed plugin namespace.  The YAML stays
@@ -52,7 +53,6 @@ NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
 NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
 BASELINE_UPGRADE_STATE="${NORMALIZER_RUNTIME_DIR}/upgrade-state"
 YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
-YAML_MAINTENANCE_MARKER="${YAML_JOB_RUNTIME_DIR}/removing"
 MONITOR_INTERVAL=5
 # First boot can download and compile the packaged default filters before the
 # DNS sockets appear, especially on slower routers.  Keep takeover disabled
@@ -71,7 +71,7 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tweb_listening <port>\tVerify an official-core TCP listener
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
-\tsettings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate>\tApply an authenticated asynchronous settings job
+\tsettings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate> <lock-fd>\tApply an authenticated asynchronous settings job
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
 \tyaml_update_job <old-hash> <new-hash> <stage> <stage-fd> <lock-fd> <token>\tRun an asynchronous LuCI YAML edit
 \ttls_prepare\t\tPrepare current YAML TLS access before core start
@@ -86,16 +86,7 @@ log_error() {
 	logger -t AdGuardHome "$*"
 }
 
-managed_config_snapshot_dir_valid() {
-	local metadata mode links owner group remainder
-	[ -d "$MANAGED_CONFIG_SNAPSHOT_DIR" ] &&
-		[ ! -L "$MANAGED_CONFIG_SNAPSHOT_DIR" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$MANAGED_CONFIG_SNAPSHOT_DIR" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$mode:$owner:$group" = "drwx------:0:0" ] && [ "$links" -ge 2 ] 2>/dev/null
-}
+# @include keep-active-config
 
 prepare_managed_config_snapshot_dir() {
 	if [ ! -e "$MANAGED_CONFIG_SNAPSHOT_DIR" ] &&
@@ -103,12 +94,15 @@ prepare_managed_config_snapshot_dir() {
 		mkdir -m 0700 "$MANAGED_CONFIG_SNAPSHOT_DIR" || return 1
 		chown 0:0 "$MANAGED_CONFIG_SNAPSHOT_DIR" || return 1
 	fi
-	managed_config_snapshot_dir_valid
+	uci_guard_snapshot_dir_valid "$MANAGED_CONFIG_SNAPSHOT_DIR"
 }
 
 refresh_managed_config_snapshot() {
-	local source="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}" temporary
+	local source="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}" temporary current_work_dir
 	uci_guard_config_file_valid "$source" || return 1
+	current_work_dir="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" || return 1
+	validate_managed_work_dir_namespace "$current_work_dir" || return 1
+	keep_active_config "${current_work_dir%/}/AdGuardHome.yaml" "$MANAGED_CONFIG_SNAPSHOT_DIR" || return 1
 	prepare_managed_config_snapshot_dir || return 1
 	if [ -e "$MANAGED_CONFIG_SNAPSHOT" ] || [ -L "$MANAGED_CONFIG_SNAPSHOT" ]; then
 		uci_guard_config_file_valid "$MANAGED_CONFIG_SNAPSHOT" || return 1
@@ -133,7 +127,7 @@ refresh_managed_config_snapshot() {
 restore_managed_config_snapshot() {
 	local target="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}" temporary
 	[ ! -e "$target" ] && [ ! -L "$target" ] || return 1
-	managed_config_snapshot_dir_valid || return 1
+	uci_guard_snapshot_dir_valid "$MANAGED_CONFIG_SNAPSHOT_DIR" || return 1
 	uci_guard_config_file_valid "$MANAGED_CONFIG_SNAPSHOT" || return 1
 	[ -d "$UCI_CONFIG_DIRECTORY" ] && [ ! -L "$UCI_CONFIG_DIRECTORY" ] || return 1
 	temporary="$(mktemp "${UCI_CONFIG_DIRECTORY}/.managed-adguardhome-restore.XXXXXX")" || return 1
@@ -1147,25 +1141,6 @@ uid853_tree_is_plain() {
 				/usr/bin/head -n 1)" || exit 1
 			[ -z "$found" ]
 		' sh "$tree" >/dev/null 2>&1 || return 1
-	tree_is_mount_free "$tree"
-}
-
-uid853_tree_is_writable() {
-	local tree="$1"
-	uid853_tree_is_plain "$tree" || return 1
-	# A structurally plain tree may still contain foreign-owned or read-only
-	# entries.  cp -p must own each destination inode in order to preserve mode
-	# and timestamps, so require uid/gid 853 in addition to probing access as that
-	# user.  An unusable tree is treated as damaged and rebuilt by the caller.
-	# $1..$3 and found intentionally expand only in the lowered child shell.
-	# shellcheck disable=SC2016
-	run_bounded 30 2 \
-		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
-		-n AGHDataWriteScan -x /bin/sh -- -c '
-			set -o pipefail
-			found="$(/usr/bin/find "$1" -xdev \( -user "$2" -group "$3" \( -type d -exec /bin/sh -c '\''[ -w "$1" ] && [ -x "$1" ]'\'' sh {} \; -o -type f -exec /bin/sh -c '\''[ -w "$1" ]'\'' sh {} \; \) -o -print \) 2>/dev/null | /usr/bin/head -n 1)" || exit 1
-			[ -z "$found" ]
-		' sh "$tree" "$ADGUARD_UID" "$ADGUARD_GID" >/dev/null 2>&1 || return 1
 	tree_is_mount_free "$tree"
 }
 
@@ -3208,7 +3183,6 @@ sync_tls_access_persistent() {
 	TLS_PRESERVED_MOUNTS=""
 	config_load "$PLUGIN_CONFIG" || return 1
 	config_list_foreach "$PLUGIN_SECTION" "$MANAGED_JAIL_OPTION" collect_tls_old_mount
-	config_load "$OFFICIAL_CONFIG" || return 1
 	config_list_foreach "$OFFICIAL_SECTION" jail_mount collect_tls_official_mount
 	derive_tls_new_managed_mounts
 
@@ -3259,7 +3233,6 @@ ${TLS_NEW_MANAGED_MOUNTS}"
 	TLS_OLD_MOUNTS=""
 	config_load "$OFFICIAL_CONFIG" || return 1
 	config_list_foreach "$OFFICIAL_SECTION" jail_mount collect_tls_official_mount
-	config_load "$PLUGIN_CONFIG" || return 1
 	config_list_foreach "$PLUGIN_SECTION" "$MANAGED_JAIL_OPTION" collect_tls_old_mount
 	verify_fingerprint="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
 	[ "$TLS_ORIGINAL_MOUNTS" = "$expected" ] &&
@@ -3329,18 +3302,8 @@ sync_official_uci_persistent() {
 		official_config="${official_work}/AdGuardHome.yaml"
 	fi
 	UCI_CHANGED=0
-	if ! uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}" >/dev/null 2>&1; then
-		uci -q set "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}=adguardhome" || return 1
-		UCI_CHANGED=1
-	elif [ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}")" != adguardhome ]; then
-		return 1
-	fi
-	if ! uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}" >/dev/null 2>&1; then
-		uci -q set "${PLUGIN_CONFIG}.${PLUGIN_SECTION}=luci" || return 1
-		UCI_CHANGED=1
-	elif [ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}")" != luci ]; then
-		return 1
-	fi
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}")" = adguardhome ] || return 1
+	[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}")" = luci ] || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" enabled "$service_enabled" || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" config_file "$official_config" || return 1
 	uci_set_if_changed "$OFFICIAL_CONFIG" "$OFFICIAL_SECTION" work_dir "$official_work" || return 1
@@ -3504,6 +3467,7 @@ clear_managed_dnsmasq_upstream() {
 		return 1
 	}
 	load_dnsmasq_section || return 1
+	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
 	upstream="127.0.0.1#${managed_port}"
 	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
 	uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
@@ -3532,6 +3496,8 @@ set_dnsmasq_upstream() {
 	local upstream="127.0.0.1#${dns_port}"
 	load_dnsmasq_section || return 1
 	dnsmasq_takeover_is_safe || return 1
+	# A default CLI delta belongs to its author, not this DNS transaction.
+	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
 	uci -q add_list "${DNSMASQ_UCI}.server=${upstream}" || return 1
 	uci -q set "${DNSMASQ_UCI}.noresolv=1" || {
 		uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
@@ -3584,6 +3550,7 @@ set_firewall_redirect() {
 			return 1
 		fi
 	fi
+	uci_guard_no_delta firewall || return 1
 	uci -q set "${section}=redirect" || return 1
 	uci -q set "${section}.${FIREWALL_OWNER_OPTION}=${FIREWALL_OWNER_VALUE}" || return 1
 	uci -q set "${section}.src=lan" || return 1
@@ -3607,6 +3574,7 @@ clear_firewall_redirect() {
 		if [ "$owner" != "$FIREWALL_OWNER_VALUE" ]; then
 			return 0
 		fi
+		uci_guard_no_delta firewall || return 1
 		existed=1
 		uci -q delete "$section" || return 1
 		uci -q commit firewall || return 1
@@ -4317,19 +4285,6 @@ yaml_job_lock_file_is_private() {
 	[ "$size" = 0 ]
 }
 
-yaml_maintenance_marker_is_private() {
-	local metadata mode links owner group remainder size
-	[ -f "$YAML_MAINTENANCE_MARKER" ] &&
-		[ ! -L "$YAML_MAINTENANCE_MARKER" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$YAML_MAINTENANCE_MARKER" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || return 1
-	size="$(wc -c <"$YAML_MAINTENANCE_MARKER" 2>/dev/null)" || return 1
-	[ "$size" = 0 ]
-}
-
 prepare_yaml_job_runtime() {
 	local lock_path="${YAML_JOB_RUNTIME_DIR}/update.lock"
 	if [ -e "$YAML_JOB_RUNTIME_DIR" ] || [ -L "$YAML_JOB_RUNTIME_DIR" ]; then
@@ -4387,12 +4342,12 @@ yaml_job_pending_matches() {
 	grep -Fqx "pending:${expected_hash}:${candidate_hash}" "$target"
 }
 
-close_yaml_job_inherited_fds() {
+prepare_job_descriptors() {
 	local inherited_fd="$1" job_lock_fd="$2" fd_path fd
 	case "$inherited_fd:$job_lock_fd" in *[!0-9:]*) return 1 ;; esac
-	[ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
-	[ "$job_lock_fd" -ge 3 ] 2>/dev/null || return 1
-	[ "$inherited_fd" != "$job_lock_fd" ] || return 1
+	[ -z "$inherited_fd" ] || [ "$inherited_fd" -ge 3 ] 2>/dev/null || return 1
+	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" || return 1
+	/usr/bin/flock -n -x "$job_lock_fd" || return 1
 	for fd_path in /proc/self/fd/[0-9]*; do
 		[ -e "$fd_path" ] || continue
 		fd="${fd_path##*/}"
@@ -4404,6 +4359,8 @@ close_yaml_job_inherited_fds() {
 		# does not support a variable file-descriptor operand for exec.
 		eval "exec ${fd}>&-" || return 1
 	done
+	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" &&
+		/usr/bin/flock -n -x "$job_lock_fd"
 }
 
 cleanup_yaml_job_stage() {
@@ -4461,11 +4418,7 @@ yaml_update_job() {
 	esac
 	yaml_job_runtime_is_private || exit 1
 	yaml_job_pending_matches "$token" "$expected_hash" "$candidate_hash" || exit 1
-	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" || exit 1
-	/usr/bin/flock -n -x "$job_lock_fd" || exit 1
-	close_yaml_job_inherited_fds "$inherited_fd" "$job_lock_fd" || exit 1
-	yaml_job_lock_fd_valid "$inherited_fd" "$job_lock_fd" || exit 1
-	/usr/bin/flock -n -x "$job_lock_fd" || exit 1
+	prepare_job_descriptors "$inherited_fd" "$job_lock_fd" || exit 1
 
 	if run_yaml_locked yaml_update_job_locked "$expected_hash" "$candidate_hash" \
 		"$stage" "$inherited_fd" "$token"; then
@@ -4913,8 +4866,10 @@ settings_update_job_locked() {
 }
 
 settings_update() {
-	[ "$#" = 9 ] || return 1
-	run_locked settings_update_job_locked "$@"
+	[ "$#" = 10 ] || return 1
+	prepare_job_descriptors "" "${10}" || return 1
+	run_locked settings_update_job_locked "$1" "$2" "$3" "$4" "$5" \
+		"$6" "$7" "$8" "$9"
 }
 
 orchestrate_core_locked() {
@@ -4957,7 +4912,10 @@ orchestrate_core_locked() {
 	memory_prepare_or_fallback_locked || return 1
 	load_runtime_dns_port || return 1
 	sync_official_uci || return 1
-	[ "$service_enabled" = 1 ] || return 0
+	if [ "$service_enabled" != 1 ]; then
+		sync_monitor_instance
+		return
+	fi
 	[ -x "$OFFICIAL_SERVICE" ] || return 1
 	if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1; then
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
@@ -4971,6 +4929,7 @@ orchestrate_core_locked() {
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
 	fi
+	sync_monitor_instance
 }
 
 reconcile_core_locked() {
@@ -4998,7 +4957,8 @@ reconcile_core_locked() {
 		if [ "$MEMORY_ACTIVE" = 1 ]; then
 			memory_deactivate_locked 1 || return 1
 		fi
-		return 0
+		sync_monitor_instance
+		return
 	fi
 	if [ "$redirect_mode" = none ]; then
 		# No DNS takeover is desired.  Keep RAM/disable handling above, remove
@@ -5134,6 +5094,30 @@ isrunning() {
 	return 1
 }
 
+declare_monitor_instance() {
+	procd_open_instance monitor
+	procd_set_param command "$initscript" monitor
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 3600 5 0
+	procd_set_param term_timeout 5
+	procd_close_instance
+}
+
+sync_monitor_instance() (
+	local definition
+	# Submit only the instance definition, never recurse through start/restart
+	# while holding the integration lock.  An unchanged instance keeps its PID.
+	procd_open_service AdGuardHome "$initscript"
+	[ "$service_enabled" != 1 ] || declare_monitor_instance
+	# The baseline procd_close_service wrapper loses the ubus exit status.
+	# Send its already-built instance map directly so apply can reject failure.
+	json_set_namespace procd
+	json_close_object
+	definition="$(json_dump)" || exit 1
+	ubus call service set "$definition" >/dev/null
+)
+
 start_service() {
 	local prepare_rc=0
 	# rc_procd closes the service transaction even when this function returns
@@ -5175,13 +5159,7 @@ start_service() {
 		log_error "AdGuard Home coordinator preparation failed"
 		return 1
 	fi
-	procd_open_instance monitor
-	procd_set_param command "$initscript" monitor
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_set_param respawn 3600 5 0
-	procd_set_param term_timeout 5
-	procd_close_instance
+	declare_monitor_instance
 	return 0
 }
 

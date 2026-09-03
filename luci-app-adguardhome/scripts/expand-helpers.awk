@@ -21,6 +21,8 @@ function read_helper(path, name, line, copying, complete, body) {
 		printf "%s", read_helper(helper_dir "/private-files.mk", "PrivateFiles")
 	else if (name == "upgrade-policy")
 		printf "%s", read_helper(helper_dir "/upgrade-policy.mk", "UpgradePolicy")
+	else if (name == "keep-active-config")
+		printf "%s", read_helper(helper_dir "/keep-active-config.mk", "KeepActiveConfig")
 	else { failed = 1; exit 1 }
 	next
 }

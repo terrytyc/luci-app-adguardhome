@@ -352,6 +352,7 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	}
 	load_runtime_dns_port() { dns_port=53335; }
 	sync_official_uci() { return 0; }
+	sync_monitor_instance() { printf 'monitor:%s:%s\n' "$COMMITTED_WORK" "$COMMITTED_ENABLED" >>"$events"; }
 	wait_for_core_ready() {
 		printf 'ready:%s:%s\n' "$3" "$config_file" >>"$events"
 		official_running
@@ -371,10 +372,16 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		printf 'stale settings revision changed UCI or service state\n' >&2
 		exit 1
 	}
-	if settings_update_locked 1 "$NEW" 0 dnsmasq-upstream 1 60 "$expected_revision"; then
-		printf 'simulated new-workdir failure was reported as success\n' >&2
+	result=0
+	settings_update_locked 1 "$NEW" 0 dnsmasq-upstream 1 60 "$expected_revision" || result=$?
+	if [ "$result" != 1 ]; then
+		printf 'new-workdir failure did not report a fully restored rollback: %s\n' "$result" >&2
 		exit 1
 	fi
+	[ "$(grep -Fxc "monitor:${OLD}:1" "$events")" = 1 ] || {
+		printf 'rollback did not restore the enabled monitor exactly once\n' >&2
+		exit 1
+	}
 	[ "$COMMITTED_WORK" = "$OLD" ] && [ "$COMMITTED_MEMORY" = 1 ] || {
 		printf 'failed apply did not restore old authoritative settings\n' >&2
 		exit 1

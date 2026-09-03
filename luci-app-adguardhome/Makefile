@@ -320,9 +320,8 @@ if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
 elif [ -d /tmp/luci-modulecache ]; then
 	rm -rf /tmp/luci-modulecache/ || exit 1
 fi
-# Refresh the process only after initialization and runtime restoration finish.
-# Reusing rpcd can retain old ucode source descriptors across package updates.
-[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1 || exit 1
+# Load the updated RPC module without restarting the shared daemon.
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1
 exit 0
 endef
 

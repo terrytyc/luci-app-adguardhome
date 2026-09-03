@@ -408,12 +408,7 @@ function read_yaml(configuration, include_hash) {
 		// This proves that the bytes read came from the same inode observed at
 		// both pathname checks, even if the uid-853 work directory is renamed.
 		after = lstat(path);
-		valid = opened?.type == 'file' && after?.type == 'file' &&
-			before.inode == opened.inode && before.inode == after.inode &&
-			before.dev?.major == opened.dev?.major &&
-			before.dev?.minor == opened.dev?.minor &&
-			before.dev?.major == after.dev?.major &&
-			before.dev?.minor == after.dev?.minor &&
+		valid = same_inode(before, opened) && same_inode(before, after) &&
 			before.size == opened.size && before.size == after.size &&
 			type(content) == 'string' && length(content) > 0 &&
 			length(content) <= MAX_CONFIG_LENGTH &&
@@ -1139,6 +1134,7 @@ function update_settings(enabled, work_dir, verbose, redirect,
 			expected_revision,
 			token,
 			candidate.revision,
+			`${job.lock_descriptor}`,
 		], { PATH: '/usr/sbin:/usr/bin:/sbin:/bin' }, function() {
 			finish_settings_process(
 				token, expected_revision, candidate.revision, job.lock
@@ -1225,10 +1221,7 @@ function update_yaml(content, expected_hash) {
 		let opened = type(descriptor) == 'int'
 			? stat(`/proc/self/fd/${descriptor}`)
 			: null;
-		if (!metadata || metadata.type != 'file' || opened?.type != 'file' ||
-		    metadata.size != length(content) || metadata.inode != opened.inode ||
-		    metadata.dev?.major != opened.dev?.major ||
-		    metadata.dev?.minor != opened.dev?.minor) {
+		if (!same_inode(metadata, opened) || metadata.size != length(content)) {
 			file.close();
 			file = null;
 			unlink(stage);
@@ -1244,10 +1237,7 @@ function update_yaml(content, expected_hash) {
 		let reader_opened = type(reader_descriptor) == 'int'
 			? stat(`/proc/self/fd/${reader_descriptor}`)
 			: null;
-		if (!reader || reader_opened?.type != 'file' ||
-		    reader_opened.inode != opened.inode ||
-		    reader_opened.dev?.major != opened.dev?.major ||
-		    reader_opened.dev?.minor != opened.dev?.minor) {
+		if (!reader || !same_inode(reader_opened, opened)) {
 			if (reader)
 				reader.close();
 			file.close();
@@ -1764,16 +1754,12 @@ function yaml_section_value(config, section, key) {
 		length(record.values[key]) ? record.values[key] : null;
 }
 
-function valid_port(value, allow_dns_port_53) {
-	if (allow_dns_port_53 == null)
-		allow_dns_port_53 = true;
-
+function valid_port(value) {
 	if (type(value) != 'string' || !match(value, /^[0-9]+$/))
 		return null;
 
 	let port = int(value);
-	if (type(port) != 'int' || port < 1 || port > 65535 ||
-	    (!allow_dns_port_53 && port == 53))
+	if (type(port) != 'int' || port < 1 || port > 65535)
 		return null;
 
 	return port;
@@ -1831,11 +1817,12 @@ function valid_dns_name(value) {
 
 function http_port(config) {
 	let address = yaml_section_value(config, 'http', 'address');
-	let matched = address ? match(address, /:([0-9]+)$/) : null;
-	if (address && (match(address, /^127(\.[0-9]+){3}:/) ||
-	                match(address, /^\[::1\]:/)))
+	let matched = address ? match(address, /^(.+):([0-9]+)$/) : null;
+	let host = matched ? replace(matched[1], /^\[|\]$/g, '') : null;
+	let ip = host ? arrtoip(iptoarr(split(host, '%')[0])) : null;
+	if (ip && (ip == '::1' || match(ip, /^(::ffff:)?127\./)))
 		return null;
-	return matched ? valid_port(matched[1]) : null;
+	return matched ? valid_port(matched[2]) : null;
 }
 
 function yaml_material_value(config, key) {
@@ -1882,10 +1869,7 @@ function config_info(content, can_probe) {
 		return result;
 
 	let config = yaml_config_values(content);
-	result.dns_port = valid_port(
-		yaml_section_value(config, 'dns', 'port'),
-		true
-	);
+	result.dns_port = valid_port(yaml_section_value(config, 'dns', 'port'));
 
 	let tls_value = yaml_section_value(config, 'tls', 'enabled');
 	let tls_enabled = tls_value == null ? false : yaml_bool(tls_value);

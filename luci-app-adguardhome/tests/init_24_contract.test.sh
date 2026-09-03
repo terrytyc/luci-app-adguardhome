@@ -31,7 +31,7 @@ require "$init_file" 'settings_update <enabled> <workdir> <verbose> <mode> <ram>
 require "$init_file" 'settings_values_revision() {'
 require "$init_file" 'settings_current_revision() {'
 require "$init_file" '[ "$current_revision" != "$expected_revision" ]'
-require "$init_file" '[ "$#" = 9 ]'
+require "$init_file" '[ "$#" = 10 ]'
 
 settings_job_body="$(function_body "$init_file" settings_update_job_locked)"
 pending_line="$(printf '%s\n' "$settings_job_body" |

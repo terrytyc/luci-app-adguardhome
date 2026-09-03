@@ -39,6 +39,7 @@ official_running() { [ "$TEST_RUNNING" = 1 ]; }
 official_test_service() { record "service:$*"; }
 wait_for_core_stopped() { record stopped; }
 memory_deactivate_locked() { record "deactivate:$*"; }
+sync_monitor_instance() { record monitor-sync; }
 load_runtime_dns_port() { record dns-port; dns_port=53335; }
 dns_port_listening() { record socket; }
 integration_matches_desired() { record integration; }
@@ -66,7 +67,7 @@ reconcile_core_locked
 TEST_BACKING=/etc/AdGuardHome
 TEST_ENABLED=0
 reconcile_core_locked
-[ "$(cat "$events")" = "$(printf 'settings\ncleanup\nservice:stop\nstopped\ndeactivate:1')" ]
+[ "$(cat "$events")" = "$(printf 'settings\ncleanup\nservice:stop\nstopped\ndeactivate:1\nmonitor-sync')" ]
 : >"$events"
 TEST_ENABLED=1
 TEST_MODE=dnsmasq-upstream

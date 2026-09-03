@@ -110,12 +110,12 @@ function loadOperation() {
 	};
 }
 
-function loadOverview(operation, ui, rpcHandlers = {}) {
-	const overviewPath = path.join(
+function loadView(name, operation, ui, rpcHandlers = {}) {
+	const viewPath = path.join(
 		packageRoot,
-		'htdocs/luci-static/resources/view/adguardhome/overview.js'
+		`htdocs/luci-static/resources/view/adguardhome/${name}.js`
 	);
-	const source = fs.readFileSync(overviewPath, 'utf8');
+	const source = fs.readFileSync(viewPath, 'utf8');
 	const rpc = {
 		declare: specification => async (...args) => {
 			const handler = rpcHandlers[specification.method];
@@ -125,7 +125,7 @@ function loadOverview(operation, ui, rpcHandlers = {}) {
 	const view = { extend: definition => definition };
 	const sandbox = {
 		E: () => ({}),
-		L: { env: {} },
+		L: { env: {}, hasViewPermission: () => true },
 		URL,
 		_: translated,
 		console,
@@ -140,7 +140,7 @@ function loadOverview(operation, ui, rpcHandlers = {}) {
 			source +
 			'\n}).call(globalThis, {}, operation, {}, {}, {}, rpc, {}, ui, view, window, L, E, _, URL, console)',
 		Object.assign(sandbox, { operation, rpc, ui, view }),
-		{ filename: overviewPath },
+		{ filename: viewPath },
 	);
 }
 
@@ -214,7 +214,7 @@ async function runSettingsSubmissionScenario(kind) {
 			};
 		},
 	};
-	const view = loadOverview(operation, {}, rpcHandlers);
+	const view = loadView('overview', operation, {}, rpcHandlers);
 	const map = {
 		readonly: false,
 		checkDepends() {},
@@ -279,6 +279,88 @@ async function runSettingsSubmissionScenario(kind) {
 		visibleValues,
 		view,
 	};
+}
+
+async function testYamlSubmissions() {
+	for (const kind of [ 'success', 'cas-rejected', 'response-lost', 'bad-token', 'leave-request', 'leave-status' ]) {
+		const state = loadOperation();
+		const scope = state.operation.createPageScope();
+		const oldHash = 'a'.repeat(64), newHash = 'b'.repeat(64), token = 'c'.repeat(32);
+		const draft = 'dns:\r\n  port: 5354\r\n';
+		const committed = 'dns:\n  port: 5354\n';
+		let accepted = false, setCalls = 0, reads = 0;
+		const polls = [];
+		const view = loadView('yaml', state.operation, {}, {
+			async set_yaml(content, hash) {
+				setCalls++;
+				assert.equal(content, committed, 'normalize editor newlines before submission');
+				assert.equal(hash, oldHash, 'submit the loaded file revision, not the candidate hash');
+				if (kind === 'cas-rejected')
+					return { error: 'YAML changed after page load' };
+				accepted = true;
+				if (kind === 'leave-request')
+					state.dispatch('pagehide');
+				if (kind === 'response-lost')
+					throw new Error('accepted request response was lost');
+				return { accepted: true, token: kind === 'bad-token' ? 'invalid' : token };
+			},
+			async get_yaml_update(receivedToken, consume) {
+				assert.equal(receivedToken, token);
+				polls.push(consume);
+				if (kind === 'leave-status')
+					state.dispatch('pagehide');
+				return { state: 'done', ok: true, sha256: newHash };
+			},
+			async get_yaml() {
+				reads++;
+				return { content: committed, sha256: newHash, path: '/etc/AdGuardHome/AdGuardHome.yaml' };
+			},
+		});
+		Object.assign(view, {
+			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
+			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
+		});
+		await view.saveYaml();
+		assert.equal(setCalls, 1, `${kind}: never replay a mutation automatically`);
+		assert.equal(accepted, kind !== 'cas-rejected');
+		if (kind === 'success') {
+			assert.equal(view.yamlEditor.value, committed);
+			assert.equal(view.yamlHash, newHash);
+			assert.equal(view.pathValue.textContent, '/etc/AdGuardHome/AdGuardHome.yaml');
+			assert.equal(reads, 1, 'reload the authoritative YAML after a confirmed save');
+			assert.deepEqual(polls, [ false, true ], 'read and consume the completed job once');
+			assert.equal(view.saveButton.disabled, false);
+			assert.equal(view.yamlEditor.readOnly, false);
+			assert.equal(state.rendered.at(-1).text, 'Configuration changes applied.');
+		} else {
+			assert.equal(view.yamlEditor.value, draft, `${kind}: preserve the editor draft`);
+			assert.equal(reads, 0, `${kind}: do not overwrite the draft with an unconfirmed reload`);
+			assert.deepEqual(polls, kind === 'leave-status' ? [ false ] : []);
+			if (kind.startsWith('leave-')) {
+				assert.equal(state.rendered.length, 1, 'late replies must not display results on another page');
+				assert.equal(view.yamlHash, oldHash, 'an obsolete continuation must not mutate editor state');
+			} else if (kind === 'cas-rejected') {
+				assert.match(state.rendered.at(-1).text, /YAML changed after page load/);
+				assert.equal(view.yamlHash, oldHash);
+				assert.equal(view.yamlEditor.readOnly, false);
+				assert.equal(view.saveButton.disabled, false);
+			} else {
+				assert.match(state.rendered.at(-1).text, /outcome is unknown.*Reload the page/);
+				assert.equal(view.yamlHash, '', `${kind}: invalidate the uncertain revision`);
+				assert.equal(view.yamlEditor.readOnly, true);
+				assert.equal(view.saveButton.disabled, true);
+				assert.equal(view.resetButton.disabled, true);
+				assert.equal(view.reloadButton.disabled, false, 'allow explicit recovery from disk');
+				await view.saveYaml();
+				assert.equal(setCalls, 1, 'require a reload before another uncertain submission');
+				await view.handleReload();
+				assert.equal(view.yamlHash, newHash, 'an explicit reload adopts the authoritative file revision');
+				assert.equal(view.yamlEditor.value, committed);
+				assert.equal(view.saveButton.disabled, false);
+			}
+		}
+		state.operation._clearTimer();
+	}
 }
 
 async function main() {
@@ -470,7 +552,7 @@ async function main() {
 	const applyEvents = [];
 	const overviewOperation = { isPageActive: () => true };
 	const overviewUi = {};
-	const overviewView = loadOverview(overviewOperation, overviewUi);
+	const overviewView = loadView('overview', overviewOperation, overviewUi);
 	let resolveSave;
 	const savePromise = new Promise(resolve => { resolveSave = resolve; });
 	const overviewContext = { settingsSubmission: null, submitSettings() {
@@ -649,7 +731,8 @@ async function main() {
 	assert.doesNotMatch(yaml, /inactive:\s*true/,
 		'an inactive YAML load must not render an empty editor');
 
-	console.log('navigation lifecycle, shared job polling and settings reconciliation tests passed');
+	await testYamlSubmissions();
+	console.log('navigation lifecycle, shared job polling and settings/YAML reconciliation tests passed');
 }
 
 main().catch(error => {

@@ -177,8 +177,8 @@ assert.match(updateSource,
 	/uloop\.process\(YAML_UPDATE_COMMAND, \[\s*'settings_update'/,
 	'settings must be applied asynchronously through the coordinator command');
 assert.match(updateSource,
-	/`\$\{candidate\.memory_writeback_interval\}`,\s*expected_revision,\s*token,\s*candidate\.revision,\s*\], \{ PATH:/,
-	'the coordinator must receive the CAS revision and one-shot job credential');
+	/`\$\{candidate\.memory_writeback_interval\}`,\s*expected_revision,\s*token,\s*candidate\.revision,\s*`\$\{job\.lock_descriptor\}`,\s*\], \{ PATH:/,
+	'the coordinator must receive the CAS revision, one-shot credential and inherited lock descriptor');
 assert.match(updateSource,
 	/function\(\) \{\s*finish_settings_process\(\s*token, expected_revision, candidate\.revision, job\.lock/,
 	'the process callback must not forward or interpret a raw wait status');
@@ -198,6 +198,8 @@ assert.ok(setSettingsStart >= 0 && setSettingsEnd > setSettingsStart);
 const setSettingsMethod = source.slice(setSettingsStart, setSettingsEnd);
 assert.doesNotMatch(setSettingsMethod, /config_file/,
 	'the set_settings RPC schema and call must not expose config_file');
+assert.doesNotMatch(setSettingsMethod, /lock_descriptor/,
+	'the public RPC must not accept the internal inherited lock descriptor');
 assert.doesNotMatch(source, /\bget_password_info\s*:/,
 	'the unused legacy password information RPC must be removed');
 assert.doesNotMatch(source, /\bset_password\s*:/,
@@ -214,6 +216,34 @@ assert.match(finishSettingsSource,
 const expectedHash = '1'.repeat(64);
 const candidateHash = '2'.repeat(64);
 const token = '3'.repeat(32);
+let launchedArguments = null;
+const launchSandbox = {
+	type: sandbox.type,
+	match: sandbox.match,
+	settings_candidate: () => candidate,
+	settings_snapshot: () => snapshot,
+	random_token: () => token,
+	prepare_yaml_job: () => ({ token, lock: {}, lock_descriptor: 193 }),
+	YAML_UPDATE_COMMAND: '/etc/init.d/AdGuardHome',
+	uloop: {
+		process(command, args) {
+			assert.equal(command, '/etc/init.d/AdGuardHome');
+			launchedArguments = Array.from(args);
+			return {};
+		},
+	},
+	discard_yaml_job() { assert.fail('an accepted job must not be discarded'); },
+	close_yaml_job_lock() { assert.fail('the parent lock must remain held for the callback'); },
+};
+vm.createContext(launchSandbox);
+vm.runInContext(`${updateSource}\nthis.update = update_settings;`, launchSandbox);
+assert.equal(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
+	true, 120, snapshot.revision).accepted, true);
+assert.deepEqual(launchedArguments, [
+	'settings_update', '1', fixture.workDir, '0', fixture.redirect, '1', '120',
+	snapshot.revision, token, candidate.revision, '193',
+], 'the worker must receive ten arguments with the numeric lock descriptor last');
+
 let record;
 let replacements;
 let closes;

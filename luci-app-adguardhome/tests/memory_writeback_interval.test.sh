@@ -82,7 +82,6 @@ require_text() {
 require_text "$defaults_file" 'set_luci_option memory_writeback_interval 60'
 require_text "$init_file" 'memory_writeback_locked_command() {'
 require_text "$init_file" 'memory_copy_live_data_locked() ('
-require_text "$init_file" 'uid853_tree_is_writable() {'
 require_text "$init_file" 'sync_yaml_workdir_pattern() {'
 require_text "$init_file" 'memory_copy_live_data_locked || return $?'
 # shellcheck disable=SC2016

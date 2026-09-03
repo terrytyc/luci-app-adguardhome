@@ -19,7 +19,7 @@ function extractFunction(name) {
 
 const functions = [
 	'configured_boolean', 'configuration_state', 'service_running', 'service_status',
-	'read_yaml', 'read_config', 'credentials_info', 'update_credentials', 'reset_yaml',
+	'same_inode', 'read_yaml', 'read_config', 'credentials_info', 'update_credentials', 'reset_yaml',
 	'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
 	'valid_port', 'yaml_bool', 'valid_dns_name', 'http_port', 'yaml_material_value',
 	'tls_material_complete', 'web_port_listening', 'config_info', 'overview_info',
@@ -58,6 +58,9 @@ const sandbox = {
 	split: (value, separator) => value.split(separator),
 	substr: (value, start, count) => value.substr(start, count),
 	trim: value => value.trim(), replace: (value, pattern, replacement) => value.replace(pattern, replacement),
+	// These fixtures use canonical addresses; the native ucode parser test
+	// covers iptoarr()/arrtoip() normalization and mapped/scoped IPv6 addresses.
+	iptoarr: value => value, arrtoip: value => value,
 	valid_work_dir: value => value === fixture.workDir ? value : null,
 	memory_state_active: () => fixture.active,
 	cursor() {

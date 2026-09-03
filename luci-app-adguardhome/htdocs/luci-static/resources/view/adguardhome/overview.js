@@ -231,20 +231,7 @@ function overviewDisplayValues({ status, config }) {
 	};
 }
 
-function renderManagementLink(endpoint, running) {
-	if (!running) {
-		return E('span', {}, [
-			E('button', {
-				class: 'cbi-button cbi-button-action',
-				type: 'button',
-				disabled: 'disabled',
-			}, _('Open Web Interface')),
-			' ',
-			E('em', {}, _('Enable AdGuard Home and click Save & Apply; the management interface becomes available after the service is running.')),
-		]);
-	}
-
-	const url = buildManagementURL(endpoint);
+function renderManagementLink(url, running) {
 	if (!url) {
 		return E('span', {}, [
 			E('button', {
@@ -253,7 +240,9 @@ function renderManagementLink(endpoint, running) {
 				disabled: 'disabled',
 			}, _('Open Web Interface')),
 			' ',
-			E('em', {}, _('The YAML management endpoint is unavailable or invalid.')),
+			E('em', {}, running
+				? _('The YAML management endpoint is unavailable or invalid.')
+				: _('Enable AdGuard Home and click Save & Apply; the management interface becomes available after the service is running.')),
 		]);
 	}
 
@@ -457,7 +446,7 @@ return view.extend({
 		const statusContainer = E('span', {}, renderServiceStatus(displayed.running));
 		const storageContainer = E('span', {}, renderStorageStatus(displayed.storage));
 		const dnsPortContainer = E('span', {}, displayed.dnsPort);
-		const managementContainer = E('span', {}, renderManagementLink(overview.config.web, displayed.running));
+		const managementContainer = E('span', {}, renderManagementLink(displayed.management, displayed.running));
 
 		const statusSection = map.section(form.TypedSection, '_status', _('Overview'));
 		statusSection.anonymous = true;
@@ -630,7 +619,7 @@ return view.extend({
 			if (next.dnsPort !== displayed.dnsPort)
 				dom.content(dnsPortContainer, next.dnsPort);
 			if (next.management !== displayed.management)
-				dom.content(managementContainer, renderManagementLink(current.config.web, next.running));
+				dom.content(managementContainer, renderManagementLink(next.management, next.running));
 			displayed = next;
 		};
 		this.statusPollCallback = statusPollCallback;

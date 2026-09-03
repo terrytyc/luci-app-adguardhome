@@ -51,7 +51,7 @@ function errorMessage(error) {
 	return String(error?.message ?? error ?? _('Unknown error'));
 }
 
-function uncertainYamlUpdateError(message) {
+function uncertainYamlUpdateError(message = _('The YAML update outcome is unknown. Reload the page before editing it again.')) {
 	const error = new Error(message);
 	error.yamlUpdateUncertain = true;
 	return error;
@@ -219,19 +219,24 @@ return view.extend({
 		const operationTicket = operation.start();
 
 		try {
-			const accepted = await callSetYaml(content, this.yamlHash);
+			const accepted = await operation.requestActive(() => callSetYaml(content, this.yamlHash), scope)
+				.catch(error => {
+					if (operation.isPageInactiveError(error))
+						throw error;
+					throw uncertainYamlUpdateError();
+				});
 			if (typeof accepted?.error === 'string' && accepted.error)
 				throw new Error(accepted.error);
-			if (accepted?.accepted !== true ||
-			    typeof accepted.token !== 'string' ||
-			    !/^[0-9a-f]{32}$/.test(accepted.token))
+			if (accepted?.accepted !== true)
 				throw new Error(_('The server did not accept the YAML update job.'));
+			if (typeof accepted.token !== 'string' || !/^[0-9a-f]{32}$/.test(accepted.token))
+				throw uncertainYamlUpdateError();
 
 			const result = await this.waitForYamlUpdate(accepted.token, scope);
 			if (result?.indeterminate === true)
 				throw uncertainYamlUpdateError(typeof result?.error === 'string' && result.error
 					? result.error
-					: _('The YAML update outcome is unknown. Reload the page before editing it again.'));
+					: undefined);
 			if (result?.ok === true &&
 			    (typeof result.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(result.sha256)))
 				throw uncertainYamlUpdateError(_('The YAML update succeeded, but its result could not be verified. Reload the page before editing it again.'));

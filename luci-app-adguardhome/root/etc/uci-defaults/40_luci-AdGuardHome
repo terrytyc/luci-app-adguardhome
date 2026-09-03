@@ -389,16 +389,7 @@ refresh_managed_config_snapshot() {
 		cmp -s /etc/config/adguardhome "$MANAGED_CONFIG_SNAPSHOT"
 }
 
-keep_active_config() {
-	local keep_dir
-	keep_dir="$(dirname "$KEEP_FILE")" || return 1
-	mkdir -p "$keep_dir" || return 1
-	touch "$KEEP_FILE" || return 1
-	grep -Fqx "$TARGET_CONFIG_FILE" "$KEEP_FILE" 2>/dev/null ||
-		printf '%s\n' "$TARGET_CONFIG_FILE" >>"$KEEP_FILE"
-	grep -Fqx "$SNAPSHOT_DIR/" "$KEEP_FILE" 2>/dev/null ||
-		printf '%s/\n' "$SNAPSHOT_DIR" >>"$KEEP_FILE"
-}
+# @include keep-active-config
 
 restore_original_config() {
 	local temporary was_running
@@ -448,7 +439,8 @@ if [ -e "$UPGRADE_STATE" ] || [ -L "$UPGRADE_STATE" ]; then
 	}
 	TARGET_WORK_DIR="$(uci -q get "$UCI_CONFIG.$OFFICIAL_SECTION.work_dir")"
 	TARGET_CONFIG_FILE="$TARGET_WORK_DIR/AdGuardHome.yaml"
-	keep_active_config && refresh_managed_config_snapshot || exit 1
+	keep_active_config "$TARGET_CONFIG_FILE" "$SNAPSHOT_DIR" &&
+		refresh_managed_config_snapshot || exit 1
 	INSTALL_COMMITTED=1
 	trap - 0 HUP INT TERM
 	exit 0
@@ -469,7 +461,7 @@ secure_target_work_dir && install_selected_yaml &&
 }
 ensure_luci_section && initialize_clean_options || exit 1
 [ "$UCI_CHANGED" = 0 ] || uci -q commit "$UCI_CONFIG" || exit 1
-baseline_config_is_valid && keep_active_config &&
+baseline_config_is_valid && keep_active_config "$TARGET_CONFIG_FILE" "$SNAPSHOT_DIR" &&
 	refresh_managed_config_snapshot || {
 	echo "Unable to validate the initialized AdGuard Home configuration." >&2
 	exit 1
