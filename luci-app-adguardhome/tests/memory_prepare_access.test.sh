@@ -1,5 +1,6 @@
 #!/bin/sh
-set -eu
+# rc.common does not enable nounset; real YAML helpers accept omitted arguments.
+set -e
 
 # Exercise real uid permissions, cp and bind mounts without changing the host's
 # mount namespace. These are test-host tools, never runtime dependencies.
@@ -67,7 +68,7 @@ memory_capacity_available() { return 0; }
 memory_durability_barrier() { return 0; }
 clear_recorded_integration_locked() { return 0; }
 memory_restore_official_persistent_paths() { return 0; }
-sync_official_uci() { return 0; }
+sync_official_uci() { load_active_tls_access; }
 log_error() { :; }
 
 set_fixture() {
@@ -76,7 +77,8 @@ set_fixture() {
 	persistent_work_dir="$test_tmp/$scenario/AdGuardHome"
 	persistent_config_file="$persistent_work_dir/AdGuardHome.yaml"
 	mkdir -m 0700 "$persistent_work_dir"
-	printf 'persistent YAML\n' >"$persistent_config_file"
+	printf 'dns: { port: 53335 }\n' >"$persistent_config_file"
+	chmod 0600 "$persistent_config_file"
 	MEMORY_RUNTIME_DIR="$test_tmp/$scenario/ram"
 	MEMORY_WORK_DIR="$MEMORY_RUNTIME_DIR/work"
 	MEMORY_DATA_DIR="$MEMORY_WORK_DIR/data"
@@ -106,14 +108,14 @@ assert_prepared() {
 	[ "$MEMORY_ACTIVE:$MEMORY_BACKING_WORK_DIR" = "1:$persistent_work_dir" ]
 	[ "$config_file" = "$persistent_config_file" ]
 	[ ! -e "$MEMORY_WORK_DIR/AdGuardHome.yaml" ]
-	[ "$(cat "$persistent_config_file")" = 'persistent YAML' ]
+	[ "$(cat "$persistent_config_file")" = 'dns: { port: 53335 }' ]
 	memory_bindings_valid "$persistent_work_dir"
 	assert_private_owner "$persistent_work_dir" "$1" "$2"
 }
 remove_prepared() {
-	# Simulate only the official init's normal parent ownership handoff. The
+	# Simulate only the official init's normal directory/YAML ownership handoff. The
 	# subsequent stopped direct writeback and bind cleanup are production code.
-	chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_work_dir"
+	chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_work_dir" "$persistent_config_file"
 	memory_deactivate_locked 1
 	[ "$MEMORY_ACTIVE" = 0 ] && [ ! -e "$MEMORY_RUNTIME_DIR" ]
 }
@@ -168,8 +170,12 @@ chown "$ADGUARD_UID:$ADGUARD_GID" "$old_work_dir"
 persistent_work_dir="$test_tmp/transition/AdGuardHome-new"
 persistent_config_file="$persistent_work_dir/AdGuardHome.yaml"
 mkdir -m 0700 "$persistent_work_dir"
-printf 'persistent YAML\n' >"$persistent_config_file"
+printf 'dns: { port: 53335 }\n' >"$persistent_config_file"
+chmod 0600 "$persistent_config_file"
+chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_config_file"
 memory_reconcile_requested_storage_locked
+# Preparing the new YAML must precede the real TLS snapshot during deactivation.
+[ "$(stat -c '%a:%u:%g' "$persistent_config_file")" = '600:0:0' ]
 [ "$(cat "$old_work_dir/data/saved")" = 'RAM update' ]
 ! path_is_exact_mountpoint "$old_work_dir/data"
 memory_prepare_runtime_locked

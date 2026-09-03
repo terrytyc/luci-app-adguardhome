@@ -4523,6 +4523,8 @@ memory_deactivate_locked() {
 	previous_work_dir="$old_backing"
 	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
+	# The new workdir must be ready before sync reads its YAML for TLS access.
+	[ "$old_backing" = "$persistent_work_dir" ] || ensure_config_file || return 1
 	sync_official_uci || return 1
 	if [ "$checkpoint" = 1 ]; then
 		log_error "Removed the AdGuard Home memory workdir after a successful direct write-back"
