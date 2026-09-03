@@ -83,7 +83,104 @@ log_error() { record "error:$*"; }
 sleep() { record "sleep:$*"; }
 wait_for_core_ready 53335 none /etc/AdGuardHome
 [ "$(grep -c '^sleep:1$' "$events")" = 2 ]
-[ "$(grep -c '^socket$' "$events")" = 4 ]
+[ "$(grep -c '^runtime-settings$' "$events")" = 3 ]
+[ "$(grep -c '^socket$' "$events")" = 3 ]
+
+# A failed listener still resets the consecutive-success count.  Readiness
+# checks every round, but does not repeat the successful final round.
+(
+	: >"$events"
+	probes=0
+	dns_port_listening() {
+		record socket
+		probes=$((probes + 1))
+		[ "$probes" -ne 2 ]
+	}
+	wait_for_core_ready 53335 none /etc/AdGuardHome
+	[ "$(grep -c '^runtime-settings$' "$events")" = 5 ]
+	[ "$(grep -c '^socket$' "$events")" = 5 ]
+	[ "$(grep -c '^sleep:1$' "$events")" = 4 ]
+	: >"$events"
+	READY_TIMEOUT=3
+	dns_port_listening() { record socket; return 1; }
+	if wait_for_core_ready 53335 none /etc/AdGuardHome; then
+		printf 'an unavailable listener passed readiness\n' >&2
+		exit 1
+	fi
+	[ "$(grep -c '^runtime-settings$' "$events")" = 3 ]
+	[ "$(grep -c '^socket$' "$events")" = 3 ]
+	[ "$(grep -c '^sleep:1$' "$events")" = 3 ]
+	: >"$events"
+	checks=0
+	runtime_settings_match() {
+		[ "$*" = '53335 none /etc/AdGuardHome' ] || return 1
+		record runtime-settings
+		checks=$((checks + 1))
+		[ "$checks" -ne 2 ]
+	}
+	dns_port_listening() { record socket; }
+	if wait_for_core_ready 53335 none /etc/AdGuardHome; then
+		printf 'readiness concealed a settings change between rounds\n' >&2
+		exit 1
+	fi
+	[ "$(grep -c '^runtime-settings$' "$events")" = 2 ]
+	[ "$(grep -c '^socket$' "$events")" = 1 ]
+	[ "$(grep -c '^sleep:1$' "$events")" = 1 ]
+)
+
+# Readiness is not authorization to install DNS takeover.  The real apply
+# path must freshly reject YAML/core changes after the wait, and must remove
+# takeover again if either changes while the resolver reload is in progress.
+(
+	eval "$(function_body "$init_file" runtime_settings_match)"
+	eval "$(function_body "$init_file" apply_integration_locked)"
+	load_settings() {
+		[ "$*" = light ] || return 1
+		record runtime-settings
+		service_enabled=1
+		redirect_mode=dnsmasq-upstream
+		work_dir=/etc/AdGuardHome
+	}
+	load_runtime_dns_port() { dns_port="$TEST_PORT"; }
+	dns_port_listening() { record socket; [ "$TEST_CORE_RUNNING" = 1 ]; }
+	set_dnsmasq_upstream() {
+		record upstream
+		case "$scenario" in
+			yaml-during) TEST_PORT=55353 ;;
+			core-during) TEST_CORE_RUNNING=0 ;;
+		esac
+	}
+	for scenario in unchanged yaml-before core-before yaml-during core-during; do
+		: >"$events"
+		TEST_PORT=53335
+		TEST_CORE_RUNNING=1
+		wait_for_core_ready 53335 dnsmasq-upstream /etc/AdGuardHome
+		[ "$(grep -c '^runtime-settings$' "$events")" = 3 ]
+		[ "$(grep -c '^socket$' "$events")" = 3 ]
+		[ "$(grep -c '^sleep:1$' "$events")" = 2 ]
+		: >"$events"
+		case "$scenario" in
+			yaml-before) TEST_PORT=55353 ;;
+			core-before) TEST_CORE_RUNNING=0 ;;
+		esac
+		if [ "$scenario" = unchanged ]; then
+			apply_integration_locked 53335 dnsmasq-upstream /etc/AdGuardHome
+			expected='runtime-settings\nsocket\ncleanup\nupstream\nruntime-settings\nsocket'
+		else
+			if apply_integration_locked 53335 dnsmasq-upstream /etc/AdGuardHome; then
+				printf 'DNS takeover accepted changed readiness: %s\n' "$scenario" >&2
+				exit 1
+			fi
+			case "$scenario" in
+				yaml-before) expected='runtime-settings\ncleanup' ;;
+				core-before) expected='runtime-settings\nsocket\ncleanup' ;;
+				yaml-during) expected='runtime-settings\nsocket\ncleanup\nupstream\nruntime-settings\ncleanup' ;;
+				core-during) expected='runtime-settings\nsocket\ncleanup\nupstream\nruntime-settings\nsocket\ncleanup' ;;
+			esac
+		fi
+		[ "$(cat "$events")" = "$(printf '%b' "$expected")" ]
+	done
+)
 
 # The scheduling result must survive command substitution without relying on
 # variable changes escaping run_locked's subshell.  Only an active, matching

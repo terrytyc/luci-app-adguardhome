@@ -125,4 +125,13 @@ if printf '%s\n' "$upgrade_defaults" |
 	exit 1
 fi
 
-printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7 to 2.4.0-r8 baseline lifecycle\n'
+# Refresh rpcd once, only after runtime restoration and cache cleanup.  Do not
+# defer this into a background child or perform it during an RPC settings job.
+rpcd_restart='[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1 || exit 1'
+[ "$(printf '%s\n' "$postinst" | grep -Fc "$rpcd_restart")" = 1 ]
+[ "$(printf '%s\n' "$postinst" | tail -n 2)" = "$(printf '%s\nexit 0' "$rpcd_restart")" ]
+! printf '%s\n' "$postinst" | grep -Fq '/etc/init.d/rpcd reload'
+! grep -Fq '/etc/init.d/rpcd restart' "$init_file"
+printf '%s\n' "$postinst" | grep -Fq '[ -z "$$IPKG_INSTROOT" ] || exit 0'
+
+printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7/r8 to 2.4.0-r9 lifecycle and final rpcd restart\n'

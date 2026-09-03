@@ -9,7 +9,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.4.0
-PKG_RELEASE:=8
+PKG_RELEASE:=9
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -320,7 +320,9 @@ if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
 elif [ -d /tmp/luci-modulecache ]; then
 	rm -rf /tmp/luci-modulecache/ || exit 1
 fi
-[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1
+# Refresh the process only after initialization and runtime restoration finish.
+# Reusing rpcd can retain old ucode source descriptors across package updates.
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd restart >/dev/null 2>&1 || exit 1
 exit 0
 endef
 
