@@ -1207,6 +1207,23 @@ tree_has_no_nested_mounts() {
 	' /proc/self/mountinfo
 }
 
+memory_binding_mounts_valid() {
+	local backing="${1%/}" target="${2%/}"
+	case "$backing" in /*) ;; *) return 1 ;; esac
+	case "$target" in /*) ;; *) return 1 ;; esac
+	[ -r /proc/self/mountinfo ] || return 1
+	awk -v backing="$backing" -v target="$target" '
+		{
+			path = $5
+			if (path == backing) backing_count++
+			else if (index(path, backing "/") == 1) nested = 1
+			if (path == target) target_count++
+			else if (index(path, target "/") == 1) nested = 1
+		}
+		END { exit backing_count == 1 && target_count == 1 && !nested ? 0 : 1 }
+	' /proc/self/mountinfo
+}
+
 uid853_mounted_tree_is_writable() {
 	local tree="$1"
 	[ -d "$tree" ] && [ ! -L "$tree" ] || return 1
@@ -1236,12 +1253,9 @@ memory_bindings_valid() {
 	[ -d "$MEMORY_BACKING_DATA_MOUNT" ] &&
 		[ ! -L "$MEMORY_BACKING_DATA_MOUNT" ] || return 1
 	[ -d "$target" ] && [ ! -L "$target" ] || return 1
-	path_is_exact_mountpoint "$MEMORY_BACKING_DATA_MOUNT" || return 1
-	path_is_exact_mountpoint "$target" || return 1
+	memory_binding_mounts_valid "$MEMORY_BACKING_DATA_MOUNT" "$target" || return 1
 	[ "$target" -ef "$MEMORY_DATA_DIR" ] || return 1
 	[ ! "$MEMORY_BACKING_DATA_MOUNT" -ef "$MEMORY_DATA_DIR" ] || return 1
-	tree_has_no_nested_mounts "$MEMORY_BACKING_DATA_MOUNT" || return 1
-	tree_has_no_nested_mounts "$target" || return 1
 	if [ "${MEMORY_STATE_VALIDATED:-0}" = 1 ]; then
 		memory_binding_identities_match "$backing" \
 			"$MEMORY_STATE_PERSISTENT_DATA_DEVICE" \
@@ -3692,7 +3706,11 @@ official_running() {
 official_pid() {
 	ubus -S call service list '{"name":"adguardhome"}' 2>/dev/null |
 		jsonfilter -e '@.adguardhome.instances[@.running=true].pid' 2>/dev/null |
-		awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
+		{
+			local pid="" remainder
+			read -r pid remainder || true
+			case "$pid" in ""|*[!0-9]*) ;; *) printf '%s\n' "$pid" ;; esac
+		}
 }
 
 official_memory_data_mount_visible() {
@@ -3707,14 +3725,19 @@ official_memory_data_mount_visible() {
 }
 
 pid_is_supervised_descendant() {
-	local candidate="$1" supervisor="$2" parent depth=0
+	local candidate="$1" supervisor="$2" parent key value remainder depth=0
 	case "$candidate:$supervisor" in
 		*[!0-9:]*) return 1 ;;
 	esac
 	while [ "$depth" -lt 64 ]; do
 		[ "$candidate" = "$supervisor" ] && return 0
 		[ -r "/proc/${candidate}/status" ] || return 1
-		parent="$(awk '$1 == "PPid:" { print $2; exit }' "/proc/${candidate}/status")"
+		parent=""
+		while read -r key value remainder || [ -n "$key$value$remainder" ]; do
+			[ "$key" = PPid: ] || continue
+			parent="$value"
+			break
+		done <"/proc/${candidate}/status" || return 1
 		case "$parent" in
 			""|*[!0-9]*) return 1 ;;
 		esac

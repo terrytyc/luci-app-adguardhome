@@ -36,13 +36,8 @@ command -v flock >/dev/null 2>&1 || {
 exec 9>"${TMPDIR:-/tmp}/luci-app-adguardhome-bounded-test.lock"
 flock -x 9
 
-extract_helper() {
-	awk '
-		/^run_bounded\(\) \($/ { copying = 1 }
-		copying { print }
-		copying && /^\)$/ { exit }
-	' "$1"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 temp_dir="$(mktemp -d /tmp/luci-app-adguardhome-bounded-test.XXXXXX)"
 cleanup() {
@@ -52,8 +47,8 @@ trap cleanup EXIT HUP INT QUIT TERM
 
 awk -v helper_dir="${package_dir}/scripts" -f "$expander" "$init_file" >"${temp_dir}/init.expanded"
 awk -v helper_dir="${package_dir}/scripts" -f "$expander" "$defaults_file" >"${temp_dir}/defaults.expanded"
-extract_helper "${temp_dir}/init.expanded" >"${temp_dir}/init.helper"
-extract_helper "${temp_dir}/defaults.expanded" >"${temp_dir}/defaults.helper"
+function_body "${temp_dir}/init.expanded" run_bounded >"${temp_dir}/init.helper"
+function_body "${temp_dir}/defaults.expanded" run_bounded >"${temp_dir}/defaults.helper"
 for expanded in "${temp_dir}/init.expanded" "${temp_dir}/defaults.expanded"; do
 	busybox ash -n "$expanded"
 	if grep -Fq '# @include run-bounded' "$expanded"; then

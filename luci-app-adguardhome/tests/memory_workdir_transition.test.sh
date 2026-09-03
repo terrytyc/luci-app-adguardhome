@@ -5,13 +5,8 @@ set -eu
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 
-function_body() {
-	awk -v function_name="$2" '
-		$0 == function_name "() {" || $0 == function_name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$1"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 apply_body="$(function_body "$init_file" memory_apply_official_path_delta)"
 normalize_persistent_body="$(function_body "$init_file" normalize_managed_config_file_persistent)"

@@ -110,6 +110,147 @@ function loadOverview() {
 	};
 }
 
+function deferred() {
+	let resolve, reject;
+	const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
+	return { promise, resolve, reject };
+}
+
+async function testApplyRefresh() {
+	async function settlesWithoutRefresh(promise) {
+		let timeout;
+		try {
+			return await Promise.race([ promise, new Promise((_resolve, reject) => {
+				timeout = setTimeout(() => reject(new Error('Apply waited for the extra status refresh')), 500);
+			}) ]);
+		} finally {
+			clearTimeout(timeout);
+		}
+	}
+	for (const kind of [ 'success', 'rejected', 'rpc-failure', 'rejected-refresh-failure', 'callback-failure', 'inactive', 'hidden' ]) {
+		const state = loadOverview();
+		await state.view.render(await state.view.load());
+		state.calls.length = 0;
+		const callback = state.view.statusPollCallback;
+		const submission = deferred();
+		const refreshReply = deferred();
+		const result = { applied: true };
+		const failure = new Error('original settings failure');
+		let submits = 0;
+		let refreshes = 0;
+		let refreshCompletion;
+		let refreshCallback = callback;
+		state.view.submitSettings = () => { submits++; return submission.promise; };
+		state.handlers.get_overview = () => {
+			refreshes++;
+			assert.equal(state.view.settingsSubmission, null, 'release the submission before refreshing status');
+			return refreshReply.promise;
+		};
+		if (kind === 'callback-failure') {
+			refreshCallback = async () => {
+				refreshes++;
+				assert.equal(state.view.settingsSubmission, null);
+				throw new Error('status rendering failed');
+			};
+		}
+		state.view.statusPollCallback = () => {
+			refreshCompletion = refreshCallback();
+			return refreshCompletion;
+		};
+
+		const applying = state.view.handleSaveApply();
+		assert.equal(state.view.handleSaveApply(), submission.promise,
+			'clicking Apply twice must reuse the same submission');
+		await callback();
+		assert.deepEqual(state.calls, [], 'routine status polling must pause during the settings transaction');
+		assert.equal(state.polls.size, 1, 'pausing for Apply must not unregister the normal timer');
+		if (kind === 'inactive')
+			state.setActive(false);
+		if (kind === 'hidden')
+			state.document.hidden = true;
+		if (kind.startsWith('rejected'))
+			submission.reject(failure);
+		else
+			submission.resolve(result);
+		if (kind.startsWith('rejected'))
+			await assert.rejects(settlesWithoutRefresh(applying), error => error === failure,
+				'the refresh must preserve the original rejected settings result without delaying it');
+		else
+			assert.equal(await settlesWithoutRefresh(applying), result,
+				'a pending status refresh must not delay or replace the settings result');
+		if (kind !== 'inactive' && kind !== 'hidden') {
+			assert.equal(state.view.settingsSubmission, null);
+			state.view.settingsMap.initialData.config.work_dir = '/mnt/storage/AdGuardHome-new-draft';
+			if (kind === 'rpc-failure' || kind === 'rejected-refresh-failure')
+				refreshReply.reject(new Error('status RPC failed after Apply'));
+			else
+				refreshReply.resolve({
+					status: { running: true, memory_requested: true, memory_active: true },
+					config: { dns_port: 5354, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
+				});
+		}
+		if (refreshCompletion)
+			await refreshCompletion.catch(() => {});
+		assert.equal(submits, 1, 'post-apply refresh must never start a second settings transaction');
+		assert.equal(state.view.settingsSubmission, null);
+		assert.equal(refreshes, kind === 'inactive' || kind === 'hidden' ? 0 : 1,
+			'each visible, active completion must refresh status exactly once');
+		if (refreshes) {
+			assert.equal(state.view.settingsMap.initialData.config.work_dir,
+				'/mnt/storage/AdGuardHome-new-draft', 'the status refresh must preserve a newly edited draft');
+		}
+		assert.ok(state.calls.every(method => method === 'get_overview'),
+			'the extra refresh must not reload or write the full settings form');
+		assert.equal(state.errors.length,
+			[ 'rpc-failure', 'rejected-refresh-failure', 'callback-failure' ].includes(kind) ? 1 : 0);
+		if (kind === 'hidden') {
+			state.document.hidden = false;
+			refreshReply.resolve({ status: { running: true }, config: { dns_port: 5354 } });
+			await callback();
+			assert.equal(refreshes, 1, 'the retained regular timer must refresh after returning to the visible page');
+		}
+	}
+
+	for (const arrival of [ 'during-apply', 'after-refresh' ]) {
+		const state = loadOverview();
+		await state.view.render(await state.view.load());
+		const callback = state.view.statusPollCallback;
+		const oldReply = deferred();
+		const submission = deferred();
+		let refreshCompletion;
+		state.handlers.get_overview = () => oldReply.promise;
+		const oldPoll = callback();
+		state.view.submitSettings = () => submission.promise;
+		const applying = state.view.handleSaveApply();
+		if (arrival === 'during-apply') {
+			oldReply.resolve({ status: { running: false }, config: { dns_port: 53 } });
+			await oldPoll;
+			assert.equal(state.updates.length, 0, 'a pre-Apply status reply must not render during the transaction');
+		}
+		state.view.statusPollCallback = () => {
+			refreshCompletion = callback();
+			return refreshCompletion;
+		};
+		state.handlers.get_overview = () => ({
+			status: { running: true, memory_requested: true, memory_active: true },
+			config: { dns_port: 5354 },
+		});
+		submission.resolve();
+		await applying;
+		await refreshCompletion;
+		assert.ok(state.updates.some(update => update.value === '5354'),
+			'the immediate completion refresh must display the final live state');
+		if (arrival === 'after-refresh') {
+			assert.equal(state.view.settingsSubmission, null);
+			const currentUpdates = state.updates.length;
+			oldReply.resolve({ status: { running: false }, config: { dns_port: 53 } });
+			await oldPoll;
+			assert.equal(state.updates.length, currentUpdates,
+				'a pre-Apply request arriving after the final refresh must not overwrite the new state');
+		}
+	}
+}
+
 async function main() {
 	const state = loadOverview();
 	const initial = await state.view.load();
@@ -255,6 +396,7 @@ async function main() {
 		'the overview must no longer declare redundant status/config RPCs');
 	assert.doesNotMatch(source, /require adguardhome\.bcrypt/,
 		'loading the overview must not load the bcrypt dependency before it is needed');
+	await testApplyRefresh();
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

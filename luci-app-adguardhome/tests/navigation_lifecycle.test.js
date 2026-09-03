@@ -162,6 +162,7 @@ async function runSettingsSubmissionScenario(kind) {
 	let statusCalls = 0;
 	let loadCalls = 0;
 	let resetCalls = 0;
+	let refreshCalls = 0;
 	let setArguments = null;
 	let context = null;
 	const optionCache = new Map(values);
@@ -248,9 +249,22 @@ async function runSettingsSubmissionScenario(kind) {
 		pageScope: {},
 		settingsMap: map,
 		committedSettings: { revision: oldRevision, memoryWritebackInterval: 60 },
+		submitSettings: () => view.submitSettings.call(context),
+		async statusPollCallback() {
+			refreshCalls++;
+			assert.equal(context.settingsSubmission, null);
+			assert.equal(successes + failures.length, 1,
+				'the original settings outcome must be reported before the extra status refresh');
+			if (kind === 'success') {
+				assert.equal(context.committedSettings.revision, currentRevision);
+				assert.equal(loadCalls, 1);
+				assert.equal(resetCalls, 1);
+			}
+		},
 	};
 
-	await view.submitSettings.call(context);
+	await view.handleSaveApply.call(context);
+	assert.equal(refreshCalls, 1, 'success and failure must each trigger only one post-apply status refresh');
 	return {
 		context,
 		failures,

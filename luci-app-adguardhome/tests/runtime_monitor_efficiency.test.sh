@@ -10,17 +10,12 @@ init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT
 
-function_body() {
-	awk -v name="$1" '
-		$0 == name "() {" || $0 == name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$init_file"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 grep -qx MONITOR_INTERVAL=5 "$init_file"
 for name in reconcile_core_locked monitor_interval_locked monitor wait_for_core_ready \
 	normalize_memory_writeback_interval; do
-	eval "$(function_body "$name")"
+	eval "$(function_body "$init_file" "$name")"
 done
 
 events="${test_tmp}/reconcile"
@@ -128,7 +123,7 @@ events="${test_tmp}/monitor"
 	MONITOR_INTERVAL=5
 	# Only bound the otherwise-infinite loop; all production scheduling branches
 	# and the real lock-result wrapper are executed unchanged.
-	eval "$(function_body monitor | sed 's/while :; do/while monitor_next_round; do/')"
+	eval "$(function_body "$init_file" monitor | sed 's/while :; do/while monitor_next_round; do/')"
 	monitor_next_round() {
 		ROUND=$((ROUND + 1))
 		[ "$ROUND" -le 16 ]

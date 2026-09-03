@@ -99,13 +99,8 @@ require_text "$po_file" 'msgid "Memory write-back interval (minutes)"'
 # shellcheck disable=SC2016
 require_text "$readme_file" '不新增 `rsync`、cron、`coreutils-stat` 或 `coreutils-timeout` 等依赖'
 
-function_body() {
-	awk -v function_name="$2" '
-		$0 == function_name "() {" || $0 == function_name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$1"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 writeback_body="$(function_body "$init_file" memory_writeback_locked_command)"
 copy_body="$(function_body "$init_file" memory_copy_live_data_locked)"

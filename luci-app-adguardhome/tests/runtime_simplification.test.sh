@@ -5,13 +5,8 @@ set -eu
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 
-function_body() {
-	awk -v name="$1" '
-		$0 == name "() {" || $0 == name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$init_file"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 for obsolete in disable_official_autostart sync_yaml_stale_memory_pattern \
 	memory_rewrite_workdir_pattern memory_clear_official_path_delta; do
@@ -21,11 +16,11 @@ for obsolete in disable_official_autostart sync_yaml_stale_memory_pattern \
 	fi
 done
 
-guard_body="$(function_body memory_run_with_official_path_guard)"
+guard_body="$(function_body "$init_file" memory_run_with_official_path_guard)"
 # One pre-commit guard and one post-commit guard; no three identical prechecks.
 [ "$(printf '%s\n' "$guard_body" | grep -Fc 'uci_guard_no_delta "$OFFICIAL_CONFIG"')" = 2 ] || exit 1
 for name in memory_prepare_runtime_locked memory_deactivate_locked; do
-	if function_body "$name" | grep -Fq sync_yaml_managed_fields_checked; then
+	if function_body "$init_file" "$name" | grep -Fq sync_yaml_managed_fields_checked; then
 		printf 'data-only RAM transition still rewrites persistent YAML\n' >&2
 		exit 1
 	fi
@@ -33,7 +28,7 @@ done
 
 # With the legacy RAM path rewrite removed, identical workdirs must not even
 # create a disposable YAML snapshot.  A real move still uses the checked path.
-managed_body="$(function_body sync_yaml_managed_fields_checked)"
+managed_body="$(function_body "$init_file" sync_yaml_managed_fields_checked)"
 (
 	eval "$managed_body"
 	mktemp() { return 1; }
@@ -51,9 +46,9 @@ managed_body="$(function_body sync_yaml_managed_fields_checked)"
 
 # Dynamic DNS ports are intentionally read from a fresh snapshot each time.
 # There is no monitor-lifetime cache which can conceal an official Web UI edit.
-runtime_body="$(function_body load_runtime_dns_port)"
-parser_body="$(function_body yaml_runtime_ports)"
-port_body="$(function_body is_valid_port)"
+runtime_body="$(function_body "$init_file" load_runtime_dns_port)"
+parser_body="$(function_body "$init_file" yaml_runtime_ports)"
+port_body="$(function_body "$init_file" is_valid_port)"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT
 (

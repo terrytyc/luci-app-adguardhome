@@ -9,13 +9,8 @@ if grep -Fq -- '-quit' "$defaults"; then
 	exit 1
 fi
 
-function_body() {
-	awk -v function_name="$2" '
-		$0 == function_name "() {" { copying = 1 }
-		copying { print }
-		copying && $0 == "}" { exit }
-	' "$1"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 select_body="$(function_body "$defaults" select_clean_install_source)"
 initialize_body="$(function_body "$defaults" initialize_clean_options)"

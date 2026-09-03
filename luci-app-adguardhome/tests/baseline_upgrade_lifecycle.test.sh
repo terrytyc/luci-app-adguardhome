@@ -5,6 +5,8 @@ script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 package_dir="$script_dir/.."
 makefile="$package_dir/Makefile"
 defaults="$package_dir/root/etc/uci-defaults/40_luci-AdGuardHome"
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 hook_body() {
 	awk -v hook="$2" '
@@ -76,11 +78,7 @@ grep -Fq 'BASELINE_UPGRADE_STATE="${NORMALIZER_RUNTIME_DIR}/upgrade-state"' \
 	printf 'init baseline upgrade-state path is missing\n' >&2
 	exit 1
 }
-start_body="$(awk '
-	/^start_service\(\) \{/ { copying = 1 }
-	copying { print }
-	copying && /^}/ { exit }
-' "$init_file")"
+start_body="$(function_body "$init_file" start_service)"
 for required in \
 	'ADGUARDHOME_BASELINE_RESUME:-0' \
 	'START_PREPARED=1' \
@@ -127,4 +125,4 @@ if printf '%s\n' "$upgrade_defaults" |
 	exit 1
 fi
 
-printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6 to 2.4.0-r7 baseline lifecycle\n'
+printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7 to 2.4.0-r8 baseline lifecycle\n'

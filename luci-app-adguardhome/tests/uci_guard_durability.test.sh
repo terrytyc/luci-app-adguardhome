@@ -15,17 +15,12 @@ init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT
 
-function_body() {
-	awk -v name="$1" '
-		$0 == name "() {" || $0 == name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$init_file"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 for name in uci_guard_configs_unchanged uci_guard_file_signature \
 	memory_run_with_official_path_guard; do
-	eval "$(function_body "$name")"
+	eval "$(function_body "$init_file" "$name")"
 done
 
 OFFICIAL_CONFIG=adguardhome

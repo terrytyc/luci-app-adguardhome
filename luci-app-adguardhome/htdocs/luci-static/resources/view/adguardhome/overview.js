@@ -590,6 +590,7 @@ return view.extend({
 		if (typeof this.statusPollCallback === 'function')
 			poll.remove(this.statusPollCallback);
 
+		let statusRequestId = 0;
 		const removeStatusPoll = () => {
 			poll.remove(statusPollCallback);
 			if (this.statusPollCallback === statusPollCallback)
@@ -600,9 +601,10 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
-			if (document.hidden)
+			if (document.hidden || this.settingsSubmission)
 				return;
 
+			const requestId = ++statusRequestId;
 			let current = null;
 			try {
 				current = await getOverview(pageScope);
@@ -617,6 +619,8 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
+			if (this.settingsSubmission || requestId !== statusRequestId)
+				return;
 
 			const next = overviewDisplayValues(current);
 			if (next.running !== displayed.running)
@@ -928,11 +932,19 @@ return view.extend({
 		if (this.settingsSubmission)
 			return this.settingsSubmission;
 
+		const scope = this.pageScope;
 		const submission = this.submitSettings();
 		this.settingsSubmission = submission;
 		return submission.finally(() => {
-			if (this.settingsSubmission === submission)
-				this.settingsSubmission = null;
+			if (this.settingsSubmission !== submission)
+				return;
+			this.settingsSubmission = null;
+			if (!operation.isPageActive(scope) || typeof this.statusPollCallback !== 'function')
+				return;
+			this.statusPollCallback().catch(error => {
+				if (!operation.isPageInactiveError(error) && operation.isPageActive(scope))
+					console.error('Unable to refresh AdGuard Home status after applying settings:', error);
+			});
 		});
 	},
 

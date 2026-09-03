@@ -7,18 +7,13 @@ init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT
 
-function_body() {
-	awk -v name="$1" '
-		$0 == name "() {" || $0 == name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$init_file"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 for name in official_socket_snapshot official_owns_socket \
 	official_owns_ipv4_reachable_socket official_memory_data_mount_visible \
 	dns_port_listening dns_ipv6_listening web_listening runtime_settings_match; do
-	eval "$(function_body "$name")"
+	eval "$(function_body "$init_file" "$name")"
 done
 
 # Readiness still loads fresh settings/YAML each time, but requests the light
@@ -40,9 +35,29 @@ fi
 
 # The exact filter is additionally exercised against the target jsonfilter in
 # the SDK/rootfs check (supply JSONFILTER_BINARY and optionally its musl loader).
-pid_body="$(function_body official_pid)"
+pid_body="$(function_body "$init_file" official_pid)"
 printf '%s\n' "$pid_body" |
 	grep -Fq "@.adguardhome.instances[@.running=true].pid"
+pid_text_calls="${test_tmp}/pid-text-calls"
+: >"$pid_text_calls"
+(
+	eval "$pid_body"
+	awk() { printf 'awk\n' >>"$pid_text_calls"; return 1; }
+	ubus() { printf '%b' "$PID_OUTPUT"; }
+	jsonfilter() {
+		[ "$*" = '-e @.adguardhome.instances[@.running=true].pid' ] || return 1
+		cat
+	}
+	for PID_OUTPUT in '20\n30\n' '20' '  20 other-fields\n30\n'; do
+		[ "$(official_pid)" = 20 ]
+	done
+	PID_OUTPUT='\t00020 extra\n30\n'
+	[ "$(official_pid)" = 00020 ]
+	for PID_OUTPUT in '' '\n20\n' 'invalid\n20\n' '-1\n20\n' '20x\n' '20\r\n'; do
+		[ -z "$(official_pid)" ]
+	done
+)
+[ ! -s "$pid_text_calls" ]
 if [ -n "${JSONFILTER_BINARY:-}" ]; then
 	jsonfilter() {
 		if [ -n "${JSONFILTER_LOADER:-}" ]; then
@@ -66,6 +81,60 @@ if [ -n "${JSONFILTER_BINARY:-}" ]; then
 		[ -z "$(official_pid)" ]
 	)
 fi
+
+# Keep one real procfs smoke check, then substitute only the /proc status root
+# to exercise disappearing/malformed parents and the original 64-level bound.
+descendant_body="$(function_body "$init_file" pid_is_supervised_descendant)"
+(
+	eval "$descendant_body"
+	real_parent="$(awk '$1 == "PPid:" { print $2; exit }' "/proc/$$/status")"
+	if [ "$real_parent" -gt 1 ]; then
+		pid_is_supervised_descendant "$$" "$real_parent"
+	fi
+)
+(
+	status_root="${test_tmp}/status"
+	# The substitution changes only the fixture location, not parent parsing.
+	# shellcheck disable=SC2016
+	eval "$(printf '%s\n' "$descendant_body" |
+		sed 's#"/proc/${candidate}/status"#"${status_root}/${candidate}/status"#g')"
+	awk() { printf 'awk\n' >>"$pid_text_calls"; return 1; }
+	status_record() {
+		mkdir -p "${status_root}/$1"
+		printf '%b' "$2" >"${status_root}/$1/status"
+	}
+	reject_parent() {
+		if pid_is_supervised_descendant "$1" "$2"; then
+			printf 'invalid parent chain accepted: %s -> %s\n' "$1" "$2" >&2
+			exit 1
+		fi
+	}
+	status_record 10 'Name:\tAdGuardHome\nPPid:\t20 extra\nPPid:\t99\n'
+	status_record 20 'PPid:\t30'
+	status_record 30 'PPid:\t1\n'
+	pid_is_supervised_descendant 10 30
+	pid_is_supervised_descendant 10 10
+	reject_parent 10 99
+	reject_parent bad 30
+	reject_parent 10 bad
+	for record in 'Name: absent\n' 'PPid:\nPPid: 30\n' 'PPid: invalid\n' \
+		'PPid: -1\n' 'PPid: 0\n' 'PPid: 1\n' 'PPid: 20\n' ''; do
+		status_record 20 "$record"
+		reject_parent 10 30
+	done
+	status_record 20 'PPid: 21\n'
+	reject_parent 10 30
+	status_record 20 'PPid: 10\n'
+	reject_parent 10 30
+	chain_pid=1000
+	while [ "$chain_pid" -lt 1064 ]; do
+		status_record "$chain_pid" "PPid: $((chain_pid + 1))\n"
+		chain_pid=$((chain_pid + 1))
+	done
+	pid_is_supervised_descendant 1000 1063
+	reject_parent 1000 1064
+)
+[ ! -s "$pid_text_calls" ]
 
 calls="${test_tmp}/calls"
 CORE_BINARY=/usr/bin/AdGuardHome
@@ -202,4 +271,4 @@ if web_listening 53336; then
 fi
 [ "$dns_port" = 53335 ]
 
-printf 'ok - light readiness, fresh official socket snapshots, PID/FD reuse and bind checks\n'
+printf 'ok - builtin PID readers, parent-chain bounds and fresh owned socket checks\n'

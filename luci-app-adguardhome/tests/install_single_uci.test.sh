@@ -22,10 +22,10 @@ reject_text() {
 }
 
 require_text "$makefile" 'PKG_VERSION:=2.4.0'
-require_text "$makefile" 'PKG_RELEASE:=7'
+require_text "$makefile" 'PKG_RELEASE:=8'
 require_text "$makefile" 'include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk'
 require_text "$makefile" 'upgrade_source_allowed "$$source_version" || exit 1'
-require_text "$policy" "ADGUARDHOME_UPGRADE_SOURCES='2.4.0-r1 2.4.0-r2 2.4.0-r3 2.4.0-r4 2.4.0-r5 2.4.0-r6'"
+require_text "$policy" "ADGUARDHOME_UPGRADE_SOURCES='2.4.0-r1 2.4.0-r2 2.4.0-r3 2.4.0-r4 2.4.0-r5 2.4.0-r6 2.4.0-r7'"
 reject_text "$makefile" '/usr/lib/opkg/'
 require_text "$makefile" "printf 'source_version=%s\\n'"
 require_text "$makefile" 'upgrade_state_source_allowed "$$upgrade_state" || exit 1'

@@ -19,13 +19,8 @@ reject() {
 	fi
 }
 
-function_body() {
-	awk -v function_name="$2" '
-		$0 == function_name "() {" || $0 == function_name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$1"
-}
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
 
 require "$init_file" 'PLUGIN_CONFIG="adguardhome"'
 require "$init_file" 'OFFICIAL_CONFIG="adguardhome"'

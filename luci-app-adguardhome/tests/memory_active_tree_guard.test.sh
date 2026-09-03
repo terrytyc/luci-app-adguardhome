@@ -10,19 +10,14 @@ init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 	exit 1
 }
 
-function_body() {
-	awk -v name="$1" '
-		$0 == name "() {" || $0 == name "() (" { copying = 1 }
-		copying { print }
-		copying && ($0 == "}" || $0 == ")") { exit }
-	' "$init_file"
-}
-tree_body="$(function_body memory_active_tree_valid)"
-layout_body="$(function_body memory_active_layout_valid)"
-state_body="$(function_body memory_state_load)"
-binds_body="$(function_body memory_state_binds_persistent)"
-load_body="$(function_body load_settings)"
-copy_body="$(function_body memory_copy_live_data_locked)"
+# shellcheck disable=SC1090
+. "$script_dir/lib/function-body.sh"
+tree_body="$(function_body "$init_file" memory_active_tree_valid)"
+layout_body="$(function_body "$init_file" memory_active_layout_valid)"
+state_body="$(function_body "$init_file" memory_state_load)"
+binds_body="$(function_body "$init_file" memory_state_binds_persistent)"
+load_body="$(function_body "$init_file" load_settings)"
+copy_body="$(function_body "$init_file" memory_copy_live_data_locked)"
 
 # The single-quoted pattern intentionally matches the literal production
 # variable reference.
@@ -45,7 +40,7 @@ fi
 # Monitor/status and live-copy setup are lightweight.  The actual copy retains
 # a full default state load, then scans the persistent destination once.
 for name in reconcile_core_locked memory_status memory_writeback_locked_command; do
-	function_body "$name" | grep -Fq 'load_settings light' || exit 1
+	function_body "$init_file" "$name" | grep -Fq 'load_settings light' || exit 1
 done
 printf '%s\n' "$load_body" | grep -Fq 'local MEMORY_STATE_CHECK="${1:-full}"' || exit 1
 printf '%s\n' "$binds_body" | grep -Fq 'memory_state_load "${MEMORY_STATE_CHECK:-full}"' || exit 1
