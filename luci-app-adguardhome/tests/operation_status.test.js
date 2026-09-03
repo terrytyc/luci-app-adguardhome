@@ -54,7 +54,7 @@ function loadOperation() {
 	};
 	const fakeUi = {
 		showModal(title, child, ...classes) {
-			rendered.push({ title, child, classes });
+			rendered.push({ title, child: Array.isArray(child) ? child[0] : child, content: child, classes });
 			return {};
 		},
 		hideModal() {
@@ -62,7 +62,7 @@ function loadOperation() {
 		},
 	};
 	const sandbox = {
-		E: (tag, attrs, child) => ({ tag, attrs, text: String(child) }),
+		E: (tag, attrs, child) => ({ tag, attrs, text: String(child), children: Array.isArray(child) ? child : [ child ] }),
 		L: { env: { apply_display: 2 } },
 		Number,
 		String,
@@ -124,8 +124,10 @@ assert.equal(state.hidden(), 2, 'custom success status must close automatically'
 state.operation.failure('failed');
 assert.equal(state.rendered.at(-1).child.text, 'failed');
 assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'error' ]);
-state.advanceOne();
-assert.equal(state.hidden(), 3, 'failure status must close automatically');
+assert.equal(state.timers.size, 0, 'failure status must remain until dismissed');
+const dismissFailure = state.rendered.at(-1).content[1].children[0].attrs.click;
+dismissFailure();
+assert.equal(state.hidden(), 3, 'failure status must close by explicit action');
 
 const staleTicket = state.operation.start();
 state.operation.success('first result', staleTicket);
@@ -135,6 +137,7 @@ assert.equal(state.timers.size, 0,
 	'a new pending operation must cancel the previous result-close timer');
 const currentRenderCount = state.rendered.length;
 staleClose();
+dismissFailure();
 state.operation.failure('obsolete result', staleTicket);
 assert.equal(state.rendered.length, currentRenderCount);
 assert.equal(state.hidden(), 3,
@@ -142,7 +145,8 @@ assert.equal(state.hidden(), 3,
 assert.equal(state.operation._modalVisible, true);
 state.operation.failure('current result', currentTicket);
 assert.equal(state.rendered.at(-1).child.text, 'current result');
-state.advanceOne();
+assert.equal(state.timers.size, 0);
+state.rendered.at(-1).content[1].children[0].attrs.click();
 assert.equal(state.hidden(), 4);
 
 const overview = fs.readFileSync(path.join(
@@ -189,7 +193,7 @@ assert.doesNotMatch(overview + yaml, /POLL_LIMIT|consecutiveErrors/,
 	'all three update flows must share the bounded job polling implementation');
 assert.doesNotMatch(log, /operation\.(?:start|success|failure)\(/,
 	'read-only log refreshes must not show an apply countdown or apply result');
-const reloadBody = yaml.slice(yaml.indexOf('\tasync handleReload()'), yaml.indexOf('\tasync reloadYaml()'));
+const reloadBody = yaml.slice(yaml.indexOf('\tasync handleReload('), yaml.indexOf('\tasync reloadYaml()'));
 assert.doesNotMatch(reloadBody, /operation\.(?:start|success|failure)\(/,
 	'reloading YAML from disk must not claim configuration changes were applied');
 assert.doesNotMatch(overview, /this\.settingsRevision/,

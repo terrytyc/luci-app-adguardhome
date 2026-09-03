@@ -234,4 +234,4 @@ else
 	printf 'skip - defaults rollback requires real UCI or ADGUARDHOME_TEST_UCI_ROOT\n'
 fi
 
-printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7/r8/r9 to 2.4.0-r10 lifecycle and final rpcd reload\n'
+printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7/r8/r9/r10 to 2.5.0-r1 lifecycle and final rpcd reload\n'

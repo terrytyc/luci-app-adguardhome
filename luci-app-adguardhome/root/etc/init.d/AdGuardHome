@@ -2499,14 +2499,6 @@ ${value}"
 	fi
 }
 
-collect_tls_old_mount() {
-	append_tls_old_mount "$1"
-}
-
-collect_tls_official_mount() {
-	append_tls_original_mount "$1"
-}
-
 derive_tls_new_managed_mounts() {
 	local value
 	TLS_NEW_MANAGED_MOUNTS=""
@@ -3172,8 +3164,8 @@ sync_tls_access_persistent() {
 	TLS_ORIGINAL_MOUNTS=""
 	TLS_PRESERVED_MOUNTS=""
 	config_load "$PLUGIN_CONFIG" || return 1
-	config_list_foreach "$PLUGIN_SECTION" "$MANAGED_JAIL_OPTION" collect_tls_old_mount
-	config_list_foreach "$OFFICIAL_SECTION" jail_mount collect_tls_official_mount
+	config_list_foreach "$PLUGIN_SECTION" "$MANAGED_JAIL_OPTION" append_tls_old_mount
+	config_list_foreach "$OFFICIAL_SECTION" jail_mount append_tls_original_mount
 	derive_tls_new_managed_mounts
 
 	expected="$TLS_PRESERVED_MOUNTS"
@@ -3222,8 +3214,8 @@ ${TLS_NEW_MANAGED_MOUNTS}"
 	TLS_PRESERVED_MOUNTS=""
 	TLS_OLD_MOUNTS=""
 	config_load "$OFFICIAL_CONFIG" || return 1
-	config_list_foreach "$OFFICIAL_SECTION" jail_mount collect_tls_official_mount
-	config_list_foreach "$PLUGIN_SECTION" "$MANAGED_JAIL_OPTION" collect_tls_old_mount
+	config_list_foreach "$OFFICIAL_SECTION" jail_mount append_tls_original_mount
+	config_list_foreach "$PLUGIN_SECTION" "$MANAGED_JAIL_OPTION" append_tls_old_mount
 	verify_fingerprint="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
 	[ "$TLS_ORIGINAL_MOUNTS" = "$expected" ] &&
 		[ "$TLS_OLD_MOUNTS" = "$expected_managed" ] &&
@@ -4495,19 +4487,17 @@ memory_reactivate_after_deactivation_failure() {
 }
 
 memory_deactivate_locked() {
-	local checkpoint="${1:-1}" old_backing
+	local old_backing
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
 	official_running && {
 		log_error "Refusing to remove a live AdGuard Home memory workdir"
 		return 1
 	}
 	old_backing="$MEMORY_BACKING_WORK_DIR"
-	if [ "$checkpoint" = 1 ]; then
-		# The core is stopped but both authenticated mounts remain present.  Copy
-		# RAM data directly over matching persistent paths through the backing
-		# alias; retain unrelated files and never replace the data root.
-		memory_copy_stopped_data_locked || return 1
-	fi
+	# The core is stopped but both authenticated mounts remain present.  Copy
+	# RAM data directly over matching persistent paths through the backing
+	# alias; retain unrelated files and never replace the data root.
+	memory_copy_stopped_data_locked || return 1
 	memory_suspend_data_bindings "$old_backing" || return 1
 	if ! memory_restore_official_persistent_paths; then
 		memory_reactivate_after_deactivation_failure "$old_backing" >/dev/null 2>&1 || true
@@ -4526,11 +4516,7 @@ memory_deactivate_locked() {
 	# The new workdir must be ready before sync reads its YAML for TLS access.
 	[ "$old_backing" = "$persistent_work_dir" ] || ensure_config_file || return 1
 	sync_official_uci || return 1
-	if [ "$checkpoint" = 1 ]; then
-		log_error "Removed the AdGuard Home memory workdir after a successful direct write-back"
-	else
-		log_error "Removed an unused AdGuard Home memory workdir"
-	fi
+	log_error "Removed the AdGuard Home memory workdir after a successful direct write-back"
 }
 
 # Reconcile an already-active RAM generation with the newly requested backing
@@ -4545,7 +4531,7 @@ memory_reconcile_requested_storage_locked() {
 			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 			wait_for_core_stopped || return 1
 		fi
-		memory_deactivate_locked 1 || return 1
+		memory_deactivate_locked || return 1
 	fi
 	memory_discard_incomplete_runtime_locked "$persistent_work_dir"
 }
@@ -4581,7 +4567,7 @@ memory_cleanup_locked_command() {
 		return
 	}
 	official_running && return 1
-	memory_deactivate_locked 1
+	memory_deactivate_locked
 }
 
 memory_prepare_locked_command() {
@@ -4660,7 +4646,7 @@ prepare_wrapper_locked() {
 			wait_for_core_stopped || return 1
 		fi
 		if [ "$MEMORY_ACTIVE" = 1 ]; then
-			memory_deactivate_locked 1 || return 1
+			memory_deactivate_locked || return 1
 		else
 			memory_discard_incomplete_runtime_locked "$persistent_work_dir" || return 1
 		fi
@@ -4869,7 +4855,7 @@ orchestrate_core_locked() {
 		memory_copy_stopped_data_locked || return 1
 	fi
 	if [ "$service_enabled" != 1 ] && [ "$MEMORY_ACTIVE" = 1 ]; then
-		memory_deactivate_locked 1 || return 1
+		memory_deactivate_locked || return 1
 	else
 		memory_reconcile_requested_storage_locked || return 1
 	fi
@@ -4934,7 +4920,7 @@ reconcile_core_locked() {
 			wait_for_core_stopped || return 1
 		fi
 		if [ "$MEMORY_ACTIVE" = 1 ]; then
-			memory_deactivate_locked 1 || return 1
+			memory_deactivate_locked || return 1
 		fi
 		sync_monitor_instance
 		return
@@ -5104,8 +5090,8 @@ start_service() {
 	START_PREPARED=0
 	START_DISABLED=0
 	# APK's generated default postinst starts enabled init scripts before our
-	# package-specific postinst can restore the recorded r1 running state.  Keep
-	# that automatic start inert while the authenticated r1 -> r2 state exists;
+	# package-specific postinst can restore the pre-upgrade running state.  Keep
+	# that automatic start inert while the authenticated upgrade state exists;
 	# the package hook explicitly opts in only when the old core was running.
 	if { [ -e "$BASELINE_UPGRADE_STATE" ] ||
 	     [ -L "$BASELINE_UPGRADE_STATE" ]; } &&
@@ -5171,7 +5157,7 @@ stop_wrapper_locked() {
 			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
 		fi
 		wait_for_core_stopped || return 1
-		memory_deactivate_locked 1 || return 1
+		memory_deactivate_locked || return 1
 	fi
 	if [ "$shutdown_mode" != 1 ]; then
 		if official_running; then

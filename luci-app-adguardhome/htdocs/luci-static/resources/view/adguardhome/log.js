@@ -65,13 +65,12 @@ async function fetchLog(source, lines, scope) {
 
 function logOutput(result) {
 	return E('textarea', {
-		class: 'cbi-input-textarea',
+		class: 'cbi-input-textarea adguardhome-log-output',
 		'aria-label': result.source === 'plugin' ? _('Plugin Runtime Log') : _('AdGuard Home Core Log'),
 		readonly: 'readonly',
-		rows: 20,
+		rows: result.log ? 20 : 1,
 		spellcheck: 'false',
 		wrap: 'off',
-		style: 'box-sizing: border-box; width: 100%; padding: .75em; font-family: monospace; resize: vertical;',
 	}, [ result.log || _('No log output.') ]);
 }
 
@@ -119,6 +118,13 @@ return view.extend({
 			type: 'button',
 			click: ui.createHandlerFn(this, 'handleRefresh'),
 		}, _('Refresh'));
+		const wrapInput = E('input', {
+			type: 'checkbox',
+			change: event => {
+				for (const source of LOG_SOURCES)
+					this.logOutputs[source].wrap = event.target.checked ? 'soft' : 'off';
+			},
+		});
 
 		for (const source of LOG_SOURCES) {
 			if (!result[source].error ||
@@ -130,26 +136,26 @@ return view.extend({
 				sourceErrorMessage(source, result[source].error)), 'error');
 		}
 
-		const root = E('div', {}, [
+		const root = E('div', { class: 'adguardhome-view' }, [
+			E('link', { rel: 'stylesheet', href: L.resource('adguardhome/style.css') }),
 			E('h2', {}, _('AdGuard Home')),
 			E('div', { class: 'cbi-map-descr' },
 				_('View recent core and plugin messages from the system log. The newest entries are shown first, and this page is read-only.')),
 			E('div', { class: 'cbi-section' }, [
-				E('div', {
-					style: 'display: flex; align-items: center; flex-wrap: wrap; gap: .5em;',
-				}, [
+				E('div', { class: 'adguardhome-actions' }, [
 					E('label', {}, [ _('Lines:'), ' ', this.lineSelect ]),
+					E('label', {}, [ wrapInput, ' ', _('Wrap lines') ]),
 					this.refreshButton,
 				]),
 			]),
-			E('div', { class: 'cbi-section' }, [
-				E('h3', {}, _('AdGuard Home Core Log')),
-				E('div', { style: 'margin-bottom: .75em;' }, [ this.logSummaries.core ]),
+			E('details', { class: 'cbi-section', open: true }, [
+				E('summary', {}, _('AdGuard Home Core Log')),
+				E('p', { class: 'adguardhome-help' }, [ this.logSummaries.core ]),
 				this.logOutputs.core,
 			]),
-			E('div', { class: 'cbi-section' }, [
-				E('h3', {}, _('Plugin Runtime Log')),
-				E('div', { style: 'margin-bottom: .75em;' }, [ this.logSummaries.plugin ]),
+			E('details', { class: 'cbi-section', open: true }, [
+				E('summary', {}, _('Plugin Runtime Log')),
+				E('p', { class: 'adguardhome-help' }, [ this.logSummaries.plugin ]),
 				this.logOutputs.plugin,
 			]),
 		]);
@@ -183,6 +189,7 @@ return view.extend({
 				}
 
 				this.logOutputs[source].value = result.log || _('No log output.');
+				this.logOutputs[source].rows = result.log ? 20 : 1;
 				this.logOutputs[source].scrollTop = 0;
 				this.logSummaries[source].textContent =
 					_('Showing up to %d lines (%d returned).').format(lines, result.lines);

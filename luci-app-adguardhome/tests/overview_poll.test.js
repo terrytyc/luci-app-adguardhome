@@ -54,11 +54,16 @@ function loadOverview() {
 	class JSONMap {
 		constructor(data) {
 			this.initialData = data;
+			this.sections = [];
 		}
 		section() {
-			return { option: () => ({ value() {}, depends() {} }) };
+			const section = { option: () => ({ value() {}, depends() {} }) };
+			this.sections.push(section);
+			return section;
 		}
-		async render() { return {}; }
+		async render() {
+			return Promise.all(this.sections.map(section => section.render?.() ?? {}));
+		}
 		load() { assert.fail('status polling must not reload unsaved form values'); }
 		reset() { assert.fail('status polling must not reset unsaved form values'); }
 	}
@@ -84,7 +89,10 @@ function loadOverview() {
 			},
 		},
 		dom: { content(node, value) {
-			if (document.activeElement === node.child)
+			const containsFocus = child => child === document.activeElement ||
+				(Array.isArray(child?.child) ? child.child.some(containsFocus)
+					: child?.child != null && containsFocus(child.child));
+			if (document.activeElement != null && containsFocus(node.child))
 				document.activeElement = null;
 			node.child = value;
 			updates.push({ node, value });
@@ -97,7 +105,7 @@ function loadOverview() {
 			return node;
 		},
 		_: value => value,
-		L: { hasViewPermission: () => true },
+		L: { hasViewPermission: () => true, resource: value => '/luci-static/resources/' + value },
 		URL: class extends URL {
 			constructor(value) { super(value); urlBuilds.push(value); }
 		},
@@ -119,6 +127,11 @@ function deferred() {
 	let resolve, reject;
 	const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
 	return { promise, resolve, reject };
+}
+
+function managementContainer(state) {
+	return state.elements.find(node => node.tag === 'span' &&
+		node.child?.attrs?.class === 'adguardhome-management');
 }
 
 async function testUnavailableStatus() {
@@ -160,7 +173,8 @@ async function testUnavailableStatus() {
 		await state.view.statusPollCallback();
 		assert.equal(service.child.child, 'Running');
 		assert.equal(storage.child.child, 'Memory');
-		assert.equal(management.child.attrs.href, 'https://adg.example:10443/');
+		assert.equal(management.child.child[0].attrs.href, 'https://adg.example:10443/');
+		assert.equal(management.child.child[1].child, 'https://adg.example:10443/');
 		assert.equal(state.polls.size, 1, 'the existing timer must recover without another polling mechanism');
 		assert.equal(state.view.committedSettings, committed);
 		assert.equal(draft.config.work_dir, '/etc/AdGuardHome-draft', 'status failure/recovery must preserve unsaved settings');
@@ -170,7 +184,7 @@ async function testUnavailableStatus() {
 async function testManagementURLValidation() {
 	const state = loadOverview();
 	await state.view.render(await state.view.load());
-	const management = state.elements.find(node => node.tag === 'span' && node.child?.tag === 'a');
+	const management = managementContainer(state);
 	for (const web of [
 		{ scheme: 'javascript', host: null, port: 3000 },
 		{ scheme: 'http', host: null, port: 0 },
@@ -185,7 +199,7 @@ async function testManagementURLValidation() {
 	}
 	state.setOverview({ status: { running: true }, config: { web: { scheme: 'https', host: 'ADG.EXAMPLE.', port: '443' } } });
 	await state.view.statusPollCallback();
-	assert.equal(management.child.attrs.href, 'https://adg.example./',
+	assert.equal(management.child.child[0].attrs.href, 'https://adg.example./',
 		'normalized endpoints must retain URL assignment checks and valid default ports');
 }
 
@@ -330,22 +344,38 @@ async function main() {
 	assert.deepEqual(state.calls.sort(), [ 'get_overview', 'get_settings', 'get_version' ]);
 	assert.equal(initial[1].status.running, true);
 	assert.equal(initial[1].config.dnsPort, 53335);
-	await state.view.render(initial);
+	const root = await state.view.render(initial);
+	assert.equal(root.attrs.class, 'adguardhome-view');
+	assert.equal(root.child[0].tag, 'link');
+	assert.equal(root.child[0].attrs.href, '/luci-static/resources/adguardhome/style.css');
+	const statusGrid = state.elements.find(node => node.tag === 'dl' &&
+		node.attrs.class === 'adguardhome-status-grid');
+	assert.equal(statusGrid.child.length, 4, 'the overview must give four primary values equal grid placement');
+	assert.deepEqual(Array.from(statusGrid.child, row => row.child[0].child),
+		[ 'Service status', 'Active storage', 'DNS listening port (YAML)', 'Management interface' ]);
+	assert.ok(state.elements.some(node => node.attrs?.class === 'adguardhome-version adguardhome-help'),
+		'the core version must remain visible outside the primary state grid');
 	assert.equal(state.urlBuilds.length, 1, 'rendering must reuse the already validated management URL');
 	assert.equal(state.polls.size, 1);
 	const callback = state.view.statusPollCallback;
 	const committed = state.view.committedSettings;
 	const draft = state.view.settingsMap.initialData;
 	draft.config.work_dir = '/mnt/storage/AdGuardHome-draft';
-	const management = state.elements.find(node => node.tag === 'span' && node.child?.tag === 'a');
+	const management = managementContainer(state);
 	assert.ok(management);
-	const initialLink = management.child;
+	const initialLink = management.child.child[0];
+	assert.equal(initialLink.attrs.href, 'http://router.example:3000/');
+	assert.equal(management.child.child[1].child, initialLink.attrs.href,
+		'the visible management address must exactly match the existing validated target');
+	assert.match(initialLink.attrs.class, /adguardhome-management-button/);
+	assert.equal(initialLink.attrs.rel, 'noopener noreferrer');
+	assert.equal(initialLink.attrs.referrerpolicy, 'no-referrer');
 	state.document.activeElement = initialLink;
 	state.calls.length = 0;
 	await callback();
 	assert.deepEqual(state.calls, [ 'get_overview' ], 'unchanged displays must still query fresh RPC state');
 	assert.equal(state.updates.length, 0, 'the initial display must seed the per-field comparison');
-	assert.equal(management.child, initialLink);
+	assert.equal(management.child.child[0], initialLink);
 	assert.equal(state.document.activeElement, initialLink, 'unchanged management links must retain keyboard focus');
 
 	state.calls.length = 0;
@@ -365,13 +395,14 @@ async function main() {
 	assert.equal(state.updates.length, 3, 'the unchanged running status must retain its node');
 	assert.equal(state.updates[0].value.child, 'Memory');
 	assert.equal(state.updates[1].value, '5353', 'DNS display must use the current YAML value');
-	assert.equal(state.updates[2].value.attrs.href, 'https://adg.example:10443/');
+	assert.equal(state.updates[2].value.child[0].attrs.href, 'https://adg.example:10443/');
+	assert.equal(state.updates[2].value.child[1].child, 'https://adg.example:10443/');
 	assert.equal(state.view.committedSettings, committed,
 		'polling must not replace the authoritative settings revision snapshot');
 	assert.equal(state.view.settingsMap.initialData, draft);
 	assert.equal(draft.config.work_dir, '/mnt/storage/AdGuardHome-draft',
 		'polling must leave unsaved work directory edits intact');
-	const activeLink = management.child;
+	const activeLink = management.child.child[0];
 	state.document.activeElement = activeLink;
 	state.updates.length = 0;
 	state.calls.length = 0;
@@ -382,7 +413,7 @@ async function main() {
 	await callback();
 	assert.deepEqual(state.calls, [ 'get_overview' ], 'display comparison must not cache RPC responses');
 	assert.equal(state.updates.length, 0, 'raw flag/type changes with identical display values must not redraw');
-	assert.equal(management.child, activeLink);
+	assert.equal(management.child.child[0], activeLink);
 	assert.equal(state.document.activeElement, activeLink);
 	state.setOverview({
 		status: { running: true, memory_requested: false, memory_active: true },
@@ -391,7 +422,7 @@ async function main() {
 	await callback();
 	assert.equal(state.updates.length, 1, 'changing only DNS must update only the DNS container');
 	assert.equal(state.updates[0].value, '5354');
-	assert.equal(management.child, activeLink);
+	assert.equal(management.child.child[0], activeLink);
 	assert.equal(state.document.activeElement, activeLink, 'unrelated status changes must preserve link focus');
 	for (const web of [
 		{ scheme: 'https', host: 'new-adg.example', port: 10443 },
@@ -406,8 +437,10 @@ async function main() {
 		await callback();
 		assert.equal(state.updates.length, 1, 'each changed management URL must update only its own container');
 		assert.equal(state.updates[0].node, management);
-		assert.equal(management.child.attrs.href,
+		assert.equal(management.child.child[0].attrs.href,
 			`${web.scheme}://${web.host ?? 'router.example'}:${web.port}/`);
+		assert.equal(management.child.child[1].child, management.child.child[0].attrs.href,
+			'the visible URL must follow every host, scheme and port change');
 	}
 	for (const [status, text, updateCount] of [
 		[{ running: true, memory_requested: true, memory_active: false }, 'Persistent storage (memory fallback)', 1],

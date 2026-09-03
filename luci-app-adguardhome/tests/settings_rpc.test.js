@@ -13,19 +13,7 @@ const rpcPath = path.join(
 );
 const source = fs.readFileSync(rpcPath, 'utf8');
 
-function extractFunction(name) {
-	const start = source.indexOf(`function ${name}(`);
-	assert.notEqual(start, -1, `missing ${name}()`);
-	const body = source.indexOf('{', start);
-	let depth = 0;
-	for (let offset = body; offset < source.length; offset++) {
-		if (source[offset] === '{')
-			depth++;
-		else if (source[offset] === '}' && --depth === 0)
-			return source.slice(start, offset + 1);
-	}
-	assert.fail(`unterminated ${name}()`);
-}
+const extractFunction = require('./lib/source').extractFunction.bind(null, source);
 
 function extractConstant(name) {
 	const match = source.match(new RegExp(`^const ${name} = .+;$`, 'm'));
@@ -165,6 +153,8 @@ assert.equal(sandbox.api.settings_candidate(
 ), null, 'oversized write-back intervals must fail closed');
 
 const updateSource = extractFunction('update_settings');
+assert.doesNotMatch(updateSource, /\blaunched\b/,
+	'settings must not retain an unreachable post-launch catch branch');
 assert.match(updateSource,
 	/prepare_yaml_job\(token, expected_revision, candidate\.revision\)/,
 	'settings and YAML transactions must share one job lock');
@@ -244,6 +234,21 @@ assert.deepEqual(launchedArguments, [
 	snapshot.revision, token, candidate.revision, '193',
 ], 'the worker must receive ten arguments with the numeric lock descriptor last');
 
+for (const failure of [ 'unavailable', 'exception' ]) {
+	let discarded = 0;
+	let released = 0;
+	launchSandbox.discard_yaml_job = () => { discarded++; return true; };
+	launchSandbox.close_yaml_job_lock = () => { released++; return true; };
+	launchSandbox.uloop.process = () => {
+		if (failure === 'exception') throw new Error('spawn failed');
+		return null;
+	};
+	assert.ok(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
+		true, 120, snapshot.revision).error);
+	assert.equal(discarded, 1, `${failure}: failed launch must discard its pending job`);
+	assert.equal(released, 1, `${failure}: failed launch must release its held lock`);
+}
+
 let record;
 let replacements;
 let closes;
@@ -301,6 +306,9 @@ assert.equal(closes, 1);
 assert.match(source, /get_settings:\s*\{/);
 assert.match(source, /set_settings:\s*\{/);
 assert.match(source, /get_settings_update:\s*\{/);
+assert.match(source, /return update_job_status\(request.args.token, request.args.consume, false\);/);
+assert.match(source, /return update_job_status\(request.args.token, request.args.consume, true\);/);
+assert.doesNotMatch(source, /function (yaml_job_status|settings_job_status)\(/);
 
 const jobFixture = {
 	record: null,
@@ -351,9 +359,7 @@ const jobSandbox = {
 	},
 };
 vm.createContext(jobSandbox);
-vm.runInContext([
-	'update_job_status', 'yaml_job_status', 'settings_job_status',
-].map(extractFunction).join('\n') + '\nthis.api = { yaml_job_status, settings_job_status };',
+vm.runInContext(extractFunction('update_job_status') + '\nthis.query = update_job_status;',
 jobSandbox, { filename: rpcPath });
 
 function resetJob(state) {
@@ -370,7 +376,7 @@ function resetJob(state) {
 }
 
 for (const settings of [ false, true ]) {
-	const query = settings ? jobSandbox.api.settings_job_status : jobSandbox.api.yaml_job_status;
+	const query = (token, consume) => jobSandbox.query(token, consume, settings);
 	const label = settings ? 'settings' : 'YAML';
 	const title = settings ? 'Settings' : 'YAML';
 	resetJob(null);

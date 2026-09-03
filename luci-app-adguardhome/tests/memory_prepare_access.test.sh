@@ -116,7 +116,7 @@ remove_prepared() {
 	# Simulate only the official init's normal directory/YAML ownership handoff. The
 	# subsequent stopped direct writeback and bind cleanup are production code.
 	chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_work_dir" "$persistent_config_file"
-	memory_deactivate_locked 1
+	memory_deactivate_locked
 	[ "$MEMORY_ACTIVE" = 0 ] && [ ! -e "$MEMORY_RUNTIME_DIR" ]
 }
 

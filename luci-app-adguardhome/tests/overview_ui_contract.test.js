@@ -11,20 +11,9 @@ const overviewPath = path.join(
 	'htdocs/luci-static/resources/view/adguardhome/overview.js'
 );
 const source = fs.readFileSync(overviewPath, 'utf8');
-
-function extractFunction(name) {
-	const start = source.indexOf(`function ${name}(`);
-	assert.notEqual(start, -1, `missing ${name}()`);
-	const body = source.indexOf('{', start);
-	let depth = 0;
-	for (let offset = body; offset < source.length; offset++) {
-		if (source[offset] === '{')
-			depth++;
-		else if (source[offset] === '}' && --depth === 0)
-			return source.slice(start, offset + 1);
-	}
-	assert.fail(`unterminated ${name}()`);
-}
+const extractFunction = require('./lib/source').extractFunction.bind(null, source);
+const css = fs.readFileSync(path.join(packageRoot,
+	'htdocs/luci-static/resources/adguardhome/style.css'), 'utf8');
 
 const credentialFieldSource = extractFunction('credentialField');
 const sandbox = {
@@ -63,4 +52,31 @@ const boundedInputStyles = source.match(
 assert.equal(boundedInputStyles.length, 3,
 	'all credential inputs must remain within the modal at desktop and mobile widths');
 
-console.log('overview credential modal layout contract tests passed');
+for (const match of css.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{/g)) {
+	const selectors = match[1].trim();
+	if (selectors.startsWith('@media'))
+		continue;
+	for (const selector of selectors.split(','))
+		assert.ok(selector.trim().startsWith('.adguardhome-view '),
+			`plugin styling must not change the global LuCI theme: ${selector}`);
+}
+assert.doesNotMatch(css, /!important/);
+assert.match(css, /grid-template-columns:\s*repeat\(2, minmax\(0, 1fr\)\)/);
+assert.match(css, /@media\s*\(max-width:\s*700px\)[\s\S]*grid-template-columns:\s*1fr/);
+assert.match(css, /\.adguardhome-management-button\s*\{[^}]*min-height:\s*40px/);
+assert.match(css, /\.adguardhome-management-button\s*\{[^}]*padding-block:\s*0;[^}]*line-height:\s*1\.5/,
+	'the link must not retain oversized theme padding or an inherited form-row line height');
+assert.match(css, /\.adguardhome-log-output\s*\{[^}]*font-size:\s*14px;[^}]*line-height:\s*1\.5/);
+assert.doesNotMatch(css.match(/\.adguardhome-log-output\s*\{([^}]*)\}/)[1], /^\s*(?:min-|max-)?height\s*:/m,
+	'empty one-row logs must not be forced into a tall viewport');
+assert.match(css, /\.adguardhome-actions\s*\{[^}]*flex-wrap:\s*wrap/);
+assert.match(css, /\.cbi-value-description\s*\{[^}]*font-size:\s*13px;[^}]*line-height:\s*1\.5;[^}]*color:\s*inherit;[^}]*opacity:\s*1/,
+	'help must remain readable without overriding light or dark theme text colors');
+assert.match(source, /Only data is copied to RAM; the core executable and YAML stay in place/);
+assert.equal((source.match(/power loss/g) ?? []).length, 1,
+	'the RAM consistency warning should be explained once, not repeated for the interval');
+assert.match(source, /0 disables scheduled write-back\. A normal stop or restart still writes data back/);
+assert.match(source, /_\('AdGuard Home account'\)/);
+assert.match(source, /ui\.showModal\(_\('Change AdGuard Home Account'\)/);
+
+console.log('scoped responsive overview, readable shared styles and credential modal contracts passed');

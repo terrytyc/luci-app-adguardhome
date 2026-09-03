@@ -12,22 +12,7 @@ const rpcPath = path.join(
 );
 const source = fs.readFileSync(rpcPath, 'utf8');
 
-function extractFunction(name) {
-	const start = source.indexOf(`function ${name}(`);
-	assert.notEqual(start, -1, `missing ${name}()`);
-	const body = source.indexOf('{', start);
-	assert.notEqual(body, -1, `missing ${name}() body`);
-
-	let depth = 0;
-	for (let offset = body; offset < source.length; offset++) {
-		if (source[offset] === '{')
-			depth++;
-		else if (source[offset] === '}' && --depth === 0)
-			return source.slice(start, offset + 1);
-	}
-
-	assert.fail(`unterminated ${name}()`);
-}
+const extractFunction = require('./lib/source').extractFunction.bind(null, source);
 
 function extractConstant(name) {
 	const match = source.match(new RegExp(`^const ${name} = .+;$`, 'm'));

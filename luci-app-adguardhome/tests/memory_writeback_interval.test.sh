@@ -92,7 +92,7 @@ require_text "$overview_file" 'option.default = String(DEFAULT_MEMORY_WRITEBACK_
 require_text "$overview_file" 'option.retain = true;'
 require_text "$overview_file" "option.depends('run_from_memory', '1');"
 require_text "$overview_file" 'interval > MAX_MEMORY_WRITEBACK_INTERVAL'
-require_text "$overview_file" 'Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back.'
+require_text "$overview_file" '0 disables scheduled write-back. A normal stop or restart still writes data back. Use 60 minutes or longer to reduce flash wear.'
 require_text "$po_file" 'msgid "Memory write-back interval (minutes)"'
 # Backticks and the package name are literal README contract text.
 # shellcheck disable=SC2016
@@ -256,7 +256,7 @@ printf '%s\n' "$orchestrate_body" | grep -Fq -- 'memory_copy_stopped_data_locked
 	printf 'normal restart no longer writes stopped RAM data directly\n' >&2
 	exit 1
 }
-printf '%s\n' "$stop_body" | grep -Fq -- 'memory_deactivate_locked 1 || return 1' || {
+printf '%s\n' "$stop_body" | grep -Fq -- 'memory_deactivate_locked || return 1' || {
 	printf 'normal stop no longer checkpoints and deactivates the RAM workdir\n' >&2
 	exit 1
 }

@@ -67,7 +67,7 @@ printf '%s\n' "$reconcile_body" |
 	exit 1
 }
 printf '%s\n' "$reconcile_body" |
-	grep -Fq 'memory_deactivate_locked 1 || return 1' || {
+	grep -Fq 'memory_deactivate_locked || return 1' || {
 	printf 'active RAM reconciliation does not write back and deactivate the old tree\n' >&2
 	exit 1
 }
@@ -317,7 +317,7 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		return 1
 	}
 	memory_deactivate_locked() {
-		[ "$1" = 1 ] && ! official_running || return 1
+		[ "$#" = 0 ] && ! official_running || return 1
 		[ "$config_file" = "${OLD}/AdGuardHome.yaml" ] || return 1
 		printf 'deactivate:%s:%s:%s\n' \
 			"$MEMORY_BACKING_WORK_DIR" "$config_file" "$persistent_work_dir" >>"$events"

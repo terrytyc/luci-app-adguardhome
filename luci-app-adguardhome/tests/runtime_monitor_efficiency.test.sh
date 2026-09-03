@@ -67,7 +67,7 @@ reconcile_core_locked
 TEST_BACKING=/etc/AdGuardHome
 TEST_ENABLED=0
 reconcile_core_locked
-[ "$(cat "$events")" = "$(printf 'settings\ncleanup\nservice:stop\nstopped\ndeactivate:1\nmonitor-sync')" ]
+[ "$(cat "$events")" = "$(printf 'settings\ncleanup\nservice:stop\nstopped\ndeactivate:\nmonitor-sync')" ]
 : >"$events"
 TEST_ENABLED=1
 TEST_MODE=dnsmasq-upstream

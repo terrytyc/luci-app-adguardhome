@@ -1089,7 +1089,6 @@ function update_settings(enabled, work_dir, verbose, redirect,
 			: 'Current settings are unavailable or invalid' };
 	}
 
-	let launched = false;
 	try {
 		// Spawn the coordinator directly without a shell.  The child inherits the
 		// already-locked job descriptor, serializing this whole settings transaction
@@ -1117,14 +1116,11 @@ function update_settings(enabled, work_dir, verbose, redirect,
 			close_yaml_job_lock({ file: job.lock });
 			return { error: 'Unable to start the settings update transaction' };
 		}
-		launched = true;
 		// Keep the parent descriptor locked until the child callback publishes
 		// the terminal record.  This closes the exit-to-callback race and keeps
 		// YAML edits mutually exclusive for the entire settings transaction.
 	}
 	catch (error) {
-		if (launched)
-			return { accepted: true, token, reused: false };
 		discard_yaml_job(token);
 		close_yaml_job_lock({ file: job.lock });
 		return { error: 'Settings update transaction failed' };
@@ -1265,14 +1261,12 @@ function update_yaml(content, expected_hash) {
 		}
 		launched = true;
 
-		let stage_closed = file.close();
+		file.close();
 		file = null;
-		let lock_closed = close_yaml_job_lock({ file: job.lock });
+		close_yaml_job_lock({ file: job.lock });
 		job.lock = null;
 		// A failed parent-side close cannot revoke the descriptor already inherited
 		// by the worker.  Let the persistent job result remain authoritative.
-		if (!stage_closed || !lock_closed)
-			return { accepted: true, token, reused: false };
 	}
 	catch (error) {
 		if (file) {
@@ -1367,14 +1361,6 @@ function update_job_status(token, consume, settings) {
 		return { error: `Unable to release ${label} update lock` };
 
 	return result;
-}
-
-function yaml_job_status(token, consume) {
-	return update_job_status(token, consume, false);
-}
-
-function settings_job_status(token, consume) {
-	return update_job_status(token, consume, true);
 }
 
 function yaml_scalar(value) {
@@ -1573,11 +1559,7 @@ function credential_record(content) {
 	if (!target)
 		return null;
 
-	let usernames = [];
-	for (let record in records)
-		push(usernames, record.username);
 	target.lines = lines;
-	target.usernames = usernames;
 	target.record_count = length(records);
 	return target;
 }
@@ -1626,9 +1608,6 @@ function update_credentials(username, password_hash, expected_hash) {
 		return { error: 'No username or password change was requested' };
 
 	if (change_username) {
-		for (let existing in record.usernames)
-			if (existing == username && existing != record.username)
-				return { error: 'The requested username already exists' };
 		if (record.record_count > 1)
 			return {
 				error: 'Cannot change the username while multiple YAML user accounts are configured; change only the password or use the YAML editor',
@@ -1643,7 +1622,7 @@ function update_credentials(username, password_hash, expected_hash) {
 			`${record.password_prefix}${password_hash}`;
 
 	let content = join('\n', record.lines);
-	if (sha256(content) == yaml.sha256)
+	if (content == yaml.content)
 		return { error: 'No username or password change was requested' };
 	return update_yaml(content, expected_hash);
 }
@@ -1996,7 +1975,7 @@ const methods = {
 	get_yaml_update: {
 		args: { token: '', consume: false },
 		call: function(request) {
-			return yaml_job_status(request.args.token, request.args.consume);
+			return update_job_status(request.args.token, request.args.consume, false);
 		},
 	},
 	set_settings: {
@@ -2024,7 +2003,7 @@ const methods = {
 	get_settings_update: {
 		args: { token: '', consume: false },
 		call: function(request) {
-			return settings_job_status(request.args.token, request.args.consume);
+			return update_job_status(request.args.token, request.args.consume, true);
 		},
 	},
 };

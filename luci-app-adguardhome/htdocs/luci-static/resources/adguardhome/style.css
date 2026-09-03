@@ -1,0 +1,93 @@
+/* SPDX-License-Identifier: Apache-2.0 */
+
+.adguardhome-view .adguardhome-status-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 1rem 2rem;
+	margin: 0;
+}
+
+.adguardhome-view .adguardhome-status-grid > div {
+	min-width: 0;
+}
+
+.adguardhome-view .adguardhome-status-grid dt {
+	font-weight: normal;
+}
+
+.adguardhome-view .adguardhome-status-grid dd {
+	margin: .35rem 0 0;
+}
+
+.adguardhome-view .adguardhome-primary-value {
+	font-weight: bold;
+}
+
+.adguardhome-view .adguardhome-version {
+	margin: 1rem 0 0;
+}
+
+.adguardhome-view .adguardhome-management {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-start;
+	gap: .4rem;
+}
+
+.adguardhome-view .adguardhome-management-button {
+	display: inline-flex;
+	align-items: center;
+	box-sizing: border-box;
+	min-height: 40px;
+	max-width: 100%;
+	padding-block: 0;
+	line-height: 1.5;
+}
+
+.adguardhome-view .adguardhome-management-url {
+	max-width: 100%;
+	overflow-wrap: anywhere;
+}
+
+.adguardhome-view .adguardhome-management em {
+	font-style: normal;
+}
+
+.adguardhome-view .adguardhome-editor,
+.adguardhome-view .adguardhome-log-output {
+	box-sizing: border-box;
+	width: 100%;
+	padding: .75em;
+	font-family: monospace;
+	font-size: 14px;
+	line-height: 1.5;
+	resize: vertical;
+}
+
+.adguardhome-view .adguardhome-editor {
+	min-height: 18rem;
+	max-height: 65vh;
+}
+
+.adguardhome-view .adguardhome-help,
+.adguardhome-view .adguardhome-management em,
+.adguardhome-view .cbi-map-descr,
+.adguardhome-view .cbi-value-description {
+	font-size: 13px;
+	line-height: 1.5;
+	color: inherit;
+	opacity: 1;
+}
+
+.adguardhome-view .adguardhome-actions {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: .5rem;
+}
+
+@media (max-width: 700px) {
+	.adguardhome-view .adguardhome-status-grid {
+		grid-template-columns: 1fr;
+	}
+}

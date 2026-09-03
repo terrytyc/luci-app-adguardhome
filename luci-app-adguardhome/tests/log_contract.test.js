@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { extractFunction } = require('./lib/source');
 
 const packageRoot = path.resolve(__dirname, '..');
 const rpcPath = path.join(
@@ -24,23 +25,6 @@ function translated(value) {
 		return value.replace(/%[sd]/g, () => String(args[offset++]));
 	};
 	return result;
-}
-
-function extractFunction(source, name) {
-	const start = source.indexOf(`function ${name}(`);
-	assert.notEqual(start, -1, `missing ${name}()`);
-	const body = source.indexOf('{', start);
-	assert.notEqual(body, -1, `missing ${name}() body`);
-
-	let depth = 0;
-	for (let offset = body; offset < source.length; offset++) {
-		if (source[offset] === '{')
-			depth++;
-		else if (source[offset] === '}' && --depth === 0)
-			return source.slice(start, offset + 1);
-	}
-
-	assert.fail(`unterminated ${name}()`);
 }
 
 function loadLogView(handler) {
@@ -83,11 +67,14 @@ function loadLogView(handler) {
 			scrollTop: null,
 			textContent: text,
 			value: text,
+			rows: attrs.rows,
+			wrap: attrs.wrap,
 		};
 	};
 	const view = { extend: definition => definition };
 	const sandbox = {
 		E: element,
+		L: { resource: path => path },
 		_: translated,
 		operation,
 		rpc,
@@ -103,6 +90,49 @@ function loadLogView(handler) {
 	);
 
 	return { definition, failures, notifications, successes };
+}
+
+async function testLogPresentation() {
+	let queries = 0;
+	let refreshed = false;
+	const state = loadLogView(async (method, source) => {
+		assert.equal(method, 'get_log');
+		queries++;
+		return { log: refreshed && source === 'core' ? 'newest\noldest' : '', source, lines: 0 };
+	});
+	const view = state.definition;
+	const root = view.render(await view.load());
+	assert.equal(root.attrs.class, 'adguardhome-view');
+	assert.equal(root.children[0].attrs.href, 'adguardhome/style.css');
+	const details = root.children.filter(node => node.tag === 'details');
+	assert.equal(details.length, 2);
+	for (const section of details) {
+		assert.equal(section.attrs.open, true);
+		assert.equal(section.children[0].tag, 'summary');
+		section.attrs.open = false;
+	}
+	for (const output of Object.values(view.logOutputs)) {
+		assert.equal(output.rows, 1, 'empty logs must not reserve a large blank editor');
+		assert.equal(output.wrap, 'off');
+		assert.match(output.attrs.class, /adguardhome-log-output/);
+	}
+	const nodes = [ root ];
+	for (let index = 0; index < nodes.length; index++)
+		nodes.push(...(nodes[index]?.children ?? []));
+	const wrap = nodes.find(node => node?.tag === 'input' && node.attrs.type === 'checkbox');
+	wrap.attrs.change({ target: { checked: true } });
+	assert.equal(view.logOutputs.core.wrap, 'soft');
+	assert.equal(view.logOutputs.plugin.wrap, 'soft');
+	wrap.attrs.change({ target: { checked: false } });
+	assert.equal(view.logOutputs.core.wrap, 'off');
+	assert.equal(queries, 2, 'folding and wrapping must not issue log queries');
+	view.lineSelect.value = '100';
+	refreshed = true;
+	await view.handleRefresh();
+	assert.equal(queries, 4, 'manual refresh must query each source exactly once');
+	assert.equal(view.logOutputs.core.rows, 20);
+	assert.equal(view.logOutputs.plugin.rows, 1);
+	assert.equal(view.logOutputs.core.scrollTop, 0);
 }
 
 async function testLogErrorPresentation() {
@@ -253,7 +283,7 @@ assert.match(viewSource, /\.scrollTop = 0;/,
 assert.doesNotMatch(viewSource, /innerHTML/,
 	'log bytes must not be interpreted as HTML');
 
-testLogErrorPresentation().then(() => {
+Promise.all([ testLogErrorPresentation(), testLogPresentation() ]).then(() => {
 	console.log('split newest-first log RPC and view contract tests passed');
 }).catch(error => {
 	console.error(error);

@@ -71,7 +71,7 @@ function loadOperation() {
 		},
 	};
 	const fakeUi = {
-		showModal(_title, child) { rendered.push(child); },
+		showModal(_title, child) { rendered.push(Array.isArray(child) ? child[0] : child); },
 		hideModal() { hidden++; },
 	};
 	const LuCIClass = createLuCIClass();
@@ -124,8 +124,13 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 	};
 	const view = { extend: definition => definition };
 	const sandbox = {
-		E: () => ({}),
-		L: { env: {}, hasViewPermission: () => true },
+		E: (tag, attrs = {}, children = []) => {
+			const childList = Array.isArray(children) ? children : [ children ];
+			const text = childList.map(child => String(child?.textContent ?? child ?? '')).join('');
+			return { tag, attrs, children: childList, textContent: text, value: text,
+				hidden: attrs.hidden === true, readOnly: attrs.readonly != null, disabled: attrs.disabled != null };
+		},
+		L: { env: {}, hasViewPermission: () => true, resource: value => value },
 		URL,
 		_: translated,
 		console,
@@ -299,6 +304,7 @@ async function testYamlTemplateReset() {
 		});
 		Object.assign(view, {
 			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
+			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
 		await view.resetYaml();
@@ -306,6 +312,8 @@ async function testYamlTemplateReset() {
 		assert.equal(view.yamlEditor.value, accepted ? template : draft);
 		assert.equal(view.yamlHash, oldHash, 'a template response without SHA must retain the active file revision');
 		assert.equal(view.yamlEditor.readOnly, false);
+		if (accepted)
+			assert.equal(view.draftStatus.hidden, false, 'loaded template must be marked unsaved');
 		if (accepted) {
 			view.yamlEditor.value += '# edited before save\n';
 			await view.saveYaml();
@@ -319,7 +327,7 @@ async function testYamlTemplateReset() {
 }
 
 async function testYamlSubmissions() {
-	for (const kind of [ 'success', 'cas-rejected', 'response-lost', 'bad-token', 'leave-request', 'leave-status' ]) {
+	for (const kind of [ 'success', 'cas-rejected', 'response-lost', 'bad-token', 'reload-failure', 'leave-request', 'leave-status', 'leave-reload' ]) {
 		const state = loadOperation();
 		const scope = state.operation.createPageScope();
 		const oldHash = 'a'.repeat(64), newHash = 'b'.repeat(64), token = 'c'.repeat(32);
@@ -350,11 +358,16 @@ async function testYamlSubmissions() {
 			},
 			async get_yaml() {
 				reads++;
+				if (kind === 'reload-failure')
+					throw new Error('post-save read failed');
+				if (kind === 'leave-reload')
+					state.dispatch('pagehide');
 				return { content: committed, sha256: newHash, path: '/etc/AdGuardHome/AdGuardHome.yaml' };
 			},
 		});
 		Object.assign(view, {
 			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
+			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
 		await view.saveYaml();
@@ -369,6 +382,22 @@ async function testYamlSubmissions() {
 			assert.equal(view.saveButton.disabled, false);
 			assert.equal(view.yamlEditor.readOnly, false);
 			assert.equal(state.rendered.at(-1).text, 'Configuration changes applied.');
+		} else if (kind === 'reload-failure' || kind === 'leave-reload') {
+			assert.equal(view.yamlEditor.value, draft, 'failed post-save reload preserves the draft');
+			assert.equal(view.yamlHash, '');
+			assert.equal(reads, 1);
+			assert.deepEqual(polls, [ false, true ]);
+			if (kind === 'leave-reload') {
+				assert.equal(state.rendered.length, 1, 'post-save reload must not report on an obsolete page');
+			} else {
+				assert.equal(view.yamlEditor.readOnly, true);
+				assert.equal(view.saveButton.disabled, true);
+				assert.equal(view.reloadButton.disabled, false);
+				assert.equal(view.editorNotice.hidden, false);
+				assert.match(view.editorNotice.textContent, /post-save read failed.*Use Reload from disk/);
+				assert.match(state.rendered.at(-1).text, /was saved and applied, but the editor could not reload it/);
+				assert.equal(state.operation._timer, null, 'a post-save reload error must await manual dismissal');
+			}
 		} else {
 			assert.equal(view.yamlEditor.value, draft, `${kind}: preserve the editor draft`);
 			assert.equal(reads, 0, `${kind}: do not overwrite the draft with an unconfirmed reload`);
@@ -388,9 +417,11 @@ async function testYamlSubmissions() {
 				assert.equal(view.saveButton.disabled, true);
 				assert.equal(view.resetButton.disabled, true);
 				assert.equal(view.reloadButton.disabled, false, 'allow explicit recovery from disk');
+				assert.equal(view.editorNotice.hidden, false);
+				assert.match(view.editorNotice.textContent, /outcome is unknown.*Use Reload from disk/);
 				await view.saveYaml();
 				assert.equal(setCalls, 1, 'require a reload before another uncertain submission');
-				await view.handleReload();
+				await view.handleReload(true);
 				assert.equal(view.yamlHash, newHash, 'an explicit reload adopts the authoritative file revision');
 				assert.equal(view.yamlEditor.value, committed);
 				assert.equal(view.saveButton.disabled, false);
@@ -398,6 +429,75 @@ async function testYamlSubmissions() {
 		}
 		state.operation._clearTimer();
 	}
+}
+
+async function testYamlEditing() {
+	const state = loadOperation();
+	const modals = [], notifications = [], calls = [];
+	const active = 'dns:\n  port: 53335\n';
+	const template = '# template\n' + active;
+	let failRead = false;
+	const ui = {
+		createHandlerFn: (context, method) => (...args) => typeof method === 'function'
+			? method.apply(context, args) : context[method](...args),
+		showModal: (title, children) => modals.push({ title: String(title), children }),
+		hideModal() {},
+		addNotification: (...args) => notifications.push(args),
+	};
+	const view = loadView('yaml', state.operation, ui, {
+		async get_yaml() {
+			calls.push('read');
+			if (failRead) throw new Error('disk read failed');
+			return { content: active.replace(/\n/g, '\r\n'), sha256: 'a'.repeat(64), path: '/etc/AdGuardHome/AdGuardHome.yaml' };
+		},
+		async reset_yaml() { calls.push('template'); return { content: template }; },
+		async set_yaml() { calls.push('save'); return { error: 'invalid YAML' }; },
+	});
+	const root = view.render(await view.load());
+	assert.equal(root.attrs.class, 'adguardhome-view');
+	assert.equal(root.children[0].attrs.href, 'adguardhome/style.css');
+	assert.equal(view.hasDraft(), false);
+	assert.equal(view.saveButton.disabled, false, 'unchanged YAML can still be applied');
+	await view.handleReload();
+	assert.equal(modals.length, 0, 'clean reload needs no confirmation');
+	assert.deepEqual(calls, [ 'read', 'read' ]);
+	view.yamlEditor.value = '# draft\n';
+	view.yamlEditor.attrs.input();
+	assert.equal(view.draftStatus.hidden, false);
+	await view.handleReload();
+	assert.equal(modals.at(-1).title, 'Discard unsaved changes?');
+	assert.equal(calls.length, 2, 'showing confirmation must not read or overwrite a draft');
+	modals.at(-1).children[1].children[0].attrs.click();
+	assert.equal(view.yamlEditor.value, '# draft\n', 'Cancel preserves draft text');
+	await modals.at(-1).children[1].children.at(-1).attrs.click();
+	assert.equal(view.yamlEditor.value, active);
+	assert.equal(view.draftStatus.hidden, true);
+	assert.equal(view.editorNotice.hidden, true);
+	const modalCount = modals.length;
+	await view.resetButton.attrs.click();
+	assert.equal(modals.length, modalCount, 'loading a template is an ordinary editor action');
+	assert.doesNotMatch(view.resetButton.attrs.class, /negative/);
+	assert.equal(view.yamlEditor.value, template);
+	assert.equal(view.draftStatus.hidden, false);
+	assert.equal(calls.filter(call => call === 'save').length, 0, 'template loading must not apply');
+	failRead = true;
+	await view.handleReload(true);
+	assert.equal(view.yamlEditor.value, template, 'read failure preserves the editor draft');
+	assert.equal(view.yamlEditor.readOnly, true);
+	assert.equal(view.editorNotice.hidden, false);
+	assert.match(view.editorNotice.textContent, /disk read failed.*Use Reload from disk/);
+	assert.equal(view.reloadButton.disabled, false);
+	assert.equal(view.saveButton.disabled, true);
+	failRead = false;
+	await view.handleReload(true);
+	assert.equal(view.editorNotice.hidden, true);
+	assert.equal(view.yamlEditor.readOnly, false);
+	assert.equal(view.draftStatus.hidden, true);
+	failRead = true;
+	view.render(await view.load());
+	assert.equal(view.editorNotice.hidden, false, 'initial read errors need a persistent inline reason');
+	assert.match(view.editorNotice.textContent, /disk read failed.*Use Reload from disk/);
+	assert.equal(view.yamlEditor.readOnly, true);
 }
 
 async function main() {
@@ -552,6 +652,12 @@ async function main() {
 		return error?.pageInactive === true;
 	},
 		'a reply reaching a destroyed page must be discarded');
+	const rejectedScope = state.operation.createPageScope();
+	await assert.rejects(state.operation.requestActive(async () => {
+		state.dispatch('pagehide');
+		throw new Error('obsolete transport error');
+	}, rejectedScope), error => error?.pageInactive === true,
+		'finally must discard a stale rejection as well as a stale successful reply');
 	let obsoleteLoadSettled = false;
 	state.operation.abandonInactiveLoad(inactiveError).then(() => {
 		obsoleteLoadSettled = true;
@@ -770,6 +876,7 @@ async function main() {
 
 	await testYamlTemplateReset();
 	await testYamlSubmissions();
+	await testYamlEditing();
 	console.log('navigation lifecycle, shared job polling and settings/YAML reconciliation tests passed');
 }
 

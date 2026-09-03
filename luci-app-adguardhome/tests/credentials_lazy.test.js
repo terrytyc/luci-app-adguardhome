@@ -139,7 +139,7 @@ async function readyDialog() {
 	state.moduleReply.resolve(state.bcrypt);
 	await pending;
 	assert.equal(state.modals.length, 1);
-	assert.equal(state.modals[0].title, 'Change Username and Password');
+	assert.equal(state.modals[0].title, 'Change AdGuard Home Account');
 	assert.equal(state.inputs().length, 3);
 	assert.equal(state.failures.length, 0);
 	return state;

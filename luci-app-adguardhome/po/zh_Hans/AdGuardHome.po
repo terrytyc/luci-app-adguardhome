@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-adguardhome 2.4.0\n"
-"PO-Revision-Date: 2026-09-01 00:00+0800\n"
+"Project-Id-Version: luci-app-adguardhome 2.5.0\n"
+"PO-Revision-Date: 2026-09-03 00:00+0800\n"
 "Last-Translator: terrytyc\n"
 "Language-Team: Chinese (Simplified)\n"
 "MIME-Version: 1.0\n"
@@ -11,6 +11,57 @@ msgstr ""
 
 msgid "AdGuard Home"
 msgstr "AdGuard Home"
+
+msgid "Persistent data and AdGuardHome.yaml are stored in this directory."
+msgstr "持久化 data 和 AdGuardHome.yaml 保存在此目录。"
+
+msgid "AdGuard Home account"
+msgstr "AdGuard Home 登录账号"
+
+msgid "DNS and memory settings"
+msgstr "DNS 与内存设置"
+
+msgid "Choose how LAN DNS reaches AdGuard Home. The listening port is read from YAML."
+msgstr "选择 LAN DNS 接入 AdGuard Home 的方式，监听端口从 YAML 读取。"
+
+msgid "Only data is copied to RAM; the core executable and YAML stay in place. Live write-back does not restart services and cannot guarantee consistency during concurrent changes or power loss."
+msgstr "仅将 data 放入内存，主程序和 YAML 保留在持久目录。直接回写不重启服务，不保证并发修改或断电时的数据一致性。"
+
+msgid "0 disables scheduled write-back. A normal stop or restart still writes data back. Use 60 minutes or longer to reduce flash wear."
+msgstr "0 关闭定时回写，正常停止或重启仍会回写。建议设为 60 分钟或更长，以减少闪存磨损。"
+
+msgid "Change AdGuard Home Account"
+msgstr "修改 AdGuard Home 登录账号"
+
+msgid "Close"
+msgstr "关闭"
+
+msgid "Unsaved changes"
+msgstr "未保存"
+
+msgid "Load Template"
+msgstr "载入模板"
+
+msgid "Saving checks for changes made elsewhere and validates the YAML before applying it."
+msgstr "保存时会检查文件是否已被其他操作修改，并校验 YAML 后再应用。"
+
+msgid "Load Template changes only the editor. The active configuration stays unchanged until Validate, Save & Apply."
+msgstr "载入模板仅替换编辑内容，点击“校验、保存并应用”前不会修改运行配置。"
+
+msgid "Discard unsaved changes?"
+msgstr "放弃未保存的修改？"
+
+msgid "Reloading from disk will replace your unsaved editor text."
+msgstr "从磁盘重新载入将覆盖编辑器中未保存的内容。"
+
+msgid "Use Reload from disk before editing again."
+msgstr "请先点击“从磁盘重新载入”，再继续编辑。"
+
+msgid "Unable to load the YAML template: %s"
+msgstr "无法载入 YAML 模板：%s"
+
+msgid "Wrap lines"
+msgstr "自动换行"
 
 msgid "Grant permissions for the AdGuard Home LuCI app"
 msgstr "授予 AdGuard Home LuCI 应用权限"

@@ -40,7 +40,7 @@ const callGetYamlUpdate = rpc.declare({
 
 function normalizeYaml(result) {
 	return {
-		content: typeof result?.content === 'string' ? result.content : '',
+		content: typeof result?.content === 'string' ? result.content.replace(/\r\n?/g, '\n') : '',
 		sha256: typeof result?.sha256 === 'string' ? result.sha256 : '',
 		path: typeof result?.path === 'string' ? result.path : '',
 		error: typeof result?.error === 'string' && result.error ? result.error : null,
@@ -82,14 +82,17 @@ return view.extend({
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
 		this.yamlHash = result.sha256;
+		this.loadedYaml = result.content;
+		this.editorNotice = E('p', { class: 'alert-message error', role: 'status', hidden: true });
+		this.draftStatus = E('p', { class: 'adguardhome-help', role: 'status', hidden: true }, _('Unsaved changes'));
 		this.yamlEditor = E('textarea', {
-			class: 'cbi-input-textarea',
+			class: 'cbi-input-textarea adguardhome-editor',
 			'aria-label': _('YAML Configuration'),
 			rows: 32,
 			spellcheck: 'false',
 			wrap: 'off',
 			readonly: result.error || !result.sha256 || !L.hasViewPermission() ? 'readonly' : null,
-			style: 'box-sizing: border-box; width: 100%; padding: .75em; font-family: monospace; tab-size: 2; resize: vertical;',
+			input: () => this.updateDraftStatus(),
 		}, [ result.content ]);
 		this.pathValue = E('code', {}, result.path || _('Unavailable'));
 		this.saveButton = E('button', {
@@ -99,11 +102,11 @@ return view.extend({
 			click: ui.createHandlerFn(this, 'handleSaveClick'),
 		}, _('Validate, Save & Apply'));
 		this.resetButton = E('button', {
-			class: 'cbi-button cbi-button-negative',
+			class: 'cbi-button',
 			type: 'button',
 			disabled: result.error || !result.sha256 || !L.hasViewPermission() ? 'disabled' : null,
-			click: ui.createHandlerFn(this, 'handleTemplateResetClick'),
-		}, _('Restore Template'));
+			click: ui.createHandlerFn(this, 'resetYaml'),
+		}, _('Load Template'));
 		this.reloadButton = E('button', {
 			class: 'cbi-button',
 			type: 'button',
@@ -114,8 +117,13 @@ return view.extend({
 			ui.addNotification(null, E('p', {},
 				_('Unable to read the YAML configuration: %s').format(errorMessage(result.error))), 'error');
 		}
+		if (result.error || !result.sha256)
+			this.invalidateYamlEditor(result.error
+				? _('Unable to read the YAML configuration: %s').format(errorMessage(result.error))
+				: _('The YAML configuration is unavailable.'));
 
-		const root = E('div', {}, [
+		const root = E('div', { class: 'adguardhome-view' }, [
+			E('link', { rel: 'stylesheet', href: L.resource('adguardhome/style.css') }),
 			E('h2', {}, _('AdGuard Home')),
 			E('div', { class: 'cbi-map-descr' }, [
 				_('Edit the active AdGuard Home configuration file directly.'),
@@ -125,14 +133,16 @@ return view.extend({
 			E('div', { class: 'cbi-section' }, [
 				E('h3', {}, _('YAML Configuration')),
 				E('p', {}, [ E('strong', {}, `${_('Path')}: `), this.pathValue ]),
-				E('p', { class: 'alert-message warning' },
-					_('A content hash prevents overwriting changes made after this page was loaded. If a conflict is reported, reload the file and merge your changes before saving. Invalid YAML is rejected without replacing the current file.')),
+				E('p', { class: 'adguardhome-help' },
+					_('Saving checks for changes made elsewhere and validates the YAML before applying it.')),
+				E('p', { class: 'adguardhome-help' },
+					_('Load Template changes only the editor. The active configuration stays unchanged until Validate, Save & Apply.')),
+				this.editorNotice,
+				this.draftStatus,
 				this.yamlEditor,
-				E('div', { class: 'cbi-page-actions' }, [
+				E('div', { class: 'cbi-page-actions adguardhome-actions' }, [
 					this.reloadButton,
-					' ',
 					this.resetButton,
-					' ',
 					this.saveButton,
 				]),
 			]),
@@ -140,17 +150,31 @@ return view.extend({
 		return pageScope.attach(root);
 	},
 
-	async handleReload() {
+	async handleReload(discardDraft = false) {
 		const scope = this.pageScope;
 		if (this.operationBusy || !operation.isPageActive(scope))
 			return;
+		if (discardDraft !== true && this.hasDraft()) {
+			ui.showModal(_('Discard unsaved changes?'), [
+				E('p', {}, _('Reloading from disk will replace your unsaved editor text.')),
+				E('div', { class: 'right' }, [
+					E('button', { class: 'cbi-button', type: 'button', click: ui.hideModal }, _('Cancel')),
+					' ',
+					E('button', {
+						class: 'cbi-button cbi-button-action', type: 'button',
+						click: () => { ui.hideModal(); return this.handleReload(true); },
+					}, _('Reload from disk')),
+				]),
+			]);
+			return;
+		}
 		this.setBusy(true);
 		try {
 			await this.reloadYaml();
 		} catch (error) {
 			if (operation.isPageInactiveError(error))
 				return;
-			this.invalidateYamlEditor();
+			this.invalidateYamlEditor(_('Unable to read the YAML configuration: %s').format(errorMessage(error)));
 			ui.addNotification(null, E('p', {},
 				_('Unable to read the YAML configuration: %s').format(errorMessage(error))), 'error');
 		} finally {
@@ -170,14 +194,28 @@ return view.extend({
 			throw new Error(_('The YAML configuration is unavailable.'));
 
 		this.yamlEditor.value = result.content;
+		this.loadedYaml = result.content;
 		this.yamlHash = result.sha256;
 		this.pathValue.textContent = result.path || _('Unavailable');
+		this.editorNotice.hidden = true;
+		this.editorNotice.textContent = '';
+		this.updateDraftStatus();
 		this.yamlEditor.readOnly = this.operationBusy || !this.yamlHash || !L.hasViewPermission();
 	},
 
-	invalidateYamlEditor() {
+	hasDraft() {
+		return this.yamlEditor.value !== this.loadedYaml;
+	},
+
+	updateDraftStatus() {
+		this.draftStatus.hidden = !this.hasDraft();
+	},
+
+	invalidateYamlEditor(reason = _('The YAML configuration is unavailable.')) {
 		this.yamlHash = '';
 		this.yamlEditor.readOnly = true;
+		this.editorNotice.textContent = `${reason} ${_('Use Reload from disk before editing again.')}`;
+		this.editorNotice.hidden = false;
 	},
 
 	setBusy(busy) {
@@ -250,7 +288,10 @@ return view.extend({
 			try {
 				await this.reloadYaml();
 			} catch (error) {
-				operation.success(
+				if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+					return;
+				this.invalidateYamlEditor(_('Unable to read the YAML configuration: %s').format(errorMessage(error)));
+				operation.failure(
 					_('The YAML configuration was saved and applied, but the editor could not reload it: %s. Refresh this page before editing again.').format(errorMessage(error)),
 					operationTicket,
 				);
@@ -261,7 +302,7 @@ return view.extend({
 			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
 				return;
 			if (error?.yamlUpdateUncertain === true)
-				this.invalidateYamlEditor();
+				this.invalidateYamlEditor(errorMessage(error));
 			operation.failure(
 				_('Unable to save the YAML configuration: %s').format(errorMessage(error)),
 				operationTicket,
@@ -270,31 +311,6 @@ return view.extend({
 			if (operation.isPageActive(scope))
 				this.setBusy(false);
 		}
-	},
-
-	handleTemplateResetClick() {
-		ui.showModal(_('Restore YAML Template'), [
-			E('p', { class: 'alert-message warning' },
-				_('This replaces only the text currently shown in the editor with the packaged template.')),
-			E('p', {},
-				_('The active YAML file, service and data remain unchanged until you choose Validate, Save & Apply. Continue editing after the template is loaded, or reload from disk to discard it.')),
-			E('div', { class: 'right' }, [
-				E('button', {
-					class: 'cbi-button',
-					type: 'button',
-					click: ui.hideModal,
-				}, _('Cancel')),
-				' ',
-				E('button', {
-					class: 'cbi-button cbi-button-negative',
-					type: 'button',
-					click: ui.createHandlerFn(this, async () => {
-						ui.hideModal();
-						await this.resetYaml();
-					}),
-				}, _('Restore Template')),
-			]),
-		]);
 	},
 
 	async resetYaml() {
@@ -315,11 +331,12 @@ return view.extend({
 			// Keep yamlHash unchanged: it still represents the active file revision
 			// that set_yaml must compare when the user later saves this editor text.
 			this.yamlEditor.value = template.content;
+			this.updateDraftStatus();
 		} catch (error) {
 			if (!operation.isPageActive(scope))
 				return;
 			operation.failure(
-				_('Unable to restore the YAML template: %s').format(errorMessage(error)),
+				_('Unable to load the YAML template: %s').format(errorMessage(error)),
 			);
 		} finally {
 			if (operation.isPageActive(scope))

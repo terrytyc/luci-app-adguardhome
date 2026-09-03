@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { extractFunction } = require('./lib/source');
 
 const packageRoot = path.resolve(__dirname, '..');
 const read = relative => fs.readFileSync(path.join(packageRoot, relative), 'utf8');
@@ -17,20 +18,6 @@ const ucitrackPath = path.join(
 	packageRoot,
 	'root/usr/share/ucitrack/luci-app-adguardhome.json'
 );
-
-function extractFunction(source, name) {
-	const start = source.indexOf(`function ${name}(`);
-	assert.notEqual(start, -1, `missing ${name}()`);
-	const body = source.indexOf('{', start);
-	let depth = 0;
-	for (let offset = body; offset < source.length; offset++) {
-		if (source[offset] === '{')
-			depth++;
-		else if (source[offset] === '}' && --depth === 0)
-			return source.slice(start, offset + 1);
-	}
-	assert.fail(`unterminated ${name}()`);
-}
 
 async function testYamlViewPermissionGuard() {
 	let yamlReads = 0;
@@ -91,7 +78,7 @@ async function testYamlViewPermissionGuard() {
 	});
 	const sandbox = {
 		E: element,
-		L: { hasViewPermission: () => false },
+		L: { hasViewPermission: () => false, resource: path => path },
 		_: translate,
 		window: { setTimeout },
 	};

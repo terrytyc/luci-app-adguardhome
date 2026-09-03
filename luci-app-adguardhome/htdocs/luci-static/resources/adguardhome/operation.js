@@ -6,7 +6,6 @@
 'require ui';
 
 const DEFAULT_RESULT_DISPLAY_SECONDS = 3;
-const ERROR_DISPLAY_SECONDS = 8;
 const JOB_POLL_INTERVAL = 2000;
 const JOB_POLL_LIMIT = 180;
 
@@ -115,14 +114,10 @@ return baseclass.extend({
 			throw this.pageInactiveError();
 
 		try {
-			const result = await requestFn();
+			return await requestFn();
+		} finally {
 			if (!this.isPageActive(scope))
 				throw this.pageInactiveError();
-			return result;
-		} catch (error) {
-			if (!this.isPageActive(scope))
-				throw this.pageInactiveError();
-			throw error;
 		}
 	},
 
@@ -189,7 +184,18 @@ return baseclass.extend({
 		if (spinning)
 			classes.push('spinning');
 
-		ui.showModal('', E('p', {}, message), ...classes);
+		const content = E('p', {}, message);
+		const generation = this._generation;
+		ui.showModal('', type === 'error' ? [ content,
+			E('div', { class: 'right' }, E('button', {
+				class: 'cbi-button',
+				type: 'button',
+				click: () => {
+					if (generation === this._generation && this.isPageActive())
+						this._hide();
+				},
+			}, _('Close'))),
+		] : content, ...classes);
 		this._modalVisible = true;
 	},
 
@@ -236,15 +242,9 @@ return baseclass.extend({
 		if (!this._ticketActive(ticket))
 			return;
 		this._clearTimer();
-		const generation = ++this._generation;
+		this._generation++;
 		if (!this.isPageActive())
 			return;
 		this._show('error', String(message ?? _('Unknown error')), false);
-		this._timer = window.setTimeout(() => {
-			if (generation === this._generation) {
-				this._timer = null;
-				this._hide();
-			}
-		}, ERROR_DISPLAY_SECONDS * 1000);
 	},
 });

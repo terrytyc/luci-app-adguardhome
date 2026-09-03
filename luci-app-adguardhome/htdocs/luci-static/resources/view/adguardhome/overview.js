@@ -231,9 +231,9 @@ function overviewDisplayValues({ status, config }) {
 
 function renderManagementLink(url, running) {
 	if (!url) {
-		return E('span', {}, [
+		return E('span', { class: 'adguardhome-management' }, [
 			E('button', {
-				class: 'cbi-button cbi-button-action',
+				class: 'cbi-button cbi-button-action adguardhome-management-button',
 				type: 'button',
 				disabled: 'disabled',
 			}, _('Open Web Interface')),
@@ -244,13 +244,16 @@ function renderManagementLink(url, running) {
 		]);
 	}
 
-	return E('a', {
-		class: 'cbi-button cbi-button-action',
-		href: url,
-		target: '_blank',
-		rel: 'noopener noreferrer',
-		referrerpolicy: 'no-referrer',
-	}, _('Open Web Interface'));
+	return E('span', { class: 'adguardhome-management' }, [
+		E('a', {
+			class: 'cbi-button cbi-button-action adguardhome-management-button',
+			href: url,
+			target: '_blank',
+			rel: 'noopener noreferrer',
+			referrerpolicy: 'no-referrer',
+		}, _('Open Web Interface')),
+		E('code', { class: 'adguardhome-management-url' }, url),
+	]);
 }
 
 function validateWorkDir(_sectionId, value) {
@@ -443,7 +446,7 @@ return view.extend({
 
 		const statusContainer = E('span', {}, renderServiceStatus(displayed.running));
 		const storageContainer = E('span', {}, renderStorageStatus(displayed.storage));
-		const dnsPortContainer = E('span', {}, displayed.dnsPort);
+		const dnsPortContainer = E('span', { class: 'adguardhome-primary-value' }, displayed.dnsPort);
 		const managementContainer = E('span', {}, renderManagementLink(displayed.management, displayed.running));
 
 		const statusSection = map.section(form.TypedSection, '_status', _('Overview'));
@@ -451,40 +454,20 @@ return view.extend({
 		statusSection.addremove = false;
 		statusSection.cfgsections = () => [ '_status' ];
 
-		const statusOption = statusSection.option(
-			form.DummyValue,
-			'_service_status',
-			_('Service status'),
-		);
-		statusOption.renderWidget = () => statusContainer;
-
-		const storageOption = statusSection.option(
-			form.DummyValue,
-			'_storage_status',
-			_('Active storage'),
-		);
-		storageOption.renderWidget = () => storageContainer;
-
-		const versionOption = statusSection.option(
-			form.DummyValue,
-			'_core_version',
-			_('Core version'),
-		);
-		versionOption.cfgvalue = () => version;
-
-		const dnsPortOption = statusSection.option(
-			form.DummyValue,
-			'_dns_port',
-			_('DNS listening port (YAML)'),
-		);
-		dnsPortOption.renderWidget = () => dnsPortContainer;
-
-		const webOption = statusSection.option(
-			form.DummyValue,
-			'_web_interface',
-			_('Management interface'),
-		);
-		webOption.renderWidget = () => managementContainer;
+		statusSection.render = () => E('section', { class: 'cbi-section adguardhome-overview' }, [
+			E('h3', {}, _('Overview')),
+			E('dl', { class: 'adguardhome-status-grid' }, [
+				[ _('Service status'), statusContainer ],
+				[ _('Active storage'), storageContainer ],
+				[ _('DNS listening port (YAML)'), dnsPortContainer ],
+				[ _('Management interface'), managementContainer ],
+			].map(([label, value]) => E('div', {}, [
+				E('dt', {}, label), E('dd', {}, value),
+			]))),
+			E('p', { class: 'adguardhome-version adguardhome-help' }, [
+				`${_('Core version')}: `, E('code', {}, version),
+			]),
+		]);
 
 		const coreSection = map.section(
 			form.NamedSection,
@@ -502,7 +485,7 @@ return view.extend({
 			form.Value,
 			'work_dir',
 			_('Working directory'),
-			_('Runtime data is stored here. The YAML configuration is fixed at WORKDIR/AdGuardHome.yaml.'),
+			_('Persistent data and AdGuardHome.yaml are stored in this directory.'),
 		);
 		option.default = DEFAULT_WORK_DIR;
 		option.placeholder = DEFAULT_WORK_DIR;
@@ -516,7 +499,7 @@ return view.extend({
 		option = coreSection.option(
 			form.DummyValue,
 			'_change_credentials',
-			_('Change Username and Password'),
+			_('AdGuard Home account'),
 		);
 		option.renderWidget = () => E('button', {
 			class: 'cbi-button cbi-button-action',
@@ -529,7 +512,7 @@ return view.extend({
 			form.NamedSection,
 			LUCI_SECTION_NAME,
 			LUCI_SECTION_NAME,
-			_('DNS and memory integration'),
+			_('DNS and memory settings'),
 		);
 		luciSection.addremove = false;
 
@@ -537,7 +520,7 @@ return view.extend({
 			form.ListValue,
 			'redirect',
 			_('DNS redirect mode'),
-			_('Choose how LAN DNS traffic is routed to the DNS port read dynamically from WORKDIR/AdGuardHome.yaml.'),
+			_('Choose how LAN DNS reaches AdGuard Home. The listening port is read from YAML.'),
 		);
 		option.value('none', _('None'));
 		option.value('dnsmasq-upstream', _('Use AdGuard Home as dnsmasq upstream'));
@@ -549,7 +532,7 @@ return view.extend({
 			form.Flag,
 			'run_from_memory',
 			_('Run from memory'),
-			_('At startup, copies only the persistent data directory into RAM and runs the official core there. AdGuardHome.yaml always remains in and is read from the persistent work directory. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back.'),
+			_('Only data is copied to RAM; the core executable and YAML stay in place. Live write-back does not restart services and cannot guarantee consistency during concurrent changes or power loss.'),
 		);
 		option.default = '0';
 		option.rmempty = false;
@@ -558,7 +541,7 @@ return view.extend({
 			form.Value,
 			'memory_writeback_interval',
 			_('Memory write-back interval (minutes)'),
-			_('At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back.'),
+			_('0 disables scheduled write-back. A normal stop or restart still writes data back. Use 60 minutes or longer to reduce flash wear.'),
 		);
 		option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
 		option.placeholder = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
@@ -623,7 +606,10 @@ return view.extend({
 		this.statusPollCallback = statusPollCallback;
 		poll.add(statusPollCallback, POLL_INTERVAL);
 
-		return pageScope.attach(E('div', {}, rendered));
+		return pageScope.attach(E('div', { class: 'adguardhome-view' }, [
+			E('link', { rel: 'stylesheet', href: L.resource('adguardhome/style.css') }),
+			rendered,
+		]));
 	},
 
 	async openCredentialsDialog() {
@@ -700,7 +686,7 @@ return view.extend({
 			);
 		}));
 
-		ui.showModal(_('Change Username and Password'), [
+		ui.showModal(_('Change AdGuard Home Account'), [
 			E('p', {}, [
 				`${_('Current username')}: `,
 				E('strong', {}, info.username),

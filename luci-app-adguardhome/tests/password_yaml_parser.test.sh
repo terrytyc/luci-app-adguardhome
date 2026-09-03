@@ -48,6 +48,7 @@ const TEST_CANDIDATE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 let mock_yaml = null;
 let updated_content = null;
 let listening_ports = [];
+let no_op_hashes = 0;
 
 function web_port_listening(port) {
 	for (let listening in listening_ports)
@@ -61,6 +62,7 @@ function read_yaml() {
 }
 
 function sha256(content) {
+	no_op_hashes++;
 	return content == mock_yaml.content ? mock_yaml.sha256 : TEST_CANDIDATE;
 }
 
@@ -311,6 +313,8 @@ if (!update_credentials('root user', '', REVISION)?.error)
 	fail('unsafe RPC username', 'an unsafe username was accepted');
 if (!update_credentials('root', '', REVISION)?.error)
 	fail('unchanged RPC username', 'a no-op username update was accepted');
+if (!update_credentials('', OLD_HASH, REVISION)?.error)
+	fail('unchanged RPC password', 'a byte-identical password update was accepted');
 print('ok - RPC credential validation\n');
 
 mock_yaml = {
@@ -318,7 +322,8 @@ mock_yaml = {
 	sha256: REVISION,
 };
 let duplicate_result = update_credentials('guest', '', REVISION);
-if (duplicate_result?.error != 'The requested username already exists')
+if (duplicate_result?.error !=
+		'Cannot change the username while multiple YAML user accounts are configured; change only the password or use the YAML editor')
 	fail('duplicate RPC username', 'a duplicate username was accepted');
 print('ok - duplicate RPC username rejected\n');
 
@@ -338,6 +343,8 @@ if (multi_rename?.error !=
 	fail('multi-user simultaneous update', 'a multi-user username/password change was not rejected atomically');
 print('ok - multi-user simultaneous update rejected\n');
 
+if (no_op_hashes != 0)
+	fail('credential no-op comparison', 'comparing existing YAML bytes recomputed a digest');
 print('credential YAML parser fixture tests passed\n');
 
 function expect_config(name, content, ports, dns_port, scheme, host, port) {

@@ -163,6 +163,10 @@ for forbidden in AGHDataClear AGHDataMake '/bin/rm' '/bin/mkdir'; do
 done
 
 deactivate_body="$(function_body "$init_file" memory_deactivate_locked)"
+if printf '%s\n' "$deactivate_body" | grep -Eq 'checkpoint|\$\{?1'; then
+	printf 'RAM deactivation must always write back, without a bypass parameter\n' >&2
+	exit 1
+fi
 copy_line="$(printf '%s\n' "$deactivate_body" | grep -n 'memory_copy_stopped_data_locked || return 1' | cut -d: -f1)"
 suspend_line="$(printf '%s\n' "$deactivate_body" | grep -n 'memory_suspend_data_bindings "$old_backing" || return 1' | cut -d: -f1)"
 [ -n "$copy_line" ] && [ -n "$suspend_line" ] && [ "$copy_line" -lt "$suspend_line" ] || {
