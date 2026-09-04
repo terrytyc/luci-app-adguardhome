@@ -90,7 +90,7 @@ require_text "$init_file" 'PACKAGED_CONFIG_TEMPLATE="/usr/share/luci-app-adguard
 require_text "$overview_file" "'memory_writeback_interval',"
 require_text "$overview_file" 'option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);'
 require_text "$overview_file" 'option.retain = true;'
-require_text "$overview_file" "option.depends('run_from_memory', '1');"
+require_text "$overview_file" 'option.depends(`${map.config}.${CORE_SECTION_NAME}.run_from_memory`, '\''1'\'');'
 require_text "$overview_file" 'interval > MAX_MEMORY_WRITEBACK_INTERVAL'
 require_text "$overview_file" '0 disables scheduled write-back. A normal stop or restart still writes data back. Use 60 minutes or longer to reduce flash wear.'
 require_text "$po_file" 'msgid "Memory write-back interval (minutes)"'

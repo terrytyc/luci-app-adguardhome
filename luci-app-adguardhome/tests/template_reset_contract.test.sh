@@ -153,7 +153,7 @@ reset_view = view[reset_start:reset_end]
 for required in (
     "const template = await callResetYaml(this.yamlHash);",
     "this.yamlEditor.value = template.content;",
-    "this.updateDraftStatus();",
+    "this.refreshYamlEditor();",
 ):
     if required not in reset_view:
         raise SystemExit(f"template editor flow omits: {required}")

@@ -131,7 +131,7 @@ function deferred() {
 
 function managementContainer(state) {
 	return state.elements.find(node => node.tag === 'span' &&
-		node.child?.attrs?.class === 'adguardhome-management');
+		node.attrs?.class === 'adguardhome-management');
 }
 
 async function testUnavailableStatus() {
@@ -148,8 +148,9 @@ async function testUnavailableStatus() {
 				config: { dns_port: 53335, web: { scheme: 'http', host: null, port: 3000 } },
 			});
 		await state.view.render(await state.view.load());
-		const [ service, storage, management ] = state.elements.filter(node =>
-			node.tag === 'span' && [ 'span', 'a' ].includes(node.child?.tag));
+		const [ service, storage ] = state.elements.filter(node =>
+			node.tag === 'span' && node.child?.tag === 'span');
+		const management = managementContainer(state);
 		if (initial === 'request-failure' || initial === 'invalid-response') {
 			assert.equal(service.child.child, 'Unavailable', 'the initial render must not invent a stopped state');
 			assert.equal(storage.child.child, 'Unavailable');
@@ -161,8 +162,8 @@ async function testUnavailableStatus() {
 		await state.view.statusPollCallback();
 		assert.equal(service.child.child, 'Unavailable', `${initial}: a failed query is not a stopped core`);
 		assert.equal(storage.child.child, 'Unavailable', `${initial}: a failed query cannot report persistent storage`);
-		assert.equal(management.child.child[0].attrs.disabled, 'disabled');
-		assert.equal(management.child.child[2].child, 'Service status: Unavailable');
+		assert.equal(management.child.attrs.disabled, 'disabled');
+		assert.equal(management.child.child, 'Open Web Interface');
 		state.updates.length = 0;
 		await state.view.statusPollCallback();
 		assert.equal(state.updates.length, 0, 'repeated failures must not redraw an unchanged unknown state');
@@ -173,8 +174,8 @@ async function testUnavailableStatus() {
 		await state.view.statusPollCallback();
 		assert.equal(service.child.child, 'Running');
 		assert.equal(storage.child.child, 'Memory');
-		assert.equal(management.child.child[0].attrs.href, 'https://adg.example:10443/');
-		assert.equal(management.child.child[1].child, 'https://adg.example:10443/');
+		assert.equal(management.child.attrs.href, 'https://adg.example:10443/');
+		assert.equal(management.child.child, 'Open Web Interface');
 		assert.equal(state.polls.size, 1, 'the existing timer must recover without another polling mechanism');
 		assert.equal(state.view.committedSettings, committed);
 		assert.equal(draft.config.work_dir, '/etc/AdGuardHome-draft', 'status failure/recovery must preserve unsaved settings');
@@ -195,11 +196,11 @@ async function testManagementURLValidation() {
 	]) {
 		state.setOverview({ status: { running: true }, config: { web } });
 		await state.view.statusPollCallback();
-		assert.equal(management.child.child[0].attrs.disabled, 'disabled', JSON.stringify(web));
+		assert.equal(management.child.attrs.disabled, 'disabled', JSON.stringify(web));
 	}
 	state.setOverview({ status: { running: true }, config: { web: { scheme: 'https', host: 'ADG.EXAMPLE.', port: '443' } } });
 	await state.view.statusPollCallback();
-	assert.equal(management.child.child[0].attrs.href, 'https://adg.example./',
+	assert.equal(management.child.attrs.href, 'https://adg.example./',
 		'normalized endpoints must retain URL assignment checks and valid default ports');
 }
 
@@ -352,9 +353,10 @@ async function main() {
 		node.attrs.class === 'adguardhome-status-grid');
 	assert.equal(statusGrid.child.length, 4, 'the overview must give four primary values equal grid placement');
 	assert.deepEqual(Array.from(statusGrid.child, row => row.child[0].child),
-		[ 'Service status', 'Active storage', 'DNS listening port (YAML)', 'Management interface' ]);
-	assert.ok(state.elements.some(node => node.attrs?.class === 'adguardhome-version adguardhome-help'),
-		'the core version must remain visible outside the primary state grid');
+		[ 'Service status', 'Active storage', 'Listening port', '' ]);
+	assert.equal(root.child[2].attrs.class, 'adguardhome-version adguardhome-help',
+		'the core version must follow the rendered form instead of occupying the overview card');
+	assert.equal(root.child[2].child, 'Core version: v0.107.76');
 	assert.equal(state.urlBuilds.length, 1, 'rendering must reuse the already validated management URL');
 	assert.equal(state.polls.size, 1);
 	const callback = state.view.statusPollCallback;
@@ -363,11 +365,11 @@ async function main() {
 	draft.config.work_dir = '/mnt/storage/AdGuardHome-draft';
 	const management = managementContainer(state);
 	assert.ok(management);
-	const initialLink = management.child.child[0];
+	const initialLink = management.child;
 	assert.equal(initialLink.attrs.href, 'http://router.example:3000/');
-	assert.equal(management.child.child[1].child, initialLink.attrs.href,
-		'the visible management address must exactly match the existing validated target');
-	assert.match(initialLink.attrs.class, /adguardhome-management-button/);
+	assert.equal(initialLink.child, 'Open Web Interface',
+		'the overview must display only the management action, not its target URL');
+	assert.match(initialLink.attrs.class, /adguardhome-action-button/);
 	assert.equal(initialLink.attrs.rel, 'noopener noreferrer');
 	assert.equal(initialLink.attrs.referrerpolicy, 'no-referrer');
 	state.document.activeElement = initialLink;
@@ -375,7 +377,7 @@ async function main() {
 	await callback();
 	assert.deepEqual(state.calls, [ 'get_overview' ], 'unchanged displays must still query fresh RPC state');
 	assert.equal(state.updates.length, 0, 'the initial display must seed the per-field comparison');
-	assert.equal(management.child.child[0], initialLink);
+	assert.equal(management.child, initialLink);
 	assert.equal(state.document.activeElement, initialLink, 'unchanged management links must retain keyboard focus');
 
 	state.calls.length = 0;
@@ -395,14 +397,14 @@ async function main() {
 	assert.equal(state.updates.length, 3, 'the unchanged running status must retain its node');
 	assert.equal(state.updates[0].value.child, 'Memory');
 	assert.equal(state.updates[1].value, '5353', 'DNS display must use the current YAML value');
-	assert.equal(state.updates[2].value.child[0].attrs.href, 'https://adg.example:10443/');
-	assert.equal(state.updates[2].value.child[1].child, 'https://adg.example:10443/');
+	assert.equal(state.updates[2].value.attrs.href, 'https://adg.example:10443/');
+	assert.equal(state.updates[2].value.child, 'Open Web Interface');
 	assert.equal(state.view.committedSettings, committed,
 		'polling must not replace the authoritative settings revision snapshot');
 	assert.equal(state.view.settingsMap.initialData, draft);
 	assert.equal(draft.config.work_dir, '/mnt/storage/AdGuardHome-draft',
 		'polling must leave unsaved work directory edits intact');
-	const activeLink = management.child.child[0];
+	const activeLink = management.child;
 	state.document.activeElement = activeLink;
 	state.updates.length = 0;
 	state.calls.length = 0;
@@ -413,7 +415,7 @@ async function main() {
 	await callback();
 	assert.deepEqual(state.calls, [ 'get_overview' ], 'display comparison must not cache RPC responses');
 	assert.equal(state.updates.length, 0, 'raw flag/type changes with identical display values must not redraw');
-	assert.equal(management.child.child[0], activeLink);
+	assert.equal(management.child, activeLink);
 	assert.equal(state.document.activeElement, activeLink);
 	state.setOverview({
 		status: { running: true, memory_requested: false, memory_active: true },
@@ -422,7 +424,7 @@ async function main() {
 	await callback();
 	assert.equal(state.updates.length, 1, 'changing only DNS must update only the DNS container');
 	assert.equal(state.updates[0].value, '5354');
-	assert.equal(management.child.child[0], activeLink);
+	assert.equal(management.child, activeLink);
 	assert.equal(state.document.activeElement, activeLink, 'unrelated status changes must preserve link focus');
 	for (const web of [
 		{ scheme: 'https', host: 'new-adg.example', port: 10443 },
@@ -437,10 +439,10 @@ async function main() {
 		await callback();
 		assert.equal(state.updates.length, 1, 'each changed management URL must update only its own container');
 		assert.equal(state.updates[0].node, management);
-		assert.equal(management.child.child[0].attrs.href,
+		assert.equal(management.child.attrs.href,
 			`${web.scheme}://${web.host ?? 'router.example'}:${web.port}/`);
-		assert.equal(management.child.child[1].child, management.child.child[0].attrs.href,
-			'the visible URL must follow every host, scheme and port change');
+		assert.equal(management.child.child, 'Open Web Interface',
+			'the target URL must remain available only through the management action');
 	}
 	for (const [status, text, updateCount] of [
 		[{ running: true, memory_requested: true, memory_active: false }, 'Persistent storage (memory fallback)', 1],
@@ -464,40 +466,37 @@ async function main() {
 		config: { dns_port: 65536, web: { scheme: 'https', host: 'bad/host', port: 443 } },
 	});
 	await callback();
-	assert.equal(state.updates.length, 4, 'an invalid running flag must produce unknown status, storage and endpoint state');
+	assert.equal(state.updates.length, 3, 'an invalid running flag must produce unknown status and storage state');
 	assert.equal(state.updates[2].value, 'Unavailable');
-	assert.equal(management.child.tag, 'span');
+	assert.equal(management.child.tag, 'button');
 	state.updates.length = 0;
 	state.setOverview({
 		status: { running: false, memory_requested: false, memory_active: false },
 		config: { dns_port: null, web: { scheme: 'https', host: 'adg.example', port: 10443 } },
 	});
 	await callback();
-	assert.equal(state.updates.length, 3, 'a confirmed stopped response must replace the unknown-state messages');
+	assert.equal(state.updates.length, 2, 'a confirmed stopped response must replace the unknown-state messages');
 	state.updates.length = 0;
 	await callback();
 	assert.equal(state.updates.length, 0, 'endpoint changes while stopped must not rebuild the disabled button');
-	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
-	assert.match(management.child.child[2].child, /Enable AdGuard Home/);
+	assert.equal(management.child.attrs.disabled, 'disabled');
 	state.setOverview({ status: { running: true }, config: {} });
 	await callback();
-	assert.equal(state.updates.filter(update => update.node === management).length, 1,
-		'false (stopped) to null (invalid endpoint) must repaint the disabled-button explanation');
-	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
-	assert.match(management.child.child[2].child, /YAML management endpoint is unavailable/);
+	assert.equal(state.updates.filter(update => update.node === management).length, 0,
+		'an unavailable endpoint must retain the same compact disabled action');
+	assert.equal(management.child.attrs.disabled, 'disabled');
 	state.updates.length = 0;
 	state.setOverview({ status: { running: false }, config: {} });
 	await callback();
-	assert.equal(state.updates.filter(update => update.node === management).length, 1,
-		'null (invalid endpoint) to false (stopped) must repaint the disabled-button explanation');
-	assert.equal(management.child.child[0].attrs.disabled, 'disabled');
-	assert.match(management.child.child[2].child, /Enable AdGuard Home/);
+	assert.equal(state.updates.filter(update => update.node === management).length, 0,
+		'stopping with no endpoint must retain the same compact disabled action');
+	assert.equal(management.child.attrs.disabled, 'disabled');
 	state.updates.length = 0;
 
 	state.handlers.get_overview = () => { throw new Error('temporary RPC failure'); };
 	await callback();
 	assert.equal(state.errors.length, 1, 'real RPC failures must remain diagnosable');
-	assert.equal(state.updates.length, 3, 'a failed status query must not continue to claim that the core is stopped');
+	assert.equal(state.updates.length, 2, 'a failed status query must not continue to claim that the core is stopped');
 	assert.equal(state.polls.size, 1, 'a transient failure must not permanently stop status polling');
 
 	let resolveReply;

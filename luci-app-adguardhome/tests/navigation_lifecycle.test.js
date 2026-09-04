@@ -128,6 +128,7 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 			const childList = Array.isArray(children) ? children : [ children ];
 			const text = childList.map(child => String(child?.textContent ?? child ?? '')).join('');
 			return { tag, attrs, children: childList, textContent: text, value: text,
+				innerHTML: '', style: {}, scrollLeft: 0, scrollTop: 0, selectionStart: 0,
 				hidden: attrs.hidden === true, readOnly: attrs.readonly != null, disabled: attrs.disabled != null };
 		},
 		L: { env: {}, hasViewPermission: () => true, resource: value => value },
@@ -304,6 +305,7 @@ async function testYamlTemplateReset() {
 		});
 		Object.assign(view, {
 			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
+			yamlLineNumbers: { style: {} }, yamlHighlight: { children: [], style: {} },
 			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
@@ -367,6 +369,7 @@ async function testYamlSubmissions() {
 		});
 		Object.assign(view, {
 			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
+			yamlLineNumbers: { style: {} }, yamlHighlight: { children: [], style: {} },
 			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
@@ -456,12 +459,39 @@ async function testYamlEditing() {
 	const root = view.render(await view.load());
 	assert.equal(root.attrs.class, 'adguardhome-view');
 	assert.equal(root.children[0].attrs.href, 'adguardhome/style.css');
+	assert.equal(view.yamlEditor.attrs.class, 'adguardhome-editor',
+		'the YAML overlay must not inherit theme textarea backgrounds');
+	assert.equal(view.yamlEditorFrame.children.length, 3);
+	assert.equal(view.yamlEditorFrame.children[0], view.yamlLineNumbers);
+	assert.equal(view.yamlEditorFrame.children[1], view.yamlHighlight);
+	assert.equal(view.yamlEditorFrame.children[2], view.yamlEditor,
+		'the native textarea must share one editor frame with its line and highlight layers');
+	assert.equal(view.yamlLineNumbers.attrs['aria-hidden'], 'true');
+	assert.equal(view.yamlHighlight.attrs['aria-hidden'], 'true');
+	assert.equal(view.yamlLineNumbers.textContent, '1\n2\n3');
+	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-key[^>]*>dns</);
+	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-number[^>]*>53335</);
 	assert.equal(view.hasDraft(), false);
 	assert.equal(view.saveButton.disabled, false, 'unchanged YAML can still be applied');
 	await view.handleReload();
 	assert.equal(modals.length, 0, 'clean reload needs no confirmation');
 	assert.deepEqual(calls, [ 'read', 'read' ]);
+	view.yamlEditor.value = 'unsafe: <img src=x onerror=alert(1)>\nflag: false # note\n';
+	view.yamlEditor.selectionStart = view.yamlEditor.value.indexOf('flag');
+	view.yamlEditor.attrs.input();
+	assert.doesNotMatch(view.yamlHighlight.innerHTML, /<img/i,
+		'YAML highlighting must not turn editor text into HTML');
+	assert.match(view.yamlHighlight.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
+	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-literal[^>]*>false</);
+	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-comment[^>]*># note</);
+	assert.equal((view.yamlHighlight.innerHTML.match(/adguardhome-yaml-line active/g) ?? []).length, 1);
+	view.yamlEditor.scrollLeft = 13;
+	view.yamlEditor.scrollTop = 27;
+	view.yamlEditor.attrs.scroll();
+	assert.equal(view.yamlLineNumbers.style.transform, 'translateY(-27px)');
+	assert.equal(view.yamlHighlight.style.transform, 'translate(-13px, -27px)');
 	view.yamlEditor.value = '# draft\n';
+	view.yamlEditor.selectionStart = 0;
 	view.yamlEditor.attrs.input();
 	assert.equal(view.draftStatus.hidden, false);
 	await view.handleReload();

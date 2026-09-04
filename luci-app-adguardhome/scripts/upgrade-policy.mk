@@ -1,6 +1,6 @@
 # One explicit source-version policy for all self-contained install scripts.
 define AdGuardHome/UpgradePolicy
-ADGUARDHOME_UPGRADE_SOURCES='2.4.0-r1 2.4.0-r2 2.4.0-r3 2.4.0-r4 2.4.0-r5 2.4.0-r6 2.4.0-r7 2.4.0-r8 2.4.0-r9 2.4.0-r10'
+ADGUARDHOME_UPGRADE_SOURCES='2.4.0-r1 2.4.0-r2 2.4.0-r3 2.4.0-r4 2.4.0-r5 2.4.0-r6 2.4.0-r7 2.4.0-r8 2.4.0-r9 2.4.0-r10 2.5.0-r1'
 
 upgrade_source_allowed() {
 	local allowed

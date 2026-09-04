@@ -83,6 +83,7 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tmemory_status\t\tReport requested/active/backing RAM state"
 
 log_error() {
+	[ "${ADGUARDHOME_LOG_SILENT:-0}" != 1 ] || return 0
 	logger -t AdGuardHome "$*"
 }
 
@@ -1714,6 +1715,7 @@ memory_prepare_runtime_locked() {
 	config_file="$persistent_config_file"
 	# Only the data child is bound into RAM; the persistent YAML needs no rewrite.
 	log_error "AdGuard Home data directory prepared in memory from ${persistent_work_dir}/data"
+	return 0
 }
 
 memory_durability_barrier() {
@@ -1847,7 +1849,8 @@ memory_copy_live_data_locked() (
 	[ "$original_owner:$original_group:$mode" = \
 		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || exit 1
 	[ -z "$core_pid" ] || [ "$(official_pid)" = "$core_pid" ] || exit 1
-	log_error "Copied live AdGuard Home RAM data directly to ${MEMORY_BACKING_WORK_DIR}/data"
+	log_error "Wrote AdGuard Home RAM data back to ${MEMORY_BACKING_WORK_DIR}/data"
+	return 0
 )
 
 memory_copy_stopped_data_locked() {
@@ -3866,6 +3869,7 @@ wait_for_core_stopped() {
 		sleep 1
 		elapsed=$((elapsed + 1))
 	done
+	log_error "AdGuard Home core did not stop within 10 seconds"
 	return 1
 }
 
@@ -4214,6 +4218,7 @@ yaml_update_locked() {
 	fi
 	YAML_INSTALLED=0
 	trap - HUP INT QUIT TERM
+	log_error "Applied AdGuard Home YAML configuration"
 	return 0
 }
 
@@ -4516,7 +4521,7 @@ memory_deactivate_locked() {
 	# The new workdir must be ready before sync reads its YAML for TLS access.
 	[ "$old_backing" = "$persistent_work_dir" ] || ensure_config_file || return 1
 	sync_official_uci || return 1
-	log_error "Removed the AdGuard Home memory workdir after a successful direct write-back"
+	return 0
 }
 
 # Reconcile an already-active RAM generation with the newly requested backing
@@ -4595,7 +4600,7 @@ memory_writeback_locked_command() {
 		[ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ] || return 2
 	official_running || return 2
 	memory_copy_live_data_locked || return $?
-	log_error "Completed the live AdGuard Home memory write-back without restarting the core"
+	return 0
 }
 
 memory_checkpoint() {
@@ -4753,12 +4758,14 @@ settings_update_locked() {
 			"$old_enabled" "$old_work_dir" "$old_verbose" \
 			"$old_redirect" "$old_memory" "$old_interval" >/dev/null 2>&1 &&
 		   refresh_managed_config_snapshot >/dev/null 2>&1; then
+			log_error "Unable to save the new AdGuard Home settings; previous settings were restored"
 			return 1
 		fi
 		log_error "Unable to prove that the previous AdGuard Home settings were restored"
 		return 2
 	fi
 	if orchestrate_core_locked; then
+		log_error "Applied AdGuard Home settings (enabled ${old_enabled}->${requested_enabled}, DNS ${old_redirect}->${requested_redirect}, memory ${old_memory}->${requested_memory})"
 		return 0
 	fi
 	log_error "Unable to apply the new AdGuard Home settings; restoring the previous settings"
@@ -4880,6 +4887,7 @@ orchestrate_core_locked() {
 	fi
 	[ -x "$OFFICIAL_SERVICE" ] || return 1
 	if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1; then
+		log_error "Official AdGuard Home service start command failed"
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
 	fi
@@ -4990,7 +4998,7 @@ monitor_interval_locked() {
 	# Return only this round's normalized scheduling value across run_locked's
 	# subshell.  A DNS-only reconciliation failure must not reset a valid RAM
 	# deadline; failed settings/RAM loading leaves this local flag unset.
-	reconcile_core_locked >/dev/null || true
+	ADGUARDHOME_LOG_SILENT=1 reconcile_core_locked >/dev/null || true
 	if [ "$MONITOR_SETTINGS_READY" = 1 ] &&
 	   [ "$service_enabled" = 1 ] && [ "$memory_requested" = 1 ] &&
 	   [ "$MEMORY_ACTIVE" = 1 ] &&
@@ -5129,16 +5137,23 @@ start_service() {
 }
 
 service_started() {
+	local rc=0
 	if [ "$START_PREPARED" != 1 ]; then
 		run_locked fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	fi
 	[ "$START_DISABLED" != 1 ] || return 0
 	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
-		RELOAD_SERVICES=0 run_locked reconcile_core_locked
+		RELOAD_SERVICES=0 run_locked reconcile_core_locked || rc=$?
 	else
-		run_locked orchestrate_core_locked
+		run_locked orchestrate_core_locked || rc=$?
 	fi
+	if [ "$rc" = 0 ]; then
+		log_error "AdGuard Home coordinator started"
+	else
+		log_error "AdGuard Home coordinator start failed"
+	fi
+	return "$rc"
 }
 
 stop_wrapper_locked() {
@@ -5168,7 +5183,14 @@ stop_wrapper_locked() {
 }
 
 stop_service() {
-	run_locked stop_wrapper_locked "${WRAPPER_SHUTDOWN:-0}"
+	local rc=0
+	run_locked stop_wrapper_locked "${WRAPPER_SHUTDOWN:-0}" || rc=$?
+	if [ "$rc" = 0 ]; then
+		log_error "AdGuard Home coordinator stopped"
+	else
+		log_error "AdGuard Home coordinator stop failed"
+	fi
+	return "$rc"
 }
 
 service_triggers() {

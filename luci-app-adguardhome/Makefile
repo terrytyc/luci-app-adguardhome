@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk
 
 PKG_NAME:=luci-app-adguardhome
-PKG_VERSION:=2.5.0
+PKG_VERSION:=2.6.0
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
@@ -48,7 +48,7 @@ define Package/$(PKG_NAME)/conffiles
 /root/.luci-app-adguardhome/
 endef
 
-# Version 2.4 is the only in-place upgrade baseline. A clean installation
+# Versions 2.4 and 2.5 are the in-place upgrade baselines. A clean installation
 # captures the untouched official lowercase package state for uninstall.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
@@ -224,7 +224,7 @@ bounded_private_file "$$managed_snapshot" || {
 	exit 1
 }
 official_delta_is_clean && baseline_config_is_valid || {
-	echo "The installed 2.4 configuration is invalid or has pending changes." >&2
+	echo "The installed baseline configuration is invalid or has pending changes." >&2
 	exit 1
 }
 
@@ -236,7 +236,7 @@ case "$$running_rc" in
 	*) echo "Unable to determine the AdGuard Home runtime state." >&2; exit 1 ;;
 esac
 ensure_runtime_dir && write_upgrade_state || {
-	echo "Unable to create the 2.4 baseline upgrade state." >&2
+	echo "Unable to create the baseline upgrade state." >&2
 	exit 1
 }
 run_bounded 180 5 /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || {

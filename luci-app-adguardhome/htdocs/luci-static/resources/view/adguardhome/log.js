@@ -142,9 +142,9 @@ return view.extend({
 			E('div', { class: 'cbi-map-descr' },
 				_('View recent core and plugin messages from the system log. The newest entries are shown first, and this page is read-only.')),
 			E('div', { class: 'cbi-section' }, [
-				E('div', { class: 'adguardhome-actions' }, [
-					E('label', {}, [ _('Lines:'), ' ', this.lineSelect ]),
-					E('label', {}, [ wrapInput, ' ', _('Wrap lines') ]),
+				E('div', { class: 'adguardhome-actions adguardhome-log-toolbar' }, [
+					E('label', {}, [ _('Lines:'), this.lineSelect ]),
+					E('label', {}, [ wrapInput, _('Wrap lines') ]),
 					this.refreshButton,
 				]),
 			]),

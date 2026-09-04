@@ -431,7 +431,7 @@ ensure_original_snapshot || {
 
 if [ -e "$UPGRADE_STATE" ] || [ -L "$UPGRADE_STATE" ]; then
 	upgrade_state_is_valid && baseline_config_is_valid || {
-		echo "The 2.4 baseline upgrade state or configuration is invalid." >&2
+		echo "The baseline upgrade state or configuration is invalid." >&2
 		exit 1
 	}
 	TARGET_WORK_DIR="$(uci -q get "$UCI_CONFIG.$OFFICIAL_SECTION.work_dir")"

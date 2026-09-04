@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-adguardhome 2.5.0\n"
-"PO-Revision-Date: 2026-09-03 00:00+0800\n"
+"Project-Id-Version: luci-app-adguardhome 2.6.0\n"
+"PO-Revision-Date: 2026-09-04 00:00+0800\n"
 "Last-Translator: terrytyc\n"
 "Language-Team: Chinese (Simplified)\n"
 "MIME-Version: 1.0\n"
@@ -138,8 +138,8 @@ msgstr "路径"
 msgid "Enable"
 msgstr "启用"
 
-msgid "DNS listening port (YAML)"
-msgstr "DNS 监听端口（YAML）"
+msgid "Listening port"
+msgstr "监听端口"
 
 msgid "DNS redirect mode"
 msgstr "DNS 重定向模式"
@@ -151,10 +151,10 @@ msgid "None"
 msgstr "无"
 
 msgid "Use AdGuard Home as dnsmasq upstream"
-msgstr "将 AdGuard Home 用作 dnsmasq 上游"
+msgstr "作为 dnsmasq 上游"
 
-msgid "Redirect LAN port 53 to AdGuard Home"
-msgstr "将 LAN 的 53 端口重定向到 AdGuard Home"
+msgid "Redirect port 53"
+msgstr "重定向 53 端口"
 
 msgid "Working directory"
 msgstr "工作目录"
@@ -205,7 +205,10 @@ msgid "Unable to apply settings: %s"
 msgstr "无法应用设置：%s"
 
 msgid "Change Username and Password"
-msgstr "修改用户及密码"
+msgstr "修改用户名及密码"
+
+msgid "Configuration changes applied."
+msgstr "配置已应用。"
 
 msgid "Current username"
 msgstr "当前用户名"

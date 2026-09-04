@@ -67,6 +67,11 @@ async function testYamlViewPermissionGuard() {
 			children: childList,
 			disabled: attrs?.disabled != null,
 			readOnly: attrs?.readonly != null,
+			innerHTML: '',
+			style: {},
+			scrollLeft: 0,
+			scrollTop: 0,
+			selectionStart: 0,
 			textContent: childList.map(value => String(value ?? '')).join(''),
 			value: childList.map(value => String(value ?? '')).join(''),
 		};
@@ -162,30 +167,38 @@ assert.doesNotMatch(overview, /ui\.changes\.apply\(|operation\.markApplyPending\
 	'the settings page must not invoke a second global LuCI apply');
 
 const coreStart = overview.indexOf('const coreSection = map.section(');
-const luciStart = overview.indexOf('const luciSection = map.section(');
 const renderStart = overview.indexOf('const rendered = await map.render();');
-assert.ok(coreStart >= 0 && luciStart > coreStart && renderStart > luciStart,
-	'the settings form must define core and LuCI sections before rendering');
+assert.ok(coreStart >= 0 && renderStart > coreStart,
+	'the settings form must define its single visible section before rendering');
+assert.doesNotMatch(overview, /const luciSection = map\.section\(/,
+	'plugin options must not require a second visible settings section');
 
-const coreBlock = overview.slice(coreStart, luciStart);
-const luciBlock = overview.slice(luciStart, renderStart);
+const coreBlock = overview.slice(coreStart, renderStart);
 for (const option of [ 'enabled', 'work_dir', 'verbose' ])
 	assert.ok(coreBlock.includes(`'${option}'`),
 		`official option ${option} must be rendered from config`);
 assert.ok(!coreBlock.includes("'config_file'"),
 	'config_file must stay derived from work_dir instead of becoming a separate form field');
 for (const option of [ 'redirect', 'run_from_memory', 'memory_writeback_interval' ])
-	assert.ok(luciBlock.includes(`'${option}'`),
-		`plugin option ${option} must be rendered from luci`);
-for (const option of [ 'redirect', 'run_from_memory', 'memory_writeback_interval' ])
-	assert.ok(!coreBlock.includes(`'${option}'`),
-		`plugin option ${option} must not be stored in config`);
-for (const option of [ 'enabled', 'work_dir', 'verbose', 'config_file' ])
-	assert.ok(!luciBlock.includes(`'${option}'`),
-		`official option ${option} must not be stored in luci`);
+	assert.ok(coreBlock.includes(`'${option}'`),
+		`plugin option ${option} must share the visible settings section`);
+const pluginOptions = [ 'redirect', 'run_from_memory', 'memory_writeback_interval' ];
+for (let i = 0; i < pluginOptions.length; i++) {
+	const start = coreBlock.indexOf(`'${pluginOptions[i]}'`);
+	const end = coreBlock.indexOf(`'${pluginOptions[i + 1] ?? '_change_credentials'}'`, start + 1);
+	assert.match(coreBlock.slice(start, end), /option\.ucisection = LUCI_SECTION_NAME;/,
+		`plugin option ${pluginOptions[i]} must still read and write the luci data section`);
+}
+assert.equal((coreBlock.match(/option\.ucisection = LUCI_SECTION_NAME;/g) ?? []).length, 3,
+	'only the three plugin-owned options may be redirected to the luci data section');
+assert.ok(coreBlock.indexOf("'_change_credentials'") >
+	coreBlock.indexOf("'memory_writeback_interval'"),
+	'the account action must be the final settings row');
+assert.match(coreBlock, /form\.DummyValue, '_change_credentials', ' '\)/,
+	'the account action must retain alignment without a visible label');
 assert.doesNotMatch(overview, /['"]workdir['"]/,
 	'the settings form must not expose the obsolete workdir option');
-assert.match(luciBlock, /option\.retain = true;[\s\S]*?option\.depends\('run_from_memory', '1'\);/,
+assert.match(coreBlock, /option\.retain = true;[\s\S]*?option\.depends\(`\$\{map\.config\}\.\$\{CORE_SECTION_NAME\}\.run_from_memory`, '1'\);/,
 	'the hidden write-back interval must remain in the JSON model while RAM is disabled');
 
 const settingsFromMapSource = extractFunction(overview, 'settingsFromMap');

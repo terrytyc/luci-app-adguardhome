@@ -42,7 +42,7 @@ esac
 [ "$version_line" -lt "$state_line" ] &&
 	[ "$state_line" -lt "$stop_line" ] &&
 	[ "$stop_line" -lt "$commit_line" ] || {
-	printf '2.4 baseline upgrade is not gated, recorded, stopped and committed in order\n' >&2
+	printf 'baseline upgrade is not gated, recorded, stopped and committed in order\n' >&2
 	exit 1
 }
 
@@ -121,7 +121,7 @@ for required in \
 done
 if printf '%s\n' "$upgrade_defaults" |
 	grep -Eq 'uci[[:space:]]+-q[[:space:]]+(set|delete|commit)'; then
-	printf 'uci-defaults mutates UCI during the 2.4 baseline upgrade\n' >&2
+	printf 'uci-defaults mutates UCI during the baseline upgrade\n' >&2
 	exit 1
 fi
 
@@ -234,4 +234,4 @@ else
 	printf 'skip - defaults rollback requires real UCI or ADGUARDHOME_TEST_UCI_ROOT\n'
 fi
 
-printf 'ok - 2.4.0-r1/r2/r3/r4/r5/r6/r7/r8/r9/r10 to 2.5.0-r1 lifecycle and final rpcd reload\n'
+printf 'ok - 2.4.0-r1-r10 and 2.5.0-r1 to 2.6.0-r1 lifecycle and final rpcd reload\n'

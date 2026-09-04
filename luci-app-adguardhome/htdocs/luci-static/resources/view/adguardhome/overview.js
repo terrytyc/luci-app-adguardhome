@@ -176,7 +176,9 @@ function renderServiceStatus(running) {
 	if (running == null)
 		return E('span', {}, _('Unavailable'));
 	return E('span', {
-		style: `color: var(${running ? '--success-color-high, #2e7d32' : '--error-color-high, #c62828'}); font-weight: bold`,
+		style: `color: ${running
+			? 'var(--success-color-high, var(--success, #2e7d32))'
+			: 'var(--error-color-high, var(--danger, #c62828))'}; font-weight: bold`,
 	}, running ? _('Running') : _('Not running'));
 }
 
@@ -184,9 +186,9 @@ function renderStorageStatus(mode) {
 	if (mode === 'unknown')
 		return E('span', {}, _('Unavailable'));
 	if (mode === 'memory')
-		return E('span', { style: 'color: var(--success-color-high, #2e7d32); font-weight: bold' }, _('Memory'));
+		return E('span', { style: 'color: var(--success-color-high, var(--success, #2e7d32)); font-weight: bold' }, _('Memory'));
 	if (mode === 'fallback')
-		return E('span', { style: 'color: var(--warning-color-high, #b26a00); font-weight: bold' }, _('Persistent storage (memory fallback)'));
+		return E('span', { style: 'color: var(--warn-color-high, var(--warning, #b26a00)); font-weight: bold' }, _('Persistent storage (memory fallback)'));
 	if (mode === 'pending')
 		return E('span', {}, _('Persistent storage (memory on next start)'));
 	return E('span', {}, _('Persistent storage'));
@@ -225,35 +227,26 @@ function overviewDisplayValues({ status, config }) {
 		storage: status.running == null ? 'unknown' : status.memoryActive ? 'memory'
 			: status.memoryRequested ? (status.running ? 'fallback' : 'pending') : 'persistent',
 		dnsPort: String(config.dnsPort ?? _('Unavailable')),
-		management: status.running ? buildManagementURL(config.web) : false,
+		management: status.running ? buildManagementURL(config.web) : null,
 	};
 }
 
-function renderManagementLink(url, running) {
+function renderManagementLink(url) {
 	if (!url) {
-		return E('span', { class: 'adguardhome-management' }, [
-			E('button', {
-				class: 'cbi-button cbi-button-action adguardhome-management-button',
-				type: 'button',
-				disabled: 'disabled',
-			}, _('Open Web Interface')),
-			' ',
-			E('em', {}, running == null ? `${_('Service status')}: ${_('Unavailable')}` : running
-				? _('The YAML management endpoint is unavailable or invalid.')
-				: _('Enable AdGuard Home and click Save & Apply; the management interface becomes available after the service is running.')),
-		]);
+		return E('button', {
+			class: 'cbi-button cbi-button-action adguardhome-action-button',
+			type: 'button',
+			disabled: 'disabled',
+		}, _('Open Web Interface'));
 	}
 
-	return E('span', { class: 'adguardhome-management' }, [
-		E('a', {
-			class: 'cbi-button cbi-button-action adguardhome-management-button',
-			href: url,
-			target: '_blank',
-			rel: 'noopener noreferrer',
-			referrerpolicy: 'no-referrer',
-		}, _('Open Web Interface')),
-		E('code', { class: 'adguardhome-management-url' }, url),
-	]);
+	return E('a', {
+		class: 'cbi-button cbi-button-action adguardhome-action-button',
+		href: url,
+		target: '_blank',
+		rel: 'noopener noreferrer',
+		referrerpolicy: 'no-referrer',
+	}, _('Open Web Interface'));
 }
 
 function validateWorkDir(_sectionId, value) {
@@ -447,7 +440,8 @@ return view.extend({
 		const statusContainer = E('span', {}, renderServiceStatus(displayed.running));
 		const storageContainer = E('span', {}, renderStorageStatus(displayed.storage));
 		const dnsPortContainer = E('span', { class: 'adguardhome-primary-value' }, displayed.dnsPort);
-		const managementContainer = E('span', {}, renderManagementLink(displayed.management, displayed.running));
+		const managementContainer = E('span', { class: 'adguardhome-management' },
+			renderManagementLink(displayed.management));
 
 		const statusSection = map.section(form.TypedSection, '_status', _('Overview'));
 		statusSection.anonymous = true;
@@ -459,14 +453,11 @@ return view.extend({
 			E('dl', { class: 'adguardhome-status-grid' }, [
 				[ _('Service status'), statusContainer ],
 				[ _('Active storage'), storageContainer ],
-				[ _('DNS listening port (YAML)'), dnsPortContainer ],
-				[ _('Management interface'), managementContainer ],
+				[ _('Listening port'), dnsPortContainer ],
+				[ '', managementContainer ],
 			].map(([label, value]) => E('div', {}, [
 				E('dt', {}, label), E('dd', {}, value),
 			]))),
-			E('p', { class: 'adguardhome-version adguardhome-help' }, [
-				`${_('Core version')}: `, E('code', {}, version),
-			]),
 		]);
 
 		const coreSection = map.section(
@@ -497,58 +488,49 @@ return view.extend({
 		option.rmempty = false;
 
 		option = coreSection.option(
-			form.DummyValue,
-			'_change_credentials',
-			_('AdGuard Home account'),
-		);
-		option.renderWidget = () => E('button', {
-			class: 'cbi-button cbi-button-action',
-			type: 'button',
-			disabled: !L.hasViewPermission() ? 'disabled' : null,
-			click: ui.createHandlerFn(this, 'openCredentialsDialog'),
-		}, _('Change Username and Password'));
-
-		const luciSection = map.section(
-			form.NamedSection,
-			LUCI_SECTION_NAME,
-			LUCI_SECTION_NAME,
-			_('DNS and memory settings'),
-		);
-		luciSection.addremove = false;
-
-		option = luciSection.option(
 			form.ListValue,
 			'redirect',
 			_('DNS redirect mode'),
 			_('Choose how LAN DNS reaches AdGuard Home. The listening port is read from YAML.'),
 		);
+		option.ucisection = LUCI_SECTION_NAME;
 		option.value('none', _('None'));
 		option.value('dnsmasq-upstream', _('Use AdGuard Home as dnsmasq upstream'));
-		option.value('redirect', _('Redirect LAN port 53 to AdGuard Home'));
+		option.value('redirect', _('Redirect port 53'));
 		option.default = 'dnsmasq-upstream';
 		option.rmempty = false;
 
-		option = luciSection.option(
+		option = coreSection.option(
 			form.Flag,
 			'run_from_memory',
 			_('Run from memory'),
 			_('Only data is copied to RAM; the core executable and YAML stay in place. Live write-back does not restart services and cannot guarantee consistency during concurrent changes or power loss.'),
 		);
+		option.ucisection = LUCI_SECTION_NAME;
 		option.default = '0';
 		option.rmempty = false;
 
-		option = luciSection.option(
+		option = coreSection.option(
 			form.Value,
 			'memory_writeback_interval',
 			_('Memory write-back interval (minutes)'),
 			_('0 disables scheduled write-back. A normal stop or restart still writes data back. Use 60 minutes or longer to reduce flash wear.'),
 		);
+		option.ucisection = LUCI_SECTION_NAME;
 		option.default = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
 		option.placeholder = String(DEFAULT_MEMORY_WRITEBACK_INTERVAL);
 		option.rmempty = false;
 		option.retain = true;
 		option.validate = validateMemoryWritebackInterval;
-		option.depends('run_from_memory', '1');
+		option.depends(`${map.config}.${CORE_SECTION_NAME}.run_from_memory`, '1');
+
+		option = coreSection.option(form.DummyValue, '_change_credentials', ' ');
+		option.renderWidget = () => E('button', {
+			class: 'cbi-button cbi-button-action adguardhome-action-button',
+			type: 'button',
+			disabled: !L.hasViewPermission() ? 'disabled' : null,
+			click: ui.createHandlerFn(this, 'openCredentialsDialog'),
+		}, _('Change Username and Password'));
 
 		this.settingsMap = map;
 		this.committedSettings = settings;
@@ -599,8 +581,8 @@ return view.extend({
 				dom.content(storageContainer, renderStorageStatus(next.storage));
 			if (next.dnsPort !== displayed.dnsPort)
 				dom.content(dnsPortContainer, next.dnsPort);
-			if (next.management !== displayed.management || next.running !== displayed.running)
-				dom.content(managementContainer, renderManagementLink(next.management, next.running));
+			if (next.management !== displayed.management)
+				dom.content(managementContainer, renderManagementLink(next.management));
 			displayed = next;
 		};
 		this.statusPollCallback = statusPollCallback;
@@ -609,6 +591,8 @@ return view.extend({
 		return pageScope.attach(E('div', { class: 'adguardhome-view' }, [
 			E('link', { rel: 'stylesheet', href: L.resource('adguardhome/style.css') }),
 			rendered,
+			E('p', { class: 'adguardhome-version adguardhome-help' },
+				`${_('Core version')}: ${version}`),
 		]));
 	},
 

@@ -1,22 +1,33 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
+.adguardhome-view {
+	box-sizing: border-box;
+	width: 100%;
+	margin-inline: 0;
+}
+
 .adguardhome-view .adguardhome-status-grid {
 	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 1fr));
-	gap: 1rem 2rem;
-	margin: 0 1.25rem;
+	gap: 1rem;
+	margin: 0 1rem 1rem;
 }
 
 .adguardhome-view .adguardhome-status-grid > div {
+	display: grid;
+	grid-template-columns: 12.5rem minmax(0, 1fr);
+	align-items: center;
+	column-gap: 1rem;
 	min-width: 0;
 }
 
 .adguardhome-view .adguardhome-status-grid dt {
 	font-weight: normal;
+	text-align: right;
 }
 
 .adguardhome-view .adguardhome-status-grid dd {
-	margin: .35rem 0 0;
+	min-width: 0;
+	margin: 0;
 }
 
 .adguardhome-view .adguardhome-primary-value {
@@ -29,36 +40,202 @@
 }
 
 .adguardhome-view .adguardhome-management {
-	display: flex;
-	flex-direction: column;
-	align-items: flex-start;
-	gap: .4rem;
+	display: inline-flex;
 }
 
-.adguardhome-view .adguardhome-management-button {
+.adguardhome-view .adguardhome-action-button {
 	display: inline-flex;
 	align-items: center;
+	justify-content: center;
 	box-sizing: border-box;
+	width: 150px;
+	min-width: 150px;
 	min-height: 40px;
 	max-width: 100%;
 	padding-block: 0;
 	line-height: 1.5;
 }
 
-.adguardhome-view .adguardhome-management-url {
-	max-width: 100%;
-	overflow-wrap: anywhere;
+.adguardhome-view #cbi-json-config-_change_credentials .cbi-value-title {
+	min-height: 40px;
 }
 
-.adguardhome-view .adguardhome-management em {
-	font-style: normal;
+.adguardhome-view [data-section-id="config"].cbi-section-node {
+	padding-bottom: 1rem;
 }
 
-.adguardhome-view .adguardhome-editor,
+.adguardhome-view [data-section-id="config"] .cbi-value-title {
+	box-sizing: border-box;
+	width: 13.5rem;
+	padding-right: 1rem;
+}
+
+.adguardhome-view [data-widget="CBI.FlagValue"] > .cbi-value-title {
+	min-height: 40px;
+	line-height: 40px;
+}
+
+.adguardhome-view .adguardhome-yaml-heading {
+	display: flex;
+	align-items: baseline;
+	gap: .75rem;
+	padding: 0 1rem;
+}
+
+.adguardhome-view .adguardhome-yaml-heading > h3 {
+	width: auto;
+	margin: 0;
+	padding: .875rem 0;
+	border: 0;
+	background: transparent;
+	box-shadow: none;
+}
+
+.adguardhome-view .adguardhome-yaml-draft {
+	color: var(--warn-color-high, var(--warning, #b45309));
+	font-size: 13px;
+}
+
+.adguardhome-view .adguardhome-yaml-path {
+	margin: 0;
+	padding: 0 1rem 1rem;
+}
+
+.adguardhome-view .adguardhome-yaml-editor {
+	position: relative;
+	box-sizing: border-box;
+	width: calc(100% - 2rem);
+	min-width: 0;
+	margin-inline: 1rem;
+	height: 28rem;
+	min-height: 18rem;
+	max-height: 65vh;
+	overflow: hidden;
+	border: 1px solid var(--border-color-medium, #ccd3dc);
+	border-radius: 3px;
+	font-family: monospace;
+	font-size: 14px;
+	line-height: 1.5;
+	color: inherit;
+	caret-color: currentColor;
+	resize: vertical;
+}
+
+.adguardhome-view .adguardhome-yaml-editor:focus-within {
+	border-color: var(--primary-color-high, var(--primary, #3b6fd8));
+	box-shadow: 0 0 0 1px var(--primary-color-high, var(--primary, #3b6fd8));
+}
+
+.adguardhome-view .adguardhome-yaml-editor::before {
+	position: absolute;
+	z-index: 1;
+	top: 0;
+	bottom: 0;
+	left: 0;
+	width: 3rem;
+	background: rgba(127, 127, 127, .08);
+	content: "";
+	pointer-events: none;
+}
+
+.adguardhome-view .adguardhome-yaml-lines,
+.adguardhome-view .adguardhome-yaml-highlight,
+.adguardhome-view .adguardhome-editor {
+	position: absolute;
+	top: 0;
+	box-sizing: border-box;
+	margin: 0;
+	font: inherit;
+	line-height: inherit;
+	tab-size: 2;
+	white-space: pre;
+}
+
+.adguardhome-view .adguardhome-yaml-lines,
+.adguardhome-view .adguardhome-yaml-highlight {
+	border: 0;
+	border-radius: 0;
+	background: transparent;
+	pointer-events: none;
+	user-select: none;
+}
+
+.adguardhome-view .adguardhome-yaml-lines {
+	z-index: 2;
+	left: 0;
+	width: 3rem;
+	padding: .75rem .75rem .75rem 0;
+	color: inherit;
+	text-align: right;
+}
+
+.adguardhome-view .adguardhome-yaml-highlight {
+	z-index: 0;
+	left: 3rem;
+	width: max-content;
+	min-width: calc(100% - 3rem);
+	padding: .75rem;
+	color: inherit;
+}
+
+.adguardhome-view .adguardhome-yaml-line {
+	display: block;
+	min-width: 100%;
+	background: transparent;
+}
+
+.adguardhome-view .adguardhome-yaml-line.active {
+	background: rgba(80, 120, 220, .08);
+}
+
+.adguardhome-view .adguardhome-yaml-key {
+	color: var(--primary-color-high, var(--primary, #174ea6));
+}
+
+.adguardhome-view .adguardhome-yaml-literal {
+	color: var(--error-color-high, var(--danger, #b42318));
+}
+
+.adguardhome-view .adguardhome-yaml-number {
+	color: var(--warn-color-high, var(--warning, #7a3e9d));
+}
+
+.adguardhome-view .adguardhome-yaml-scalar {
+	color: var(--success-color-high, var(--success, #087443));
+}
+
+.adguardhome-view .adguardhome-yaml-comment {
+	color: inherit;
+	opacity: .65;
+}
+
+.adguardhome-view .adguardhome-editor {
+	z-index: 3;
+	inset: 0;
+	width: 100%;
+	height: 100%;
+	min-width: 0;
+	padding: .75rem .75rem .75rem 3.75rem;
+	overflow: auto;
+	border: 0;
+	outline: 0;
+	background: transparent;
+	color: transparent;
+	caret-color: inherit;
+	-webkit-text-fill-color: transparent;
+	resize: none;
+}
+
+.adguardhome-view .adguardhome-editor::selection {
+	background: rgba(80, 120, 220, .22);
+	-webkit-text-fill-color: transparent;
+}
+
 .adguardhome-view .adguardhome-log-output {
 	box-sizing: border-box;
 	width: 100%;
 	min-width: 0;
+	min-height: 0;
 	padding: .75em;
 	font-family: monospace;
 	font-size: 14px;
@@ -67,17 +244,7 @@
 	resize: vertical;
 }
 
-.adguardhome-view .adguardhome-editor {
-	min-height: 18rem;
-	max-height: 65vh;
-}
-
-.adguardhome-view .adguardhome-log-output {
-	min-height: 0;
-}
-
 .adguardhome-view .adguardhome-help,
-.adguardhome-view .adguardhome-management em,
 .adguardhome-view .cbi-map-descr,
 .adguardhome-view .cbi-value-description {
 	font-size: 13px;
@@ -86,15 +253,104 @@
 	opacity: 1;
 }
 
-.adguardhome-view .adguardhome-actions {
+.adguardhome-view .adguardhome-actions,
+.adguardhome-view .adguardhome-actions-secondary {
 	display: flex;
 	flex-wrap: wrap;
 	align-items: center;
 	gap: .5rem;
 }
 
+.adguardhome-view .adguardhome-actions-secondary {
+	margin-right: auto;
+}
+
+.adguardhome-view .adguardhome-log-toolbar {
+	gap: .75rem 1rem;
+	margin: 0;
+	padding: .75rem 1rem;
+}
+
+.adguardhome-view .adguardhome-log-toolbar label {
+	display: inline-flex;
+	align-items: center;
+	gap: .5rem;
+	margin: 0;
+}
+
+.adguardhome-view .adguardhome-log-toolbar .cbi-input-select,
+.adguardhome-view .adguardhome-log-toolbar .cbi-button {
+	min-height: 40px;
+	margin: 0;
+}
+
+.adguardhome-view .adguardhome-log-toolbar .cbi-input-select {
+	min-width: 6.5rem;
+}
+
+.adguardhome-view .adguardhome-log-toolbar input[type="checkbox"] {
+	margin: 0;
+}
+
+.adguardhome-view .adguardhome-log-toolbar .cbi-button {
+	margin-left: auto;
+}
+
+.adguardhome-view details.cbi-section > summary {
+	box-sizing: border-box;
+	min-height: 40px;
+	padding: .75rem 1rem;
+	cursor: pointer;
+	font-weight: 600;
+	line-height: 1.5;
+	list-style-position: inside;
+}
+
+.adguardhome-view .adguardhome-yaml-editor + .adguardhome-help {
+	margin: 0;
+	padding: .75rem 1rem 0;
+}
+
+.adguardhome-view .adguardhome-yaml-heading ~ .adguardhome-actions {
+	margin: 0;
+	padding-inline: 1rem;
+}
+
 @media (max-width: 700px) {
-	.adguardhome-view .adguardhome-status-grid {
+	.adguardhome-view .adguardhome-status-grid > div {
 		grid-template-columns: 1fr;
+		gap: .25rem;
+	}
+
+	.adguardhome-view .adguardhome-status-grid dt {
+		text-align: left;
+	}
+
+	.adguardhome-view .adguardhome-status-grid dt:empty {
+		display: none;
+	}
+
+	.adguardhome-view [data-section-id="config"].cbi-section-node .cbi-value-title {
+		width: auto;
+		padding-right: 0;
+	}
+
+	.adguardhome-view #cbi-json-config-_change_credentials .cbi-value-title {
+		display: none;
+	}
+
+}
+
+@media (forced-colors: active) {
+	.adguardhome-view .adguardhome-yaml-editor::before,
+	.adguardhome-view .adguardhome-yaml-lines,
+	.adguardhome-view .adguardhome-yaml-highlight {
+		display: none;
+	}
+
+	.adguardhome-view .adguardhome-editor {
+		padding-left: .75rem;
+		color: CanvasText;
+		-webkit-text-fill-color: CanvasText;
 	}
 }
