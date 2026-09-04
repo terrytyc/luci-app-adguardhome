@@ -104,6 +104,12 @@ async function testLogPresentation() {
 	const root = view.render(await view.load());
 	assert.equal(root.attrs.class, 'adguardhome-view');
 	assert.equal(root.children[0].attrs.href, 'adguardhome/style.css');
+	const toolbar = root.children[3].children[0];
+	assert.equal(toolbar.attrs.class, 'adguardhome-actions adguardhome-log-toolbar');
+	const wrapLabel = toolbar.children[1];
+	const wrap = wrapLabel.children[1];
+	assert.equal(String(wrapLabel.children[0]), 'Wrap lines');
+	assert.equal(wrap.attrs.type, 'checkbox');
 	const details = root.children.filter(node => node.tag === 'details');
 	assert.equal(details.length, 2);
 	for (const section of details) {
@@ -116,10 +122,6 @@ async function testLogPresentation() {
 		assert.equal(output.wrap, 'off');
 		assert.match(output.attrs.class, /adguardhome-log-output/);
 	}
-	const nodes = [ root ];
-	for (let index = 0; index < nodes.length; index++)
-		nodes.push(...(nodes[index]?.children ?? []));
-	const wrap = nodes.find(node => node?.tag === 'input' && node.attrs.type === 'checkbox');
 	wrap.attrs.change({ target: { checked: true } });
 	assert.equal(view.logOutputs.core.wrap, 'soft');
 	assert.equal(view.logOutputs.plugin.wrap, 'soft');

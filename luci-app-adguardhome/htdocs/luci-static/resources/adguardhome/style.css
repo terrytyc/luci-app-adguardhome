@@ -107,7 +107,7 @@
 	width: calc(100% - 2rem);
 	min-width: 0;
 	margin-inline: 1rem;
-	height: 28rem;
+	height: calc(100vh - 24rem);
 	min-height: 18rem;
 	max-height: 65vh;
 	overflow: hidden;
@@ -288,7 +288,8 @@
 	min-width: 6.5rem;
 }
 
-.adguardhome-view .adguardhome-log-toolbar input[type="checkbox"] {
+.adguardhome-view .adguardhome-log-toolbar label > input[type="checkbox"] {
+	position: static;
 	margin: 0;
 }
 

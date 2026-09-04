@@ -144,7 +144,7 @@ return view.extend({
 			E('div', { class: 'cbi-section' }, [
 				E('div', { class: 'adguardhome-actions adguardhome-log-toolbar' }, [
 					E('label', {}, [ _('Lines:'), this.lineSelect ]),
-					E('label', {}, [ wrapInput, _('Wrap lines') ]),
+					E('label', {}, [ _('Wrap lines'), wrapInput ]),
 					this.refreshButton,
 				]),
 			]),

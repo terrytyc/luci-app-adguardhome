@@ -63,7 +63,7 @@ for policy in "$temporary/policy.sh" "$temporary/preinst.policy" \
 	# shellcheck disable=SC1090
 	. "$policy"
 	[ "$ADGUARDHOME_UPGRADE_SOURCES" = \
-		'2.4.0-r1 2.4.0-r2 2.4.0-r3 2.4.0-r4 2.4.0-r5 2.4.0-r6 2.4.0-r7 2.4.0-r8 2.4.0-r9 2.4.0-r10 2.5.0-r1' ]
+		'2.4.0-r1 2.4.0-r2 2.4.0-r3 2.4.0-r4 2.4.0-r5 2.4.0-r6 2.4.0-r7 2.4.0-r8 2.4.0-r9 2.4.0-r10 2.5.0-r1 2.6.0-r1' ]
 	for release in 1 2 3 4 5 6 7 8 9 10; do
 		upgrade_source_allowed "2.4.0-r$release"
 		printf 'source_version=2.4.0-r%s\nwas_running=1\n' "$release" \
@@ -73,8 +73,11 @@ for policy in "$temporary/policy.sh" "$temporary/preinst.policy" \
 	upgrade_source_allowed '2.5.0-r1'
 	printf 'source_version=2.5.0-r1\nwas_running=1\n' >"$temporary/state"
 	upgrade_state_source_allowed "$temporary/state"
+	upgrade_source_allowed '2.6.0-r1'
+	printf 'source_version=2.6.0-r1\nwas_running=1\n' >"$temporary/state"
+	upgrade_state_source_allowed "$temporary/state"
 	for rejected in '' unknown 2.3.0-r6 2.4.0 2.4.0-r0 \
-		2.4.0-r11 2.4.0-r99 2.4.0-r01 2.4.0-r8-extra 2.4.1-r1 2.5.0 2.5.0-r2 2.6.0-r1 \
+		2.4.0-r11 2.4.0-r99 2.4.0-r01 2.4.0-r8-extra 2.4.1-r1 2.5.0 2.5.0-r2 2.6.0 2.6.0-r2 \
 		' 2.4.0-r6' '2.4.0-r6 ' '2.4.0-r1 2.4.0-r2' '*'; do
 		if upgrade_source_allowed "$rejected" 2>"$temporary/error"; then
 			printf 'unsupported upgrade source was accepted: %s\n' "$rejected" >&2
@@ -99,4 +102,4 @@ if awk -v helper_dir="$helper_dir" -f "$helper_dir/expand-helpers.awk" \
 	exit 1
 fi
 
-printf 'ok - single-source 2.4/2.5 upgrade policy, hook expansion and rejection gates\n'
+printf 'ok - single-source 2.4/2.5/2.6-r1 upgrade policy, hook expansion and rejection gates\n'

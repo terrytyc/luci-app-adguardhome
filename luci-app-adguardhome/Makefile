@@ -9,7 +9,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=2.6.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home

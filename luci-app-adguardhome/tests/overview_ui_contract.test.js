@@ -91,7 +91,8 @@ assert.match(css, /\[data-widget="CBI\.FlagValue"\] > \.cbi-value-title\s*\{[^}]
 assert.match(css, /\.adguardhome-log-output\s*\{[^}]*font-size:\s*14px;[^}]*line-height:\s*1\.5/);
 assert.match(css, /\.adguardhome-log-output\s*\{[^}]*min-height:\s*0/,
 	'empty logs must remain compact');
-assert.match(css, /\.adguardhome-yaml-editor\s*\{[^}]*height:\s*28rem;[^}]*resize:\s*vertical/);
+assert.match(css, /\.adguardhome-yaml-editor\s*\{[^}]*height:\s*calc\(100vh - 24rem\);[^}]*min-height:\s*18rem;[^}]*max-height:\s*65vh;[^}]*resize:\s*vertical/,
+	'the YAML editor must follow the viewport while retaining useful resize bounds');
 assert.match(css, /\.adguardhome-yaml-editor\s*\{[^}]*width:\s*calc\(100% - 2rem\);[^}]*margin-inline:\s*1rem/,
 	'the editor must not touch the section boundary');
 assert.match(css, /\.adguardhome-yaml-heading > h3\s*\{[^}]*width:\s*auto;[^}]*background:\s*transparent/,
@@ -122,6 +123,8 @@ assert.match(css, /\.adguardhome-log-toolbar\s*\{[^}]*gap:\s*\.75rem 1rem;[^}]*p
 	'the log controls must have consistent spacing and section padding');
 assert.match(css, /\.adguardhome-log-toolbar label\s*\{[^}]*display:\s*inline-flex;[^}]*align-items:\s*center;[^}]*gap:\s*\.5rem/,
 	'the log control labels and inputs must align as compact groups');
+assert.match(css, /\.adguardhome-log-toolbar label > input\[type="checkbox"\]\s*\{[^}]*position:\s*static;[^}]*margin:\s*0/,
+	'the wrap checkbox must not inherit the theme offset');
 assert.match(css, /\.adguardhome-log-toolbar \.cbi-button\s*\{[^}]*margin-left:\s*auto/,
 	'the refresh action must sit apart from the log display controls');
 assert.match(css, /details\.cbi-section > summary\s*\{[^}]*min-height:\s*40px;[^}]*padding:\s*\.75rem 1rem;[^}]*list-style-position:\s*inside/,

@@ -22,7 +22,7 @@ reject_text() {
 }
 
 require_text "$makefile" 'PKG_VERSION:=2.6.0'
-require_text "$makefile" 'PKG_RELEASE:=1'
+require_text "$makefile" 'PKG_RELEASE:=2'
 require_text "$makefile" 'include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk'
 require_text "$makefile" 'upgrade_source_allowed "$$source_version" || exit 1'
 reject_text "$makefile" '/usr/lib/opkg/'
