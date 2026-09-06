@@ -174,8 +174,9 @@ printf 'dns: { port: 53335 }\n' >"$persistent_config_file"
 chmod 0600 "$persistent_config_file"
 chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_config_file"
 memory_reconcile_requested_storage_locked
-# Preparing the new YAML must precede the real TLS snapshot during deactivation.
-[ "$(stat -c '%a:%u:%g' "$persistent_config_file")" = '600:0:0' ]
+# Preparing the new YAML must precede the real TLS snapshot during deactivation
+# without rewriting restored metadata.
+[ "$(stat -c '%a:%u:%g' "$persistent_config_file")" = '600:853:853' ]
 [ "$(cat "$old_work_dir/data/saved")" = 'RAM update' ]
 ! path_is_exact_mountpoint "$old_work_dir/data"
 memory_prepare_runtime_locked

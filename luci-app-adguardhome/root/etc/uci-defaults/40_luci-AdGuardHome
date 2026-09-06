@@ -283,10 +283,10 @@ initialize_clean_options() {
 secure_target_work_dir() {
 	valid_managed_work_dir "$TARGET_WORK_DIR" || return 1
 	if [ ! -e "$TARGET_WORK_DIR" ] && [ ! -L "$TARGET_WORK_DIR" ]; then
-		mkdir -m 0700 "$TARGET_WORK_DIR" || return 1
+		mkdir -m 0700 "$TARGET_WORK_DIR" &&
+			chown 0:0 "$TARGET_WORK_DIR" && chmod 0700 "$TARGET_WORK_DIR" || return 1
 	fi
-	[ -d "$TARGET_WORK_DIR" ] && [ ! -L "$TARGET_WORK_DIR" ] || return 1
-	chown 0:0 "$TARGET_WORK_DIR" && chmod 0700 "$TARGET_WORK_DIR"
+	[ -d "$TARGET_WORK_DIR" ] && [ ! -L "$TARGET_WORK_DIR" ]
 }
 
 install_selected_yaml() {

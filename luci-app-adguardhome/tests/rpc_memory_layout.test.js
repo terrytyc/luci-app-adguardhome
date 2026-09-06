@@ -82,8 +82,12 @@ const fixture = {
 	visibleDataInode: 52,
 	statePersistentDataInode: 43,
 	stateMemoryDataInode: 52,
+	backingUid: 853,
+	backingGid: 853,
+	backingMode: 0o700,
 	symlinkPath: null,
 	writablePath: null,
+	filePath: null,
 	lstatPaths: [],
 	lsdirPaths: [],
 	openPaths: [],
@@ -112,6 +116,8 @@ function stateContent() {
 function metadata(pathname) {
 	if (pathname === fixture.symlinkPath)
 		return { type: 'link', uid: 0, gid: 0, mode: 0o777 };
+	if (pathname === fixture.filePath)
+		return { type: 'file', uid: 0, gid: 0, mode: 0o644 };
 	if (pathname === fixture.writablePath)
 		return {
 			...directory(0, 0, 0o777, 32),
@@ -120,7 +126,8 @@ function metadata(pathname) {
 	if (pathname === '/etc')
 		return directory(0, 0, 0o755, 20);
 	if (pathname === PERSISTENT_WORK_DIR)
-		return directory(853, 853, 0o700, BACKING_INODE);
+		return directory(fixture.backingUid, fixture.backingGid,
+			fixture.backingMode, BACKING_INODE);
 	if (pathname === '/mnt')
 		return directory(0, 0, 0o755, 30);
 	if (pathname === '/mnt/storage')
@@ -253,6 +260,15 @@ assert.equal(api.config_path(), PERSISTENT_CONFIG,
 assert.equal(api.service_status().memory_active, true,
 	'the independent RAM state validator should report the active generation');
 
+fixture.backingUid = 0;
+fixture.backingGid = 853;
+fixture.backingMode = 0o777;
+assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), true,
+	'a restored persistent work directory must not be rejected for its owner or mode');
+fixture.backingUid = 853;
+fixture.backingGid = 853;
+fixture.backingMode = 0o700;
+
 fixture.runtimePresent = false;
 fixture.lstatPaths.length = 0;
 fixture.lsdirPaths.length = 0;
@@ -359,10 +375,15 @@ assert.equal(api.config_path(), null,
 
 fixture.symlinkPath = null;
 fixture.writablePath = '/mnt/storage';
-assert.equal(api.config_path(), null,
-	'a writable mount ancestor must invalidate a custom persistent YAML namespace');
+assert.equal(api.config_path(), CUSTOM_CONFIG,
+	'a writable directory ancestor must remain a valid custom persistent namespace');
 
 fixture.writablePath = null;
+fixture.filePath = '/mnt/storage';
+assert.equal(api.config_path(), null,
+	'a non-directory mount ancestor must invalidate a custom persistent YAML namespace');
+
+fixture.filePath = null;
 fixture.workDir = '/mnt/storage/../AdGuardHome';
 fixture.configFile = `${fixture.workDir}/AdGuardHome.yaml`;
 assert.equal(api.config_path(), null,

@@ -58,13 +58,10 @@ function valid_work_dir(value) {
 		let metadata = lstat(current);
 		if (metadata?.type == 'link')
 			return null;
-		// Custom /mnt locations are allowed only below trusted mountpoint
-		// ancestors.  The leaf itself is normally owned by uid 853, but every
-		// existing ancestor that can redirect or replace it must be a root-owned,
-		// non-group/world-writable directory.
+		// Existing custom mount ancestors must still be real directories.
+		// Ownership and Unix modes are managed outside this RPC service.
 		if (match(value, /^\/mnt\//) && current != value && metadata &&
-		    (metadata.type != 'directory' || metadata.uid != 0 ||
-		     metadata.perm?.group_write || metadata.perm?.other_write))
+		    metadata.type != 'directory')
 			return null;
 		if (current == value)
 			final_metadata = metadata;
@@ -232,9 +229,7 @@ function memory_state_active(persistent_work_dir) {
 	    active.gid != ADGUARD_GID || active.mode != 0o700 ||
 	    data?.type != 'directory' || data.uid != ADGUARD_UID ||
 	    data.gid != ADGUARD_GID || data.mode != 0o700 ||
-	    backing?.type != 'directory' || backing.mode != 0o700 ||
-	    !((backing.uid == 0 && (backing.gid == 0 || backing.gid == ADGUARD_GID)) ||
-	      (backing.uid == ADGUARD_UID && backing.gid == ADGUARD_GID)) ||
+	    backing?.type != 'directory' ||
 	    visible_data?.type != 'directory' || visible_data.uid != ADGUARD_UID ||
 	    visible_data.gid != ADGUARD_GID || visible_data.mode != 0o700 ||
 	    backing_data?.type != 'directory' || backing_data.uid != ADGUARD_UID ||

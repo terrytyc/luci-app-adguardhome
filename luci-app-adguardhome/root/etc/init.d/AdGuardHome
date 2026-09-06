@@ -352,8 +352,7 @@ validate_work_dir() {
 }
 
 validate_mnt_ancestors() {
-	local value="${1%/}" parent remaining component current="" metadata mode owner
-	local links group remainder
+	local value="${1%/}" parent remaining component current=""
 	case "$value" in /mnt/*) ;; *) return 0 ;; esac
 	parent="${value%/*}"
 	remaining="${parent#/}"
@@ -365,20 +364,6 @@ validate_mnt_ancestors() {
 				log_error "Untrusted work-directory ancestor: '$current'"
 				return 1
 			fi
-			metadata="$(LC_ALL=C ls -ldn "$current" 2>/dev/null)" || return 1
-			read -r mode links owner group remainder <<-EOF
-			$metadata
-			EOF
-			if [ "$owner" != 0 ]; then
-				log_error "Work-directory ancestor is not root-owned: '$current'"
-				return 1
-			fi
-			case "$mode" in
-				?????w*|????????w*)
-					log_error "Work-directory ancestor is group/world-writable: '$current'"
-					return 1
-					;;
-			esac
 		fi
 		[ "$remaining" = "$component" ] && break
 		remaining="${remaining#*/}"
@@ -944,20 +929,12 @@ yaml_replace_section_list_item() {
 }
 
 secure_active_paths() {
-	local data_dir="${work_dir}/data" metadata mode links owner group remainder
+	local data_dir="${work_dir}/data"
 	[ -d "$work_dir" ] || return 1
 	[ ! -L "$work_dir" ] || return 1
 	[ -f "$config_file" ] || return 1
 	[ ! -L "$config_file" ] || return 1
 	path_contains_symlink "$work_dir" && return 1
-	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	case "$owner:$group:$mode" in
-		0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
-		*) return 1 ;;
-	esac
 	if [ -e "$data_dir" ] || [ -L "$data_dir" ]; then
 		if [ ! -d "$data_dir" ] || [ -L "$data_dir" ]; then
 			log_error "Unsafe AdGuard Home data path: ${data_dir}"
@@ -967,127 +944,22 @@ secure_active_paths() {
 }
 
 secure_active_config() (
-	local directory snapshot metadata mode links owner group size remainder
-	local workdir_fd old_fd stage_fd stage="" capture verify old_hash snapshot_fd=""
+	local directory snapshot
 	secure_active_paths || exit 1
 	umask 077
 	directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || exit 1
-	trap '[ -z "$stage" ] || rm -f "$stage"; rm -rf "$directory"' EXIT
+	trap 'rm -rf "$directory"' EXIT
 	snapshot="${directory}/AdGuardHome.yaml"
-
-	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || exit 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	case "$owner:$group:$mode" in
-		0:0:drwx------|0:"$ADGUARD_GID":drwx------)
-			metadata="$(LC_ALL=C ls -ldn "$config_file" 2>/dev/null)" || exit 1
-			read -r mode links owner group size remainder <<-EOF
-			$metadata
-			EOF
-			case "$owner" in
-				0) ;;
-				"$ADGUARD_UID")
-					# The package installer can leave a service-owned YAML inside a
-					# root-private directory before the official service first starts.
-					# Do not relax the directory or chown that inode: an old writer FD
-					# would retain access.  With the namespace frozen at 0700, copy the
-					# exact bounded inode into a new private inode and atomically replace
-					# it.  The official service will chown it back on its next start.
-					[ "$group:$mode:$links" = "$ADGUARD_GID:-rw-------:1" ] ||
-						[ "$group:$mode:$links" = "$ADGUARD_GID:-rw-r-----:1" ] || exit 1
-					case "$size" in ""|*[!0-9]*) exit 1 ;; esac
-					[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
-					official_running && exit 1
-					exec 7<"$work_dir" || exit 1
-					workdir_fd=/proc/self/fd/7
-					[ -d "$workdir_fd" ] && [ "$workdir_fd" -ef "$work_dir" ] || exit 1
-					exec 8<"$config_file" || exit 1
-					old_fd=/proc/self/fd/8
-					[ -f "$old_fd" ] && [ "$old_fd" -ef "$config_file" ] || exit 1
-					metadata="$(LC_ALL=C ls -ldnL "$old_fd" 2>/dev/null)" || exit 1
-					read -r mode links owner group size remainder <<-EOF
-					$metadata
-					EOF
-					case "$owner:$group:$mode:$links" in
-						"$ADGUARD_UID":"$ADGUARD_GID":-rw-------:1|"$ADGUARD_UID":"$ADGUARD_GID":-rw-r-----:1) ;;
-						*) exit 1 ;;
-					esac
-					case "$size" in ""|*[!0-9]*) exit 1 ;; esac
-					[ "$size" -gt 0 ] && [ "$size" -le "$MAX_YAML_SIZE" ] || exit 1
-					# Two bounded captures must agree before the active pathname can be
-					# replaced.  Hash only those private captures, never the mutable old
-					# inode directly, so an old writer cannot create an unbounded read.
-					capture="${directory}/service-owned.yaml"
-					verify="${directory}/service-owned-verify.yaml"
-					snapshot_config_file "$config_file" "$capture" "" 8 || exit 1
-					old_hash="$SNAPSHOT_CONFIG_HASH"
-					snapshot_config_file "$config_file" "$verify" "$old_hash" 8 || exit 1
-					stage="$(mktemp "${work_dir}/.AdGuardHome-secure.XXXXXX")" || exit 1
-					exec 9<>"$stage" || exit 1
-					stage_fd=/proc/self/fd/9
-					[ -f "$stage_fd" ] && [ "$stage_fd" -ef "$stage" ] || exit 1
-					run_bounded 3 1 /bin/dd if="$capture" bs=4096 count=129 \
-						of="$stage_fd" 2>/dev/null || exit 1
-					secure_config_inode "$stage_fd" || exit 1
-					# This is the final size/hash gate before rename.  A truncate or
-					# growth beyond MAX_YAML_SIZE therefore leaves the old path intact.
-					snapshot_config_file "$stage" "$snapshot" "$old_hash" 9 || exit 1
-					[ -f "$old_fd" ] && [ ! -L "$config_file" ] &&
-						[ "$old_fd" -ef "$config_file" ] || exit 1
-					[ -d "$workdir_fd" ] && [ "$workdir_fd" -ef "$work_dir" ] || exit 1
-					metadata="$(LC_ALL=C ls -ldnL "$workdir_fd" 2>/dev/null)" || exit 1
-					read -r mode links owner group remainder <<-EOF
-					$metadata
-					EOF
-					case "$owner:$group:$mode" in
-						0:0:drwx------|0:"$ADGUARD_GID":drwx------) ;;
-						*) exit 1 ;;
-					esac
-					official_running && exit 1
-					mv "$stage" "$config_file" || exit 1
-					stage=""
-					[ "$stage_fd" -ef "$config_file" ] || exit 1
-					metadata="$(LC_ALL=C ls -ldnL "$stage_fd" 2>/dev/null)" || exit 1
-					read -r mode links owner group size remainder <<-EOF
-					$metadata
-					EOF
-					[ "$owner:$group:$mode:$links" = "0:0:-rw-------:1" ] || exit 1
-					snapshot_fd=9
-					;;
-				*) exit 1 ;;
-			esac
-			;;
-		"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
-		*) exit 1 ;;
-	esac
-
-	snapshot_config_file "$config_file" "$snapshot" "$old_hash" "$snapshot_fd" || exit 1
+	snapshot_config_file "$config_file" "$snapshot" "" "" || exit 1
 )
 
 secure_config_inode() {
-	local inode_path="$1" metadata mode owner links group remainder
+	local inode_path="$1"
 	case "$inode_path" in /proc/self/fd/[0-9]*|/proc/[0-9]*/fd/[0-9]*) ;; *) return 1 ;; esac
 	[ -f "$inode_path" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$work_dir" 2>/dev/null)" || return 1
-	read -r mode links owner group remainder <<-EOF
-	$metadata
-	EOF
-	case "$owner" in
-		0)
-			chown 0:0 "$inode_path" && chmod 0600 "$inode_path"
-			;;
-		"$ADGUARD_UID")
-			# A previously-running official service owns the workdir.  Keep an
-			# edited, root-owned YAML group-readable so disabled -> edit -> enable
-			# can still be opened by the official uid without making it writable.
-			chown "0:${ADGUARD_GID}" "$inode_path" && chmod 0640 "$inode_path"
-			;;
-		*)
-			log_error "Unexpected AdGuard Home work-directory owner: ${owner}"
-			return 1
-			;;
-	esac
+	# New YAML inodes do not inherit restored directory metadata.  Keep them
+	# private to root and the official service group on every persistent path.
+	chown "0:${ADGUARD_GID}" "$inode_path" && chmod 0640 "$inode_path"
 }
 
 ensure_config_file() {
@@ -1663,22 +1535,23 @@ memory_prepare_runtime_locked() {
 	data_target="$MEMORY_DATA_DIR"
 	if ! (
 		# Keep EXIT-trap state in this subshell, not ash function locals.
-		original_owner="" original_group=""
+		original_owner="" original_group="" restore_access=0
 		metadata="$(LC_ALL=C ls -ldn "$persistent_work_dir" 2>/dev/null)" || exit 1
 		read -r mode links original_owner original_group remainder <<-EOF
 		$metadata
 		EOF
 		case "$original_owner:$original_group:$mode" in
-			0:0:drwx------|0:"$ADGUARD_GID":drwx------|"$ADGUARD_UID":"$ADGUARD_GID":drwx------) ;;
-			*) exit 1 ;;
+			0:0:drwx------|0:"$ADGUARD_GID":drwx------) restore_access=1 ;;
 		esac
 		# A fresh workdir is root-private until the official core first starts.
-		# Give uid 853 traversal only for the complete stopped copy/bind boundary,
-		# not just the copy: both empty-data and activation scans need this access.
-		trap 'restore_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
+		# Give uid 853 temporary traversal only when needed.  A restored directory
+		# that is already accessible keeps its original mode and ownership.
+		trap '[ "$restore_access" != 1 ] || restore_workdir_access "$persistent_work_dir" "$original_owner" "$original_group" >/dev/null 2>&1 || true' EXIT
 		trap 'exit 1' HUP INT QUIT TERM
-		chown "0:${ADGUARD_GID}" "$persistent_work_dir" &&
-			chmod 0710 "$persistent_work_dir" || exit 1
+		if [ "$restore_access" = 1 ]; then
+			chown "0:${ADGUARD_GID}" "$persistent_work_dir" &&
+				chmod 0710 "$persistent_work_dir" || exit 1
+		fi
 		memory_create_runtime_parent || exit 1
 		mkdir -m 0700 "$MEMORY_WORK_DIR" &&
 			chown "${ADGUARD_UID}:${ADGUARD_GID}" "$MEMORY_WORK_DIR" || exit 1
@@ -1696,8 +1569,10 @@ memory_prepare_runtime_locked() {
 		chmod 0700 "$MEMORY_WORK_DIR" &&
 			memory_active_tree_valid "$persistent_work_dir" &&
 			memory_activate_data_bindings "$persistent_work_dir" || exit 1
-		restore_workdir_access "$persistent_work_dir" \
-			"$original_owner" "$original_group" || exit 1
+		if [ "$restore_access" = 1 ]; then
+			restore_workdir_access "$persistent_work_dir" \
+				"$original_owner" "$original_group" || exit 1
+		fi
 		trap - EXIT HUP INT QUIT TERM
 		memory_write_state "$persistent_work_dir"
 	); then
@@ -1792,7 +1667,7 @@ memory_backing_identity() {
 # persistent copy, which is acceptable for this mode.
 memory_copy_live_data_locked() (
 	local source="${MEMORY_WORK_DIR}/data" target="$MEMORY_BACKING_DATA_MOUNT"
-	local backing_fd=/proc/self/fd/9 metadata mode links original_owner original_group remainder
+	local backing_fd=/proc/self/fd/9
 	local backing_device backing_inode core_pid="" require_live="${1:-1}"
 	[ "$MEMORY_ACTIVE" = 1 ] || exit 2
 	[ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
@@ -1803,16 +1678,6 @@ memory_copy_live_data_locked() (
 		[ ! -L "$MEMORY_BACKING_WORK_DIR" ] || exit 1
 	exec 9<"$MEMORY_BACKING_WORK_DIR" || exit 1
 	[ -d "$backing_fd" ] && [ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
-	metadata="$(LC_ALL=C ls -ldnL "$backing_fd" 2>/dev/null)" || exit 1
-	read -r mode links original_owner original_group remainder <<-EOF
-	$metadata
-	EOF
-	# In v2.4 this directory also contains the live persistent YAML.  While the
-	# core runs, never freeze or chown that parent: doing so would make the Web
-	# UI's atomic YAML save fail.  The official service must already own its
-	# config directory before a live write-back is eligible.
-	[ "$original_owner:$original_group:$mode" = \
-		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || exit 1
 	memory_backing_identity "$backing_fd" || exit 1
 	backing_device="$MEMORY_IDENTITY_DEVICE"
 	backing_inode="$MEMORY_IDENTITY_INODE"
@@ -1842,12 +1707,6 @@ memory_copy_live_data_locked() (
 		-n AGHDataMode -x /bin/chmod -- 0700 "$target" || exit 1
 	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
 	[ "$backing_fd" -ef "$MEMORY_BACKING_WORK_DIR" ] || exit 1
-	metadata="$(LC_ALL=C ls -ldnL "$backing_fd" 2>/dev/null)" || exit 1
-	read -r mode links original_owner original_group remainder <<-EOF
-	$metadata
-	EOF
-	[ "$original_owner:$original_group:$mode" = \
-		"$ADGUARD_UID:$ADGUARD_GID:drwx------" ] || exit 1
 	[ -z "$core_pid" ] || [ "$(official_pid)" = "$core_pid" ] || exit 1
 	log_error "Wrote AdGuard Home RAM data back to ${MEMORY_BACKING_WORK_DIR}/data"
 	return 0
@@ -1861,12 +1720,16 @@ root_private_config_source() {
 	local candidate="$1" parent mode
 	parent="${candidate%/*}"
 	[ -n "$parent" ] || parent=/
-	[ -O "$candidate" ] && [ -O "$parent" ] || return 1
+	if [ "$candidate" = "$config_file" ] && [ "$parent" = "$work_dir" ]; then
+		[ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
+		path_contains_symlink "$parent" && return 1
+		return 0
+	fi
+	[ -O "$candidate" ] || return 1
 	path_contains_symlink "$parent" && return 1
+	[ -O "$parent" ] || return 1
 	mode="$(LC_ALL=C ls -ldn "$parent" 2>/dev/null)" || return 1
 	mode="${mode%% *}"
-	# Reject group- or world-writable parents.  A root-owned file under such a
-	# directory could still be renamed between the identity check and open.
 	case "$mode" in ?????w*|????????w*) return 1 ;; esac
 }
 
@@ -1893,9 +1756,9 @@ snapshot_config_file() {
 		fi
 	else
 		[ -f "$candidate" ] && [ ! -L "$candidate" ] || return 1
-		# A root-owned private workdir cannot be renamed by uid 853 (clean,
-		# disabled installation).  Otherwise capture as uid 853 so a concurrent
-		# symlink swap can never grant the snapshotter root read access.
+		# Capture the exact active YAML through a held root FD so restored Unix
+		# metadata cannot block startup.  Other candidates use the stricter source
+		# policy or uid 853.
 		if root_private_config_source "$candidate"; then
 			capture_root_file_bytes "$candidate" "$target" 129 || capture_rc=$?
 		else
@@ -2533,9 +2396,9 @@ valid_tls_path_syntax() {
 	esac
 }
 
-# Require every ancestor of a root-read file to be root-owned.  Writable
-# ancestors are rejected except for the target's top-level /etc (exposed as
-# mode 0777 by this rootfs) and the root-owned sticky /tmp used by mktemp.
+# The exact active YAML is protected by held-FD identity checks instead of Unix
+# metadata.  Other root-read files require root-owned ancestors.  Writable
+# ancestors are rejected except for the target's top-level /etc and /tmp.
 # ImmortalWrt's fixed /var -> /tmp link is treated exactly like /tmp only when
 # its target and dereferenced permissions match that system layout.  Every
 # deeper ancestor must be non-writable, and the held-FD identity checks below
@@ -2543,8 +2406,13 @@ valid_tls_path_syntax() {
 trusted_root_file_source() {
 	local value="$1" parent remaining component current="" metadata mode owner
 	local links group remainder protected_ancestor=0
-	[ -f "$value" ] && [ ! -L "$value" ] && [ -O "$value" ] || return 1
+	[ -f "$value" ] && [ ! -L "$value" ] || return 1
 	parent="${value%/*}"
+	if [ "$value" = "$config_file" ] && [ "$parent" = "$work_dir" ]; then
+		path_contains_symlink "$parent" && return 1
+		return 0
+	fi
+	[ -O "$value" ] || return 1
 	remaining="${parent#/}"
 	while [ -n "$remaining" ]; do
 		component="${remaining%%/*}"
@@ -2592,7 +2460,10 @@ capture_root_file_bytes() {
 		$fd_metadata
 		EOF
 		case "$fd_mode" in -*) ;; *) exit 1 ;; esac
-		[ "$fd_owner" = 0 ] || exit 1
+		if [ "$source" != "$config_file" ] ||
+		   [ "${source%/*}" != "$work_dir" ]; then
+			[ "$fd_owner" = 0 ] || exit 1
+		fi
 		[ ! -L "$source" ] && [ /proc/self/fd/8 -ef "$source" ] || exit 1
 		run_bounded 5 1 /bin/dd if=/proc/self/fd/8 \
 			bs=4096 count="$blocks" of="$target" 2>/dev/null || exit 1
