@@ -1,6 +1,9 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 
+# acme.sh runs its saved hook before ImmortalWrt refreshes /etc/ssl/acme.
+[ "$ACTION" = renewed ] && [ -n "${CERT_FULLCHAIN_PATH:-}" ] && exit 0
+
 case "$ACTION" in
 	issued|renewed)
 		[ -x /etc/init.d/AdGuardHome ] || exit 0

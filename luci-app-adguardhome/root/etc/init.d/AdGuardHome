@@ -4281,7 +4281,7 @@ restore_tls_fingerprint() {
 }
 
 tls_refresh_locked() {
-	local old_fingerprint was_running=0
+	local old_fingerprint new_fingerprint was_running=0
 	load_settings || return 1
 	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 0
 	old_fingerprint="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
@@ -4291,7 +4291,8 @@ tls_refresh_locked() {
 	[ "$TLS_USES_ACME" = 1 ] || return 0
 	check_core_config || return 1
 	sync_tls_access || return 1
-	[ "$old_fingerprint" != "$TLS_FINGERPRINT" ] || return 0
+	new_fingerprint="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
+	[ "$old_fingerprint" != "$new_fingerprint" ] || return 0
 	[ "$service_enabled" = 1 ] || return 0
 	official_running && was_running=1
 

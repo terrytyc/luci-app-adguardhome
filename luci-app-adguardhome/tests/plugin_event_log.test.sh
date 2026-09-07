@@ -9,7 +9,8 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-for name in service_started stop_service wait_for_core_stopped settings_update_locked; do
+for name in service_started stop_service wait_for_core_stopped settings_update_locked \
+	tls_refresh_locked; do
 	eval "$(function_body "$init_file" "$name")"
 done
 
@@ -147,4 +148,59 @@ ADGUARDHOME_LOG_SILENT=1 log_error 'hidden monitor detail'
 ADGUARDHOME_LOG_SILENT=0 log_error 'visible event'
 expect_log '-t AdGuardHome visible event'
 
-printf 'ok - sparse plugin lifecycle events and shared RAM write-back logging\n'
+hotplug_file="${script_dir}/../root/etc/hotplug.d/acme/95-AdGuardHome"
+hotplug_log="$test_tmp/hotplug-events"
+sed "s#/etc/init.d/AdGuardHome#$test_tmp/AdGuardHome#g" \
+	"$hotplug_file" >"$test_tmp/acme-hotplug"
+cat >"$test_tmp/AdGuardHome" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >>"$HOTPLUG_LOG"
+EOF
+chmod 0755 "$test_tmp/AdGuardHome" "$test_tmp/acme-hotplug"
+export HOTPLUG_LOG="$hotplug_log"
+: >"$hotplug_log"
+ACTION=renewed CERT_FULLCHAIN_PATH=/etc/acme/example/fullchain.cer \
+	"$test_tmp/acme-hotplug"
+[ ! -s "$hotplug_log" ]
+ACTION=renewed CERT_FULLCHAIN_PATH='' "$test_tmp/acme-hotplug"
+ACTION=issued CERT_FULLCHAIN_PATH=/etc/acme/example/fullchain.cer \
+	"$test_tmp/acme-hotplug"
+[ "$(wc -l <"$hotplug_log")" = 2 ]
+[ "$(grep -cx tls_refresh "$hotplug_log")" = 2 ]
+
+PLUGIN_CONFIG=adguardhome
+PLUGIN_SECTION=luci
+MANAGED_TLS_FINGERPRINT=managed_tls_fingerprint
+config_file="$test_tmp/AdGuardHome.yaml"
+printf 'dns:\n  port: 53335\n' >"$config_file"
+OFFICIAL_SERVICE="$test_tmp/official-service"
+official_log="$test_tmp/official-events"
+cat >"$OFFICIAL_SERVICE" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" >>"$OFFICIAL_LOG"
+EOF
+chmod 0755 "$OFFICIAL_SERVICE"
+export OFFICIAL_LOG="$official_log"
+uci() {
+	[ "$1" = -q ] && shift
+	[ "$1" = get ] && printf '%s\n' "$UCI_FINGERPRINT"
+}
+load_settings() { service_enabled=1; work_dir=/etc/AdGuardHome; redirect_mode=none; }
+load_active_tls_access() { TLS_USES_ACME=1; TLS_FINGERPRINT=loaded; }
+check_core_config() { TLS_FINGERPRINT=; }
+sync_tls_access() { UCI_FINGERPRINT="$SYNC_FINGERPRINT"; }
+official_running() { return 1; }
+clear_recorded_integration_locked() { :; }
+load_runtime_dns_port() { dns_port=53335; }
+wait_for_core_ready() { :; }
+apply_integration_locked() { :; }
+restore_tls_fingerprint() { :; }
+resume_yaml_runtime() { :; }
+
+: >"$official_log"
+UCI_FINGERPRINT=same SYNC_FINGERPRINT=same tls_refresh_locked
+[ ! -s "$official_log" ]
+UCI_FINGERPRINT=old SYNC_FINGERPRINT=new tls_refresh_locked
+[ "$(cat "$official_log")" = start ]
+
+printf 'ok - sparse plugin events, ACME refresh ordering and shared RAM write-back logging\n'
