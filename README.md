@@ -12,7 +12,7 @@ DNS、配置、日志，在路由器里一处管理。
 - **data 可选内存运行**：主程序和 YAML 留在持久目录，只有 data 进入内存。支持定时、手动回写，回写不重启服务。
 - **直接编辑 YAML**：语法高亮、行号、未保存提醒，保存前校验。“载入模板”只替换编辑内容，确认保存后才生效。
 - **日志分开看**：核心日志和插件日志独立展示，最新记录在上，支持折叠和换行。插件只记录启停、配置应用、回写等关键事件。
-- **管理入口更省事**：按 YAML 生成 HTTP / HTTPS 管理地址，也能直接修改 AdGuard Home 登录账号；密码在浏览器端生成 BCrypt 哈希。
+- **管理入口更省事**：按 YAML 生成 HTTP / HTTPS 管理地址，也能直接修改 AdGuard Home 登录账号或密码。
 
 纯 LuCI JavaScript + ucode RPC，无 Lua、无 CBI。不替换官方核心或服务文件，也不另做核心更新器。
 
@@ -37,7 +37,7 @@ apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 
 打开 LuCI → **服务 → AdGuard Home**，勾选启用并保存应用。全新安装默认关闭，不会立即接管 DNS。
 
-默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号，它与路由器登录账号无关。
+默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号或密码。
 
 后续更新只需：
 
