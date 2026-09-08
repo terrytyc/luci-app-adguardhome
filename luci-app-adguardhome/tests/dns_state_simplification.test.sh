@@ -80,16 +80,24 @@ config_get() {
 }
 config_foreach() {
 	[ "$2" = dnsmasq ] || return 1
-	"$1" cfg01411c
+	local section
+	for section in ${TEST_DNSMASQ_SECTIONS:-cfg01411c}; do
+		"$1" "$section"
+	done
 }
 config_list_foreach() {
-	local callback="$3" value
-	[ "$1:$2" = cfg01411c:server ] || return 1
+	local callback="$3" value values
+	[ "$2" = server ] || return 1
+	case "$1" in
+		cfg01411c) values="${TEST_SERVERS:-}" ;;
+		cfgsecond) values="${TEST_SECOND_SERVERS:-}" ;;
+		*) return 1 ;;
+	esac
 	while IFS= read -r value; do
 		[ -n "$value" ] || continue
 		"$callback" "$value"
 	done <<-EOF
-	${TEST_SERVERS:-}
+	$values
 	EOF
 }
 log_error() { printf 'log:%s\n' "$*" >>"$uci_log"; }
@@ -174,6 +182,44 @@ for expected in \
 		exit 1
 	}
 done
+
+# Cleanup may locate its unique recorded upstream after another dnsmasq
+# instance is added, but takeover remains single-instance only.
+TEST_DNSMASQ_SECTIONS='cfg01411c cfgsecond'
+TEST_SERVERS='/example.test/192.0.2.53'
+TEST_SECOND_SERVERS="/second.test/192.0.2.54
+127.0.0.1#53335"
+: >"$uci_log"
+clear_managed_dnsmasq_upstream
+grep -Fqx -- 'del_list:dhcp.cfgsecond.server=127.0.0.1#53335' "$uci_log"
+if grep -Fq 'dhcp.cfg01411c' "$uci_log"; then
+	printf 'DNS cleanup modified an unrelated dnsmasq instance\n' >&2
+	exit 1
+fi
+: >"$uci_log"
+if set_dnsmasq_upstream; then
+	printf 'DNS takeover accepted multiple dnsmasq instances\n' >&2
+	exit 1
+fi
+if grep -Eq '^(add_list|set|delete|del_list|commit):' "$uci_log"; then
+	printf 'rejected multi-instance takeover changed UCI state\n' >&2
+	exit 1
+fi
+
+# More than one section containing the recorded upstream is ambiguous and
+# must fail before any UCI mutation.
+TEST_SERVERS='127.0.0.1#53335'
+: >"$uci_log"
+if clear_managed_dnsmasq_upstream; then
+	printf 'ambiguous managed dnsmasq upstream was cleaned\n' >&2
+	exit 1
+fi
+if grep -Eq '^(add_list|set|delete|del_list|commit):' "$uci_log"; then
+	printf 'ambiguous DNS cleanup changed UCI state\n' >&2
+	exit 1
+fi
+TEST_DNSMASQ_SECTIONS=cfg01411c
+TEST_SECOND_SERVERS=''
 
 TEST_MANAGED_PORT=53335
 TEST_NORESOLV=1

@@ -116,6 +116,8 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		`htdocs/luci-static/resources/view/adguardhome/${name}.js`
 	);
 	const source = fs.readFileSync(viewPath, 'utf8');
+	const animationFrames = new Map();
+	let nextAnimationFrame = 1;
 	const rpc = {
 		declare: specification => async (...args) => {
 			const handler = rpcHandlers[specification.method];
@@ -138,16 +140,30 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		window: {
 			location: { href: 'https://router.example/cgi-bin/luci/admin/services/adguardhome' },
 			setTimeout(callback) { return setTimeout(callback, 0); },
+			requestAnimationFrame(callback) {
+				const id = nextAnimationFrame++;
+				animationFrames.set(id, callback);
+				return id;
+			},
+			cancelAnimationFrame(id) { animationFrames.delete(id); },
 		},
 	};
 	vm.createContext(sandbox);
-	return vm.runInContext(
+	const loadedView = vm.runInContext(
 		'(function(bcrypt, operation, dom, form, poll, rpc, uci, ui, view, window, L, E, _, URL, console) {\n' +
 			source +
 			'\n}).call(globalThis, {}, operation, {}, {}, {}, rpc, {}, ui, view, window, L, E, _, URL, console)',
 		Object.assign(sandbox, { operation, rpc, ui, view }),
 		{ filename: viewPath },
 	);
+	loadedView.pendingAnimationFrames = () => animationFrames.size;
+	loadedView.flushAnimationFrames = () => {
+		for (const [ id, callback ] of [ ...animationFrames ]) {
+			animationFrames.delete(id);
+			callback();
+		}
+	};
+	return loadedView;
 }
 
 async function runSettingsSubmissionScenario(kind) {
@@ -476,9 +492,25 @@ async function testYamlEditing() {
 	await view.handleReload();
 	assert.equal(modals.length, 0, 'clean reload needs no confirmation');
 	assert.deepEqual(calls, [ 'read', 'read' ]);
+	let lineNumberWrites = 0;
+	let lineNumberText = view.yamlLineNumbers.textContent;
+	Object.defineProperty(view.yamlLineNumbers, 'textContent', {
+		get: () => lineNumberText,
+		set: value => { lineNumberWrites++; lineNumberText = value; },
+	});
 	view.yamlEditor.value = 'unsafe: <img src=x onerror=alert(1)>\nflag: false # note\n';
 	view.yamlEditor.selectionStart = view.yamlEditor.value.indexOf('flag');
 	view.yamlEditor.attrs.input();
+	view.yamlEditor.attrs.input();
+	view.yamlEditor.attrs.keyup();
+	assert.equal(view.pendingAnimationFrames(), 1,
+		'multiple input events in one frame must schedule only one YAML redraw');
+	assert.equal(view.activeYamlLine, 0,
+		'keyup must leave the pending input redraw to calculate the new active line once');
+	view.flushAnimationFrames();
+	assert.equal(lineNumberWrites, 0,
+		'editing without changing the line count must not rebuild line numbers');
+	assert.equal(view.activeYamlLine, 1, 'the coalesced redraw must retain the cursor line');
 	assert.doesNotMatch(view.yamlHighlight.innerHTML, /<img/i,
 		'YAML highlighting must not turn editor text into HTML');
 	assert.match(view.yamlHighlight.innerHTML, /&lt;img src=x onerror=alert\(1\)&gt;/);
@@ -493,6 +525,8 @@ async function testYamlEditing() {
 	view.yamlEditor.value = '# draft\n';
 	view.yamlEditor.selectionStart = 0;
 	view.yamlEditor.attrs.input();
+	view.flushAnimationFrames();
+	assert.equal(lineNumberWrites, 1, 'changing the line count must rebuild line numbers once');
 	assert.equal(view.draftStatus.hidden, false);
 	await view.handleReload();
 	assert.equal(modals.at(-1).title, 'Discard unsaved changes?');
@@ -528,6 +562,15 @@ async function testYamlEditing() {
 	assert.equal(view.editorNotice.hidden, false, 'initial read errors need a persistent inline reason');
 	assert.match(view.editorNotice.textContent, /disk read failed.*Use Reload from disk/);
 	assert.equal(view.yamlEditor.readOnly, true);
+
+	view.yamlEditor.value = '# obsolete input\n';
+	view.yamlEditor.attrs.input();
+	assert.equal(view.pendingAnimationFrames(), 1);
+	const obsoleteHighlight = view.yamlHighlight.innerHTML;
+	state.dispatch('pagehide');
+	view.flushAnimationFrames();
+	assert.equal(view.yamlHighlight.innerHTML, obsoleteHighlight,
+		'a queued editor redraw must not update an inactive page');
 }
 
 async function main() {

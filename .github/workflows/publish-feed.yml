@@ -4,11 +4,6 @@ on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: Stable v3 release tag; blank selects the latest
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -26,6 +21,8 @@ jobs:
           (startsWith(github.event.release.tag_name, 'v3.') &&
            github.event.release.prerelease == false) }}
     runs-on: ubuntu-latest
+    outputs:
+      current: ${{ steps.releases.outputs.current }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -36,37 +33,33 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REQUESTED_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -Eeuo pipefail
           die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
           release_list=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("v3."))) | .tag_name') ||
+            --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("v3."))) | .tag_name' | sort -Vr) ||
             die 'unable to list releases'
           mapfile -t stable_tags < <(printf '%s' "$release_list")
 
-          current=$REQUESTED_TAG
-          [[ -n $current ]] || current=${stable_tags[0]:-}
+          current=${stable_tags[0]:-}
           [[ $current =~ ^v3\.[0-9A-Za-z.+_~-]+$ ]] ||
             die "not a stable v3 release tag: $current"
 
-          found=false
-          previous=
-          for candidate in "${stable_tags[@]}"; do
-            if [[ $found == true ]]; then
-              [[ $candidate =~ ^v3\.[0-9A-Za-z.+_~-]+$ ]] || continue
-              previous=$candidate
-              break
-            fi
-            [[ $candidate == "$current" ]] && found=true
-          done
-          [[ $found == true ]] || die "stable release does not exist: $current"
+          if [[ -n $REQUESTED_TAG && $REQUESTED_TAG != "$current" ]]; then
+            printf 'Skipping old release %s; latest stable release is %s\n' "$REQUESTED_TAG" "$current"
+            exit 0
+          fi
+          previous=${stable_tags[1]:-}
+          [[ -z $previous || $previous =~ ^v3\.[0-9A-Za-z.+_~-]+$ ]] ||
+            die "not a stable v3 release tag: $previous"
 
           printf 'current=%s\nprevious=%s\n' "$current" "$previous" >>"$GITHUB_OUTPUT"
 
       - name: Download release APKs
+        if: steps.releases.outputs.current != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -85,6 +78,7 @@ jobs:
           fi
 
       - name: Build and verify signed feed
+        if: steps.releases.outputs.current != ''
         shell: bash
         env:
           APK_SIGNING_KEY_B64: ${{ secrets.APK_SIGNING_KEY_B64 }}
@@ -103,15 +97,18 @@ jobs:
             '
 
       - name: Configure GitHub Pages
+        if: steps.releases.outputs.current != ''
         uses: actions/configure-pages@v6
 
       - name: Upload Pages artifact
+        if: steps.releases.outputs.current != ''
         uses: actions/upload-pages-artifact@v5
         with:
           path: site
 
   deploy:
     needs: build
+    if: needs.build.outputs.current != ''
     runs-on: ubuntu-latest
     environment:
       name: github-pages

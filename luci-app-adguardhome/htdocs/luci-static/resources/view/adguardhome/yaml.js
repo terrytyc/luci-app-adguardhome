@@ -125,10 +125,18 @@ function highlightYamlLine(line) {
 	return highlighted + (comment ? yamlToken('comment', comment) : '');
 }
 
-function highlightYaml(content, activeLine) {
-	return String(content).split('\n').map((line, index) =>
+function highlightYaml(lines, activeLine) {
+	return lines.map((line, index) =>
 		`<span class="adguardhome-yaml-line${index === activeLine ? ' active' : ''}">${highlightYamlLine(line) || '&#8203;'}</span>`
 	).join('');
+}
+
+function yamlActiveLine(content, cursor) {
+	let activeLine = 0;
+	for (let offset = content.indexOf('\n'); offset >= 0 && offset < cursor;
+	     offset = content.indexOf('\n', offset + 1))
+		activeLine++;
+	return activeLine;
 }
 
 return view.extend({
@@ -174,7 +182,7 @@ return view.extend({
 			spellcheck: 'false',
 			wrap: 'off',
 			readonly: result.error || !result.sha256 || !L.hasViewPermission() ? 'readonly' : null,
-			input: () => this.refreshYamlEditor(),
+			input: () => this.scheduleYamlEditorRefresh(),
 			scroll: () => this.syncYamlEditorScroll(),
 			click: () => this.updateActiveYamlLine(),
 			keyup: () => this.updateActiveYamlLine(),
@@ -185,6 +193,7 @@ return view.extend({
 			this.yamlHighlight,
 			this.yamlEditor,
 		]);
+		this.yamlLineCount = null;
 		this.refreshYamlEditor();
 		this.pathValue = E('span', {}, result.path || _('Unavailable'));
 		this.saveButton = E('button', {
@@ -305,27 +314,50 @@ return view.extend({
 		this.draftStatus.hidden = !this.hasDraft();
 	},
 
+	scheduleYamlEditorRefresh() {
+		if (this.yamlRefreshFrame != null)
+			return;
+
+		const scope = this.pageScope;
+		this.yamlRefreshFrame = window.requestAnimationFrame(() => {
+			this.yamlRefreshFrame = null;
+			if (operation.isPageActive(scope))
+				this.refreshYamlEditor();
+		});
+	},
+
 	refreshYamlEditor() {
+		if (this.yamlRefreshFrame != null) {
+			window.cancelAnimationFrame(this.yamlRefreshFrame);
+			this.yamlRefreshFrame = null;
+		}
+
 		const content = String(this.yamlEditor.value ?? '');
 		const cursor = Number.isInteger(this.yamlEditor.selectionStart)
 			? this.yamlEditor.selectionStart
 			: 0;
-		const activeLine = content.slice(0, cursor).split('\n').length - 1;
-		const lineCount = content.split('\n').length;
+		const lines = content.split('\n');
+		const activeLine = yamlActiveLine(content, cursor);
 
-		this.yamlLineNumbers.textContent = Array.from({ length: lineCount }, (_, index) => index + 1).join('\n');
-		this.yamlHighlight.innerHTML = highlightYaml(content, activeLine);
+		if (lines.length !== this.yamlLineCount) {
+			this.yamlLineNumbers.textContent = Array.from({ length: lines.length }, (_, index) => index + 1).join('\n');
+			this.yamlLineCount = lines.length;
+		}
+		this.yamlHighlight.innerHTML = highlightYaml(lines, activeLine);
 		this.activeYamlLine = activeLine;
 		this.syncYamlEditorScroll();
 		this.updateDraftStatus();
 	},
 
 	updateActiveYamlLine() {
+		if (this.yamlRefreshFrame != null)
+			return;
+
 		const content = String(this.yamlEditor.value ?? '');
 		const cursor = Number.isInteger(this.yamlEditor.selectionStart)
 			? this.yamlEditor.selectionStart
 			: 0;
-		const activeLine = content.slice(0, cursor).split('\n').length - 1;
+		const activeLine = yamlActiveLine(content, cursor);
 
 		if (activeLine === this.activeYamlLine)
 			return;

@@ -51,7 +51,7 @@ fi
 stop_line="$(printf '%s\n' "$preinst" |
 	grep -n 'run_bounded 180 5 /etc/init.d/AdGuardHome stop' | cut -d: -f1)"
 snapshot_line="$(printf '%s\n' "$preinst" |
-	grep -n '^snapshot_dir=' | cut -d: -f1)"
+	grep -n '^SNAPSHOT_DIR=' | cut -d: -f1)"
 [ "$stop_line" -lt "$snapshot_line" ] || {
 	printf 'overwrite is not selected before first-install snapshot creation\n' >&2
 	exit 1

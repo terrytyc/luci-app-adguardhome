@@ -120,7 +120,7 @@ function loadOverview() {
 		{ filename: overviewPath });
 	view.pageScope = scope;
 	return {
-		view, bcrypt, credentialReply, moduleReply, events, nodes, modals, failures, timers,
+		view, bcrypt, credentialReply, moduleReply, handlers, events, nodes, modals, failures, timers,
 		setActive(value) { active = value; },
 		inputs() { return nodes.filter(node => node.tag === 'input'); },
 		submit() { return nodes.find(node => node.tag === 'button' && node.events.click).events.click(); },
@@ -178,6 +178,44 @@ async function main() {
 	await renamed.submit();
 	assert.deepEqual(renamed.events.find(Array.isArray), [ 'set_credentials', 'operator', '', info.sha256 ],
 		'username-only updates must preserve the password without hashing an empty string');
+
+	for (const scenario of [
+		{
+			name: 'lost response',
+			reply: () => { throw new Error('accepted response was lost'); },
+			expected: /outcome is unknown.*may have reached.*accepted response was lost.*Reopen this dialog/,
+			uncertain: true,
+		},
+		{
+			name: 'accepted without token',
+			reply: () => ({ accepted: true, token: 'invalid' }),
+			expected: /outcome is unknown.*accepted the update job.*valid status token.*Reopen this dialog/,
+			uncertain: true,
+		},
+		{
+			name: 'rejected',
+			reply: () => ({ accepted: false }),
+			expected: /Unable to change.*did not accept/,
+			uncertain: false,
+		},
+	]) {
+		const state = await readyDialog();
+		state.handlers.set_credentials = (...args) => {
+			state.events.push([ 'set_credentials', ...args ]);
+			return scenario.reply();
+		};
+		state.inputs()[0].value = 'operator';
+		await state.submit();
+		assert.equal(state.failures.length, 1, `${scenario.name}: report one result`);
+		assert.match(state.failures[0], scenario.expected);
+		assert.equal(state.failures[0].includes('outcome is unknown'), scenario.uncertain,
+			`${scenario.name}: distinguish an uncertain outcome from a confirmed rejection`);
+		assert.deepEqual(state.events.filter(Array.isArray), [
+			[ 'set_credentials', 'operator', '', info.sha256 ],
+		], `${scenario.name}: submit the CAS-protected mutation only once`);
+		assert.equal(state.events.some(event => Array.isArray(event) && event[0] === 'get_yaml_update'), false,
+			`${scenario.name}: do not poll without a valid token`);
+	}
 
 	for (const failedDependency of [ 'moduleReply', 'credentialReply' ]) {
 		const state = loadOverview();

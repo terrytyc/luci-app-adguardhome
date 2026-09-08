@@ -656,7 +656,6 @@ load_settings() {
 		*) return 1 ;;
 	esac
 
-	validate_managed_work_dir "$configured_work_dir" || return 1
 	persistent_work_dir="${configured_work_dir%/}"
 	persistent_config_file="${persistent_work_dir}/AdGuardHome.yaml"
 	work_dir="$persistent_work_dir"
@@ -3247,21 +3246,42 @@ reload_service_if_present() {
 	"$service" "$action" >/dev/null 2>&1
 }
 
+mark_managed_dnsmasq_upstream() {
+	[ "$1" != "$DNSMASQ_CLEANUP_UPSTREAM" ] || DNSMASQ_CLEANUP_FOUND=1
+}
+
 remember_first_dnsmasq() {
 	DNSMASQ_COUNT=$((DNSMASQ_COUNT + 1))
 	[ -n "$DNSMASQ_SECTION" ] || DNSMASQ_SECTION="$1"
+	[ -n "$DNSMASQ_CLEANUP_UPSTREAM" ] || return 0
+	DNSMASQ_CLEANUP_FOUND=0
+	config_list_foreach "$1" server mark_managed_dnsmasq_upstream
+	[ "$DNSMASQ_CLEANUP_FOUND" = 1 ] || return 0
+	DNSMASQ_CLEANUP_COUNT=$((DNSMASQ_CLEANUP_COUNT + 1))
+	DNSMASQ_CLEANUP_SECTION="$1"
 }
 
 load_dnsmasq_section() {
+	local cleanup_upstream="${1:-}"
 	DNSMASQ_SECTION=""
 	DNSMASQ_UCI=""
 	DNSMASQ_COUNT=0
+	DNSMASQ_CLEANUP_UPSTREAM="$cleanup_upstream"
+	DNSMASQ_CLEANUP_COUNT=0
+	DNSMASQ_CLEANUP_SECTION=""
 	config_load dhcp || return 1
 	config_foreach remember_first_dnsmasq dnsmasq
 	[ -n "$DNSMASQ_SECTION" ] || return 1
 	if [ "$DNSMASQ_COUNT" -ne 1 ]; then
-		log_error "dnsmasq-upstream mode requires exactly one dnsmasq instance; found ${DNSMASQ_COUNT}"
-		return 1
+		if [ -z "$cleanup_upstream" ]; then
+			log_error "dnsmasq-upstream mode requires exactly one dnsmasq instance; found ${DNSMASQ_COUNT}"
+			return 1
+		fi
+		if [ "$DNSMASQ_CLEANUP_COUNT" -ne 1 ]; then
+			log_error "Unable to uniquely locate the managed dnsmasq upstream; found ${DNSMASQ_CLEANUP_COUNT} matching instances"
+			return 1
+		fi
+		DNSMASQ_SECTION="$DNSMASQ_CLEANUP_SECTION"
 	fi
 	DNSMASQ_UCI="dhcp.${DNSMASQ_SECTION}"
 }
@@ -3300,9 +3320,9 @@ clear_managed_dnsmasq_upstream() {
 		log_error "Invalid managed dnsmasq upstream port '${managed_port}'"
 		return 1
 	}
-	load_dnsmasq_section || return 1
-	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
 	upstream="127.0.0.1#${managed_port}"
+	load_dnsmasq_section "$upstream" || return 1
+	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
 	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
 	uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
 	uci -q commit dhcp || return 1

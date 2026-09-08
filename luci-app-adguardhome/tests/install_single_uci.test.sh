@@ -21,7 +21,7 @@ reject_text() {
 }
 
 require_text "$makefile" 'PKG_VERSION:=3.0.0'
-require_text "$makefile" 'PKG_RELEASE:=1'
+require_text "$makefile" 'PKG_RELEASE:=2'
 reject_text "$makefile" '/usr/lib/opkg/'
 require_text "$makefile" 'run_bounded 180 5 /etc/init.d/AdGuardHome stop'
 require_text "$makefile" 'managed_dnsmasq_upstream'
@@ -29,6 +29,8 @@ require_text "$makefile" 'official-adguardhome.config'
 require_text "$makefile" 'managed-adguardhome.config'
 require_text "$makefile" '/etc/init.d/AdGuardHome memory_cleanup'
 require_text "$makefile" 'cmp -s "$$snapshot_config" /etc/config/adguardhome'
+require_text "$makefile" '$(AdGuardHome/OriginalSnapshot)'
+require_text "$defaults" '# @include original-snapshot'
 
 conffiles="$(sed -n '/^define Package\/$(PKG_NAME)\/conffiles$/,/^endef$/p' "$makefile")"
 printf '%s\n' "$conffiles" | grep -Fqx '/etc/AdGuardHome/AdGuardHome.yaml'

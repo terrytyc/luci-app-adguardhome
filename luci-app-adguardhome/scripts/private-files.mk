@@ -24,4 +24,12 @@ root_private_file() {
 	[ "$$mode" = -rw------- ] && [ "$$links" = 1 ] &&
 		[ "$$owner" = 0 ] && [ "$$group" = 0 ]
 }
+
+bounded_private_file() {
+	local size
+	root_private_file "$$1" || return 1
+	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
+	case "$$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$$size" -gt 0 ] && [ "$$size" -le 524288 ]
+}
 endef

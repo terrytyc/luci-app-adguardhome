@@ -77,4 +77,9 @@ for test_file in "${js_tests[@]}"; do
 	fi
 done
 
+for test_file in "$SCRIPT_DIR"/tests/*.test.sh; do
+	printf 'TEST %s\n' "${test_file#"$REPO/"}"
+	bash "$test_file"
+done
+
 printf 'TEST_OK shell=%d javascript=%d\n' "${#shell_tests[@]}" "${#js_tests[@]}"

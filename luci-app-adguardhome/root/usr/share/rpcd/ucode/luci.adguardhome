@@ -1908,19 +1908,9 @@ const methods = {
 			return overview_info();
 		},
 	},
-	get_status: {
-		call: function() {
-			return service_status();
-		},
-	},
 	get_version: {
 		call: function() {
 			return { version: core_version() };
-		},
-	},
-	get_config_info: {
-		call: function() {
-			return overview_info().config;
 		},
 	},
 	get_settings: {

@@ -5,10 +5,11 @@ ADGUARDHOME_SOURCE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(TOPDIR)/rules.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
+include $(ADGUARDHOME_SOURCE_DIR)scripts/original-snapshot.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.0.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -71,74 +72,13 @@ if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
 	exit 0
 fi
 
-bounded_private_file() {
-	local size
-	root_private_file "$$1" || return 1
-	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
-	case "$$size" in ""|*[!0-9]*) return 1 ;; esac
-	[ "$$size" -gt 0 ] && [ "$$size" -le 524288 ]
-}
+SNAPSHOT_DIR=/root/.luci-app-adguardhome
+SNAPSHOT_CONFIG="$$SNAPSHOT_DIR/official-adguardhome.config"
+SNAPSHOT_STATE="$$SNAPSHOT_DIR/official-adguardhome.state"
+SNAPSHOT_VERSION="$$SNAPSHOT_DIR/snapshot-version"
+SNAPSHOT_STAGE=""
 
-official_delta_is_clean() {
-	local changes
-	changes="$$(uci -q changes adguardhome 2>/dev/null)" || return 1
-	[ -z "$$changes" ]
-}
-
-snapshot_dir=/root/.luci-app-adguardhome
-snapshot_config="$$snapshot_dir/official-adguardhome.config"
-snapshot_state="$$snapshot_dir/official-adguardhome.state"
-snapshot_version="$$snapshot_dir/snapshot-version"
-snapshot_stage=""
-was_running=0
-
-validate_original_snapshot() {
-	root_private_directory "$$snapshot_dir" &&
-		bounded_private_file "$$snapshot_config" &&
-		root_private_file "$$snapshot_state" &&
-		root_private_file "$$snapshot_version" &&
-		grep -Eq '^was_running=[01]$$' "$$snapshot_state" &&
-		[ "$$(wc -l <"$$snapshot_state" 2>/dev/null)" = 1 ] &&
-		grep -qx '1' "$$snapshot_version"
-}
-
-cleanup_snapshot_stage() {
-	[ -n "$$snapshot_stage" ] || return 0
-	rm -f "$$snapshot_stage/official-adguardhome.config" \
-		"$$snapshot_stage/official-adguardhome.state" \
-		"$$snapshot_stage/snapshot-version" 2>/dev/null || true
-	rmdir "$$snapshot_stage" 2>/dev/null || true
-	snapshot_stage=""
-}
-
-create_original_snapshot() {
-	local running_rc=0
-	[ ! -e "$$snapshot_dir" ] && [ ! -L "$$snapshot_dir" ] || return 1
-	[ -f /etc/config/adguardhome ] && [ ! -L /etc/config/adguardhome ] || return 1
-	official_delta_is_clean || return 1
-	snapshot_stage="$$(mktemp -d /root/.luci-app-adguardhome.XXXXXX)" || return 1
-	chown 0:0 "$$snapshot_stage" && chmod 0700 "$$snapshot_stage" || return 1
-	run_bounded 5 1 /bin/dd if=/etc/config/adguardhome \
-		of="$$snapshot_stage/official-adguardhome.config" bs=4096 count=129 \
-		2>/dev/null || return 1
-	run_bounded 5 1 uci -q export adguardhome >/dev/null || return 1
-	if [ -x /etc/init.d/adguardhome ]; then
-		run_bounded 5 1 /etc/init.d/adguardhome running \
-			>/dev/null 2>&1 || running_rc=$$?
-		case "$$running_rc" in
-			0) was_running=1 ;;
-			1) was_running=0 ;;
-			*) return 1 ;;
-		esac
-	fi
-	printf 'was_running=%s\n' "$$was_running" \
-		>"$$snapshot_stage/official-adguardhome.state" || return 1
-	printf '1\n' >"$$snapshot_stage/snapshot-version" || return 1
-	chown 0:0 "$$snapshot_stage"/* && chmod 0600 "$$snapshot_stage"/* || return 1
-	mv "$$snapshot_stage" "$$snapshot_dir" || return 1
-	snapshot_stage=""
-	validate_original_snapshot
-}
+$(AdGuardHome/OriginalSnapshot)
 
 rollback_preinst() {
 	local rc=$$?
@@ -187,14 +127,6 @@ esac
 $(AdGuardHome/RunBounded)
 
 $(AdGuardHome/PrivateFiles)
-bounded_private_file() {
-	local size
-	root_private_file "$$1" || return 1
-	size="$$(wc -c <"$$1" 2>/dev/null)" || return 1
-	case "$$size" in ""|*[!0-9]*) return 1 ;; esac
-	[ "$$size" -gt 0 ] && [ "$$size" -le 524288 ]
-}
-
 snapshot_dir=/root/.luci-app-adguardhome
 snapshot_config="$$snapshot_dir/official-adguardhome.config"
 snapshot_state="$$snapshot_dir/official-adguardhome.state"

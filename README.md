@@ -56,6 +56,8 @@ config luci 'luci'
 
 `redirect` 和 `dnsmasq-upstream` 要求 YAML 的 `dns.port` 不是 53；`none` 模式可使用 53。停用插件或离开 `dnsmasq-upstream` 时会删除插件记录的精确上游并取消 `noresolv`，不修改 `resolvfile`；切换其他模式时只撤销插件自己创建的 DNS 或防火墙项。
 
+接管后新增 dnsmasq 实例时，退出清理只处理唯一包含已记录上游的实例，不修改其他实例；无法唯一定位时停止清理并报错。新接管仍要求只有一个实例。
+
 ## LuCI 页面
 
 LuCI 菜单入口统一为小写 `/admin/services/adguardhome`，包含三个页签：
@@ -115,6 +117,16 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 `@terrytyc` 用于选择本项目的同名软件包，避免被官方 LuCI 插件替换。公钥安装后正常校验签名，无需在路由器使用 `--allow-untrusted`。将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，可在保留配置升级固件时同时保留公钥。
 
 发布使用 `scripts/build-apk.sh` 构建主包和翻译包，`scripts/publish-feed.sh` 生成签名索引。发布 3.x GitHub Release 后，工作流将相同 APK 部署到 GitHub Pages；签名私钥保存在 Actions Secret `APK_SIGNING_KEY_B64`，公开公钥位于 `keys/public-key.pem`。
+
+构建脚本默认只读取 `HEAD` 提交，可用 `SOURCE_REF=v3.0.0-r2` 指定标签；未提交的修改和未跟踪文件不会进入构建。源码包、版本号和 APK 使用同一提交，构建结束后恢复 SDK 原有的软件包链接。重跑旧版发布任务会跳过软件源部署，手动运行则发布最新稳定版。
+
+## 3.0.0-r2
+
+- 修复新增 dnsmasq 实例后无法撤销原有 DNS 接管的问题。
+- 修改账号时，连接中断或缺少任务状态令牌会明确提示结果未知。
+- 减少 YAML 编辑时的重复扫描和行号刷新，合并同帧输入更新。
+- 合并安装快照辅助代码，删除闲置 RPC 和同轮重复的工作目录检查；监控间隔仍为 5 秒。
+- 发布构建只使用已提交源码，固定 APK 来源路径；旧发布任务不再覆盖新版软件源。
 
 ## 3.0.0-r1
 

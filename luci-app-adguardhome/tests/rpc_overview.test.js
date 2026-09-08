@@ -234,8 +234,7 @@ for (const failure of [ 'badInode', 'badDevice', 'badSize', 'fileCloseSucceeds' 
 
 reset();
 assert.equal(sandbox.rpc.get_overview.call().config.dns_port, 53335);
-assert.equal(sandbox.rpc.get_config_info.call().dns_port, 53335);
-assert.equal(fixture.hashes, 0, 'both status RPC entry points must use the hashless reader');
+assert.equal(fixture.hashes, 0, 'the overview RPC must use the hashless reader');
 const editor = sandbox.rpc.get_yaml.call();
 const originalHash = digest(fixture.yaml);
 assert.equal(editor.sha256, originalHash, 'the editor must still receive its exact YAML revision');
@@ -278,7 +277,9 @@ const acl = JSON.parse(fs.readFileSync(path.join(packageRoot,
 	'root/usr/share/rpcd/acl.d/luci-app-adguardhome.json'), 'utf8'));
 assert.ok(acl['luci-app-adguardhome'].read.ubus['luci.adguardhome'].includes('get_overview'));
 assert.match(source, /get_overview:\s*\{\s*call: function\(\) \{\s*return overview_info\(\);/);
-assert.match(source, /get_config_info:\s*\{\s*call: function\(\) \{\s*return overview_info\(\)\.config;/,
-	'the existing config-info API must share the same safe implementation');
+for (const unused of [ 'get_status', 'get_config_info' ]) {
+	assert.equal(sandbox.rpc[unused], undefined);
+	assert.ok(!acl['luci-app-adguardhome'].read.ubus['luci.adguardhome'].includes(unused));
+}
 
 console.log('single-snapshot overview RPC and locked endpoint probe tests passed');

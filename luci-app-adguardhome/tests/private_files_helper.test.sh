@@ -21,7 +21,7 @@ busybox ash -n "$temporary/defaults.sh"
 awk '
 	/^entry_metadata\(\) \{/ { copying=1 }
 	copying { print }
-	/^root_private_file\(\) \{/ { last=1 }
+	/^bounded_private_file\(\) \{/ { last=1 }
 	copying && last && /^}/ { exit }
 ' "$temporary/defaults.sh" >"$temporary/defaults.helper"
 cmp "$temporary/helper.sh" "$temporary/defaults.helper"
@@ -29,7 +29,7 @@ awk -v helper_dir="$helper_dir" -f "$helper_dir/expand-helpers.awk" \
 	"$init_file" >"$temporary/init.sh"
 busybox ash -n "$temporary/init.sh"
 . "$script_dir/lib/function-body.sh"
-for name in entry_metadata root_private_directory root_private_file; do
+for name in entry_metadata root_private_directory root_private_file bounded_private_file; do
 	function_body "$temporary/init.sh" "$name"
 	printf '\n'
 done >"$temporary/init.helper"
@@ -38,7 +38,8 @@ sed '/^$/d' "$temporary/helper.sh" >"$temporary/helper.compact"
 sed '/^$/d' "$temporary/init.helper" >"$temporary/init.compact"
 cmp "$temporary/helper.compact" "$temporary/init.compact"
 [ "$(grep -Fc '$(AdGuardHome/PrivateFiles)' "$makefile")" = 3 ]
-! grep -Eq '^entry_metadata\(\)|^root_private_(directory|file)\(\)' "$makefile" "$defaults"
+! grep -Eq '^entry_metadata\(\)|^root_private_(directory|file)\(\)|^bounded_private_file\(\)' \
+	"$makefile" "$defaults"
 ! grep -Fq '# @include ' "$temporary/defaults.sh"
 
 # Missing, unknown or duplicated source markers must fail the build.
@@ -66,6 +67,9 @@ chmod 0600 "$temporary/private/file"
 if [ "$(id -u)" = 0 ] && [ "$(id -g)" = 0 ]; then
 	root_private_directory "$temporary/private"
 	root_private_file "$temporary/private/file"
+	! bounded_private_file "$temporary/private/file"
+	printf 'x\n' >"$temporary/private/file"
+	bounded_private_file "$temporary/private/file"
 fi
 ln -s "$temporary/private/file" "$temporary/link"
 ! root_private_file "$temporary/link"

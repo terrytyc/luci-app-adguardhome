@@ -98,6 +98,12 @@ function uncertainSettingsUpdateError(message) {
 	return error;
 }
 
+function uncertainCredentialUpdateError(message) {
+	const error = new Error(message);
+	error.credentialUpdateUncertain = true;
+	return error;
+}
+
 function waitForYamlUpdate(token, scope) {
 	return operation.waitForJob(callGetYamlUpdate, token, scope, {
 		unknown: _('The credential update returned an unknown job state.'),
@@ -727,12 +733,25 @@ return view.extend({
 			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
-			const response = await callSetCredentials(username, passwordHash, info.sha256);
+			const response = await operation.requestActive(
+				() => callSetCredentials(username, passwordHash, info.sha256),
+				scope,
+			).catch(error => {
+				if (operation.isPageInactiveError(error))
+					throw error;
+				throw uncertainCredentialUpdateError(
+					_('The username or password update outcome is unknown. The request may have reached the router, but its response could not be read: %s. Reopen this dialog to review the current account before making another change.').format(errorMessage(error)),
+				);
+			});
 			if (typeof response?.error === 'string' && response.error)
 				throw new Error(response.error);
-			if (response?.accepted !== true || typeof response.token !== 'string' ||
-			    !/^[0-9a-f]{32}$/.test(response.token))
+			if (response?.accepted !== true)
 				throw new Error(_('The server did not accept the credential update job.'));
+			if (typeof response.token !== 'string' ||
+			    !/^[0-9a-f]{32}$/.test(response.token))
+				throw uncertainCredentialUpdateError(
+					_('The username or password update outcome is unknown. The server accepted the update job but did not return a valid status token. Reopen this dialog to review the current account before making another change.'),
+				);
 
 			const result = await waitForYamlUpdate(response.token, scope);
 			if (result?.ok !== true)
@@ -747,10 +766,10 @@ return view.extend({
 			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
-			operation.failure(
-				_('Unable to change the username or password: %s').format(errorMessage(error)),
-				operationTicket,
-			);
+			operation.failure(error?.credentialUpdateUncertain === true
+				? errorMessage(error)
+				: _('Unable to change the username or password: %s').format(errorMessage(error)),
+			operationTicket);
 		} finally {
 			username = null;
 			password = null;
