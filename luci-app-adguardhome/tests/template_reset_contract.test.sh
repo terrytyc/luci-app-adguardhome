@@ -147,7 +147,7 @@ for forbidden in ("update_yaml(", "write(", "yaml_update_job"):
         raise SystemExit(f"reset_yaml still applies the template directly: {forbidden}")
 
 view = view_path.read_text(encoding="utf-8")
-reset_start = view.index("\tasync resetYaml() {")
+reset_start = view.index("\tasync resetYaml(")
 reset_end = view.index("\n\tasync waitForYamlUpdate(", reset_start)
 reset_view = view[reset_start:reset_end]
 for required in (

@@ -91,4 +91,82 @@ for stage_fd in 187 193; do (
 	fi
 )
 
+# The new RAM task shares the real private-state and inherited-FD protocol.
+# Only settings/process discovery and the data copy are replaced here.
+for name in yaml_job_hash_valid yaml_job_token_valid yaml_job_runtime_is_private \
+	yaml_job_file_is_private yaml_job_pending_matches write_yaml_job_state \
+	memory_writeback_locked_command memory_writeback_job_locked memory_writeback_job; do
+	eval "$(function_body "$test_tmp/init.expanded" "$name")"
+done
+for scenario in bad-lock pending candidate stale hash-failure inactive stopped \
+	copy-failure reporting-failure success; do (
+	expected=1111111111111111111111111111111111111111111111111111111111111111
+	other=3333333333333333333333333333333333333333333333333333333333333333
+	token=22222222222222222222222222222222
+	candidate="$(printf 'memory_writeback:%s' "$expected" | sha256sum)"
+	candidate="${candidate%% *}"
+	[ "$scenario" != candidate ] || candidate="$other"
+	pending="pending:${expected}:${candidate}"
+	[ "$scenario" != pending ] || pending="pending:${other}:${candidate}"
+	state_file="$test_tmp/$token"
+	events="$test_tmp/writeback-events"
+	printf '%s\n' "$pending" >"$state_file"
+	chmod 0600 "$state_file"
+	: >"$events"
+	load_settings() {
+		[ "$1:${SETTINGS_CAS_GUARD:-0}" = light:1 ] || return 1
+		printf 'settings\n' >>"$events"
+		service_enabled=1 memory_requested=1 MEMORY_ACTIVE=1
+		persistent_work_dir=/etc/AdGuardHome
+		MEMORY_BACKING_WORK_DIR="$persistent_work_dir"
+		[ "$scenario" != inactive ] || MEMORY_ACTIVE=0
+	}
+	settings_current_revision() {
+		if [ "$scenario" = stale ]; then printf '%s\n' "$other"; else printf '%s\n' "$expected"; fi
+		[ "$scenario" != hash-failure ]
+	}
+	official_running() { [ "$scenario" != stopped ]; }
+	log_error() { printf 'log:%s\n' "$*" >>"$events"; }
+	memory_copy_live_data_locked() {
+		printf 'copy\n' >>"$events"
+		if [ "$scenario" = copy-failure ]; then log_error 'copy failed'; return 1; fi
+		[ "$scenario" != reporting-failure ] || YAML_JOB_RUNTIME_DIR="$test_tmp/unavailable"
+		return 0
+	}
+	OFFICIAL_SERVICE=unexpected_service
+	unexpected_service() { printf 'unexpected-service:%s\n' "$*" >>"$events"; return 1; }
+	orchestrate_core_locked() { unexpected_service orchestrate; }
+	clear_recorded_integration_locked() { unexpected_service clear-dns; }
+	lock_fd=3
+	exec 3<>"$test_tmp/update.lock"
+	/usr/bin/flock -n -x 3
+	if [ "$scenario" = bad-lock ]; then exec 4</dev/null; lock_fd=4; fi
+	rc=0
+	memory_writeback_job "$expected" "$candidate" "$token" "$lock_fd" || rc=$?
+	case "$scenario" in
+		bad-lock|pending|candidate)
+			[ "$rc" != 0 ] && [ ! -s "$events" ] || exit 1
+			[ "$(cat "$state_file")" = "$pending" ]
+			;;
+		success)
+			[ "$rc" = 0 ] && [ "$(grep -c '^copy$' "$events")" = 1 ] || exit 1
+			[ "$(cat "$state_file")" = "success:${candidate}:0:${expected}:${candidate}" ]
+			;;
+		reporting-failure)
+			[ "$rc" != 0 ] && [ "$(grep -c '^copy$' "$events")" = 1 ] || exit 1
+			grep -Eq "^running:[1-9][0-9]*:${expected}:${candidate}$" "$state_file"
+			;;
+		*)
+			[ "$rc" = 1 ] && [ "$(cat "$state_file")" = "failure:${expected}:${candidate}" ] || exit 1
+			if [ "$scenario" = copy-failure ]; then
+				[ "$(grep -c '^copy$' "$events")" = 1 ]
+				[ "$(grep '^log:' "$events")" = 'log:copy failed' ]
+			else
+				if grep -q '^copy$' "$events"; then exit 1; fi
+			fi
+			;;
+	esac
+	! grep -q '^unexpected-service:' "$events"
+); done
+
 printf 'ok - settings/YAML share authenticated inherited-FD cleanup and retain task locks\n'

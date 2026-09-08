@@ -85,7 +85,7 @@ async function testYamlViewPermissionGuard() {
 		E: element,
 		L: { hasViewPermission: () => false, resource: path => path },
 		_: translate,
-		window: { setTimeout },
+		window: Object.assign(new EventTarget(), { setTimeout }),
 	};
 	vm.createContext(sandbox);
 	const definition = vm.runInContext(

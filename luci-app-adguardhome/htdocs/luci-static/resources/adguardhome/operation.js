@@ -204,12 +204,12 @@ return baseclass.extend({
 		ui.hideModal();
 	},
 
-	start() {
+	start(message) {
 		this._clearTimer();
 		const generation = ++this._generation;
 		const ticket = { generation, scope: this._activeScope };
 		if (this._ticketActive(ticket))
-			this._show('notice', _('Applying configuration changes…'), true);
+			this._show('notice', String(message ?? _('Applying configuration changes…')), true);
 		return ticket;
 	},
 

@@ -109,6 +109,20 @@ uci() {
 	command="${1:-}"
 	shift || true
 	case "$command:$*" in
+		export:*) [ "$*" != "${TEST_UNREADABLE_PACKAGE:-}" ]; return ;;
+		changes:*)
+			[ "$*" != "${TEST_PENDING_PACKAGE:-}" ] || printf 'pending edit\n'
+			return 0
+			;;
+		"get:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.redirect")
+			printf '%s\n' "${TEST_MODE:-none}"
+			return 0
+			;;
+		"get:firewall.${FIREWALL_SECTION}.${FIREWALL_OWNER_OPTION}")
+			[ "${TEST_FIREWALL_RECORDED:-0}" = 1 ] || return 1
+			printf '%s\n' "$FIREWALL_OWNER_VALUE"
+			return 0
+			;;
 		"get:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}")
 			[ -n "${TEST_MANAGED_PORT:-}" ] || return 1
 			printf '%s\n' "$TEST_MANAGED_PORT"
@@ -266,5 +280,62 @@ if firewall_integration_matches; then
 fi
 TEST_FW_FAMILY=any
 firewall_integration_matches
+
+# Status uses the same matching rules without reconciling or waiting.  Even
+# none mode verifies that no plugin-owned takeover remains, without DNS probes.
+(
+	for action in integration_status web_listening; do
+		. "$init_file"
+		[ -z "$USE_PROCD" ]
+	done
+	action=restart
+	. "$init_file"
+	[ "$USE_PROCD" = 1 ]
+)
+INTEGRATION_LOCK="${test_tmp}/integration.lock"
+: >"$INTEGRATION_LOCK"
+load_settings() { printf 'unexpected-settings\n' >>"$uci_log"; return 1; }
+run_locked() { printf 'unexpected-lock\n' >>"$uci_log"; return 1; }
+wait_for_core_ready() { printf 'unexpected-wait\n' >>"$uci_log"; return 1; }
+dns_port_listening() { printf 'probe\n' >>"$uci_log"; [ "${TEST_LISTENING:-1}" = 1 ]; }
+expect_status() {
+	local expected="$1" rc=0
+	shift
+	integration_status "$@" || rc=$?
+	[ "$rc" = "$expected" ] || { printf 'unexpected integration status: %s (expected %s)\n' "$rc" "$expected" >&2; exit 1; }
+}
+: >"$uci_log"
+TEST_MODE=none TEST_MANAGED_PORT=''
+expect_status 0 53335 none
+! grep -q '^probe$' "$uci_log"
+TEST_FIREWALL_RECORDED=1 expect_status 1 53335 none
+TEST_MANAGED_PORT=53335
+expect_status 1 53335 none
+TEST_MODE=dnsmasq-upstream TEST_SERVERS='127.0.0.1#53335'
+expect_status 0 53335 dnsmasq-upstream
+TEST_PENDING_PACKAGE=dhcp expect_status 2 53335 dnsmasq-upstream
+TEST_LISTENING=0 expect_status 1 53335 dnsmasq-upstream
+TEST_SERVERS='9.9.9.9' expect_status 1 53335 dnsmasq-upstream
+TEST_MODE=redirect TEST_MANAGED_PORT=''
+expect_status 0 53335 redirect
+TEST_FW_DEST_PORT=55353 expect_status 1 53335 redirect
+TEST_UNREADABLE_PACKAGE=firewall expect_status 2 53335 redirect
+TEST_PENDING_PACKAGE=adguardhome expect_status 2 53335 redirect
+expect_status 2 53335 none
+for port in 0 65536 053335 -1 invalid ''; do expect_status 2 "$port" redirect; done
+expect_status 2 53335 invalid
+expect_status 2 53335 redirect extra
+exec 199<"$INTEGRATION_LOCK"
+/usr/bin/flock -x 199
+expect_status 2 53335 redirect
+/usr/bin/flock -u 199
+exec 199<&-
+INTEGRATION_LOCK="${test_tmp}/missing.lock"
+expect_status 2 53335 redirect
+[ ! -e "$INTEGRATION_LOCK" ]
+if grep -Eq '^(unexpected-|add_list:|set:|delete:|del_list:|commit:|reload:|snapshot)' "$uci_log"; then
+	printf 'integration status entered a mutating or blocking path\n' >&2
+	exit 1
+fi
 
 printf 'ok - simplified DNS ownership state and exact dnsmasq lifecycle\n'

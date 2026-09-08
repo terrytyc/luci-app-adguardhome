@@ -165,6 +165,18 @@ return view.extend({
 
 		this.yamlHash = result.sha256;
 		this.loadedYaml = result.content;
+		if (this.yamlBeforeUnload)
+			window.removeEventListener('beforeunload', this.yamlBeforeUnload);
+		const beforeUnload = event => {
+			if (!operation.isPageActive(pageScope) || !this.hasDraft())
+				return;
+			event.preventDefault();
+			event.returnValue = '';
+		};
+		this.yamlBeforeUnload = beforeUnload;
+		window.addEventListener('pagehide', () => {
+			window.removeEventListener('beforeunload', beforeUnload);
+		}, { once: true });
 		this.editorNotice = E('p', { class: 'alert-message error', role: 'status', hidden: true });
 		this.draftStatus = E('span', { class: 'adguardhome-yaml-draft', role: 'status', hidden: true }, _('Unsaved changes'));
 		this.yamlLineNumbers = E('pre', {
@@ -180,6 +192,8 @@ return view.extend({
 			'aria-label': _('YAML Configuration'),
 			rows: 32,
 			spellcheck: 'false',
+			autocapitalize: 'none',
+			autocorrect: 'off',
 			wrap: 'off',
 			readonly: result.error || !result.sha256 || !L.hasViewPermission() ? 'readonly' : null,
 			input: () => this.scheduleYamlEditorRefresh(),
@@ -311,10 +325,18 @@ return view.extend({
 	},
 
 	updateDraftStatus() {
-		this.draftStatus.hidden = !this.hasDraft();
+		const dirty = this.hasDraft();
+		this.draftStatus.hidden = !dirty;
+		if (this.yamlBeforeUnload) {
+			if (dirty)
+				window.addEventListener('beforeunload', this.yamlBeforeUnload);
+			else
+				window.removeEventListener('beforeunload', this.yamlBeforeUnload);
+		}
 	},
 
 	scheduleYamlEditorRefresh() {
+		this.updateDraftStatus();
 		if (this.yamlRefreshFrame != null)
 			return;
 
@@ -476,10 +498,24 @@ return view.extend({
 		}
 	},
 
-	async resetYaml() {
+	async resetYaml(discardDraft = false) {
 		const scope = this.pageScope;
 		if (!this.yamlHash || this.operationBusy || !operation.isPageActive(scope))
 			return;
+		if (discardDraft !== true && this.hasDraft()) {
+			ui.showModal(_('Discard unsaved changes?'), [
+				E('p', {}, _('Loading the template will replace your unsaved editor text.')),
+				E('div', { class: 'right' }, [
+					E('button', { class: 'cbi-button', type: 'button', click: ui.hideModal }, _('Cancel')),
+					' ',
+					E('button', {
+						class: 'cbi-button cbi-button-action', type: 'button',
+						click: () => { ui.hideModal(); return this.resetYaml(true); },
+					}, _('Load Template')),
+				]),
+			]);
+			return;
+		}
 
 		this.setBusy(true);
 		try {

@@ -294,11 +294,13 @@ function configuration_state() {
 	let uci = null;
 	let work_dir = null;
 	let memory_requested = false;
+	let redirect = null;
 
 	try {
 		uci = cursor();
 		let configured_work_dir = uci.get(CONFIG_NAME, CONFIG_SECTION, 'work_dir');
 		let configured_file = uci.get(CONFIG_NAME, CONFIG_SECTION, 'config_file');
+		redirect = uci.get(CONFIG_NAME, LUCI_SECTION, 'redirect');
 		memory_requested = configured_boolean(
 			uci.get(CONFIG_NAME, LUCI_SECTION, 'run_from_memory')) === true;
 		if (configured_file == `${configured_work_dir}/${CONFIG_FILENAME}`)
@@ -322,6 +324,7 @@ function configuration_state() {
 		work_dir,
 		path: work_dir ? `${work_dir}/${CONFIG_FILENAME}` : null,
 		memory_requested,
+		redirect,
 	};
 }
 
@@ -1038,6 +1041,24 @@ function finish_settings_process(token, expected_hash, candidate_hash,
 	close_yaml_job_lock(lock);
 }
 
+function start_settings_process(job, expected_hash, candidate_hash, args) {
+	let token = job.token;
+	try {
+		let child = uloop.process(YAML_UPDATE_COMMAND, args,
+			{ PATH: '/usr/sbin:/usr/bin:/sbin:/bin' }, function() {
+				finish_settings_process(token, expected_hash, candidate_hash, job.lock);
+			});
+		// Keep the parent descriptor until the callback, including the short
+		// child-exit handoff. Settings, YAML and write-back share this lock.
+		if (child)
+			return { accepted: true, token, reused: false };
+	}
+	catch (error) { }
+	discard_yaml_job(token);
+	close_yaml_job_lock({ file: job.lock });
+	return { error: 'Unable to start the requested operation' };
+}
+
 function update_settings(enabled, work_dir, verbose, redirect,
 					 run_from_memory, interval, expected_revision) {
 	if (type(expected_revision) != 'string' ||
@@ -1080,12 +1101,7 @@ function update_settings(enabled, work_dir, verbose, redirect,
 			: 'Current settings are unavailable or invalid' };
 	}
 
-	try {
-		// Spawn the coordinator directly without a shell.  The child inherits the
-		// already-locked job descriptor, serializing this whole settings transaction
-		// with YAML edits while the init script performs its own integration-locked
-		// UCI commit, convergence and rollback.
-		let child = uloop.process(YAML_UPDATE_COMMAND, [
+	return start_settings_process(job, expected_revision, candidate.revision, [
 			'settings_update',
 			candidate.enabled ? '1' : '0',
 			candidate.work_dir,
@@ -1097,27 +1113,34 @@ function update_settings(enabled, work_dir, verbose, redirect,
 			token,
 			candidate.revision,
 			`${job.lock_descriptor}`,
-		], { PATH: '/usr/sbin:/usr/bin:/sbin:/bin' }, function() {
-			finish_settings_process(
-				token, expected_revision, candidate.revision, job.lock
-			);
-		});
-		if (!child) {
-			discard_yaml_job(token);
-			close_yaml_job_lock({ file: job.lock });
-			return { error: 'Unable to start the settings update transaction' };
-		}
-		// Keep the parent descriptor locked until the child callback publishes
-		// the terminal record.  This closes the exit-to-callback race and keeps
-		// YAML edits mutually exclusive for the entire settings transaction.
-	}
-	catch (error) {
-		discard_yaml_job(token);
-		close_yaml_job_lock({ file: job.lock });
-		return { error: 'Settings update transaction failed' };
-	}
+	]);
+}
 
-	return { accepted: true, token, reused: false };
+function memory_writeback(expected_revision) {
+	if (type(expected_revision) != 'string' ||
+	    !match(expected_revision, /^[0-9a-f]{64}$/))
+		return { error: 'Invalid or missing settings revision' };
+	let current = settings_snapshot();
+	if (!current || current.revision != expected_revision)
+		return { error: 'Settings changed since the page was loaded' };
+	if (!current.enabled || !current.run_from_memory ||
+	    !memory_state_active(current.work_dir) || !service_running())
+		return { error: 'RAM data is not currently running' };
+	let token = random_token();
+	let candidate_hash = sha256(`memory_writeback:${expected_revision}`);
+	if (!token || !candidate_hash)
+		return { error: 'Unable to allocate a write-back token' };
+	let job = prepare_yaml_job(token, expected_revision, candidate_hash);
+	if (job.error)
+		return job;
+	if (job.reused)
+		return { accepted: true, token: job.token, reused: true };
+	// The worker checks the revision again under the integration lock. No
+	// unsaved form values are accepted, and the existing live copy never restarts.
+	return start_settings_process(job, expected_revision, candidate_hash, [
+		'memory_writeback_job', expected_revision, candidate_hash,
+		token, `${job.lock_descriptor}`,
+	]);
 }
 
 function update_yaml(content, expected_hash) {
@@ -1280,8 +1303,9 @@ function update_yaml(content, expected_hash) {
 }
 
 function update_job_status(token, consume, settings) {
-	let title = settings ? 'Settings' : 'YAML';
-	let label = settings ? 'settings' : 'YAML';
+	let writeback = settings == 'writeback';
+	let title = writeback ? 'Write-back' : settings ? 'Settings' : 'YAML';
+	let label = writeback ? 'write-back' : settings ? 'settings' : 'YAML';
 	let record = read_yaml_job(token);
 	if (!record)
 		return { error: `${title} update job is unavailable` };
@@ -1330,18 +1354,22 @@ function update_job_status(token, consume, settings) {
 			state: 'done',
 			ok: false,
 			indeterminate: true,
-			error: settings
+			error: writeback
+				? 'The write-back was interrupted; refresh the page before trying again'
+				: settings
 				? 'The settings update was interrupted; reload the current settings before editing them again'
 				: 'The YAML update was interrupted; reload the current YAML before editing it again',
 		}
 		: {
 			state: 'done',
 			ok: false,
-			error: settings
+			error: writeback
+				? 'Write-back failed or RAM data is no longer running; check the plugin log'
+				: settings
 				? 'Settings were rejected or changed concurrently'
 				: 'YAML was rejected or changed concurrently',
 		};
-	if (result.ok)
+	if (result.ok && !writeback)
 		result[settings ? 'revision' : 'sha256'] = record.sha256;
 
 	if (consume === true && !discard_yaml_job(token)) {
@@ -1851,12 +1879,23 @@ function overview_info() {
 	try {
 		let configuration = configuration_state();
 		result.status = service_status(configuration);
-		result.config = config_info(read_config(configuration),
-			!!lock.file && result.status.running && !yaml_job_active());
+		let can_probe = !!lock.file && result.status.running && !yaml_job_active();
+		result.config = config_info(read_config(configuration), can_probe);
+		result.status.dns_integration = 'unknown';
+		if (can_probe && result.config.dns_port &&
+		    match(configuration.redirect || '', /^(none|redirect|dnsmasq-upstream)$/)) {
+			let status = system([ YAML_UPDATE_COMMAND, 'integration_status',
+				`${result.config.dns_port}`, configuration.redirect ]);
+			result.status.dns_integration = status == 0
+				? (configuration.redirect == 'none' ? 'none' : 'ready')
+				: status == 1 ? 'pending' : 'unknown';
+		}
 	}
 	catch (error) { }
-	if (!close_yaml_job_lock(lock))
+	if (!close_yaml_job_lock(lock)) {
 		result.config.web = null;
+		result.status.dns_integration = 'unknown';
+	}
 	return result;
 }
 
@@ -1905,7 +1944,8 @@ const methods = {
 	},
 	get_version: {
 		call: function() {
-			return { version: core_version() };
+			return { version: core_version(),
+				plugin_version: trim(readfile(`${TEMPLATE_DIRECTORY}/version`) || '') || null };
 		},
 	},
 	get_settings: {
@@ -1985,6 +2025,18 @@ const methods = {
 		args: { token: '', consume: false },
 		call: function(request) {
 			return update_job_status(request.args.token, request.args.consume, true);
+		},
+	},
+	memory_writeback: {
+		args: { revision: '' },
+		call: function(request) {
+			return memory_writeback(request.args.revision);
+		},
+	},
+	get_memory_writeback: {
+		args: { token: '', consume: false },
+		call: function(request) {
+			return update_job_status(request.args.token, request.args.consume, 'writeback');
 		},
 	},
 };

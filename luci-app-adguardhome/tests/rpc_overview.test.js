@@ -26,6 +26,7 @@ function reset() {
 	Object.assign(fixture, {
 		workDir: '/etc/AdGuardHome', configFile: '/etc/AdGuardHome/AdGuardHome.yaml',
 		requested: '0', active: false, running: true, locked: false,
+		redirect: 'dnsmasq-upstream', integration: 0, integrationProbes: [],
 		busy: false, jobActive: false, closeSucceeds: true, throwRead: false,
 		yaml: 'dns:\n  port: 53335\nhttp:\n  address: 0.0.0.0:3000\n',
 		listening: [ 3000 ], reads: 0, cursors: 0, serviceCalls: 0,
@@ -47,6 +48,9 @@ const sandbox = {
 	CONFIG_FILENAME: 'AdGuardHome.yaml', SERVICE_NAME: 'adguardhome',
 	INSTANCE_NAME: 'adguardhome', YAML_UPDATE_COMMAND: '/etc/init.d/AdGuardHome',
 	MAX_CONFIG_LENGTH: 512 * 1024,
+	TEMPLATE_DIRECTORY: '/usr/share/luci-app-adguardhome',
+	core_version: () => 'AdGuard Home, version v0.107.76',
+	readfile: pathname => pathname === '/usr/share/luci-app-adguardhome/version' ? '3.0.0-r5\n' : null,
 	type: value => Number.isInteger(value) ? 'int' : typeof value,
 	lc: value => value.toLowerCase(), match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(Number(value)), length: value => value?.length ?? 0,
@@ -65,6 +69,7 @@ const sandbox = {
 				return {
 					'config.work_dir': fixture.workDir, 'config.config_file': fixture.configFile,
 					'luci.run_from_memory': fixture.requested,
+					'luci.redirect': fixture.redirect,
 				}[`${section}.${option}`];
 			},
 			unload() {},
@@ -134,6 +139,10 @@ const sandbox = {
 	system(args) {
 		assert.equal(fixture.locked, true, 'every core endpoint probe must hold the same job lock');
 		assert.equal(args[0], '/etc/init.d/AdGuardHome');
+		if (args[1] === 'integration_status') {
+			fixture.integrationProbes.push(args.slice(2));
+			return fixture.integration;
+		}
 		assert.equal(args[1], 'web_listening');
 		const port = Number(args[2]);
 		fixture.probes.push(port);
@@ -147,9 +156,11 @@ vm.runInContext(`${functions}\n${methodsSource}\nthis.rpc = methods; this.overvi
 	sandbox, { filename: rpcPath });
 
 let result = sandbox.overview();
+assert.equal(sandbox.rpc.get_version.call().plugin_version, '3.0.0-r5');
 assert.equal(result.status.running, true);
 assert.equal(result.status.memory_requested, false);
 assert.equal(result.status.memory_active, false);
+assert.equal(result.status.dns_integration, 'ready');
 assert.equal(result.config.dns_port, 53335);
 assert.equal(result.config.web.scheme, 'http');
 assert.equal(result.config.web.host, null);
@@ -162,6 +173,16 @@ assert.equal(fixture.locks, 1);
 assert.equal(fixture.closes, 1);
 assert.equal(fixture.jobChecks, 1);
 assert.deepEqual(fixture.probes, [ 3000 ]);
+assert.deepEqual(Array.from(fixture.integrationProbes[0]), [ '53335', 'dnsmasq-upstream' ]);
+fixture.integration = 1;
+assert.equal(sandbox.overview().status.dns_integration, 'pending');
+fixture.integration = 2;
+assert.equal(sandbox.overview().status.dns_integration, 'unknown');
+fixture.redirect = 'none';
+fixture.integration = 0;
+assert.equal(sandbox.overview().status.dns_integration, 'none');
+reset();
+sandbox.overview();
 
 fixture.yaml = 'dns:\n  port: 5354\nhttp:\n  address: 0.0.0.0:3080\n';
 fixture.listening = [ 3080 ];

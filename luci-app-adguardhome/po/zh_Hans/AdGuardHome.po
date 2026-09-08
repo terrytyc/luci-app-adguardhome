@@ -453,6 +453,66 @@ msgstr "设置更新已结束，但页面无法重新载入结果：%s。再次�
 msgid "Applying configuration changes…"
 msgstr "正在应用配置…"
 
+msgid "Loading the template will replace your unsaved editor text."
+msgstr "载入模板将替换尚未保存的编辑内容。"
+
+msgid "The memory write-back outcome is unknown."
+msgstr "内存回写结果未知。"
+
+msgid "Ready"
+msgstr "就绪"
+
+msgid "Not ready"
+msgstr "未就绪"
+
+msgid "Not required"
+msgstr "无需接管"
+
+msgid "DNS integration"
+msgstr "DNS 集成状态"
+
+msgid "Writes back only the currently running data; unsaved settings are not applied."
+msgstr "仅回写当前运行的 data，不应用尚未保存的设置。"
+
+msgid "Write back now"
+msgstr "立即回写"
+
+msgid "Plugin version"
+msgstr "插件版本"
+
+msgid "The current settings state is unknown. Reload this page before writing back memory data."
+msgstr "当前设置状态未知。回写内存数据前请重新加载此页面。"
+
+msgid "Writing memory data back…"
+msgstr "正在回写内存数据…"
+
+msgid "The server did not accept the memory write-back job."
+msgstr "服务器未接受内存回写任务。"
+
+msgid "The memory write-back returned an unknown job state."
+msgstr "内存回写任务返回了未知状态。"
+
+msgid "The memory write-back status is temporarily unavailable: %s"
+msgstr "暂时无法获取内存回写状态：%s"
+
+msgid "The memory write-back is still running."
+msgstr "内存回写仍在进行。"
+
+msgid "The server rejected the memory write-back."
+msgstr "服务器拒绝了内存回写。"
+
+msgid "Memory data written back."
+msgstr "内存数据已回写。"
+
+msgid "Unable to write back memory data: %s"
+msgstr "无法回写内存数据：%s"
+
+msgid "Reload this page before trying again."
+msgstr "请重新加载此页面后再试。"
+
+msgid "The memory write-back outcome is unknown. Reload this page before trying again."
+msgstr "内存回写结果未知。请重新加载此页面后再试。"
+
 msgid "Choose a dedicated working directory, not a system directory."
 msgstr "请选择独立的工作目录，不要使用系统目录本身。"
 

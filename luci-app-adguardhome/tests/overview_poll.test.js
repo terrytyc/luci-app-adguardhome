@@ -18,13 +18,14 @@ function loadOverview() {
 	const elements = [];
 	const document = { hidden: false, activeElement: null };
 	let active = true;
+	let writable = true;
 	let overviewResult = {
 		status: { running: true, memory_requested: false, memory_active: false },
 		config: { dns_port: 53335, web: { scheme: 'http', host: null, port: 3000 } },
 	};
 	const handlers = {
 		get_overview: () => overviewResult,
-		get_version: () => ({ version: 'v0.107.76' }),
+		get_version: () => ({ version: 'v0.107.76', plugin_version: '3.0.0-r5' }),
 		get_settings: () => ({
 			enabled: true,
 			work_dir: '/etc/AdGuardHome',
@@ -53,16 +54,23 @@ function loadOverview() {
 	};
 	class JSONMap {
 		constructor(data) {
+			this.config = 'json';
 			this.initialData = data;
 			this.sections = [];
 		}
 		section() {
-			const section = { option: () => ({ value() {}, depends() {} }) };
+			const options = [];
+			const section = { options, option: (_type, name) => {
+				const option = { name, value() {}, depends(...args) { this.dependency = args; } };
+				options.push(option);
+				return option;
+			} };
 			this.sections.push(section);
 			return section;
 		}
 		async render() {
-			return Promise.all(this.sections.map(section => section.render?.() ?? {}));
+			return Promise.all(this.sections.map(section => section.render?.() ??
+				section.options.map(option => option.renderWidget?.() ?? {})));
 		}
 		load() { assert.fail('status polling must not reload unsaved form values'); }
 		reset() { assert.fail('status polling must not reset unsaved form values'); }
@@ -105,7 +113,7 @@ function loadOverview() {
 			return node;
 		},
 		_: value => value,
-		L: { hasViewPermission: () => true, resource: value => '/luci-static/resources/' + value },
+		L: { hasViewPermission: () => writable, resource: value => '/luci-static/resources/' + value },
 		URL: class extends URL {
 			constructor(value) { super(value); urlBuilds.push(value); }
 		},
@@ -119,6 +127,7 @@ function loadOverview() {
 	return {
 		view, calls, updates, errors, urlBuilds, polls, handlers, document, elements,
 		setActive: value => { active = value; },
+		setWritable: value => { writable = value; },
 		setOverview: value => { overviewResult = value; },
 	};
 }
@@ -202,6 +211,46 @@ async function testManagementURLValidation() {
 	await state.view.statusPollCallback();
 	assert.equal(management.child.attrs.href, 'https://adg.example./',
 		'normalized endpoints must retain URL assignment checks and valid default ports');
+}
+
+async function testDnsAndWritebackAvailability() {
+	const state = loadOverview();
+	await state.view.render(await state.view.load());
+	const button = state.view.memoryWritebackButton;
+	assert.equal(button.child, 'Write back now');
+	assert.equal(button.disabled, true, 'persistent storage cannot be manually written back');
+	const options = state.view.settingsMap.sections[1].options;
+	const option = options.find(option => option.name === '_memory_writeback');
+	assert.deepEqual(Array.from(option.dependency), [ 'json.config.run_from_memory', '1' ]);
+	assert.equal(options.indexOf(option), options.findIndex(option => option.name === 'memory_writeback_interval') + 1);
+	const grid = state.elements.find(node => node.tag === 'dl');
+	const dns = grid.child.find(row => row.child[0].child === 'DNS integration').child[1].child;
+	for (const [value, text] of [ [ 'ready', 'Ready' ], [ 'pending', 'Not ready' ],
+		[ 'none', 'Not required' ], [ 'unknown', 'Unavailable' ], [ 'invalid', 'Unavailable' ] ]) {
+		state.setOverview({ status: { running: true, memory_active: true, dns_integration: value } });
+		await state.view.statusPollCallback();
+		assert.equal(dns.child.child, text);
+		assert.equal(button.disabled, false);
+	}
+	for (const status of [ { running: false, memory_active: true }, { running: true, memory_active: false }, {} ]) {
+		state.setOverview({ status });
+		await state.view.statusPollCallback();
+		assert.equal(button.disabled, true, 'write-back needs both a running core and active RAM data');
+	}
+	state.setOverview({ status: { running: true, memory_active: true } });
+	await state.view.statusPollCallback();
+	state.setWritable(false);
+	state.view.updateMemoryWritebackButton();
+	assert.equal(button.disabled, true, 'read-only sessions cannot request write-back');
+	state.setWritable(true);
+	state.view.settingsSubmission = Promise.resolve();
+	state.view.updateMemoryWritebackButton();
+	assert.equal(button.disabled, true, 'settings Apply temporarily disables write-back');
+	state.view.settingsSubmission = null;
+	state.view.memoryWritebackBusy = true;
+	state.calls.length = 0;
+	await state.view.statusPollCallback();
+	assert.deepEqual(state.calls, [], 'write-back pauses the existing status poll without adding a timer');
 }
 
 async function testApplyRefresh() {
@@ -351,12 +400,12 @@ async function main() {
 	assert.equal(root.child[0].attrs.href, '/luci-static/resources/adguardhome/style.css');
 	const statusGrid = state.elements.find(node => node.tag === 'dl' &&
 		node.attrs.class === 'adguardhome-status-grid');
-	assert.equal(statusGrid.child.length, 4, 'the overview must give four primary values equal grid placement');
+	assert.equal(statusGrid.child.length, 5, 'the overview must include DNS integration beside the existing values');
 	assert.deepEqual(Array.from(statusGrid.child, row => row.child[0].child),
-		[ 'Service status', 'Active storage', 'Listening port', '' ]);
+		[ 'Service status', 'Active storage', 'Listening port', 'DNS integration', '' ]);
 	assert.equal(root.child[2].attrs.class, 'adguardhome-version adguardhome-help',
 		'the core version must follow the rendered form instead of occupying the overview card');
-	assert.equal(root.child[2].child, 'Core version: v0.107.76');
+	assert.equal(root.child[2].child, 'Plugin version: 3.0.0-r5 · Core version: v0.107.76');
 	assert.equal(state.urlBuilds.length, 1, 'rendering must reuse the already validated management URL');
 	assert.equal(state.polls.size, 1);
 	const callback = state.view.statusPollCallback;
@@ -524,6 +573,7 @@ async function main() {
 	await testApplyRefresh();
 	await testUnavailableStatus();
 	await testManagementURLValidation();
+	await testDnsAndWritebackAvailability();
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

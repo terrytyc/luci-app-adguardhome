@@ -28,10 +28,10 @@ const callGetOverview = rpc.declare({
 	reject: true,
 });
 
-const callGetCoreVersion = rpc.declare({
+const callGetVersions = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_version',
-	expect: { '': { version: null } },
+	expect: { '': { version: null, plugin_version: null } },
 });
 
 const callGetSettings = rpc.declare({
@@ -62,6 +62,22 @@ const callGetSettingsUpdate = rpc.declare({
 	method: 'get_settings_update',
 	params: [ 'token', 'consume' ],
 	expect: { '': { state: '', ok: false, revision: '' } },
+	reject: true,
+});
+
+const callMemoryWriteback = rpc.declare({
+	object: 'luci.adguardhome',
+	method: 'memory_writeback',
+	params: [ 'revision' ],
+	expect: { '': { accepted: false, token: '', reused: false } },
+	reject: true,
+});
+
+const callGetMemoryWriteback = rpc.declare({
+	object: 'luci.adguardhome',
+	method: 'get_memory_writeback',
+	params: [ 'token', 'consume' ],
+	expect: { '': { state: '', ok: false } },
 	reject: true,
 });
 
@@ -104,6 +120,12 @@ function uncertainCredentialUpdateError(message) {
 	return error;
 }
 
+function uncertainMemoryWritebackError(message = _('The memory write-back outcome is unknown.')) {
+	const error = new Error(message);
+	error.memoryWritebackUncertain = true;
+	return error;
+}
+
 function waitForYamlUpdate(token, scope) {
 	return operation.waitForJob(callGetYamlUpdate, token, scope, {
 		unknown: _('The credential update returned an unknown job state.'),
@@ -128,6 +150,8 @@ async function getOverview(scope) {
 				running: typeof result?.status?.running === 'boolean' ? result.status.running : null,
 				memoryRequested: result?.status?.memory_requested === true,
 				memoryActive: result?.status?.memory_active === true,
+				dnsIntegration: [ 'ready', 'pending', 'none' ].includes(result?.status?.dns_integration)
+					? result.status.dns_integration : 'unknown',
 			},
 			config: normalizeConfigInfo(result?.config),
 		};
@@ -136,21 +160,24 @@ async function getOverview(scope) {
 			throw error;
 		console.error('Unable to query the AdGuard Home overview:', error);
 		return {
-			status: { running: null, memoryRequested: false, memoryActive: false },
+			status: { running: null, memoryRequested: false, memoryActive: false, dnsIntegration: 'unknown' },
 			config: { dnsPort: null, web: null },
 		};
 	}
 }
 
-async function getCoreVersion(scope) {
+async function getVersions(scope) {
 	try {
-		const result = await operation.requestActive(callGetCoreVersion, scope);
-		return String(result?.version ?? '').trim() || _('Unknown');
+		const result = await operation.requestActive(callGetVersions, scope);
+		return {
+			core: String(result?.version ?? '').trim() || _('Unknown'),
+			plugin: String(result?.plugin_version ?? '').trim() || _('Unknown'),
+		};
 	} catch (error) {
 		if (operation.isPageInactiveError(error))
 			throw error;
 		console.error('Unable to query AdGuard Home version:', error);
-		return _('Unknown');
+		return { core: _('Unknown'), plugin: _('Unknown') };
 	}
 }
 
@@ -200,6 +227,12 @@ function renderStorageStatus(mode) {
 	return E('span', {}, _('Persistent storage'));
 }
 
+function renderDnsIntegration(status) {
+	return E('span', {}, status === 'ready' ? _('Ready')
+		: status === 'pending' ? _('Not ready')
+		: status === 'none' ? _('Not required') : _('Unavailable'));
+}
+
 function buildManagementURL(endpoint) {
 	if (!endpoint)
 		return null;
@@ -233,6 +266,7 @@ function overviewDisplayValues({ status, config }) {
 		storage: status.running == null ? 'unknown' : status.memoryActive ? 'memory'
 			: status.memoryRequested ? (status.running ? 'fallback' : 'pending') : 'persistent',
 		dnsPort: String(config.dnsPort ?? _('Unavailable')),
+		dnsIntegration: status.dnsIntegration,
 		management: status.running ? buildManagementURL(config.web) : null,
 	};
 }
@@ -407,7 +441,7 @@ return view.extend({
 			const result = await Promise.all([
 				getSettings(pageScope),
 				getOverview(pageScope),
-				getCoreVersion(pageScope),
+				getVersions(pageScope),
 			]);
 			return [ ...result, pageScope ];
 		} catch (error) {
@@ -415,11 +449,12 @@ return view.extend({
 		}
 	},
 
-	async render([settings, overview, version, pageScope]) {
+	async render([settings, overview, versions, pageScope]) {
 		if (!operation.isPageActive(pageScope))
 			return operation.abandonInactiveLoad(operation.pageInactiveError());
 
 		let displayed = overviewDisplayValues(overview);
+		this.memoryWritebackAvailable = displayed.running === true && displayed.storage === 'memory';
 		const map = new form.JSONMap(
 			settingsMapData(settings),
 			_('AdGuard Home'),
@@ -433,6 +468,7 @@ return view.extend({
 		const statusContainer = E('span', {}, renderServiceStatus(displayed.running));
 		const storageContainer = E('span', {}, renderStorageStatus(displayed.storage));
 		const dnsPortContainer = E('span', { class: 'adguardhome-primary-value' }, displayed.dnsPort);
+		const dnsIntegrationContainer = E('span', {}, renderDnsIntegration(displayed.dnsIntegration));
 		const managementContainer = E('span', { class: 'adguardhome-management' },
 			renderManagementLink(displayed.management));
 
@@ -447,6 +483,7 @@ return view.extend({
 				[ _('Service status'), statusContainer ],
 				[ _('Active storage'), storageContainer ],
 				[ _('Listening port'), dnsPortContainer ],
+				[ _('DNS integration'), dnsIntegrationContainer ],
 				[ '', managementContainer ],
 			].map(([label, value]) => E('div', {}, [
 				E('dt', {}, label), E('dd', {}, value),
@@ -517,6 +554,19 @@ return view.extend({
 		option.validate = validateMemoryWritebackInterval;
 		option.depends(`${map.config}.${CORE_SECTION_NAME}.run_from_memory`, '1');
 
+		option = coreSection.option(form.DummyValue, '_memory_writeback', ' ',
+			_('Writes back only the currently running data; unsaved settings are not applied.'));
+		option.depends(`${map.config}.${CORE_SECTION_NAME}.run_from_memory`, '1');
+		option.renderWidget = () => {
+			this.memoryWritebackButton = E('button', {
+				class: 'cbi-button cbi-button-action adguardhome-action-button',
+				type: 'button',
+				click: ui.createHandlerFn(this, 'handleMemoryWriteback'),
+			}, _('Write back now'));
+			this.updateMemoryWritebackButton();
+			return this.memoryWritebackButton;
+		};
+
 		option = coreSection.option(form.DummyValue, '_change_credentials', ' ');
 		option.renderWidget = () => E('button', {
 			class: 'cbi-button cbi-button-action adguardhome-action-button',
@@ -546,7 +596,7 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
-			if (document.hidden || this.settingsSubmission)
+			if (document.hidden || this.settingsSubmission || this.memoryWritebackBusy)
 				return;
 
 			const requestId = ++statusRequestId;
@@ -564,7 +614,7 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
-			if (this.settingsSubmission || requestId !== statusRequestId)
+			if (this.settingsSubmission || this.memoryWritebackBusy || requestId !== statusRequestId)
 				return;
 
 			const next = overviewDisplayValues(current);
@@ -574,9 +624,13 @@ return view.extend({
 				dom.content(storageContainer, renderStorageStatus(next.storage));
 			if (next.dnsPort !== displayed.dnsPort)
 				dom.content(dnsPortContainer, next.dnsPort);
+			if (next.dnsIntegration !== displayed.dnsIntegration)
+				dom.content(dnsIntegrationContainer, renderDnsIntegration(next.dnsIntegration));
 			if (next.management !== displayed.management)
 				dom.content(managementContainer, renderManagementLink(next.management));
 			displayed = next;
+			this.memoryWritebackAvailable = next.running === true && next.storage === 'memory';
+			this.updateMemoryWritebackButton();
 		};
 		this.statusPollCallback = statusPollCallback;
 		poll.add(statusPollCallback, POLL_INTERVAL);
@@ -585,8 +639,82 @@ return view.extend({
 			E('link', { rel: 'stylesheet', href: L.resource('adguardhome/style.css') }),
 			rendered,
 			E('p', { class: 'adguardhome-version adguardhome-help' },
-				`${_('Core version')}: ${version}`),
+				`${_('Plugin version')}: ${versions.plugin} · ${_('Core version')}: ${versions.core}`),
 		]));
+	},
+
+	updateMemoryWritebackButton() {
+		if (this.memoryWritebackButton)
+			this.memoryWritebackButton.disabled = !this.memoryWritebackAvailable ||
+				!!this.memoryWritebackBusy || !!this.settingsSubmission ||
+				!!this.memoryWritebackUncertain || !this.committedSettings || !L.hasViewPermission();
+	},
+
+	async handleMemoryWriteback() {
+		const scope = this.pageScope;
+		if (!this.memoryWritebackAvailable || this.memoryWritebackBusy || this.settingsSubmission ||
+		    this.memoryWritebackUncertain || !L.hasViewPermission() || !operation.isPageActive(scope))
+			return;
+
+		const revision = this.committedSettings?.revision;
+		if (typeof revision !== 'string' || !/^[0-9a-f]{64}$/.test(revision)) {
+			operation.failure(_('The current settings state is unknown. Reload this page before writing back memory data.'));
+			return;
+		}
+
+		this.memoryWritebackBusy = true;
+		this.updateMemoryWritebackButton();
+		const operationTicket = operation.start(_('Writing memory data back…'));
+		try {
+			const response = await operation.requestActive(() => callMemoryWriteback(revision), scope)
+				.catch(error => {
+					if (operation.isPageInactiveError(error))
+						throw error;
+					throw uncertainMemoryWritebackError();
+				});
+			if (typeof response?.error === 'string' && response.error)
+				throw new Error(response.error);
+			if (response?.accepted !== true)
+				throw new Error(_('The server did not accept the memory write-back job.'));
+			if (typeof response.token !== 'string' || !/^[0-9a-f]{32}$/.test(response.token))
+				throw uncertainMemoryWritebackError();
+
+			const result = await operation.waitForJob(callGetMemoryWriteback, response.token, scope, {
+				unknown: _('The memory write-back returned an unknown job state.'),
+				unavailable: _('The memory write-back status is temporarily unavailable: %s'),
+				pending: _('The memory write-back is still running.'),
+			}, uncertainMemoryWritebackError);
+			if (result?.indeterminate === true)
+				throw uncertainMemoryWritebackError(typeof result?.error === 'string' && result.error
+					? result.error : undefined);
+			if (result?.ok !== true)
+				throw new Error(typeof result?.error === 'string' && result.error
+					? result.error : _('The server rejected the memory write-back.'));
+			operation.success(_('Memory data written back.'), operationTicket);
+		} catch (error) {
+			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
+				return;
+			if (error?.memoryWritebackUncertain === true)
+				this.memoryWritebackUncertain = true;
+			operation.failure(_('Unable to write back memory data: %s').format(errorMessage(error)) +
+				(error?.memoryWritebackUncertain === true ? ' ' + _('Reload this page before trying again.') : ''),
+				operationTicket);
+		} finally {
+			if (operation.isPageActive(scope)) {
+				this.memoryWritebackBusy = false;
+				this.updateMemoryWritebackButton();
+				this.refreshOverviewStatus(scope);
+			}
+		}
+	},
+
+	refreshOverviewStatus(scope) {
+		if (!operation.isPageActive(scope) || typeof this.statusPollCallback !== 'function')
+			return;
+		this.statusPollCallback().catch(error => {
+			if (!operation.isPageInactiveError(error) && operation.isPageActive(scope))
+				console.error('Unable to refresh AdGuard Home status after an operation:', error);
+		});
 	},
 
 	async openCredentialsDialog() {
@@ -894,20 +1022,25 @@ return view.extend({
 	handleSaveApply() {
 		if (this.settingsSubmission)
 			return this.settingsSubmission;
+		if (this.memoryWritebackBusy)
+			return Promise.resolve();
+		if (this.memoryWritebackUncertain) {
+			operation.failure(_('The memory write-back outcome is unknown. Reload this page before trying again.'));
+			return Promise.resolve();
+		}
 
 		const scope = this.pageScope;
 		const submission = this.submitSettings();
 		this.settingsSubmission = submission;
+		this.updateMemoryWritebackButton();
 		return submission.finally(() => {
 			if (this.settingsSubmission !== submission)
 				return;
 			this.settingsSubmission = null;
-			if (!operation.isPageActive(scope) || typeof this.statusPollCallback !== 'function')
+			if (!operation.isPageActive(scope))
 				return;
-			this.statusPollCallback().catch(error => {
-				if (!operation.isPageInactiveError(error) && operation.isPageActive(scope))
-					console.error('Unable to refresh AdGuard Home status after applying settings:', error);
-			});
+			this.updateMemoryWritebackButton();
+			this.refreshOverviewStatus(scope);
 		});
 	},
 

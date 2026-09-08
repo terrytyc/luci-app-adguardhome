@@ -6,6 +6,8 @@
 # sections, so the official init script remains the only process supervisor.
 
 USE_PROCD=1
+# rc.common sources procd.sh (and takes its service lock) before dispatch.
+case "${action:-}" in integration_status|web_listening) USE_PROCD="" ;; esac
 START=18
 STOP=90
 
@@ -63,10 +65,11 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_cleanup memory_prepare memory_status"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile integration_status web_listening check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_writeback_job memory_cleanup memory_prepare memory_status"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
+\tintegration_status <port> <mode>\tRead DNS listener and integration configuration status
 \tweb_listening <port>\tVerify an official-core TCP listener
 \tcheck_work_dir <path>\tCheck a persistent work directory
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
@@ -3527,6 +3530,33 @@ integration_matches_desired() {
 	esac
 }
 
+# Read-only snapshot: 0 means matching configuration/listeners (or clean none),
+# 1 means not ready/mismatched, and 2 means unavailable/busy/invalid arguments.
+# This does not test a DNS query or inspect the firewall's live nftables rules.
+integration_status() (
+	local dns_port="${1:-}" redirect_mode="${2:-}" package current_mode
+	local MEMORY_ACTIVE=0 ADGUARDHOME_LOG_SILENT=1
+	[ "$#" = 2 ] && is_valid_port "$dns_port" || exit 2
+	case "$dns_port" in 0*) exit 2 ;; esac
+	case "$redirect_mode" in none|redirect|dnsmasq-upstream) ;; *) exit 2 ;; esac
+	# Do not create a lock file or wait behind a start/apply transaction.  The
+	# shared lock prevents observing partially committed integration settings.
+	[ -f "$INTEGRATION_LOCK" ] && [ ! -L "$INTEGRATION_LOCK" ] || exit 2
+	exec 198<"$INTEGRATION_LOCK" || exit 2
+	/usr/bin/flock -n -s 198 || exit 2
+	[ /proc/self/fd/198 -ef "$INTEGRATION_LOCK" ] || exit 2
+	set -- "$PLUGIN_CONFIG" firewall
+	[ "$redirect_mode" != dnsmasq-upstream ] || set -- "$@" dhcp
+	for package in "$@"; do
+		uci -q export "$package" >/dev/null 2>&1 &&
+			uci_guard_no_delta "$package" || exit 2
+	done
+	current_mode="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.redirect")" || exit 2
+	[ "$current_mode" = "$redirect_mode" ] || exit 2
+	[ "$redirect_mode" = none ] || dns_port_listening || exit 1
+	integration_matches_desired || exit 1
+)
+
 official_running() {
 	[ -x "$OFFICIAL_SERVICE" ] && "$OFFICIAL_SERVICE" running >/dev/null 2>&1
 }
@@ -3906,6 +3936,7 @@ resume_paused_yaml_runtime() {
 # transaction without a shell.  Revalidate everything under the integration
 # lock, validate a disposable candidate, stop the sole YAML writer, then make
 # the final optimistic-lock comparison before the atomic rename.
+# Return 2 only for a rejected preflight, before changing the YAML or runtime.
 yaml_update_locked() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local before_hash final_hash verify_hash held_hash fd_path
@@ -3913,7 +3944,7 @@ yaml_update_locked() {
 	local was_running=0 backup="" backup_directory=""
 	load_settings || return 1
 	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
-		"$inherited_fd" || return 1
+		"$inherited_fd" || return 2
 	YAML_STAGE_CLEANUP="$stage"
 	YAML_BACKUP_CLEANUP=""
 	YAML_INSTALLED=0
@@ -3922,11 +3953,11 @@ yaml_update_locked() {
 	trap cleanup_yaml_update EXIT
 	trap abort_yaml_update HUP INT QUIT TERM
 
-	before_hash="$(active_config_hash)" || return 1
-	[ "$before_hash" = "$expected_hash" ] || return 1
+	before_hash="$(active_config_hash)" || return 2
+	[ "$before_hash" = "$expected_hash" ] || return 2
 	check_core_config_file "$stage" "$candidate_hash" "$inherited_fd" || {
 		log_error "AdGuard Home rejected the staged LuCI YAML"
-		return 1
+		return 2
 	}
 	official_running && was_running=1
 	YAML_WAS_RUNNING="$was_running"
@@ -4209,19 +4240,20 @@ cleanup_yaml_job_stage() {
 
 yaml_update_job_locked() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
-	local token="$5" final_hash restarted=0
+	local token="$5" final_hash restarted=0 update_rc=0 terminal=indeterminate
 	yaml_job_pending_matches "$token" "$expected_hash" "$candidate_hash" || return 1
 	write_yaml_job_state "$token" \
 		"running:$$:${expected_hash}:${candidate_hash}" || return 1
 
-	if ! yaml_update_locked "$expected_hash" "$candidate_hash" \
-		"$stage" "$inherited_fd"; then
+	yaml_update_locked "$expected_hash" "$candidate_hash" \
+		"$stage" "$inherited_fd" || update_rc=$?
+	if [ "$update_rc" != 0 ]; then
 		cleanup_yaml_job_stage "$stage" "$inherited_fd"
-		# yaml_update_locked() can fail after an attempted rollback.  Its single
-		# return code cannot prove that the old runtime was restored completely,
-		# so never publish a definitive rejection that might invite an unsafe retry.
+		# Only preflight rejection proves that no YAML/runtime change began.
+		# Later failures remain uncertain even after an attempted rollback.
+		[ "$update_rc" != 2 ] || terminal=failure
 		write_yaml_job_state "$token" \
-			"indeterminate:${expected_hash}:${candidate_hash}" >/dev/null 2>&1 || true
+			"${terminal}:${expected_hash}:${candidate_hash}" >/dev/null 2>&1 || true
 		return 1
 	fi
 
@@ -4459,8 +4491,13 @@ memory_prepare_locked_command() {
 # a journal or restart any service.  Return 2 when RAM mode is not currently
 # active and eligible for a live copy.
 memory_writeback_locked_command() {
+	local current_revision
 	# The copy boundary performs one full scan; settings only need identity here.
 	load_settings light || return 1
+	if [ -n "${1:-}" ]; then
+		current_revision="$(settings_current_revision)" || return 1
+		[ "$current_revision" = "$1" ] || return 2
+	fi
 	[ "$service_enabled" = 1 ] && [ "$memory_requested" = 1 ] &&
 		[ "$MEMORY_ACTIVE" = 1 ] &&
 		[ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ] || return 2
@@ -4475,6 +4512,36 @@ memory_checkpoint() {
 
 memory_writeback() {
 	run_locked memory_writeback_locked_command
+}
+
+memory_writeback_job_locked() {
+	local expected_revision="$1" candidate_hash="$2" token="$3" calculated
+	local SETTINGS_CAS_GUARD=1 writeback_rc=0
+	yaml_job_hash_valid "$expected_revision" &&
+		yaml_job_hash_valid "$candidate_hash" && yaml_job_token_valid "$token" &&
+		yaml_job_runtime_is_private &&
+		yaml_job_pending_matches "$token" "$expected_revision" "$candidate_hash" || return 1
+	calculated="$(printf 'memory_writeback:%s' "$expected_revision" | sha256sum)" || return 1
+	[ "${calculated%% *}" = "$candidate_hash" ] || return 1
+	write_yaml_job_state "$token" \
+		"running:$$:${expected_revision}:${candidate_hash}" || return 1
+	memory_writeback_locked_command "$expected_revision" || writeback_rc=$?
+	if [ "$writeback_rc" = 0 ]; then
+		write_yaml_job_state "$token" \
+			"success:${candidate_hash}:0:${expected_revision}:${candidate_hash}"
+	else
+		[ "$writeback_rc" != 2 ] ||
+			log_error "Requested RAM data write-back is stale or RAM data is no longer running"
+		write_yaml_job_state "$token" \
+			"failure:${expected_revision}:${candidate_hash}" >/dev/null 2>&1 || true
+		return 1
+	fi
+}
+
+memory_writeback_job() {
+	[ "$#" = 4 ] || return 1
+	prepare_job_descriptors "" "$4" || return 1
+	run_locked memory_writeback_job_locked "$1" "$2" "$3"
 }
 
 memory_cleanup() {

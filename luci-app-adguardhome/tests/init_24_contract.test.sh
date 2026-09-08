@@ -128,6 +128,59 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 	printf 'normal settings job did not publish an authenticated success terminal\n' >&2
 	exit 1
 }
+
+# Exercise the actual YAML transaction through its first runtime boundary.
+# Preflight rejection is definitive; load/cleanup failures remain uncertain.
+(
+	eval "$(function_body "$init_file" yaml_update_locked)"
+	eval "$(function_body "$init_file" yaml_update_job_locked)"
+	expected_hash=1111111111111111111111111111111111111111111111111111111111111111
+	candidate_hash=3333333333333333333333333333333333333333333333333333333333333333
+	token=22222222222222222222222222222222
+	states="${protocol_tmp}/yaml-states"
+	load_settings() { [ "$scenario" != settings ]; }
+	validate_yaml_stage() { [ "$scenario" != stage ]; }
+	active_config_hash() {
+		[ "$scenario" != hash-read ] || return 1
+		if [ "$scenario" = hash-conflict ]; then
+			printf '%s\n' "$candidate_hash"
+		else
+			printf '%s\n' "$expected_hash"
+		fi
+	}
+	check_core_config_file() { [ "$scenario" != validation ]; }
+	official_running() { return 0; }
+	clear_recorded_integration_locked() { touched=1; return 1; }
+	resume_paused_yaml_runtime() { return 1; }
+	log_error() { :; }
+	cleanup_yaml_update() { :; }
+	cleanup_yaml_job_stage() { :; }
+	yaml_job_pending_matches() { return 0; }
+	write_yaml_job_state() {
+		[ "$1" = "$token" ] || return 1
+		printf '%s\n' "$2" >>"$states"
+	}
+	for scenario in validation settings stage hash-read hash-conflict cleanup; do
+		: >"$states"
+		touched=0
+		# Values from an earlier call must not affect this job's classification.
+		update_rc=2 terminal=failure
+		if yaml_update_job_locked "$expected_hash" "$candidate_hash" \
+		   /unused/AdGuardHome.yaml.luci-test 9 "$token"; then
+			exit 1
+		fi
+		case "$scenario" in
+			settings|cleanup) expected=indeterminate ;;
+			*) expected=failure ;;
+		esac
+		[ "$(tail -n 1 "$states")" = \
+			"${expected}:${expected_hash}:${candidate_hash}" ] || exit 1
+		case "$scenario" in cleanup) [ "$touched" = 1 ] ;; *) [ "$touched" = 0 ] ;; esac
+	done
+) || {
+	printf 'YAML preflight failure was confused with an uncertain runtime result\n' >&2
+	exit 1
+}
 rm -rf "$protocol_tmp"
 trap - EXIT
 

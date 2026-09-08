@@ -168,6 +168,7 @@ assert.equal(sandbox.api.settings_candidate(
 ), null, 'oversized write-back intervals must fail closed');
 
 const updateSource = extractFunction('update_settings');
+const startSource = extractFunction('start_settings_process');
 assert.doesNotMatch(updateSource, /\blaunched\b/,
 	'settings must not retain an unreachable post-launch catch branch');
 assert.match(updateSource,
@@ -179,13 +180,13 @@ assert.match(updateSource,
 	/let locked_current = settings_snapshot\(\);[\s\S]*?locked_current\.revision != expected_revision[\s\S]*?discard_yaml_job\(token\)[\s\S]*?close_yaml_job_lock\(\{ file: job\.lock \}\)/,
 	'the settings revision must be rechecked and stale job state removed while holding the shared lock');
 assert.match(updateSource,
-	/uloop\.process\(YAML_UPDATE_COMMAND, \[\s*'settings_update'/,
+	/start_settings_process\(job, expected_revision, candidate\.revision, \[\s*'settings_update'/,
 	'settings must be applied asynchronously through the coordinator command');
 assert.match(updateSource,
-	/`\$\{candidate\.memory_writeback_interval\}`,\s*expected_revision,\s*token,\s*candidate\.revision,\s*`\$\{job\.lock_descriptor\}`,\s*\], \{ PATH:/,
+	/`\$\{candidate\.memory_writeback_interval\}`,\s*expected_revision,\s*token,\s*candidate\.revision,\s*`\$\{job\.lock_descriptor\}`,\s*\]\)/,
 	'the coordinator must receive the CAS revision, one-shot credential and inherited lock descriptor');
-assert.match(updateSource,
-	/function\(\) \{\s*finish_settings_process\(\s*token, expected_revision, candidate\.revision, job\.lock/,
+assert.match(startSource,
+	/function\(\) \{\s*finish_settings_process\(\s*token, expected_hash, candidate_hash, job\.lock/,
 	'the process callback must not forward or interpret a raw wait status');
 assert.doesNotMatch(updateSource, /system\(|popen\(|\/bin\/sh|uci\.(?:set|commit)/,
 	'the RPC transaction must not use a shell or commit UCI itself');
@@ -241,13 +242,44 @@ const launchSandbox = {
 	close_yaml_job_lock() { assert.fail('the parent lock must remain held for the callback'); },
 };
 vm.createContext(launchSandbox);
-vm.runInContext(`${updateSource}\nthis.update = update_settings;`, launchSandbox);
+vm.runInContext(`${startSource}\n${updateSource}\n${extractFunction('memory_writeback')}\nthis.update = update_settings; this.writeback = memory_writeback;`, launchSandbox);
 assert.equal(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
 	true, 120, snapshot.revision).accepted, true);
 assert.deepEqual(launchedArguments, [
 	'settings_update', '1', fixture.workDir, '0', fixture.redirect, '1', '120',
 	snapshot.revision, token, candidate.revision, '193',
 ], 'the worker must receive ten arguments with the numeric lock descriptor last');
+
+launchSandbox.sha256 = sandbox.sha256;
+launchSandbox.memory_state_active = () => true;
+launchSandbox.service_running = () => true;
+launchSandbox.settings_snapshot = () => ({ ...snapshot, run_from_memory: true });
+let writebackJob;
+launchSandbox.prepare_yaml_job = (jobToken, expected, hash) => {
+	writebackJob = [ jobToken, expected, hash ];
+	return { token: jobToken, lock: {}, lock_descriptor: 193 };
+};
+assert.equal(launchSandbox.writeback(snapshot.revision).accepted, true);
+const writebackHash = sandbox.sha256(`memory_writeback:${snapshot.revision}`);
+assert.deepEqual(writebackJob, [ token, snapshot.revision, writebackHash ]);
+assert.deepEqual(launchedArguments, [
+	'memory_writeback_job', snapshot.revision, writebackHash, token, '193',
+], 'write-back accepts only a committed revision, never draft settings');
+launchSandbox.prepare_yaml_job = () => ({ token, reused: true });
+launchedArguments = null;
+assert.equal(launchSandbox.writeback(snapshot.revision).reused, true);
+assert.equal(launchedArguments, null, 'repeated requests must reuse the running job');
+for (const revision of [ '', null, 'bad', expectedHash ])
+	assert.ok(launchSandbox.writeback(revision).error);
+launchSandbox.memory_state_active = () => false;
+assert.ok(launchSandbox.writeback(snapshot.revision).error);
+launchSandbox.memory_state_active = () => true;
+launchSandbox.service_running = () => false;
+assert.ok(launchSandbox.writeback(snapshot.revision).error);
+launchSandbox.service_running = () => true;
+launchSandbox.settings_snapshot = () => snapshot;
+assert.ok(launchSandbox.writeback(snapshot.revision).error);
+launchSandbox.prepare_yaml_job = () => ({ token, lock: {}, lock_descriptor: 193 });
 
 for (const failure of [ 'unavailable', 'exception' ]) {
 	let discarded = 0;
@@ -459,7 +491,24 @@ for (const settings of [ false, true ]) {
 	assert.equal(query(token, false).error, `Unable to release ${label} update lock`);
 }
 
-console.log('2.4 asynchronous RPC settings transaction tests passed');
+for (const state of [ 'success', 'failure', 'running', 'indeterminate' ]) {
+	resetJob(state);
+	jobFixture.record.restarted = false;
+	const result = jobSandbox.query(token, true, 'writeback');
+	assert.equal(result.state, 'done');
+	assert.equal(result.ok, state === 'success');
+	assert.equal(result.revision, undefined, 'write-back does not publish a new settings revision');
+	assert.equal(result.sha256, undefined, 'write-back does not publish a new YAML revision');
+	if (state === 'success')
+		assert.equal(result.restarted, false);
+	else if (state === 'failure')
+		assert.match(result.error, /Write-back failed/);
+	else
+		assert.equal(result.indeterminate, true);
+	assert.equal(jobFixture.yamlRecoveries, 0);
+	assert.equal(jobFixture.consumes, 1);
+}
+console.log('asynchronous settings and memory write-back RPC transaction tests passed');
 
 // The shared writer retains separate creation and replacement policies while
 // using one audited exclusive-create / flush / rename sequence.

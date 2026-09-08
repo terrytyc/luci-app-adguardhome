@@ -117,6 +117,8 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 	);
 	const source = fs.readFileSync(viewPath, 'utf8');
 	const animationFrames = new Map();
+	const windowEvents = new EventTarget();
+	const beforeUnloadListeners = new Set();
 	let nextAnimationFrame = 1;
 	const rpc = {
 		declare: specification => async (...args) => {
@@ -139,6 +141,14 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		console,
 		window: {
 			location: { href: 'https://router.example/cgi-bin/luci/admin/services/adguardhome' },
+			addEventListener(type, callback, options) {
+				if (type === 'beforeunload') beforeUnloadListeners.add(callback);
+				windowEvents.addEventListener(type, callback, options);
+			},
+			removeEventListener(type, callback) {
+				if (type === 'beforeunload') beforeUnloadListeners.delete(callback);
+				windowEvents.removeEventListener(type, callback);
+			},
 			setTimeout(callback) { return setTimeout(callback, 0); },
 			requestAnimationFrame(callback) {
 				const id = nextAnimationFrame++;
@@ -156,6 +166,8 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		Object.assign(sandbox, { operation, rpc, ui, view }),
 		{ filename: viewPath },
 	);
+	loadedView.beforeUnloadListenerCount = () => beforeUnloadListeners.size;
+	loadedView.dispatchWindowEvent = event => windowEvents.dispatchEvent(event);
 	loadedView.pendingAnimationFrames = () => animationFrames.size;
 	loadedView.flushAnimationFrames = () => {
 		for (const [ id, callback ] of [ ...animationFrames ]) {
@@ -267,7 +279,7 @@ async function runSettingsSubmissionScenario(kind) {
 			},
 		},
 	};
-	context = {
+	context = Object.assign(Object.create(view), {
 		pageScope: {},
 		settingsMap: map,
 		committedSettings: { revision: oldRevision, memoryWritebackInterval: 60 },
@@ -283,7 +295,7 @@ async function runSettingsSubmissionScenario(kind) {
 				assert.equal(resetCalls, 1);
 			}
 		},
-	};
+	});
 
 	await view.handleSaveApply.call(context);
 	assert.equal(refreshCalls, 1, 'success and failure must each trigger only one post-apply status refresh');
@@ -325,7 +337,7 @@ async function testYamlTemplateReset() {
 			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
-		await view.resetYaml();
+		await view.resetYaml(true);
 		assert.deepEqual(calls, [[ 'template', oldHash ]], 'loading the template must not save, apply or poll a job');
 		assert.equal(view.yamlEditor.value, accepted ? template : draft);
 		assert.equal(view.yamlHash, oldHash, 'a template response without SHA must retain the active file revision');
@@ -450,6 +462,85 @@ async function testYamlSubmissions() {
 	}
 }
 
+async function testMemoryWriteback() {
+	for (const kind of [ 'success', 'reused', 'rejected', 'failed', 'bad-token', 'request-lost',
+		'status-lost', 'indeterminate', 'inactive-request', 'inactive-status' ]) {
+		const state = loadOperation();
+		const scope = state.operation.createPageScope();
+		const revision = 'a'.repeat(64), token = 'b'.repeat(32);
+		const calls = [];
+		let releaseRequest, refreshes = 0, settingsSubmits = 0;
+		const requestBarrier = new Promise(resolve => { releaseRequest = resolve; });
+		const view = loadView('overview', state.operation, {}, {
+			async memory_writeback(...args) {
+				calls.push([ 'writeback', ...args ]);
+				await requestBarrier;
+				if (kind === 'request-lost') throw new Error('request timed out');
+				if (kind === 'inactive-request') state.dispatch('pagehide');
+				if (kind === 'rejected') return { error: 'settings revision changed' };
+				return { accepted: true, token: kind === 'bad-token' ? '' : token, reused: kind === 'reused' };
+			},
+			async get_memory_writeback(receivedToken, consume) {
+				assert.equal(receivedToken, token);
+				calls.push([ 'status', consume ]);
+				if (kind === 'status-lost') throw new Error('status unavailable');
+				if (kind === 'inactive-status') state.dispatch('pagehide');
+				return { state: 'done', ok: ![ 'failed', 'indeterminate' ].includes(kind),
+					indeterminate: kind === 'indeterminate', error: 'write-back failed' };
+			},
+		});
+		const draft = { workDir: '/mnt/unsaved-workdir', interval: 99 };
+		const committed = { revision };
+		Object.assign(view, {
+			pageScope: scope, memoryWritebackAvailable: true, memoryWritebackButton: {},
+			committedSettings: committed,
+			settingsMap: { draft, reset() { assert.fail('write-back must not reset form drafts'); },
+				parse() { assert.fail('write-back must not parse unsaved settings'); } },
+			submitSettings() { settingsSubmits++; return Promise.resolve(); },
+			async statusPollCallback() {
+				assert.equal(view.memoryWritebackBusy, false);
+				refreshes++;
+			},
+		});
+		const writeback = view.handleMemoryWriteback();
+		assert.equal(view.memoryWritebackButton.disabled, true);
+		assert.equal(state.rendered.at(-1).text, 'Writing memory data back…');
+		await view.handleMemoryWriteback();
+		await view.handleSaveApply();
+		assert.deepEqual(calls, [ [ 'writeback', revision ] ],
+			'repeated clicks must not submit again, and only the committed revision may be sent');
+		assert.equal(settingsSubmits, 0, 'Apply must not overlap a running write-back');
+		releaseRequest();
+		await writeback;
+		assert.equal(view.committedSettings, committed);
+		assert.equal(view.settingsMap.draft, draft);
+		assert.deepEqual(draft, { workDir: '/mnt/unsaved-workdir', interval: 99 });
+		if (kind.startsWith('inactive')) {
+			assert.equal(refreshes, 0);
+			assert.equal(state.rendered.length, 1, 'obsolete jobs must not show results or refresh the new view');
+		} else {
+			assert.equal(refreshes, 1, 'completion must refresh only the overview once');
+			const uncertain = [ 'bad-token', 'request-lost', 'status-lost', 'indeterminate' ].includes(kind);
+			assert.equal(view.memoryWritebackButton.disabled, uncertain);
+			if (kind === 'success' || kind === 'reused') {
+				assert.equal(state.rendered.at(-1).text, 'Memory data written back.');
+				assert.deepEqual(calls, [ [ 'writeback', revision ], [ 'status', false ], [ 'status', true ] ]);
+			} else {
+				assert.match(state.rendered.at(-1).text, /Unable to write back memory data:/);
+			}
+			if (uncertain) {
+				assert.match(state.rendered.at(-1).text, /Reload this page before trying again/);
+				const beforeRetry = calls.length;
+				await view.handleMemoryWriteback();
+				await view.handleSaveApply();
+				assert.equal(calls.length, beforeRetry, 'unknown outcomes must not allow a second write-back');
+				assert.equal(settingsSubmits, 0, 'unknown jobs may still be running and must not overlap Apply');
+			}
+		}
+		state.operation._clearTimer();
+	}
+}
+
 async function testYamlEditing() {
 	const state = loadOperation();
 	const modals = [], notifications = [], calls = [];
@@ -477,6 +568,8 @@ async function testYamlEditing() {
 	assert.equal(root.children[0].attrs.href, 'adguardhome/style.css');
 	assert.equal(view.yamlEditor.attrs.class, 'adguardhome-editor',
 		'the YAML overlay must not inherit theme textarea backgrounds');
+	assert.equal(view.yamlEditor.attrs.autocapitalize, 'none');
+	assert.equal(view.yamlEditor.attrs.autocorrect, 'off');
 	assert.equal(view.yamlEditorFrame.children.length, 3);
 	assert.equal(view.yamlEditorFrame.children[0], view.yamlLineNumbers);
 	assert.equal(view.yamlEditorFrame.children[1], view.yamlHighlight);
@@ -488,6 +581,7 @@ async function testYamlEditing() {
 	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-key[^>]*>dns</);
 	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-number[^>]*>53335</);
 	assert.equal(view.hasDraft(), false);
+	assert.equal(view.beforeUnloadListenerCount(), 0, 'clean YAML must not register a leave warning');
 	assert.equal(view.saveButton.disabled, false, 'unchanged YAML can still be applied');
 	await view.handleReload();
 	assert.equal(modals.length, 0, 'clean reload needs no confirmation');
@@ -503,6 +597,10 @@ async function testYamlEditing() {
 	view.yamlEditor.attrs.input();
 	view.yamlEditor.attrs.input();
 	view.yamlEditor.attrs.keyup();
+	assert.equal(view.beforeUnloadListenerCount(), 1, 'the first edit must protect the draft before the next animation frame');
+	const leaveWithDraft = new Event('beforeunload', { cancelable: true });
+	view.dispatchWindowEvent(leaveWithDraft);
+	assert.equal(leaveWithDraft.defaultPrevented, true, 'refreshing or leaving must request the native draft warning');
 	assert.equal(view.pendingAnimationFrames(), 1,
 		'multiple input events in one frame must schedule only one YAML redraw');
 	assert.equal(view.activeYamlLine, 0,
@@ -568,6 +666,7 @@ async function testYamlEditing() {
 	await modals.at(-1).children[1].children.at(-1).attrs.click();
 	assert.equal(view.yamlEditor.value, active);
 	assert.equal(view.draftStatus.hidden, true);
+	assert.equal(view.beforeUnloadListenerCount(), 0, 'successful reload removes the leave warning');
 	assert.equal(view.editorNotice.hidden, true);
 	const modalCount = modals.length;
 	await view.resetButton.attrs.click();
@@ -575,7 +674,21 @@ async function testYamlEditing() {
 	assert.doesNotMatch(view.resetButton.attrs.class, /negative/);
 	assert.equal(view.yamlEditor.value, template);
 	assert.equal(view.draftStatus.hidden, false);
+	assert.equal(view.beforeUnloadListenerCount(), 1, 'loading a template creates a protected draft');
 	assert.equal(calls.filter(call => call === 'save').length, 0, 'template loading must not apply');
+	view.yamlEditor.value += '# keep my draft\n';
+	view.yamlEditor.attrs.input();
+	const templateCalls = calls.filter(call => call === 'template').length;
+	await view.resetButton.attrs.click();
+	assert.equal(modals.at(-1).title, 'Discard unsaved changes?');
+	assert.equal(calls.filter(call => call === 'template').length, templateCalls,
+		'a dirty template load must wait for confirmation before issuing its RPC');
+	modals.at(-1).children[1].children[0].attrs.click();
+	assert.equal(view.yamlEditor.value, template + '# keep my draft\n', 'Cancel preserves the template draft');
+	assert.equal(view.beforeUnloadListenerCount(), 1);
+	await modals.at(-1).children[1].children.at(-1).attrs.click();
+	assert.equal(view.yamlEditor.value, template);
+	assert.equal(calls.filter(call => call === 'template').length, templateCalls + 1);
 	failRead = true;
 	await view.handleReload(true);
 	assert.equal(view.yamlEditor.value, template, 'read failure preserves the editor draft');
@@ -584,11 +697,21 @@ async function testYamlEditing() {
 	assert.match(view.editorNotice.textContent, /disk read failed.*Use Reload from disk/);
 	assert.equal(view.reloadButton.disabled, false);
 	assert.equal(view.saveButton.disabled, true);
+	assert.equal(view.beforeUnloadListenerCount(), 1, 'a failed reload must keep protecting the retained draft');
 	failRead = false;
 	await view.handleReload(true);
 	assert.equal(view.editorNotice.hidden, true);
 	assert.equal(view.yamlEditor.readOnly, false);
 	assert.equal(view.draftStatus.hidden, true);
+	view.yamlEditor.value = '# temporary draft\n';
+	view.yamlEditor.attrs.input();
+	assert.equal(view.beforeUnloadListenerCount(), 1);
+	view.yamlEditor.value = active;
+	view.yamlEditor.attrs.input();
+	assert.equal(view.beforeUnloadListenerCount(), 0, 'undoing all edits removes the leave warning immediately');
+	const leaveClean = new Event('beforeunload', { cancelable: true });
+	view.dispatchWindowEvent(leaveClean);
+	assert.equal(leaveClean.defaultPrevented, false);
 	failRead = true;
 	view.render(await view.load());
 	assert.equal(view.editorNotice.hidden, false, 'initial read errors need a persistent inline reason');
@@ -600,6 +723,11 @@ async function testYamlEditing() {
 	assert.equal(view.pendingAnimationFrames(), 1);
 	const obsoleteHighlight = view.yamlHighlight.innerHTML;
 	state.dispatch('pagehide');
+	const leaveInactive = new Event('beforeunload', { cancelable: true });
+	view.dispatchWindowEvent(leaveInactive);
+	assert.equal(leaveInactive.defaultPrevented, false, 'an obsolete YAML page must not warn for another view');
+	view.dispatchWindowEvent(new Event('pagehide'));
+	assert.equal(view.beforeUnloadListenerCount(), 0, 'leaving the page removes its draft listener');
 	view.flushAnimationFrames();
 	assert.equal(view.yamlHighlight.innerHTML, obsoleteHighlight,
 		'a queued editor redraw must not update an inactive page');
@@ -803,10 +931,10 @@ async function main() {
 	const overviewView = loadView('overview', overviewOperation, overviewUi);
 	let resolveSave;
 	const savePromise = new Promise(resolve => { resolveSave = resolve; });
-	const overviewContext = { settingsSubmission: null, submitSettings() {
+	const overviewContext = Object.assign(Object.create(overviewView), { settingsSubmission: null, submitSettings() {
 		applyEvents.push('apply');
 		return savePromise;
-	} };
+	} });
 	const applyPromise = overviewView.handleSaveApply.call(overviewContext, null, '0');
 	assert.deepEqual(applyEvents, [ 'apply' ],
 		'Save & Apply must start the single RPC settings transaction');
@@ -983,6 +1111,7 @@ async function main() {
 
 	await testYamlTemplateReset();
 	await testYamlSubmissions();
+	await testMemoryWriteback();
 	await testYamlEditing();
 	console.log('navigation lifecycle, shared job polling and settings/YAML reconciliation tests passed');
 }

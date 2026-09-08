@@ -9,7 +9,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/original-snapshot.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.0.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -20,7 +20,19 @@ LUCI_DESCRIPTION:=LuCI integration for the packaged AdGuard Home service
 LUCI_MAINTAINER:=terrytyc
 LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
+define AdGuardHome/UciPendingGuard
+pending_uci_changes="$$(uci -q changes 2>/dev/null)" || {
+	echo "Unable to inspect pending UCI changes; package installation aborted." >&2
+	exit 1
+}
+[ -z "$$pending_uci_changes" ] || {
+	echo "Commit or revert pending UCI changes before installing this package." >&2
+	exit 1
+}
+endef
+
 define Build/Prepare/luci-app-adguardhome
+	printf '%s\n' '$(PKG_VERSION)-r$(PKG_RELEASE)' >$(PKG_BUILD_DIR)/root/usr/share/luci-app-adguardhome/version
 	mkdir -p $(PKG_BUILD_DIR)/root/etc/AdGuardHome
 	cp -p $(PKG_BUILD_DIR)/root/usr/share/luci-app-adguardhome/default.yaml \
 		$(PKG_BUILD_DIR)/root/etc/AdGuardHome/AdGuardHome.yaml
@@ -54,6 +66,8 @@ endef
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
+
+$(AdGuardHome/UciPendingGuard)
 
 $(AdGuardHome/RunBounded)
 
@@ -244,6 +258,14 @@ elif [ -d /tmp/luci-modulecache ]; then
 	rm -rf /tmp/luci-modulecache/
 fi
 [ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1
+exit 0
+endef
+
+define Package/luci-i18n-adguardhome-zh-cn/preinst
+#!/bin/sh
+[ -z "$$IPKG_INSTROOT" ] || exit 0
+
+$(AdGuardHome/UciPendingGuard)
 exit 0
 endef
 

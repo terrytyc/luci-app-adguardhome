@@ -16,20 +16,31 @@ die() {
 	exit 1
 }
 
+mode=full
+case "$#" in
+	0) ;;
+	1)
+		[ "$1" = --light ] || die "unknown option: $1"
+		mode=light
+		;;
+	*) die 'usage: scripts/test.sh [--light]' ;;
+esac
+
 for command_name in busybox git mktemp; do
 	command -v "$command_name" >/dev/null 2>&1 ||
 		die "required command is unavailable: $command_name"
 done
-[[ -x $UCODE_BIN && -x $UCODE_LOADER ]] || die "SDK target ucode runtime is missing: $SDK"
 
 if [[ -n ${NODE_BIN:-} ]]; then
 	[[ -x $NODE_BIN ]] || die "NODE_BIN is not executable: $NODE_BIN"
-elif command -v node >/dev/null 2>&1; then
+elif command -v node >/dev/null 2>&1 &&
+	node -e "require('node:assert/strict')" >/dev/null 2>&1; then
 	NODE_BIN=$(command -v node)
-elif command -v node.exe >/dev/null 2>&1; then
+elif command -v node.exe >/dev/null 2>&1 &&
+	node.exe -e "require('node:assert/strict')" >/dev/null 2>&1; then
 	NODE_BIN=$(command -v node.exe)
 else
-	die 'Node.js is unavailable; set NODE_BIN'
+	die 'Node.js 16 or newer is unavailable; set NODE_BIN'
 fi
 "$NODE_BIN" -e "require('node:assert/strict')" >/dev/null 2>&1 ||
 	die 'Node.js is too old for the JavaScript tests; set NODE_BIN to Node.js 16 or newer'
@@ -47,25 +58,35 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-ucode_library_path=$TARGET_ROOT/lib:$TARGET_ROOT/usr/lib
-"$UCODE_LOADER" --library-path "$ucode_library_path" \
-	"$UCODE_BIN" -L "$TARGET_ROOT/usr/lib/ucode" -S -c \
-	-o "$temporary/luci.adguardhome.uc" \
-	"$PACKAGE_DIR/root/usr/share/rpcd/ucode/luci.adguardhome"
+if [[ $mode == full ]]; then
+	[[ -x $UCODE_BIN && -x $UCODE_LOADER ]] ||
+		die "SDK target ucode runtime is missing: $SDK"
+	ucode_library_path=$TARGET_ROOT/lib:$TARGET_ROOT/usr/lib
+	"$UCODE_LOADER" --library-path "$ucode_library_path" \
+		"$UCODE_BIN" -L "$TARGET_ROOT/usr/lib/ucode" -S -c \
+		-o "$temporary/luci.adguardhome.uc" \
+		"$PACKAGE_DIR/root/usr/share/rpcd/ucode/luci.adguardhome"
 
-export UCODE=$UCODE_BIN
-export UCODE_LOADER
-export UCODE_LIBRARY_PATH=$ucode_library_path
-export ADGUARDHOME_TEST_UCI_ROOT=$TARGET_ROOT
+	export UCODE=$UCODE_BIN
+	export UCODE_LOADER
+	export UCODE_LIBRARY_PATH=$ucode_library_path
+	export ADGUARDHOME_TEST_UCI_ROOT=$TARGET_ROOT
+fi
 
 shopt -s nullglob
 shell_tests=("$PACKAGE_DIR"/tests/*.test.sh)
 js_tests=("$PACKAGE_DIR"/tests/*.test.js)
 ((${#shell_tests[@]} > 0 && ${#js_tests[@]} > 0)) || die 'source tests are missing'
 
+shell_count=0
 for test_file in "${shell_tests[@]}"; do
+	if [[ $mode == light && $test_file == */password_yaml_parser.test.sh ]]; then
+		printf 'SKIP %s (requires SDK ucode)\n' "${test_file#"$REPO/"}"
+		continue
+	fi
 	printf 'TEST %s\n' "${test_file#"$REPO/"}"
 	busybox ash "$test_file"
+	((shell_count += 1))
 done
 
 for test_file in "${js_tests[@]}"; do
@@ -82,4 +103,10 @@ for test_file in "$SCRIPT_DIR"/tests/*.test.sh; do
 	bash "$test_file"
 done
 
-printf 'TEST_OK shell=%d javascript=%d\n' "${#shell_tests[@]}" "${#js_tests[@]}"
+if [[ $mode == light ]]; then
+	printf 'LIGHT_TEST_OK shell=%d javascript=%d skipped=%d\n' \
+		"$shell_count" "${#js_tests[@]}" "$((${#shell_tests[@]} - shell_count))"
+else
+	printf 'TEST_OK shell=%d javascript=%d\n' \
+		"${#shell_tests[@]}" "${#js_tests[@]}"
+fi

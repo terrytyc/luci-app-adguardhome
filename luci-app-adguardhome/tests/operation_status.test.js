@@ -95,6 +95,10 @@ function loadOperation() {
 }
 
 const state = loadOperation();
+const custom = loadOperation();
+custom.operation.start('Writing memory data back…');
+assert.equal(custom.rendered.at(-1).child.text, 'Writing memory data back…');
+assert.deepEqual(custom.rendered.at(-1).classes, [ 'alert-message', 'notice', 'spinning' ]);
 const initialTicket = state.operation.start();
 assert.equal(state.rendered.at(-1).child.text,
 	'Applying configuration changes…');
@@ -188,6 +192,7 @@ assert.doesNotMatch(operationSource, /APPLY_WAIT_SECONDS|Date\.now|remaining|%ds
 	'apply progress must be driven by the job result, not a guessed deadline');
 assert.match(overview, /operation\.waitForJob\(callGetYamlUpdate,/);
 assert.match(overview, /operation\.waitForJob\(callGetSettingsUpdate,/);
+assert.match(overview, /operation\.waitForJob\(callGetMemoryWriteback,/);
 assert.match(yaml, /operation\.waitForJob\(callGetYamlUpdate,/);
 assert.doesNotMatch(overview + yaml, /POLL_LIMIT|consecutiveErrors/,
 	'all three update flows must share the bounded job polling implementation');

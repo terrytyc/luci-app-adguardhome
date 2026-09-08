@@ -150,8 +150,8 @@ assert.equal((source.match(/power loss/g) ?? []).length, 1,
 assert.match(source, /0 disables scheduled write-back\. A normal stop or restart still writes data back/);
 assert.match(source, /form\.DummyValue, '_change_credentials', ' '\)/,
 	'the credential action must keep form alignment without a visible row label');
-assert.equal((source.match(/adguardhome-action-button/g) ?? []).length, 3,
-	'the management link, disabled management button and credential action must share one compact size');
+assert.equal((source.match(/adguardhome-action-button/g) ?? []).length, 4,
+	'the management link, disabled management button, write-back and credential actions must share one compact size');
 assert.doesNotMatch(source, /adguardhome-management-url|_\('Management interface'\)/,
 	'the overview must not show a management label or target URL');
 for (const label of [ 'None', 'Use AdGuard Home as dnsmasq upstream', 'Redirect port 53' ])
