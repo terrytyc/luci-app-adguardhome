@@ -2,13 +2,11 @@
 
 本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由固件官方的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
 
-兼容基线为 OpenWrt/ImmortalWrt 25.12（APK），LuCI ≥ 23.05。
-
-仅提供 APK 包，不构建 IPK，也不检查或限制系统发行版、系统版本号。需要官方 `adguardhome >= 0.107.76-r1` 及软件包声明的运行依赖；LuCI 版本满足要求不等于支持旧版 opkg 固件。
+兼容基线为 OpenWrt/ImmortalWrt 25.12（APK），LuCI ≥ 23.05，仅提供 APK 包。
 
 ## 唯一 UCI 配置
 
-活动配置只使用一个 UCI 文件：`/etc/config/adguardhome`。运行时不创建或使用 `/etc/config/AdGuardHome`，也不存在第二个 `enabled` 或第二个 `work_dir`。
+活动配置只使用一个 UCI 文件：`/etc/config/adguardhome`。
 
 标准配置格式如下：
 
