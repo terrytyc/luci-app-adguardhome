@@ -112,9 +112,7 @@ config luci 'luci'
 
 ### 🔒 HTTPS 与证书续期
 
-证书文件路径填入 YAML 的 `tls.certificate_path` 和 `tls.private_key_path`；`certificate_chain`、`private_key` 用于直接填写 PEM 内容，不是文件路径。
-
-通过插件启动或重启时，会重新读取证书路径，确保官方核心沙箱可读取证书、私钥及必要父目录。之后更换路径也按新配置处理，不判断证书是否过期。ACME 的有效签发、续期事件会触发证书更新处理，内容不变时不重启核心。
+如果配置了https，通过插件启动或重启时，会重新读取证书路径，确保官方核心沙箱可读取证书、私钥及必要父目录。之后更换路径也按新配置处理，不判断证书是否过期。ACME 的有效签发、续期事件会触发证书更新处理，内容不变时不重启核心。
 
 直接调用官方小写 `/etc/init.d/adguardhome` 会绕过插件的启动前权限准备，请使用 LuCI 或 `/etc/init.d/AdGuardHome`。
 
