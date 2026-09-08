@@ -97,8 +97,13 @@ ports_reject() {
 	fi
 }
 ports_match '53335 3000' 'http:\n  address: 0.0.0.0:3000\ndns:\n  port: 53335\n'
-ports_match '22237 3000' 'dns: # managed\n    port: "053335" # DNS\nhttp:\n    address: "[::]:03000" # UI\n'
-ports_match '43 3000' "dns:\n  port: '00053'\nhttp:\n  address: '[::1]:3000'\n"
+# Older BusyBox awk converts leading-zero strings as octal; newer builds
+# use decimal. Compare against the host's primitive conversion and the frozen
+# reader below, rather than requiring one particular BusyBox build's behavior.
+leading_dns="$(awk -v value=053335 'BEGIN { printf "%d", value + 0 }')"
+leading_53="$(awk -v value=00053 'BEGIN { printf "%d", value + 0 }')"
+ports_match "$leading_dns 3000" 'dns: # managed\n    port: "053335" # DNS\nhttp:\n    address: "[::]:03000" # UI\n'
+ports_match "$leading_53 3000" "dns:\n  port: '00053'\nhttp:\n  address: '[::1]:3000'\n"
 ports_match '53335 3000' 'dns:\n    port: 1\n  port: 53335\nhttp:\n    address: 0.0.0.0:9\n  address: 0.0.0.0:3000\n'
 ports_match '53335 0' 'dns:\n  port: 53335\n  nested:\n    port: 53\nhttp:\n  address: missing-port\n'
 ports_match '53335 0' 'dns:\n  port: 53335\n'
@@ -126,14 +131,16 @@ full_reader_match() {
 	[ "$(reader_result legacy_load_runtime_dns_port "$mode")" = "$expected" ]
 	[ "$(reader_result load_runtime_dns_port "$mode")" = "$expected" ]
 }
-full_reader_match 0:22237 none 053335 03000
+full_reader_match "0:$leading_dns" none 053335 03000
 full_reader_match 1:3000 none 3000 03000
 full_reader_match 0:1536 none 1536 03000
 full_reader_match 0:53335 none 53335 3000
 full_reader_match 1:53335 none 53335 053335
-full_reader_match 1:22237 none 053335 22237
-full_reader_match 0:43 none 00053 3000
-full_reader_match 0:43 redirect 00053 3000
+full_reader_match "1:$leading_dns" none 053335 "$leading_dns"
+full_reader_match "0:$leading_53" none 00053 3000
+leading_53_rc=0
+[ "$leading_53" != 53 ] || leading_53_rc=1
+full_reader_match "$leading_53_rc:$leading_53" redirect 00053 3000
 full_reader_match 1:53 redirect 53 3000
 full_reader_match 0:8 none 00008 3000
 
