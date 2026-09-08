@@ -1,8 +1,8 @@
 # luci-app-adguardhome
 
-`luci-app-adguardhome` 2.6.0-r4，兼容基线为 ImmortalWrt 25.12.1（APK）。
-
 本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由 ImmortalWrt 的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
+
+兼容基线为 OpenWrt/ImmortalWrt 25.12（APK），LuCI ≥ 23.05。
 
 ## 唯一 UCI 配置
 
