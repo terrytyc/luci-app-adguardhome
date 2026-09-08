@@ -108,8 +108,10 @@ assert.match(css, /\.adguardhome-yaml-heading > h3\s*\{[^}]*width:\s*auto;[^}]*b
 	'the theme heading background must not separate the draft indicator');
 assert.match(css, /\.adguardhome-yaml-editor:focus-within\s*\{[^}]*border-color:/,
 	'the transparent native editor must retain a visible focus indicator');
-assert.match(css, /\.adguardhome-yaml-editor::before\s*\{[^}]*width:\s*3rem;[^}]*background:\s*rgba\(127, 127, 127, \.08\)/,
-	'only the stable line-number gutter needs a neutral background');
+assert.match(css, /\.adguardhome-yaml-editor\s*\{[^}]*background-color:\s*var\(--background-color-high, inherit\)/,
+	'the editor must inherit the actual section background in light and dark themes');
+assert.match(css, /\.adguardhome-yaml-editor::before\s*\{[^}]*z-index:\s*1;[^}]*width:\s*3rem;[^}]*background-color:\s*inherit;[^}]*background-image:\s*linear-gradient/,
+	'the fixed gutter must paint its neutral tint over the opaque editor background');
 assert.match(css, /\.adguardhome-yaml-line\s*\{[^}]*display:\s*block;[^}]*background:\s*transparent/);
 assert.match(css, /\.adguardhome-yaml-line\.active\s*\{[^}]*background:\s*rgba\(80, 120, 220, \.08\)/);
 assert.match(css, /\.adguardhome-editor\s*\{[^}]*color:\s*transparent;[^}]*caret-color:\s*var\(--primary-color-high,\s*var\(--primary,\s*#3b6fd8\)\);[^}]*-webkit-text-fill-color:\s*transparent/,
