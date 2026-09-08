@@ -2,7 +2,7 @@
 
 本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由固件官方的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
 
-兼容基线为 OpenWrt/ImmortalWrt 25.12（APK），LuCI ≥ 23.05，仅提供 APK 包。
+兼容基线为 OpenWrt/ImmortalWrt 25.12（APK），LuCI ≥ 23.05，fw4。
 
 ## 唯一 UCI 配置
 
@@ -90,7 +90,7 @@ ACME 的 `issued`/`renewed` 事件会触发安全重载，使续期证书生效�
 - 普通情况下更换已受管的持久工作目录不会搬移旧目录内容：新目录已有 YAML 时直接使用，没有 YAML 时写入默认模板，旧目录保持不动。
 - 更换工作目录时同步更新固件升级保留清单，保留当前 YAML 与插件 UCI 快照；不会因为清单仍指向旧目录而漏掉新 YAML。该清单不包含整个 `data`。
 
-核心更新完全交由系统 APK 软件包管理。插件不包含核心下载或更新功能，也不修改官方 APK 的二进制、服务名、UCI 主配置名和包载荷。旧版核心更新器、UPX 与 GFW 列表相关功能均已移除。
+核心更新完全交由系统 APK 软件包管理。插件不包含核心下载或更新功能，也不修改官方 APK 的二进制、服务名、UCI 主配置名和包载荷。
 
 ## APK 软件源
 
@@ -117,12 +117,6 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 ```
 
 `@terrytyc` 用于选择本项目的同名软件包，避免被官方 LuCI 插件替换。公钥安装后正常校验签名，无需在路由器使用 `--allow-untrusted`。将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，可在保留配置升级固件时同时保留公钥。
-
-发布使用 `scripts/build-apk.sh` 构建主包和翻译包，`scripts/publish-feed.sh` 生成签名索引。发布 3.x GitHub Release 后，工作流将相同 APK 部署到 GitHub Pages；签名私钥保存在 Actions Secret `APK_SIGNING_KEY_B64`，公开公钥位于 `keys/public-key.pem`。
-
-构建脚本默认只读取 `HEAD` 提交，可用 `SOURCE_REF=v3.0.0-r5` 指定标签；未提交的修改和未跟踪文件不会进入构建。源码包、版本号和 APK 使用同一提交，构建结束后恢复 SDK 原有的软件包链接。重跑旧版发布任务会跳过软件源部署，手动运行则发布最新稳定版。
-
-`bash scripts/test.sh` 运行包含 SDK ucode 的完整回归；`bash scripts/test.sh --light` 运行不依赖 SDK 的检查。GitHub Actions 在 push 和 pull request 时运行轻量检查，完整 SDK 回归在发布前本地执行。
 
 ## 3.0.0-r5
 
