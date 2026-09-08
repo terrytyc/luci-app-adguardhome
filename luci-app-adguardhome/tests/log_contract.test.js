@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -184,13 +185,19 @@ const helpers = [
 	'requested_log_lines',
 	'requested_log_source',
 	'newest_first_log',
+	'read_log',
 ].map(name => extractFunction(rpcSource, name)).join('\n')
 	// ucode's `for (value in array)` iterates values; JavaScript spells that
 	// dependency-free host-test operation as `for (value of array)`.
 	.replace('for (let line in split(output, \'\\n\'))',
 		'for (let line of split(output, \'\\n\'))');
 
+const MAX_LOG_LENGTH = 512 * 1024;
+let logInput = '';
+let logStatus = 0;
+let logProcess;
 const sandbox = {
+	MAX_LOG_LENGTH,
 	type(value) {
 		if (Number.isInteger(value))
 			return 'int';
@@ -201,12 +208,34 @@ const sandbox = {
 	push: (array, value) => array.push(value),
 	reverse: array => Array.from(array).reverse(),
 	join: (separator, array) => array.join(separator),
+	substr: (value, start, count) => value.substr(start, count),
+	index: (value, search) => value.indexOf(search),
+	popen(command, mode) {
+		assert.equal(mode, 'r');
+		// Feed fixture bytes to logread; execute the generated pipeline with the
+		// target's BusyBox shell and tail, including its original -n/-c arguments.
+		const script = `logread() { busybox grep -E "$2"; return ${logStatus}; }\n` +
+			command.replace('/sbin/logread', 'logread').replaceAll('/usr/bin/tail', 'busybox tail');
+		const args = [ 'ash', '-c', script ];
+		logProcess = process.platform === 'win32'
+			? spawnSync('wsl.exe', [ '--exec', 'busybox', ...args ], { input: logInput, encoding: 'utf8', windowsHide: true })
+			: spawnSync('busybox', args, { input: logInput, encoding: 'utf8' });
+		assert.ifError(logProcess.error);
+		return {
+			read(limit) {
+				assert.equal(limit, MAX_LOG_LENGTH + 1);
+				return logProcess.stdout.slice(0, limit);
+			},
+			close: () => logProcess.status,
+		};
+	},
 };
 vm.createContext(sandbox);
 vm.runInContext(`${helpers}\nthis.testHelpers = {
 	requested_log_lines,
 	requested_log_source,
 	newest_first_log,
+	read_log,
 };`, sandbox, { filename: rpcPath });
 
 const tested = sandbox.testHelpers;
@@ -233,6 +262,48 @@ assert.deepEqual(
 	JSON.parse(JSON.stringify(tested.newest_first_log('', 'core'))),
 	{ log: '', lines: 0, source: 'core' }
 );
+
+logInput = 'AdGuardHome[1]: oldest\nAdGuardHome: plugin\nAdGuardHome[1]: newest\n';
+for (const source of [ 'core', 'plugin' ]) {
+	const result = tested.read_log(100, source);
+	assert.equal(result.log, source === 'core'
+		? 'AdGuardHome[1]: newest\nAdGuardHome[1]: oldest' : 'AdGuardHome: plugin');
+	assert.equal(result.lines, source === 'core' ? 2 : 1);
+	assert.equal(result.source, source);
+}
+const largeLines = Array.from({ length: 500 }, (_, i) =>
+	`AdGuardHome[1]: ${String(i).padStart(3, '0')}:`.padEnd(1104, 'x'));
+logInput = largeLines.join('\n') + '\n';
+assert.ok(Buffer.byteLength(logInput) > MAX_LOG_LENGTH);
+const largeLog = tested.read_log(500, 'core');
+assert.equal(largeLog.log.split('\n')[0], largeLines[499],
+	'over-limit reads must retain the complete newest record, not the old prefix');
+assert.equal(largeLog.log, largeLines.slice(-474).reverse().join('\n'),
+	'only the oldest incomplete record may be discarded at the byte limit');
+assert.equal(largeLog.lines, 474);
+assert.ok(Buffer.byteLength(largeLog.log) <= MAX_LOG_LENGTH);
+assert.equal(Buffer.byteLength(logProcess.stdout), MAX_LOG_LENGTH + 1,
+	'the pipeline itself must bound output before read() consumes it');
+logInput = 'AdGuardHome[1]:'.padEnd(MAX_LOG_LENGTH - 1, 'x') + '\n';
+assert.equal(tested.read_log(100, 'core').log, logInput.slice(0, -1),
+	'a complete record exactly at the byte limit must remain intact');
+const boundaryLines = Array.from({ length: 257 }, (_, i) =>
+	`AdGuardHome[1]: ${i}:`.padEnd(2047, 'x'));
+logInput = boundaryLines.join('\n') + '\n';
+const boundaryLog = tested.read_log(300, 'core');
+assert.equal(boundaryLog.lines, 256,
+	'a newline sentinel must not discard a complete record that fits the byte limit');
+assert.equal(boundaryLog.log, boundaryLines.slice(1).reverse().join('\n'));
+logInput = largeLines.map(line => line.slice(0, 19)).join('\n') + '\n';
+for (const lines of [ 100, 300, 500 ])
+	assert.equal(tested.read_log(lines, 'core').lines, lines);
+logStatus = 7;
+assert.equal(tested.read_log(100, 'core').error,
+	'The system log reader exited unsuccessfully',
+	'pipefail must expose a failed logread even when both tail commands succeed');
+logStatus = 0;
+logInput = '';
+assert.equal(tested.read_log(100, 'core').log, '');
 
 assert.ok(rpcSource.includes(
 	"/sbin/logread -e '^AdGuardHome[[]' | /usr/bin/tail -n ${requested}"

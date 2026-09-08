@@ -117,7 +117,6 @@
 	font-size: 14px;
 	line-height: 1.5;
 	color: inherit;
-	caret-color: currentColor;
 	resize: vertical;
 }
 
@@ -221,7 +220,7 @@
 	outline: 0;
 	background: transparent;
 	color: transparent;
-	caret-color: inherit;
+	caret-color: var(--primary-color-high, var(--primary, #3b6fd8));
 	-webkit-text-fill-color: transparent;
 	resize: none;
 }
@@ -352,6 +351,7 @@
 	.adguardhome-view .adguardhome-editor {
 		padding-left: .75rem;
 		color: CanvasText;
+		caret-color: CanvasText;
 		-webkit-text-fill-color: CanvasText;
 	}
 }

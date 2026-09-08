@@ -211,11 +211,8 @@ function same_directory_inode(left, right) {
 }
 
 function memory_state_active(persistent_work_dir) {
-	if (!valid_work_dir(persistent_work_dir))
-		return false;
-
 	let runtime = lstat(MEMORY_RUNTIME_DIRECTORY);
-	if (runtime == null)
+	if (runtime == null || !valid_work_dir(persistent_work_dir))
 		return false;
 
 	let active = lstat(MEMORY_WORK_DIRECTORY);
@@ -544,7 +541,7 @@ function read_log(value, requested_source) {
 		let command = source == 'plugin'
 			? `set -o pipefail; /sbin/logread -e '^AdGuardHome:' | /usr/bin/tail -n ${requested}`
 			: `set -o pipefail; /sbin/logread -e '^AdGuardHome[[]' | /usr/bin/tail -n ${requested}`;
-		pipe = popen(command, 'r');
+		pipe = popen(`${command} | /usr/bin/tail -c ${MAX_LOG_LENGTH + 1}`, 'r');
 		if (!pipe)
 			return { error: 'Unable to open the system log reader', source };
 
@@ -571,10 +568,8 @@ function read_log(value, requested_source) {
 		return { error: 'The system log reader returned invalid output', source };
 
 	if (length(output) > MAX_LOG_LENGTH) {
-		output = substr(output, length(output) - MAX_LOG_LENGTH);
 		let newline = index(output, '\n');
-		if (newline >= 0)
-			output = substr(output, newline + 1);
+		output = substr(output, newline >= 0 ? newline + 1 : length(output) - MAX_LOG_LENGTH);
 	}
 
 	return newest_first_log(output, source);

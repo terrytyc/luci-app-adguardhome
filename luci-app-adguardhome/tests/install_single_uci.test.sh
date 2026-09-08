@@ -21,7 +21,7 @@ reject_text() {
 }
 
 require_text "$makefile" 'PKG_VERSION:=3.0.0'
-require_text "$makefile" 'PKG_RELEASE:=2'
+grep -Eq '^PKG_RELEASE:=[1-9][0-9]*$' "$makefile"
 reject_text "$makefile" '/usr/lib/opkg/'
 require_text "$makefile" 'run_bounded 180 5 /etc/init.d/AdGuardHome stop'
 require_text "$makefile" 'managed_dnsmasq_upstream'

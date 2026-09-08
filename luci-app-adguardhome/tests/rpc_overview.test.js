@@ -10,12 +10,7 @@ const packageRoot = path.resolve(__dirname, '..');
 const rpcPath = path.join(packageRoot, 'root/usr/share/rpcd/ucode/luci.adguardhome');
 const source = fs.readFileSync(rpcPath, 'utf8');
 
-function extractFunction(name) {
-	const start = source.indexOf(`function ${name}(`);
-	assert.notEqual(start, -1, `missing ${name}()`);
-	const next = source.indexOf('\nfunction ', start + 1);
-	return source.slice(start, next);
-}
+const extractFunction = require('./lib/source').extractFunction.bind(null, source);
 
 const functions = [
 	'configured_boolean', 'configuration_state', 'service_running', 'service_status',

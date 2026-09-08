@@ -44,7 +44,7 @@ for name in reconcile_core_locked memory_status memory_writeback_locked_command;
 done
 printf '%s\n' "$load_body" | grep -Fq 'local MEMORY_STATE_CHECK="${1:-full}"' || exit 1
 [ "$(printf '%s\n' "$load_body" |
-	grep -Fc 'validate_managed_work_dir "$configured_work_dir"')" = 1 ] || exit 1
+	grep -Fc 'validate_managed_work_dir_namespace "$configured_work_dir"')" = 1 ] || exit 1
 printf '%s\n' "$binds_body" | grep -Fq 'memory_state_load "${MEMORY_STATE_CHECK:-full}"' || exit 1
 [ "$(printf '%s\n' "$copy_body" | grep -Fc 'memory_state_load || exit 1')" = 1 ] || exit 1
 [ "$(printf '%s\n' "$copy_body" | grep -Fc 'uid853_mounted_tree_is_writable "$target"')" = 1 ] || exit 1

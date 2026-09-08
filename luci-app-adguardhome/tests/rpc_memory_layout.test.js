@@ -91,6 +91,7 @@ const fixture = {
 	lstatPaths: [],
 	lsdirPaths: [],
 	openPaths: [],
+	readfilePaths: [],
 };
 
 const directory = (uid, gid, mode, inode, major = 8, minor = 1) => ({
@@ -183,7 +184,10 @@ const sandbox = {
 	length: value => value.length,
 	split: (value, separator) => value.split(separator),
 	substr: (value, start, count) => value.substr(start, count),
-	readfile: () => '/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n',
+	readfile(pathname) {
+		fixture.readfilePaths.push(pathname);
+		return '/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n';
+	},
 	match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(value),
 	lc: value => value.toLowerCase(),
@@ -256,6 +260,8 @@ assert.doesNotMatch(configPathSource, /memory_namespace/,
 
 assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), true,
 	'a valid version=4 data-only RAM generation and both bind aliases should be active');
+assert.deepEqual(fixture.readfilePaths, [ '/proc/mounts' ],
+	'an existing runtime must validate persistent storage');
 assert.equal(api.config_path(), PERSISTENT_CONFIG,
 	'valid RAM mode must keep YAML in the persistent work directory');
 assert.equal(api.service_status().memory_active, true,
@@ -274,10 +280,13 @@ fixture.runtimePresent = false;
 fixture.lstatPaths.length = 0;
 fixture.lsdirPaths.length = 0;
 fixture.openPaths.length = 0;
+fixture.readfilePaths.length = 0;
 assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
 	'an absent RAM namespace cannot be active');
-assert.deepEqual(fixture.lstatPaths, [ '/etc', PERSISTENT_WORK_DIR, MEMORY_RUNTIME_DIR ],
-	'an absent runtime directory must stop before querying RAM work/data or bind aliases');
+assert.deepEqual(fixture.lstatPaths, [ MEMORY_RUNTIME_DIR ],
+	'an absent runtime directory must stop before querying persistent or RAM work directories');
+assert.deepEqual(fixture.readfilePaths, [],
+	'an absent runtime directory must not read /proc/mounts');
 assert.deepEqual(fixture.lsdirPaths, [], 'persistent mode must not enumerate an absent RAM work directory');
 assert.deepEqual(fixture.openPaths, [], 'persistent mode must not try opening an absent RAM state record');
 fixture.requested = '1';
@@ -289,8 +298,11 @@ for (const invalid of [ 'symlinkPath', 'writablePath' ]) {
 	fixture[invalid] = MEMORY_RUNTIME_DIR;
 	fixture.lstatPaths.length = 0;
 	fixture.lsdirPaths.length = 0;
+	fixture.readfilePaths.length = 0;
 	assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
 		`${invalid}: an existing abnormal runtime object must retain validation`);
+	assert.deepEqual(fixture.readfilePaths, [ '/proc/mounts' ],
+		'an existing abnormal runtime must still validate persistent storage');
 	assert.ok(fixture.lstatPaths.includes(MEMORY_WORK_DIR),
 		'an abnormal but existing runtime must not be mistaken for the absent-directory fast path');
 	assert.deepEqual(fixture.lsdirPaths, [ MEMORY_WORK_DIR ]);

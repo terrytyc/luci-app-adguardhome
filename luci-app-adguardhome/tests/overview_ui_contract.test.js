@@ -112,10 +112,12 @@ assert.match(css, /\.adguardhome-yaml-editor::before\s*\{[^}]*width:\s*3rem;[^}]
 	'only the stable line-number gutter needs a neutral background');
 assert.match(css, /\.adguardhome-yaml-line\s*\{[^}]*display:\s*block;[^}]*background:\s*transparent/);
 assert.match(css, /\.adguardhome-yaml-line\.active\s*\{[^}]*background:\s*rgba\(80, 120, 220, \.08\)/);
-assert.match(css, /\.adguardhome-editor\s*\{[^}]*color:\s*transparent;[^}]*caret-color:/,
-	'the native textarea caret must remain visible over the presentation layer');
-assert.match(css, /@media\s*\(forced-colors:\s*active\)[\s\S]*-webkit-text-fill-color:\s*CanvasText/,
-	'forced-colors mode must fall back to readable native textarea text');
+assert.match(css, /\.adguardhome-editor\s*\{[^}]*color:\s*transparent;[^}]*caret-color:\s*var\(--primary-color-high,\s*var\(--primary,\s*#3b6fd8\)\);[^}]*-webkit-text-fill-color:\s*transparent/,
+	'the transparent textarea needs an explicit theme caret color with a visible fallback');
+assert.doesNotMatch(css, /caret-color:\s*(?:inherit|currentColor|transparent)\s*;/i,
+	'the caret must not resolve to the transparent textarea text color');
+assert.match(css, /@media\s*\(forced-colors:\s*active\)[\s\S]*\.adguardhome-editor\s*\{[^}]*color:\s*CanvasText;[^}]*caret-color:\s*CanvasText;[^}]*-webkit-text-fill-color:\s*CanvasText/,
+	'forced-colors mode must restore both native textarea text and caret to the system text color');
 assert.match(yamlSource, /class:\s*'adguardhome-editor'/);
 assert.doesNotMatch(yamlSource, /cbi-input-textarea/,
 	'theme textarea backgrounds must not cover the YAML presentation layer');

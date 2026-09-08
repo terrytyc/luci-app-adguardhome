@@ -116,7 +116,15 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 
 发布使用 `scripts/build-apk.sh` 构建主包和翻译包，`scripts/publish-feed.sh` 生成签名索引。发布 3.x GitHub Release 后，工作流将相同 APK 部署到 GitHub Pages；签名私钥保存在 Actions Secret `APK_SIGNING_KEY_B64`，公开公钥位于 `keys/public-key.pem`。
 
-构建脚本默认只读取 `HEAD` 提交，可用 `SOURCE_REF=v3.0.0-r2` 指定标签；未提交的修改和未跟踪文件不会进入构建。源码包、版本号和 APK 使用同一提交，构建结束后恢复 SDK 原有的软件包链接。重跑旧版发布任务会跳过软件源部署，手动运行则发布最新稳定版。
+构建脚本默认只读取 `HEAD` 提交，可用 `SOURCE_REF=v3.0.0-r3` 指定标签；未提交的修改和未跟踪文件不会进入构建。源码包、版本号和 APK 使用同一提交，构建结束后恢复 SDK 原有的软件包链接。重跑旧版发布任务会跳过软件源部署，手动运行则发布最新稳定版。
+
+## 3.0.0-r3
+
+- 修复 YAML 编辑器处理长空白行时的卡顿，以及特殊换行字符引起的高亮报错。
+- 修复 YAML 编辑区光标透明不可见的问题，光标随主题配色显示。
+- 修复日志超过读取上限时遗漏最新记录的问题，仍限制返回大小。
+- 减少磁盘模式概览轮询中的重复路径检查，监控间隔保持 5 秒。
+- 删除目录校验的转发函数，复用已有测试辅助代码；不增加依赖或后台进程。
 
 ## 3.0.0-r2
 

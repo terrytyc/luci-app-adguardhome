@@ -185,9 +185,9 @@ assert_prepared 0 0
 remove_prepared
 
 # A safe persistent directory does not need a prior UCI or RAM-state anchor.
-validate_managed_work_dir "$persistent_work_dir"
-validate_managed_work_dir "$old_work_dir"
+validate_managed_work_dir_namespace "$persistent_work_dir"
+validate_managed_work_dir_namespace "$old_work_dir"
 mkdir -m 0700 "$test_tmp/transition/AdGuardHome-unowned"
-validate_managed_work_dir "$test_tmp/transition/AdGuardHome-unowned"
+validate_managed_work_dir_namespace "$test_tmp/transition/AdGuardHome-unowned"
 
 printf 'ok - real RAM preparation access, failure cleanup and workdir transition\n'

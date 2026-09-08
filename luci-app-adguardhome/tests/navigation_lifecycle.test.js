@@ -522,6 +522,38 @@ async function testYamlEditing() {
 	view.yamlEditor.attrs.scroll();
 	assert.equal(view.yamlLineNumbers.style.transform, 'translateY(-27px)');
 	assert.equal(view.yamlHighlight.style.transform, 'translate(-13px, -27px)');
+	const whitespace = ' \t'.repeat(65536);
+	const highlightCases = [
+		[ whitespace, whitespace ],
+		[ whitespace + 'value', whitespace + '<span class="adguardhome-yaml-scalar">value</span>' ],
+		[ whitespace + '# note', whitespace + '<span class="adguardhome-yaml-comment"># note</span>' ],
+	];
+	for (const separator of [ '\u2028', '\u2029' ]) {
+		for (const prefix of [ '', 'key: ', '- ' ])
+			highlightCases.push([
+				`${prefix}before${separator}after &<>`,
+				`${prefix}before${separator}after &amp;&lt;&gt;`,
+			]);
+		highlightCases.push([
+			`"before${separator}after"`,
+			`<span class="adguardhome-yaml-scalar">&quot;before${separator}after&quot;</span>`,
+		]);
+	}
+	for (const [ line, highlighted ] of highlightCases) {
+		const content = `${line}\nflag: false\n`;
+		view.yamlEditor.value = content;
+		view.yamlEditor.selectionStart = line.length + 1;
+		view.yamlEditor.attrs.input();
+		view.flushAnimationFrames();
+		assert.equal(view.yamlEditor.value, content, 'highlighting must preserve the editor text');
+		assert.equal(view.yamlLineNumbers.textContent, '1\n2\n3');
+		assert.equal(view.activeYamlLine, 1, 'only newlines change the cursor line');
+		assert.equal(view.yamlHighlight.innerHTML,
+			`<span class="adguardhome-yaml-line">${highlighted}</span>` +
+			'<span class="adguardhome-yaml-line active"><span class="adguardhome-yaml-key">flag</span>: ' +
+			'<span class="adguardhome-yaml-literal">false</span></span>' +
+			'<span class="adguardhome-yaml-line">&#8203;</span>');
+	}
 	view.yamlEditor.value = '# draft\n';
 	view.yamlEditor.selectionStart = 0;
 	view.yamlEditor.attrs.input();
@@ -946,6 +978,8 @@ async function main() {
 	), 'utf8');
 	assert.doesNotMatch(yaml, /inactive:\s*true/,
 		'an inactive YAML load must not render an empty editor');
+	assert.ok(yaml.includes("const mapping = content.includes(':') && content.match("),
+		'lines without a colon must skip mapping backtracking before the large-input checks');
 
 	await testYamlTemplateReset();
 	await testYamlSubmissions();

@@ -91,7 +91,7 @@ function yamlToken(type, value) {
 
 // ponytail: presentation-only common scalars; the backend remains the YAML parser.
 function highlightYamlScalar(value) {
-	const match = String(value).match(/^(\s*)(.*?)(\s*)$/);
+	const match = String(value).match(/^(\s*)([\s\S]*?)(\s*)$/);
 	const scalar = match[2];
 	let type = '';
 
@@ -109,7 +109,7 @@ function highlightYamlLine(line) {
 	const commentOffset = yamlCommentOffset(line);
 	const content = commentOffset < 0 ? line : line.slice(0, commentOffset);
 	const comment = commentOffset < 0 ? '' : line.slice(commentOffset);
-	const mapping = content.match(/^(\s*(?:-\s+)?)([^:#][^:]*?)(\s*:\s*)(.*)$/);
+	const mapping = content.includes(':') && content.match(/^(\s*(?:-\s+)?)([^:#][^:]*?)(\s*:\s*)(.*)$/);
 	const sequence = mapping ? null : content.match(/^(\s*-\s+)(.*)$/);
 	let highlighted;
 

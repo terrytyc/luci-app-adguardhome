@@ -373,10 +373,6 @@ validate_managed_work_dir_namespace() {
 	esac
 }
 
-validate_managed_work_dir() {
-	validate_managed_work_dir_namespace "$1"
-}
-
 check_work_dir() {
 	[ "$#" = 1 ] && validate_managed_work_dir_namespace "$1"
 }
@@ -630,7 +626,7 @@ load_settings() {
 	# config_file is never an independent YAML selector.  Validate the
 	# authoritative workdir first, then repair its derived field before any
 	# normal runtime code can read a YAML pathname.
-	validate_managed_work_dir "$configured_work_dir" || return 1
+	validate_managed_work_dir_namespace "$configured_work_dir" || return 1
 	normalize_managed_config_file "$configured_work_dir" "$official_config" || return 1
 	official_config="${configured_work_dir%/}/AdGuardHome.yaml"
 	# A preparation interrupted before the volatile state was published has no
