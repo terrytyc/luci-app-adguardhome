@@ -6,7 +6,7 @@ DNS、配置、日志，在路由器里一处管理。
 
 [下载安装](#-安装) · [版本记录](https://github.com/terrytyc/luci-app-adguardhome/releases) · [反馈问题](https://github.com/terrytyc/luci-app-adguardhome/issues)
 
-## ✨ 能做什么
+## ✨ 主要功能
 
 - **三种 DNS 模式**：不接管、作为 dnsmasq 上游、重定向 53 端口。监听端口从 YAML 读取，改端口不用再改一遍插件设置。
 - **data 可选内存运行**：主程序和 YAML 留在持久目录，只有 data 进入内存。支持定时、手动回写，回写不重启服务。
