@@ -243,4 +243,35 @@ load_runtime_dns_port
 [ "$(grep -c '^awk$' "$calls")" = 1 ]
 ! grep -q '^hash$' "$calls"
 
+# Reproduce the core's atomic startup rewrite during an actual held-FD read.
+(
+	set +u
+	work_dir="$test_tmp"
+	for name in path_contains_symlink root_private_config_source \
+		trusted_root_file_source capture_root_file_bytes; do
+		eval "$(function_body "$init_file" "$name")"
+	done
+	ROTATE=once
+	run_bounded() {
+		shift 2
+		"$@" || return 1
+		printf 'capture\n' >>"$calls"
+		if [ "$ROTATE" = always ] || [ "$(wc -l <"$calls")" = 1 ]; then
+			cp "$config_file" "${config_file}.new"
+			mv "${config_file}.new" "$config_file"
+		fi
+	}
+	: >"$calls"
+	load_runtime_dns_port
+	[ "$dns_port" = 53335 ]
+	[ "$(grep -c '^capture$' "$calls")" = 2 ]
+	ROTATE=always
+	: >"$calls"
+	if load_runtime_dns_port; then
+		printf 'repeated YAML replacement unexpectedly accepted\n' >&2
+		exit 1
+	fi
+	[ "$(grep -c '^capture$' "$calls")" = 2 ]
+)
+
 printf 'ok - single-pass runtime ports, bounded safe snapshots and unchanged CAS hashes\n'

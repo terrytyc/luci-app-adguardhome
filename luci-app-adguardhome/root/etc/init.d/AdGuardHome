@@ -697,7 +697,10 @@ load_runtime_dns_port() {
 	fi
 	directory="$(mktemp -d /tmp/AdGuardHome-runtime.XXXXXX)" || return 1
 	snapshot="${directory}/AdGuardHome.yaml"
-	if ! snapshot_config_file "$config_file" "$snapshot" "" "" "" skip-hash; then
+	# The core atomically rewrites YAML at startup. Retry a replaced inode once;
+	# both attempts keep the same bounded capture and identity checks.
+	if ! snapshot_config_file "$config_file" "$snapshot" "" "" "" skip-hash &&
+	   ! snapshot_config_file "$config_file" "$snapshot" "" "" "" skip-hash; then
 		rm -rf "$directory"
 		log_error "Unable to take a safe YAML snapshot: ${config_file}"
 		return 1
