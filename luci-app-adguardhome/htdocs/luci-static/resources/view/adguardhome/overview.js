@@ -274,21 +274,8 @@ function validateWorkDir(_sectionId, value) {
 	if (segments.includes('.') || segments.includes('..'))
 		return _('Path must not contain "." or ".." components.');
 
-	const components = segments.filter(Boolean);
-	if (components.length < 2)
-		return _('The working directory must contain at least two path components below the filesystem root (for example, /etc/AdGuardHome).');
-
-	if (value === '/tmp' || value.startsWith('/tmp/') ||
-	    value === '/var' || value.startsWith('/var/'))
-		return _('Working directories under /tmp or /var are volatile on ImmortalWrt and are not allowed.');
-
-	const leaf = components[components.length - 1];
-	const dedicatedLeaf = leaf === 'AdGuardHome' ||
-		(leaf.startsWith('AdGuardHome-') && leaf.length > 'AdGuardHome-'.length);
-	const dedicatedEtc = components[0] === 'etc' && components.length === 2;
-	const dedicatedMount = components[0] === 'mnt' && components.length >= 3;
-	if (!dedicatedLeaf || (!dedicatedEtc && !dedicatedMount))
-		return _('Use /etc/AdGuardHome, an /etc/AdGuardHome-* directory, or a dedicated AdGuardHome[-*] directory below /mnt.');
+	if (/^\/(bin|boot|dev|etc|lib|lib64|mnt|overlay|proc|rom|root|run|sbin|sys|tmp|usr|var)$/.test(value))
+		return _('Choose a dedicated working directory, not a system directory.');
 
 	return true;
 }
@@ -430,7 +417,7 @@ return view.extend({
 		const map = new form.JSONMap(
 			settingsMapData(settings),
 			_('AdGuard Home'),
-			_('The core is provided and updated by the official ImmortalWrt adguardhome package. Default web login: admin / admin.'),
+			_('The core is provided and updated by the official adguardhome package. Default web login: admin / admin.'),
 		);
 		// JSONMap deliberately skips the UCI ACL probe performed by form.Map.
 		// Derive its read-only state from the menu ACL so read-only sessions do

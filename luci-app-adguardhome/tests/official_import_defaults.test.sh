@@ -15,8 +15,9 @@ fi
 select_body="$(function_body "$defaults" select_clean_install_source)"
 initialize_body="$(function_body "$defaults" initialize_clean_options)"
 normalize_body="$(function_body "$defaults" normalize_bool)"
+secure_body="$(function_body "$defaults" secure_target_work_dir)"
 [ -n "$select_body" ] && [ -n "$initialize_body" ] &&
-	[ -n "$normalize_body" ] || {
+	[ -n "$normalize_body" ] && [ -n "$secure_body" ] || {
 	printf 'unable to extract clean-install source functions\n' >&2
 	exit 1
 }
@@ -69,6 +70,13 @@ exercise_source_selection() (
 			expected_source="$fixture_file"
 			expected_template=0
 			;;
+		persistent-tmp)
+			fixture_work=/tmp/disk/custom-dns
+			printf '%s\n' persistent >"$temporary_dir/persistent.yaml"
+			fixture_file="$temporary_dir/persistent.yaml"
+			expected_source="$fixture_file"
+			expected_template=0
+			;;
 		*) return 1 ;;
 	esac
 	uci() {
@@ -80,6 +88,7 @@ exercise_source_selection() (
 		esac
 	}
 	resolve_source_work_dir() {
+		[ "$mode" != persistent-tmp ] || return 1
 		printf '%s\n' "$1"
 	}
 	resolve_source_file() {
@@ -87,27 +96,43 @@ exercise_source_selection() (
 		printf '%s\n' "$1"
 	}
 	valid_managed_work_dir() {
-		case "$1" in /mnt/*/AdGuardHome) return 0 ;; esac
+		case "$1" in
+			/mnt/*/AdGuardHome|/tmp/disk/custom-dns) return 0 ;;
+		esac
 		return 1
 	}
 	trim_trailing_slashes() {
 		printf '%s\n' "$1" | sed 's:/*$::'
 	}
 	select_clean_install_source
-	[ "$TARGET_WORK_DIR" = "$DEFAULT_WORK_DIR" ] || [ "$mode" = managed ]
+	case "$mode" in
+		managed|persistent-tmp) [ "$TARGET_WORK_DIR" = "$fixture_work" ] ;;
+		*) [ "$TARGET_WORK_DIR" = "$DEFAULT_WORK_DIR" ] ;;
+	esac
 	[ "$SOURCE_CONFIG_FILE" = "$expected_source" ]
 	[ "$USING_TEMPLATE" = "$expected_template" ]
-	if [ "$mode" = managed ]; then
-		[ "$TARGET_WORK_DIR" = /mnt/storage/AdGuardHome ]
-	fi
 )
 
-for source_mode in template official missing managed; do
+for source_mode in template official missing managed persistent-tmp; do
 	exercise_source_selection "$source_mode" || {
 		printf 'clean official source selection failed: %s\n' "$source_mode" >&2
 		exit 1
 	}
 done
+
+exercise_nested_target() (
+	eval "$secure_body"
+	TARGET_WORK_DIR="$temporary_dir/new/nested/dns"
+	valid_managed_work_dir() { return 0; }
+	chown() { return 0; }
+	secure_target_work_dir
+	[ -d "$TARGET_WORK_DIR" ]
+)
+
+exercise_nested_target || {
+	printf 'nested managed work directory creation failed\n' >&2
+	exit 1
+}
 
 exercise_defaults() (
 	mode="$1"

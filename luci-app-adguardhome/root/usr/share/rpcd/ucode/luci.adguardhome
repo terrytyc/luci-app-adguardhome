@@ -41,32 +41,33 @@ function valid_work_dir(value) {
 		return null;
 
 	let components = split(substr(value, 1), '/');
-	if (length(components) < 2 || value == '/tmp' || match(value, /^\/tmp\//) ||
-	    value == '/var' || match(value, /^\/var\//))
-		return null;
-	if (!match(value, /^\/etc\/AdGuardHome(-[A-Za-z0-9_.+@%:,=-]+)?$/) &&
-	    !match(value, /^\/mnt\/([A-Za-z0-9_.+@%:,=-]+\/)+AdGuardHome(-[A-Za-z0-9_.+@%:,=-]+)?$/))
+	if (match(value, /^\/(bin|boot|dev|etc|lib|lib64|mnt|overlay|proc|rom|root|run|sbin|sys|tmp|usr|var)$/))
 		return null;
 
 	let current = '';
-	let final_metadata = null;
 	for (let component in components) {
 		if (!length(component) || component == '.' || component == '..')
 			return null;
 
 		current += `/${component}`;
 		let metadata = lstat(current);
-		if (metadata?.type == 'link')
-			return null;
 		// Existing custom mount ancestors must still be real directories.
 		// Ownership and Unix modes are managed outside this RPC service.
-		if (match(value, /^\/mnt\//) && current != value && metadata &&
-		    metadata.type != 'directory')
+		if (metadata && metadata.type != 'directory')
 			return null;
-		if (current == value)
-			final_metadata = metadata;
 	}
-	if (final_metadata && final_metadata.type != 'directory')
+
+	let mounts = split(readfile('/proc/mounts') ?? '', '\n');
+	let filesystem = null, longest = 0;
+	for (let i = 0; i < length(mounts); i++) {
+		let fields = split(mounts[i], /\s+/), mount = fields[1];
+		if (mount && (mount == '/' || value == mount ||
+		    substr(value, 0, length(mount) + 1) == `${mount}/`) && length(mount) >= longest) {
+			longest = length(mount);
+			filesystem = fields[2];
+		}
+	}
+	if (!filesystem || match(filesystem, /^(tmpfs|ramfs|rootfs|devtmpfs|proc|sysfs|cgroup|cgroup2)$/))
 		return null;
 	return value;
 }

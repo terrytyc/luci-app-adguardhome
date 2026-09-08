@@ -51,7 +51,6 @@ MEMORY_WRITEBACK_MAX_MINUTES=10080
 INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
 NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
 NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
-BASELINE_UPGRADE_STATE="${NORMALIZER_RUNTIME_DIR}/upgrade-state"
 YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
 MONITOR_INTERVAL=5
 # First boot can download and compile the packaged default filters before the
@@ -64,11 +63,12 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_cleanup memory_prepare memory_status"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile web_listening check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_cleanup memory_prepare memory_status"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
 \tweb_listening <port>\tVerify an official-core TCP listener
+\tcheck_work_dir <path>\tCheck a persistent work directory
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
 \tsettings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate> <lock-fd>\tApply an authenticated asynchronous settings job
@@ -330,9 +330,8 @@ validate_work_dir() {
 	esac
 	value="${value%/}"
 	case "$value" in
-		/*/*) ;;
-		*)
-			log_error "Work directory must not be a top-level directory: '${value}'"
+		/bin|/boot|/dev|/etc|/lib|/lib64|/mnt|/overlay|/proc|/rom|/root|/run|/sbin|/sys|/tmp|/usr|/var)
+			log_error "A system directory cannot be used as the work directory: '${value}'"
 			return 1
 			;;
 	esac
@@ -351,59 +350,35 @@ validate_work_dir() {
 	[ -n "$value" ] && [ "$value" != / ] && ! path_contains_symlink "$value"
 }
 
-validate_mnt_ancestors() {
-	local value="${1%/}" parent remaining component current=""
-	case "$value" in /mnt/*) ;; *) return 0 ;; esac
-	parent="${value%/*}"
-	remaining="${parent#/}"
-	while [ -n "$remaining" ]; do
-		component="${remaining%%/*}"
-		current="${current}/${component}"
-		if [ -e "$current" ] || [ -L "$current" ]; then
-			if [ ! -d "$current" ] || [ -L "$current" ]; then
-				log_error "Untrusted work-directory ancestor: '$current'"
-				return 1
-			fi
-		fi
-		[ "$remaining" = "$component" ] && break
-		remaining="${remaining#*/}"
-	done
-}
-
 validate_managed_work_dir_namespace() {
-	local value="${1%/}"
+	local value="$1" parent filesystem
 	validate_work_dir "$1" || return 1
-	case "$value" in
-		/etc/AdGuardHome|/etc/AdGuardHome-?*|/mnt/*/AdGuardHome|/mnt/*/AdGuardHome-?*)
-			;;
-		*)
-			log_error "Work directory is outside the dedicated AdGuard Home namespace: '$value'"
-			return 1
-			;;
+	parent="$value"
+	while [ ! -e "$parent" ]; do
+		parent="${parent%/*}"
+		[ -n "$parent" ] || parent=/
+	done
+	[ -d "$parent" ] || return 1
+	parent="$(readlink -f "$parent")" || return 1
+	filesystem="$(awk -v path="$parent" '
+		($2 == "/" || path == $2 || index(path, $2 "/") == 1) && length($2) >= longest {
+			longest = length($2); type = $3
+		}
+		END { print type }
+	' /proc/mounts)" || return 1
+	case "$filesystem" in
+		""|tmpfs|ramfs|rootfs|devtmpfs|proc|sysfs|cgroup|cgroup2)
+			log_error "Work directory must use persistent storage: '$value' ($filesystem)"
+			return 1 ;;
 	esac
-	validate_mnt_ancestors "$value"
 }
 
 validate_managed_work_dir() {
-	local value="${1%/}" official_work
-	validate_managed_work_dir_namespace "$1" || return 1
-	[ "$value" = "$DEFAULT_WORK_DIR" ] && return 0
-	[ -e "$value" ] || [ -L "$value" ] || return 0
-	official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
-	[ -n "$official_work" ] ||
-		official_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.workdir")"
-	# config_file is derived from this authoritative work_dir and is normalized
-	# separately.  It must never be required as a second custom-directory anchor.
-	if [ "${official_work%/}" = "$value" ]; then
-		return 0
-	fi
-	# Only a previous backing needs the RAM-state fallback.  The current UCI
-	# workdir is already anchored above; load_settings validates RAM state once.
-	if memory_state_binds_persistent "$value"; then
-		return 0
-	fi
-	log_error "Refusing an existing custom work directory not anchored by official adguardhome UCI: '$value'"
-	return 1
+	validate_managed_work_dir_namespace "$1"
+}
+
+check_work_dir() {
+	[ "$#" = 1 ] && validate_managed_work_dir_namespace "$1"
 }
 
 normalize_managed_config_file_persistent() {
@@ -4955,7 +4930,7 @@ sync_monitor_instance() (
 	# while holding the integration lock.  An unchanged instance keeps its PID.
 	procd_open_service AdGuardHome "$initscript"
 	[ "$service_enabled" != 1 ] || declare_monitor_instance
-	# The baseline procd_close_service wrapper loses the ubus exit status.
+	# The procd_close_service wrapper loses the ubus exit status.
 	# Send its already-built instance map directly so apply can reject failure.
 	json_set_namespace procd
 	json_close_object
@@ -4969,17 +4944,6 @@ start_service() {
 	# non-zero, so initialize the service_started() gate before every early exit.
 	START_PREPARED=0
 	START_DISABLED=0
-	# APK's generated default postinst starts enabled init scripts before our
-	# package-specific postinst can restore the pre-upgrade running state.  Keep
-	# that automatic start inert while the authenticated upgrade state exists;
-	# the package hook explicitly opts in only when the old core was running.
-	if { [ -e "$BASELINE_UPGRADE_STATE" ] ||
-	     [ -L "$BASELINE_UPGRADE_STATE" ]; } &&
-	   [ "${ADGUARDHOME_BASELINE_RESUME:-0}" != 1 ]; then
-		START_PREPARED=1
-		START_DISABLED=1
-		return 0
-	fi
 	if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	   [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
 		log_error "Configuration migration is incomplete; refusing to start the coordinator"

@@ -16,7 +16,6 @@ for name in declare_monitor_instance sync_monitor_instance start_service \
 done
 
 initscript=/etc/init.d/AdGuardHome
-BASELINE_UPGRADE_STATE="$test_tmp/absent-upgrade-state"
 OFFICIAL_SERVICE=/bin/true
 TEST_ENABLED=0
 TEST_RUNNING=0
@@ -99,7 +98,7 @@ commit_monitor_definition() {
 	printf '%s\n' "$LIVE_DEFINITION" >"$test_tmp/definition"
 	printf '%s %s\n' "$MONITOR_STARTS" "$MONITOR_PID" >"$test_tmp/monitor-state"
 }
-# The baseline helper masks ubus failure during JSON cleanup. Apply must use
+# The platform helper masks ubus failure during JSON cleanup. Apply must use
 # its direct checked submission rather than inherit this return-status loss.
 procd_close_service() { commit_monitor_definition || true; }
 json_set_namespace() { [ "$*" = procd ]; }

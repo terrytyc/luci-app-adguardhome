@@ -183,6 +183,7 @@ const sandbox = {
 	length: value => value.length,
 	split: (value, separator) => value.split(separator),
 	substr: (value, start, count) => value.substr(start, count),
+	readfile: () => '/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n',
 	match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(value),
 	lc: value => value.toLowerCase(),

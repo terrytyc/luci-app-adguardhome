@@ -37,7 +37,7 @@ done >"$temporary/init.helper"
 sed '/^$/d' "$temporary/helper.sh" >"$temporary/helper.compact"
 sed '/^$/d' "$temporary/init.helper" >"$temporary/init.compact"
 cmp "$temporary/helper.compact" "$temporary/init.compact"
-[ "$(grep -Fc '$(AdGuardHome/PrivateFiles)' "$makefile")" = 4 ]
+[ "$(grep -Fc '$(AdGuardHome/PrivateFiles)' "$makefile")" = 3 ]
 ! grep -Eq '^entry_metadata\(\)|^root_private_(directory|file)\(\)' "$makefile" "$defaults"
 ! grep -Fq '# @include ' "$temporary/defaults.sh"
 

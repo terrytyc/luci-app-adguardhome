@@ -21,16 +21,25 @@ const css = fs.readFileSync(path.join(packageRoot,
 
 const credentialFieldSource = extractFunction('credentialField');
 const sandbox = {
+	_: value => value,
 	E(tag, attrs, children) {
 		return { tag, attrs: attrs ?? {}, children };
 	},
 };
 vm.createContext(sandbox);
 vm.runInContext(
-	`${credentialFieldSource}\nthis.credentialField = credentialField;`,
+	`${source.match(/^const SAFE_PATH_RE = .+;$/m)[0]}\n` +
+	`${extractFunction('validateWorkDir')}\n` +
+	`${credentialFieldSource}\nthis.credentialField = credentialField; this.validateWorkDir = validateWorkDir;`,
 	sandbox,
 	{ filename: overviewPath },
 );
+
+for (const directory of [ '/dns', '/opt/mydns', '/srv/nested/dns', '/tmp/disk/dns' ])
+	assert.equal(sandbox.validateWorkDir(null, directory), true,
+		'the browser must leave filesystem validation to the router');
+for (const directory of [ '/', '/etc', '/etc/../dns', 'dns', '/dns/' ])
+	assert.notEqual(sandbox.validateWorkDir(null, directory), true);
 
 const input = { tag: 'input' };
 const field = sandbox.credentialField('New username', input);

@@ -47,6 +47,8 @@ const fixture = {
 	redirect: 'dnsmasq-upstream',
 	runFromMemory: '0',
 	interval: '60',
+	mounts: '/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n' +
+		'tmpfs /opt/ram tmpfs rw 0 0\n/dev/sda1 /tmp/disk ext4 rw 0 0\n',
 };
 
 function cursor() {
@@ -82,6 +84,7 @@ const sandbox = {
 	length: value => value.length,
 	split: (value, separator) => value.split(separator),
 	substr: (value, start, count) => value.substr(start, count),
+	readfile: () => fixture.mounts,
 	lstat(pathname) {
 		if (pathname === '/etc')
 			return { type: 'directory', uid: 0, gid: 0, mode: 0o755 };
@@ -143,6 +146,18 @@ assert.equal(sandbox.api.settings_candidate(
 	false,
 	60
 ), null, 'volatile work_dir values must fail closed');
+for (const workDir of [ '/opt/dns-custom', '/srv/dns', '/dns', '/opt/ramdisk/dns', '/tmp/disk/dns' ]) {
+	assert.ok(sandbox.api.settings_candidate(true, workDir, false, 'none', false, 60),
+		`${workDir}: persistent directories must not require a specific name or prefix`);
+}
+for (const workDir of [ '/', '/etc', '/opt/ram/dns', '/tmp/dns', '/srv/../dns' ]) {
+	assert.equal(sandbox.api.settings_candidate(true, workDir, false, 'none', false, 60), null,
+		`${workDir}: unsafe or memory-backed directories must be rejected`);
+}
+const mountedFilesystems = fixture.mounts;
+fixture.mounts = '';
+assert.equal(sandbox.api.settings_snapshot(), null, 'unknown storage must not be accepted');
+fixture.mounts = mountedFilesystems;
 assert.equal(sandbox.api.settings_candidate(
 	true,
 	fixture.workDir,

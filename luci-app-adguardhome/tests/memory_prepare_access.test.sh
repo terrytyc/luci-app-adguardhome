@@ -184,23 +184,10 @@ assert_prepared 0 0
 [ ! -e "$MEMORY_DATA_DIR/saved" ]
 remove_prepared
 
-# Prefer the committed official anchor. Only an old generation not selected
-# by that UCI path needs the state fallback, which must remain available.
-uci() {
-	[ "$1:$2:$3" = "-q:get:adguardhome.config.work_dir" ] || return 1
-	printf '%s\n' "$persistent_work_dir"
-}
-STATE_FALLBACKS=0
-memory_state_binds_persistent() {
-	STATE_FALLBACKS=$((STATE_FALLBACKS + 1))
-	[ "$1" = "$old_work_dir" ]
-}
+# A safe persistent directory does not need a prior UCI or RAM-state anchor.
 validate_managed_work_dir "$persistent_work_dir"
-[ "$STATE_FALLBACKS" = 0 ]
 validate_managed_work_dir "$old_work_dir"
-[ "$STATE_FALLBACKS" = 1 ]
 mkdir -m 0700 "$test_tmp/transition/AdGuardHome-unowned"
-if validate_managed_work_dir "$test_tmp/transition/AdGuardHome-unowned"; then exit 1; fi
-[ "$STATE_FALLBACKS" = 2 ]
+validate_managed_work_dir "$test_tmp/transition/AdGuardHome-unowned"
 
 printf 'ok - real RAM preparation access, failure cleanup and workdir transition\n'

@@ -5,11 +5,10 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 package_dir="$script_dir/.."
 makefile="$package_dir/Makefile"
 defaults="$package_dir/root/etc/uci-defaults/40_luci-AdGuardHome"
-policy="$package_dir/scripts/upgrade-policy.mk"
 
 require_text() {
 	grep -Fq "$2" "$1" || {
-		printf 'missing baseline installer contract in %s: %s\n' "$1" "$2" >&2
+		printf 'missing installer contract in %s: %s\n' "$1" "$2" >&2
 		exit 1
 	}
 }
@@ -21,13 +20,10 @@ reject_text() {
 	fi
 }
 
-require_text "$makefile" 'PKG_VERSION:=2.6.0'
-require_text "$makefile" 'PKG_RELEASE:=4'
-require_text "$makefile" 'include $(ADGUARDHOME_SOURCE_DIR)scripts/upgrade-policy.mk'
-require_text "$makefile" 'upgrade_source_allowed "$$source_version" || exit 1'
+require_text "$makefile" 'PKG_VERSION:=3.0.0'
+require_text "$makefile" 'PKG_RELEASE:=1'
 reject_text "$makefile" '/usr/lib/opkg/'
-require_text "$makefile" "printf 'source_version=%s\\n'"
-require_text "$makefile" 'upgrade_state_source_allowed "$$upgrade_state" || exit 1'
+require_text "$makefile" 'run_bounded 180 5 /etc/init.d/AdGuardHome stop'
 require_text "$makefile" 'managed_dnsmasq_upstream'
 require_text "$makefile" 'official-adguardhome.config'
 require_text "$makefile" 'managed-adguardhome.config'
@@ -61,29 +57,35 @@ require_text "$defaults" 'set_official_option work_dir "$TARGET_WORK_DIR"'
 require_text "$defaults" 'set_luci_option redirect "$redirect"'
 require_text "$defaults" 'set_luci_option run_from_memory 0'
 require_text "$defaults" 'set_luci_option memory_writeback_interval 60'
-require_text "$defaults" 'upgrade_state_is_valid && baseline_config_is_valid'
-require_text "$defaults" '# @include upgrade-policy'
-require_text "$defaults" 'upgrade_state_source_allowed "$UPGRADE_STATE"'
+require_text "$defaults" 'managed_config_is_valid'
+require_text "$defaults" 'run_bounded 5 1 /etc/init.d/AdGuardHome check_work_dir "$1"'
+require_text "$defaults" 'mkdir -p -m 0700 "$TARGET_WORK_DIR"'
+require_text "$defaults" 'if [ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci ]; then'
 require_text "$defaults" 'refresh_managed_config_snapshot'
 require_text "$defaults" 'normalize_config'
 require_text "$defaults" 'SOURCE_WORK_DIR="$(resolve_source_work_dir "$configured_work")"'
 
-upgrade_block="$(sed -n '/if \[ -e "$UPGRADE_STATE"/,/^fi$/p' "$defaults")"
-printf '%s\n' "$upgrade_block" | grep -Fq 'baseline_config_is_valid'
-printf '%s\n' "$upgrade_block" | grep -Fq 'refresh_managed_config_snapshot'
-if printf '%s\n' "$upgrade_block" | grep -Eq 'uci[[:space:]]+-q[[:space:]]+(set|delete|commit)'; then
-	printf 'the baseline upgrade path mutates UCI instead of preserving it\n' >&2
+managed_block="$(sed -n '/^if \[ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci \]; then$/,/^fi$/p' "$defaults")"
+printf '%s\n' "$managed_block" | grep -Fq 'managed_config_is_valid'
+printf '%s\n' "$managed_block" | grep -Fq 'refresh_managed_config_snapshot'
+if printf '%s\n' "$managed_block" | grep -Eq 'uci[[:space:]]+-q[[:space:]]+(set|delete|commit)'; then
+	printf 'the overwrite path mutates UCI instead of preserving it\n' >&2
 	exit 1
 fi
 
 for removed in \
 	'/etc/config/AdGuardHome' \
 	'/etc/AdGuardHome.yaml' \
-	'2.1.0-r1' \
-	'2.2.0-r1' \
-	'2.2.0-r2' \
-	'2.3.0-r1' \
-	'2.3.0-r2' \
+	'ADGUARDHOME_UPGRADE_SOURCES' \
+	'UpgradePolicy' \
+	'upgrade-policy' \
+	'upgrade_state' \
+	'UPGRADE_STATE' \
+	'BASELINE_UPGRADE_STATE' \
+	'ADGUARDHOME_BASELINE_RESUME' \
+	'source_version' \
+	'baseline_config_is_valid' \
+	'official-adguardhome.uci' \
 	'exchange' \
 	'dnsmasq_snapshot' \
 	'dnsmasq_active_fingerprint' \
@@ -93,17 +95,10 @@ for removed in \
 	'/var/run/AdGredir' \
 	'upgrade-active.yaml' \
 	'upgrade-workdir.meta' \
-	'upgrade-legacy.config' \
-	'maintenance-upgrade' \
-	'cold-upgrade'; do
+	'upgrade-legacy.config'; do
 	reject_text "$makefile" "$removed"
 	reject_text "$defaults" "$removed"
 done
-
-if grep -E '2\.(1|2|3)\.[0-9]' "$makefile" "$defaults"; then
-	printf 'a pre-2.4 package version remains in the installer\n' >&2
-	exit 1
-fi
 
 make_lines="$(wc -l <"$makefile")"
 defaults_lines="$(wc -l <"$defaults")"
@@ -131,4 +126,4 @@ for hook in preinst postinst prerm postrm; do
 	$syntax_shell -n "$temporary_dir/$hook.sh"
 done
 
-printf 'ok - compact baseline install, upgrade and uninstall contract\n'
+printf 'ok - compact install, overwrite and uninstall contract\n'

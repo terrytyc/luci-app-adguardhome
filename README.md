@@ -1,8 +1,8 @@
 # luci-app-adguardhome
 
-`luci-app-adguardhome` 2.6.0-r4，兼容基线为 ImmortalWrt 25.12.1（APK）。
+`luci-app-adguardhome` 3.0.0-r1，仅提供 APK 包，要求 LuCI 23.05 及以上，默认支持 OpenWrt / ImmortalWrt 25.12 起采用 APK 的固件。不检查或限制系统发行版、系统版本号；需要官方 `adguardhome >= 0.107.76-r1` 及软件包声明的运行依赖。LuCI 版本满足要求不等于支持旧版 opkg 固件，本项目不构建 IPK。
 
-本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由 ImmortalWrt 的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
+本项目是去 Lua、去 CBI 的纯 LuCI JavaScript + ucode RPC 实现。AdGuard Home 核心、二进制、官方小写服务和官方 UCI 主配置均由固件官方的 `adguardhome` 软件包提供，本插件只负责 LuCI 管理、DNS 集成、配置协调和可选的内存数据运行。
 
 ## 唯一 UCI 配置
 
@@ -32,7 +32,7 @@ config luci 'luci'
 
 `luci` 段只保存插件自己的 DNS 模式、内存模式和回写周期。插件会保留官方配置中不属于它管理范围的选项。
 
-默认工作目录为 `/etc/AdGuardHome`。自定义工作目录仅允许使用 `/etc/AdGuardHome-*`，或 `/mnt` 挂载盘下以 `AdGuardHome`/`AdGuardHome-*` 命名的专用叶目录，以免官方服务改动系统目录的所有权。
+默认工作目录为 `/etc/AdGuardHome`。自定义目录不限名称和存放位置，按实际挂载文件系统检查，不能位于 tmpfs、ramfs 等内存文件系统。使用绝对路径、避免符号链接，并选择专用目录：官方服务会递归调整工作目录的属主，`/`、`/etc` 等系统目录不能直接作为工作目录。
 
 ## 核心与内存模式
 
@@ -77,14 +77,49 @@ ACME 的 `issued`/`renewed` 事件会触发安全重载，使续期证书生效�
 ## 安装与升级
 
 - 全新安装默认不启用服务（`enabled '0'`），在设置页启用并应用后才启动核心和 DNS 集成。默认工作目录缺少 YAML 时安装默认模板；导入已存在的官方实例时保留其启用状态。使用模板时默认选择 `dnsmasq-upstream`；导入既有官方 YAML 时初始使用 `none`，不改变原 DNS 策略。
-- `2.4.0-r1` 至 `2.4.0-r10`、`2.5.0-r1`、`2.6.0-r1` 至 `2.6.0-r3` 均支持原位升级到 `2.6.0-r4`。升级保留当前 UCI、YAML、HTTPS 配置、运行数据和内存模式设置；升级脚本不迁移或删除 2.4 基线以前的历史配置项。
+- 通过 APK 直接覆盖更新。安装前停止插件和核心，完成后按当前 `enabled` 设置启动；保留现有格式的 UCI、YAML 和 data。不再识别旧插件版本、迁移历史格式或清理旧版本遗留文件。
 - 安装或升级完成、服务状态恢复后，插件通过 `rpcd reload` 加载新模块，不重启共享 `rpcd` 进程。设置与 YAML 任务会清理无关的继承文件描述符，保留必要的任务锁，不依赖旧进程恰好留有空闲描述符。
-- 从 2.3 及更早版本或未知开发版升级不受支持；应先完整卸载旧 LuCI 插件，再安装 2.6.0-r4。官方 `adguardhome` 核心软件包无需卸载。
-- 导入既有官方配置时，如果官方 `work_dir` 位于 `/var/*` 或 `/tmp/*`，插件会把 YAML 和现有 `data` 迁移到持久的 `/etc/AdGuardHome`，并把官方 `config_file` 统一为 `/etc/AdGuardHome/AdGuardHome.yaml`；原易失目录保留，便于人工恢复。
+- 配置格式与当前版本不同的旧安装，需要手动整理配置，或卸载 LuCI 插件后重新安装；官方 `adguardhome` 核心无需卸载。
+- 导入既有官方配置时，持久工作目录保持原位置；若官方使用 `/var/*` 或 `/tmp/*` 下的易失目录，则把 YAML 和现有 `data` 导入 `/etc/AdGuardHome`，原目录保留。实际挂载磁盘的子目录不受路径前缀影响。
 - 普通情况下更换已受管的持久工作目录不会搬移旧目录内容：新目录已有 YAML 时直接使用，没有 YAML 时写入默认模板，旧目录保持不动。
 - 更换工作目录时同步更新固件升级保留清单，保留当前 YAML 与插件 UCI 快照；不会因为清单仍指向旧目录而漏掉新 YAML。该清单不包含整个 `data`。
 
-核心更新完全交由 ImmortalWrt APK 软件包管理。插件不包含核心下载或更新功能，也不修改官方 APK 的二进制、服务名、UCI 主配置名和包载荷。旧版核心更新器、UPX 与 GFW 列表相关功能均已移除。
+核心更新完全交由系统 APK 软件包管理。插件不包含核心下载或更新功能，也不修改官方 APK 的二进制、服务名、UCI 主配置名和包载荷。旧版核心更新器、UPX 与 GFW 列表相关功能均已移除。
+
+## APK 软件源
+
+软件源仅发布本插件及中文翻译，核心和依赖继续从固件官方源安装。主包和翻译包均为 `noarch`，使用同一个源地址。
+
+首次添加公钥和软件源：
+
+```sh
+mkdir -p /etc/apk/keys /etc/apk/repositories.d
+wget -O /etc/apk/keys/terrytyc-adguardhome.pem \
+  https://terrytyc.github.io/luci-app-adguardhome/public-key.pem
+feed='@terrytyc https://terrytyc.github.io/luci-app-adguardhome/packages/packages.adb'
+grep -qxF "$feed" /etc/apk/repositories.d/customfeeds.list 2>/dev/null || \
+  printf '%s\n' "$feed" >> /etc/apk/repositories.d/customfeeds.list
+apk update
+apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
+```
+
+后续更新：
+
+```sh
+apk update
+apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
+```
+
+`@terrytyc` 用于选择本项目的同名软件包，避免被官方 LuCI 插件替换。公钥安装后正常校验签名，无需在路由器使用 `--allow-untrusted`。将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，可在保留配置升级固件时同时保留公钥。
+
+发布使用 `scripts/build-apk.sh` 构建主包和翻译包，`scripts/publish-feed.sh` 生成签名索引。发布 3.x GitHub Release 后，工作流将相同 APK 部署到 GitHub Pages；签名私钥保存在 Actions Secret `APK_SIGNING_KEY_B64`，公开公钥位于 `keys/public-key.pem`。
+
+## 3.0.0-r1
+
+- 仅发布 APK，要求 LuCI 23.05 及以上，默认支持 OpenWrt / ImmortalWrt 25.12 起的 APK 固件，不设置系统版本拦截。
+- 删除旧插件版本白名单和专用升级恢复流程，使用 APK 直接覆盖更新。
+- 自定义工作目录取消命名和位置限制，按实际文件系统检查是否为持久存储。
+- 提供带签名的 APK 软件源，包含主包和中文翻译。
 
 ## 2.6.0-r4
 

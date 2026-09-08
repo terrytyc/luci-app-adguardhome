@@ -1,0 +1,122 @@
+name: Publish signed APK feed
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable v3 release tag; blank selects the latest
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' ||
+          (startsWith(github.event.release.tag_name, 'v3.') &&
+           github.event.release.prerelease == false) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Select current and previous stable v3 releases
+        id: releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -Eeuo pipefail
+          die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+          release_list=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false and (.tag_name | startswith("v3."))) | .tag_name') ||
+            die 'unable to list releases'
+          mapfile -t stable_tags < <(printf '%s' "$release_list")
+
+          current=$REQUESTED_TAG
+          [[ -n $current ]] || current=${stable_tags[0]:-}
+          [[ $current =~ ^v3\.[0-9A-Za-z.+_~-]+$ ]] ||
+            die "not a stable v3 release tag: $current"
+
+          found=false
+          previous=
+          for candidate in "${stable_tags[@]}"; do
+            if [[ $found == true ]]; then
+              [[ $candidate =~ ^v3\.[0-9A-Za-z.+_~-]+$ ]] || continue
+              previous=$candidate
+              break
+            fi
+            [[ $candidate == "$current" ]] && found=true
+          done
+          [[ $found == true ]] || die "stable release does not exist: $current"
+
+          printf 'current=%s\nprevious=%s\n' "$current" "$previous" >>"$GITHUB_OUTPUT"
+
+      - name: Download release APKs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_TAG: ${{ steps.releases.outputs.current }}
+          PREVIOUS_TAG: ${{ steps.releases.outputs.previous }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p release/current release/previous
+          gh release download "$CURRENT_TAG" --dir release/current \
+            --pattern 'luci-app-adguardhome-*.apk' \
+            --pattern 'luci-i18n-adguardhome-zh-cn-*.apk'
+          if [[ -n $PREVIOUS_TAG ]]; then
+            gh release download "$PREVIOUS_TAG" --dir release/previous \
+              --pattern 'luci-app-adguardhome-*.apk' \
+              --pattern 'luci-i18n-adguardhome-zh-cn-*.apk'
+          fi
+
+      - name: Build and verify signed feed
+        shell: bash
+        env:
+          APK_SIGNING_KEY_B64: ${{ secrets.APK_SIGNING_KEY_B64 }}
+        run: |
+          set -Eeuo pipefail
+          mkdir -p site
+          cp keys/public-key.pem site/public-key.pem
+          docker run --rm \
+            -e APK_SIGNING_KEY_B64 \
+            -v "$PWD:/work" \
+            -w /work \
+            alpine:3.23 sh -ec '
+              apk add --no-cache openssl
+              exec sh scripts/publish-feed.sh /sbin/apk \
+                keys/public-key.pem release/current site/packages release/previous
+            '
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

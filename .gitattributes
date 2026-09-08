@@ -6,6 +6,8 @@
 *.mk text eol=lf
 *.awk text eol=lf
 *.yaml text eol=lf
+*.yml text eol=lf
+*.pem text eol=lf
 Makefile text eol=lf
 README.md text eol=lf
 .gitattributes text eol=lf

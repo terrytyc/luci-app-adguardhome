@@ -66,8 +66,8 @@ msgstr "自动换行"
 msgid "Grant permissions for the AdGuard Home LuCI app"
 msgstr "授予 AdGuard Home LuCI 应用权限"
 
-msgid "The core is provided and updated by the official ImmortalWrt adguardhome package. Default web login: admin / admin."
-msgstr "核心由 ImmortalWrt 官方 adguardhome 软件包提供和更新。默认网页登录用户名和密码为 admin / admin。"
+msgid "The core is provided and updated by the official adguardhome package. Default web login: admin / admin."
+msgstr "核心由官方 adguardhome 软件包提供和更新。默认网页登录用户名和密码为 admin / admin。"
 
 msgid "Overview"
 msgstr "概览"
@@ -452,3 +452,6 @@ msgstr "设置更新已结束，但页面无法重新载入结果：%s。再次�
 
 msgid "Applying configuration changes…"
 msgstr "正在应用配置…"
+
+msgid "Choose a dedicated working directory, not a system directory."
+msgstr "请选择独立的工作目录，不要使用系统目录本身。"
