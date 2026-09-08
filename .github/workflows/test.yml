@@ -18,5 +18,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --no-install-recommends -y busybox python3-yaml
 
-      - name: Run tests without an SDK
-        run: bash scripts/test.sh --light
+      - name: Run root-private state tests without an SDK
+        run: |
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo env "PATH=$PATH" bash scripts/test.sh --light
