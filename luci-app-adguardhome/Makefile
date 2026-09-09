@@ -8,8 +8,8 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/original-snapshot.mk
 
 PKG_NAME:=luci-app-adguardhome
-PKG_VERSION:=3.0.0
-PKG_RELEASE:=7
+PKG_VERSION:=3.1.0
+PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -48,6 +48,7 @@ define Build/Prepare/luci-app-adguardhome
 	chmod 0755 $(PKG_BUILD_DIR)/root/etc/init.d/AdGuardHome
 	chmod 0755 $(PKG_BUILD_DIR)/root/etc/uci-defaults/40_luci-AdGuardHome
 	chmod 0755 $(PKG_BUILD_DIR)/root/etc/hotplug.d/acme/95-AdGuardHome
+	chmod 0755 $(PKG_BUILD_DIR)/root/lib/apk/commit_hooks.d/90-luci-app-adguardhome
 	chmod 0700 $(PKG_BUILD_DIR)/root/etc/AdGuardHome
 	chmod 0600 $(PKG_BUILD_DIR)/root/etc/AdGuardHome/AdGuardHome.yaml
 	chmod 0644 $(PKG_BUILD_DIR)/root/usr/share/luci-app-adguardhome/default.yaml

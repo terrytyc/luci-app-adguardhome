@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+
+[ -z "$IPKG_INSTROOT" ] || exit 0
+[ -x /etc/init.d/AdGuardHome ] || exit 0
+case "$1" in pre-commit|post-commit) ;; *) exit 0 ;; esac
+
+if ! /etc/init.d/AdGuardHome apk_commit "$1"; then
+	logger -t AdGuardHome "APK $1 service check failed; inspect the AdGuard Home service"
+	echo "AdGuard Home APK $1 check failed; inspect the service and system log." >&2
+	exit 1
+fi

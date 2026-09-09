@@ -239,6 +239,7 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	#!/bin/sh
 	printf 'service:%s\n' "$1" >>"$TEST_EVENTS"
 	case "$1" in
+		disable) ;;
 		stop) printf 'stopped\n' >"$TEST_SERVICE_STATE" ;;
 		start) printf 'running\n' >"$TEST_SERVICE_STATE" ;;
 		*) exit 1 ;;

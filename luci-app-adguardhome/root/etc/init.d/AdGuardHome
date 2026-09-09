@@ -65,10 +65,12 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile integration_status web_listening check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_writeback_job memory_cleanup memory_prepare memory_status"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile apk_commit network_ready integration_status web_listening check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_writeback_job memory_cleanup memory_prepare memory_status"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
+\tapk_commit <pre-commit|post-commit>\tReconcile an official core package update
+\tnetwork_ready\t\tRetry an enabled, stopped core after an interface comes up
 \tintegration_status <port> <mode>\tRead DNS listener and integration configuration status
 \tweb_listening <port>\tVerify an official-core TCP listener
 \tcheck_work_dir <path>\tCheck a persistent work directory
@@ -4593,10 +4595,8 @@ prepare_wrapper_locked() {
 	fi
 	if [ "$service_enabled" != 1 ]; then
 		clear_recorded_integration_locked || return 1
-		if official_running; then
-			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
-			wait_for_core_stopped || return 1
-		fi
+		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+		wait_for_core_stopped || return 1
 		if [ "$MEMORY_ACTIVE" = 1 ]; then
 			memory_deactivate_locked || return 1
 		else
@@ -4611,6 +4611,9 @@ prepare_wrapper_locked() {
 		# monitor for a deliberately disabled installation.
 		return 2
 	fi
+	# A power loss can leave persisted takeover pointing at a not-yet-started
+	# core. Restore the resolver before waiting for the first interface event.
+	[ "${WRAPPER_BOOT:-0}" != 1 ] || clear_recorded_integration_locked || return 1
 	memory_reconcile_requested_storage_locked || return 1
 	if [ "$MEMORY_ACTIVE" = 1 ]; then
 		# A coordinator restart in the same boot adopts its validated RAM
@@ -4622,7 +4625,6 @@ prepare_wrapper_locked() {
 			sync_yaml_managed_fields_checked || return 1
 		fi
 		load_runtime_dns_port || return 1
-		[ "${WRAPPER_BOOT:-0}" != 1 ] || clear_recorded_integration_locked || return 1
 		sync_official_uci
 		return
 	fi
@@ -4653,12 +4655,6 @@ prepare_wrapper_locked() {
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
 	}
-
-	# At boot restore the pre-integration resolver state first.  The monitor will
-	# apply takeover only after the official delayed start has become stable.
-	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
-		clear_recorded_integration_locked || return 1
-	fi
 
 	# Any fresh workdir initialization and RAM copy-in completed while the core was
 	# stopped.  A pre-existing disk core reaches only this non-writing check.
@@ -4803,11 +4799,11 @@ orchestrate_core_locked() {
 
 	# Clean up before stopping the listener.  If cleanup fails, leave the working
 	# core alone rather than creating a DNS black hole.
+	"$OFFICIAL_SERVICE" disable >/dev/null 2>&1 || return 1
 	clear_recorded_integration_locked || return 1
-	if official_running; then
-		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
-		wait_for_core_stopped || return 1
-	fi
+	# Delete even a stopped official instance and its pending trigger rules.
+	"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+	wait_for_core_stopped || return 1
 	# A coordinated reload/restart reaches this stopped-core boundary.  Directly
 	# overwrite matching persistent data while retaining the same RAM generation.
 	if [ "$MEMORY_ACTIVE" = 1 ] && [ "$service_enabled" = 1 ] &&
@@ -4936,6 +4932,89 @@ reconcile() {
 	run_locked reconcile_core_locked
 }
 
+core_package_fingerprint() {
+	local path
+	# APK replaces package files by rename, including same-version reinstalls.
+	# ls includes inode/size/mtime without requiring the optional stat applet or
+	# reading the whole core binary. Never interpret this snapshot as shell code.
+	# ponytail: APK rename is the boundary; use a hash if in-place updates are supported.
+	for path in "$CORE_BINARY" "$OFFICIAL_SERVICE"; do
+		if [ -e "$path" ] || [ -L "$path" ]; then
+			LC_ALL=C ls -lni "$path" 2>/dev/null || return 1
+		else
+			printf 'missing %s\n' "$path"
+		fi
+	done
+}
+
+apk_reconcile_locked() {
+	local changed="$1" running=0 service_enabled
+	[ ! -e /etc/uci-defaults/40_luci-AdGuardHome ] || return 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	config_load "$PLUGIN_CONFIG" && validate_loaded_merged_sections || return 1
+	config_get_bool service_enabled "$OFFICIAL_SECTION" enabled 0
+	# Autostart may have been re-enabled without changing the core or its PID.
+	# Correct only rc.d links; this must not restart a healthy core.
+	"$OFFICIAL_SERVICE" disable >/dev/null 2>&1 || return 1
+	official_running && running=1
+	[ "$changed" = 1 ] || [ "$service_enabled" != "$running" ] || return 0
+	if [ "$service_enabled" = 1 ]; then
+		orchestrate_core_locked || return 1
+	else
+		stop_wrapper_locked 0 && sync_monitor_instance || return 1
+	fi
+	log_error "Reconciled AdGuard Home service (enabled ${service_enabled})"
+}
+
+apk_commit() {
+	local phase="${1:-}" current previous changed=0 temporary
+	local snapshot="${NORMALIZER_RUNTIME_DIR}/apk-core-before"
+	case "$phase" in pre-commit|post-commit) ;; *) return 1 ;; esac
+	if [ ! -e "$NORMALIZER_RUNTIME_DIR" ] && [ ! -L "$NORMALIZER_RUNTIME_DIR" ]; then
+		(umask 077; mkdir "$NORMALIZER_RUNTIME_DIR") || return 1
+	fi
+	root_private_directory "$NORMALIZER_RUNTIME_DIR" || return 1
+	current="$(core_package_fingerprint)" || return 1
+	if [ -e "$snapshot" ] || [ -L "$snapshot" ]; then
+		bounded_private_file "$snapshot" || return 1
+	fi
+	if [ "$phase" = pre-commit ]; then
+		# No service changes or locks spanning an APK transaction. This volatile
+		# snapshot is replaced on every transaction, including after interruption.
+		temporary="$(mktemp "${NORMALIZER_RUNTIME_DIR}/.apk-core.XXXXXX")" || return 1
+		if ! printf '%s\n' "$current" >"$temporary" ||
+		   ! mv -f "$temporary" "$snapshot"; then
+			rm -f "$temporary"
+			return 1
+		fi
+		return 0
+	fi
+	if [ -f "$snapshot" ]; then
+		previous="$(cat "$snapshot")" || return 1
+		[ "$previous" = "$current" ] || changed=1
+	fi
+	# Also check enabled=0 with no monitor, and first installation where this
+	# hook did not exist at pre-commit. Do not recursively invoke apk here.
+	if ! run_locked apk_reconcile_locked "$changed"; then
+		log_error "Unable to reconcile AdGuard Home after the APK transaction"
+		return 1
+	fi
+	rm -f "$snapshot"
+}
+
+network_ready() {
+	# A queued interface event must not undo a subsequent manual stop, which
+	# removes this coordinator's procd object (even when it has no monitor).
+	ubus -S call service list '{"name":"AdGuardHome"}' 2>/dev/null |
+		jsonfilter -e '@.AdGuardHome' 2>/dev/null | grep -q . || return 0
+	run_locked apk_reconcile_locked 0
+}
+
+service_triggers() {
+	# START only orders scripts; DHCP/IPv6 address setup can finish later.
+	procd_add_raw_trigger 'interface.*.up' 5000 "$initscript" network_ready
+}
+
 # This is the only process supervised by the compatibility wrapper.  It never
 # launches or adopts the core; it merely reconciles DNS takeover with the state
 # reported by the official lowercase procd service.
@@ -5044,6 +5123,9 @@ sync_monitor_instance() (
 	# Send its already-built instance map directly so apply can reject failure.
 	json_set_namespace procd
 	json_close_object
+	json_add_array triggers
+	service_triggers
+	json_close_array
 	definition="$(json_dump)" || exit 1
 	ubus call service set "$definition" >/dev/null
 )
@@ -5061,6 +5143,12 @@ start_service() {
 	fi
 	if ! prepare_yaml_job_runtime; then
 		log_error "Unsafe YAML job runtime; refusing to start the coordinator"
+		return 1
+	fi
+	# Keep the official script untouched; only the coordinator owns boot and
+	# shutdown ordering. Package post-install can still call official start.
+	if ! "$OFFICIAL_SERVICE" disable >/dev/null 2>&1; then
+		log_error "Unable to disable independent AdGuard Home autostart"
 		return 1
 	fi
 	if [ "$START_PREPARED" != 1 ]; then
@@ -5089,11 +5177,10 @@ service_started() {
 		return 1
 	fi
 	[ "$START_DISABLED" != 1 ] || return 0
-	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
-		RELOAD_SERVICES=0 run_locked reconcile_core_locked || rc=$?
-	else
-		run_locked orchestrate_core_locked || rc=$?
-	fi
+	# Boot preparation precedes netifd. procd's native interface-up event starts
+	# the core later, including none+disk installations without a monitor.
+	[ "${WRAPPER_BOOT:-0}" != 1 ] || return 0
+	run_locked orchestrate_core_locked || rc=$?
 	if [ "$rc" = 0 ]; then
 		log_error "AdGuard Home coordinator started"
 	else
@@ -5111,21 +5198,12 @@ stop_wrapper_locked() {
 		[ ! -x "$OFFICIAL_SERVICE" ] || "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || true
 		return 1
 	fi
+	"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
+	wait_for_core_stopped || return 1
 	if [ "$MEMORY_ACTIVE" = 1 ]; then
-		# K89 stops the official service before this K90 shutdown hook.  A
-		# manual stop reaches the same stopped-core write-back boundary explicitly.
-		if official_running; then
-			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
-		fi
-		wait_for_core_stopped || return 1
 		memory_deactivate_locked || return 1
 	fi
-	if [ "$shutdown_mode" != 1 ]; then
-		if official_running; then
-			"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
-			wait_for_core_stopped || return 1
-		fi
-	fi
+	return 0
 }
 
 stop_service() {

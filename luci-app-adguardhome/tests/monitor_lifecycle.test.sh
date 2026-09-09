@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 # Execute the real lifecycle entry points without launching a core or monitor.
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-for name in declare_monitor_instance sync_monitor_instance start_service \
+for name in declare_monitor_instance sync_monitor_instance start_service service_triggers \
 	orchestrate_core_locked reconcile_core_locked monitor_interval_locked; do
 	eval "$(function_body "$init_file" "$name")"
 done
@@ -75,6 +75,7 @@ log_error() { printf '%s\n' "$*" >&2; }
 procd_open_service() {
 	[ "$*" = "AdGuardHome $initscript" ] || return 1
 	TX_DEFINITION=""
+	TX_TRIGGERS=""
 }
 procd_open_instance() {
 	[ "$*" = monitor ] && [ -z "$TX_DEFINITION" ] || return 1
@@ -105,7 +106,13 @@ commit_monitor_definition() {
 procd_close_service() { commit_monitor_definition || true; }
 json_set_namespace() { [ "$*" = procd ]; }
 json_close_object() { return 0; }
-json_dump() { printf '%s\n' "$TX_DEFINITION"; }
+json_add_array() { [ "$*" = triggers ]; }
+json_close_array() { return 0; }
+procd_add_raw_trigger() { TX_TRIGGERS="$*"; }
+json_dump() {
+	[ "$TX_TRIGGERS" = "interface.*.up 5000 $initscript network_ready" ] || return 1
+	printf '%s\n' "$TX_DEFINITION"
+}
 ubus() {
 	[ "$1 $2 $3" = 'call service set' ] || return 1
 	TX_DEFINITION="$4"
@@ -223,6 +230,31 @@ done
 	: >"$events"
 	run_locked stop_wrapper_locked 0
 	[ "$(cat "$events")" = "$(printf 'cleanup\nstop')" ]
+)
+
+# Apply/reload also repairs independent official autostart. Failure must leave
+# the running core untouched rather than continue to cleanup/stop/start.
+(
+	eval "$(function_body "$init_file" reload_service)"
+	OFFICIAL_SERVICE="$test_tmp/official"
+	export MONITOR_TEST_OFFICIAL_LOG="$test_tmp/official-events" MONITOR_TEST_FAILURE=""
+	printf '%s\n' '#!/bin/sh' 'printf "%s\n" "$1" >>"$MONITOR_TEST_OFFICIAL_LOG"' \
+		'[ "$MONITOR_TEST_FAILURE" != "$1" ]' >"$OFFICIAL_SERVICE"
+	chmod 0755 "$OFFICIAL_SERVICE"
+	clear_recorded_integration_locked() { printf 'cleanup\n' >>"$MONITOR_TEST_OFFICIAL_LOG"; }
+	TEST_ENABLED=1 TEST_RUNNING=1 TEST_RAM=0 TEST_MODE=dnsmasq-upstream TEST_COMMIT_FAIL=0
+	for action in orchestrate_core_locked reload_service; do
+		: >"$MONITOR_TEST_OFFICIAL_LOG"
+		MONITOR_TEST_FAILURE=""
+		"$action"
+		[ "$(cat "$MONITOR_TEST_OFFICIAL_LOG")" = "$(printf 'disable\ncleanup\nstop\nstart')" ]
+		: >"$MONITOR_TEST_OFFICIAL_LOG"
+		MONITOR_TEST_FAILURE=disable
+		previous_starts="$CORE_STARTS"
+		if "$action"; then exit 1; fi
+		[ "$(cat "$MONITOR_TEST_OFFICIAL_LOG")" = disable ]
+		[ "$TEST_RUNNING:$CORE_STARTS" = "1:$previous_starts" ]
+	done
 )
 
 printf 'ok - monitor duty selection, core start/stop, identical declarations and failed submission propagation\n'
