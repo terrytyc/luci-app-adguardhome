@@ -62,7 +62,8 @@ function loadOperation() {
 		},
 	};
 	const sandbox = {
-		E: (tag, attrs, child) => ({ tag, attrs, text: String(child), children: Array.isArray(child) ? child : [ child ] }),
+		E: (tag, attrs, child) => ({ tag, attrs, text: String(child), textChildren: Array.isArray(child),
+			children: Array.isArray(child) ? child : [ child ] }),
 		L: { env: { apply_display: 2 } },
 		Number,
 		String,
@@ -125,8 +126,11 @@ assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'notice' ]);
 state.advanceOne();
 assert.equal(state.hidden(), 2, 'custom success status must close automatically');
 
-state.operation.failure('failed');
-assert.equal(state.rendered.at(-1).child.text, 'failed');
+const errorText = 'failed: <img src=x onerror=alert(1)> & text';
+state.operation.failure(errorText);
+assert.equal(state.rendered.at(-1).child.textChildren, true,
+	'LuCI interprets scalar children as HTML; operation messages must use a text-child array');
+assert.equal(state.rendered.at(-1).child.text, errorText);
 assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'error' ]);
 assert.equal(state.timers.size, 0, 'failure status must remain until dismissed');
 const dismissFailure = state.rendered.at(-1).content[1].children[0].attrs.click;

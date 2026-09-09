@@ -32,7 +32,8 @@ function reset() {
 		listening: [ 3000 ], reads: 0, cursors: 0, serviceCalls: 0,
 		jobChecks: 0, locks: 0, closes: 0, probes: [], hashes: 0,
 		badInode: false, badDevice: false, badSize: false, fileCloseSucceeds: true,
-		hashUnavailable: false,
+		hashUnavailable: false, connectionUnavailable: false, serviceFailure: false,
+		emptyService: false,
 	});
 }
 reset();
@@ -50,8 +51,8 @@ const sandbox = {
 	MAX_CONFIG_LENGTH: 512 * 1024,
 	TEMPLATE_DIRECTORY: '/usr/share/luci-app-adguardhome',
 	core_version: () => 'AdGuard Home, version v0.107.76',
-	readfile: pathname => pathname === '/usr/share/luci-app-adguardhome/version' ? '3.0.0-r5\n' : null,
-	type: value => Number.isInteger(value) ? 'int' : typeof value,
+	readfile: pathname => pathname === '/usr/share/luci-app-adguardhome/version' ? '3.0.0-r6\n' : null,
+	type: value => value == null ? 'null' : Number.isInteger(value) ? 'int' : typeof value,
 	lc: value => value.toLowerCase(), match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(Number(value)), length: value => value?.length ?? 0,
 	split: (value, separator) => value.split(separator),
@@ -76,12 +77,18 @@ const sandbox = {
 		};
 	},
 	connect() {
+		if (fixture.connectionUnavailable)
+			return null;
 		return {
 			call(object, method, args) {
 				assert.equal(object, 'service');
 				assert.equal(method, 'list');
 				assert.equal(args.name, 'adguardhome');
 				fixture.serviceCalls++;
+				if (fixture.serviceFailure)
+					throw new Error('service lookup failed');
+				if (fixture.emptyService)
+					return {};
 				return { adguardhome: { instances: { adguardhome: { running: fixture.running } } } };
 			},
 			disconnect() {},
@@ -156,7 +163,7 @@ vm.runInContext(`${functions}\n${methodsSource}\nthis.rpc = methods; this.overvi
 	sandbox, { filename: rpcPath });
 
 let result = sandbox.overview();
-assert.equal(sandbox.rpc.get_version.call().plugin_version, '3.0.0-r5');
+assert.equal(sandbox.rpc.get_version.call().plugin_version, '3.0.0-r6');
 assert.equal(result.status.running, true);
 assert.equal(result.status.memory_requested, false);
 assert.equal(result.status.memory_active, false);
@@ -181,6 +188,29 @@ assert.equal(sandbox.overview().status.dns_integration, 'unknown');
 fixture.redirect = 'none';
 fixture.integration = 0;
 assert.equal(sandbox.overview().status.dns_integration, 'none');
+fixture.running = false;
+result = sandbox.overview();
+assert.equal(result.status.dns_integration, 'none', 'none requires no core listener');
+assert.equal(result.config.web, null, 'a stopped core must not advertise its Web UI');
+fixture.busy = true;
+assert.equal(sandbox.overview().status.dns_integration, 'unknown',
+	'none must still respect the shared transaction lock');
+fixture.busy = false;
+fixture.jobActive = true;
+assert.equal(sandbox.overview().status.dns_integration, 'unknown',
+	'none must not probe during an active transaction');
+for (const unavailable of [ 'connectionUnavailable', 'serviceFailure' ]) {
+	reset();
+	fixture[unavailable] = true;
+	result = sandbox.overview();
+	assert.equal(result.status.running, null, `${unavailable}: unknown is not stopped`);
+	assert.equal(result.config.web, null);
+	assert.deepEqual(fixture.integrationProbes, []);
+}
+reset();
+fixture.emptyService = true;
+assert.equal(sandbox.overview().status.running, false,
+	'a successful lookup with no instance means stopped');
 reset();
 sandbox.overview();
 

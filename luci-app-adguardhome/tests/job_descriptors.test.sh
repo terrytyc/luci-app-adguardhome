@@ -129,7 +129,7 @@ for scenario in bad-lock pending candidate stale hash-failure inactive stopped \
 	log_error() { printf 'log:%s\n' "$*" >>"$events"; }
 	memory_copy_live_data_locked() {
 		printf 'copy\n' >>"$events"
-		if [ "$scenario" = copy-failure ]; then log_error 'copy failed'; return 1; fi
+		[ "$scenario" != copy-failure ] || return 1
 		[ "$scenario" != reporting-failure ] || YAML_JOB_RUNTIME_DIR="$test_tmp/unavailable"
 		return 0
 	}
@@ -160,10 +160,17 @@ for scenario in bad-lock pending candidate stale hash-failure inactive stopped \
 			[ "$rc" = 1 ] && [ "$(cat "$state_file")" = "failure:${expected}:${candidate}" ] || exit 1
 			if [ "$scenario" = copy-failure ]; then
 				[ "$(grep -c '^copy$' "$events")" = 1 ]
-				[ "$(grep '^log:' "$events")" = 'log:copy failed' ]
 			else
 				if grep -q '^copy$' "$events"; then exit 1; fi
 			fi
+			case "$scenario" in
+				copy-failure|hash-failure)
+					[ "$(grep '^log:' "$events")" = 'log:Requested RAM data write-back failed' ]
+					;;
+				*)
+					[ "$(grep '^log:' "$events")" = 'log:Requested RAM data write-back is stale or RAM data is no longer running' ]
+					;;
+			esac
 			;;
 	esac
 	! grep -q '^unexpected-service:' "$events"

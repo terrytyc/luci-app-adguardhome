@@ -1,7 +1,7 @@
 msgid ""
 msgstr ""
-"Project-Id-Version: luci-app-adguardhome 2.6.0\n"
-"PO-Revision-Date: 2026-09-04 00:00+0800\n"
+"Project-Id-Version: luci-app-adguardhome 3.0.0-r6\n"
+"PO-Revision-Date: 2026-09-09 00:00+0800\n"
 "Last-Translator: terrytyc\n"
 "Language-Team: Chinese (Simplified)\n"
 "MIME-Version: 1.0\n"
@@ -12,14 +12,14 @@ msgstr ""
 msgid "AdGuard Home"
 msgstr "AdGuard Home"
 
+msgid "Preparing account change…"
+msgstr "正在准备修改账号…"
+
+msgid "Syntax highlighting is disabled for large files; editing and validation are unchanged."
+msgstr "大文件已关闭语法高亮，编辑和校验功能不变。"
+
 msgid "Persistent data and AdGuardHome.yaml are stored in this directory."
 msgstr "持久化 data 和 AdGuardHome.yaml 保存在此目录。"
-
-msgid "AdGuard Home account"
-msgstr "AdGuard Home 登录账号"
-
-msgid "DNS and memory settings"
-msgstr "DNS 与内存设置"
 
 msgid "Choose how LAN DNS reaches AdGuard Home. The listening port is read from YAML."
 msgstr "选择 LAN DNS 接入 AdGuard Home 的方式，监听端口从 YAML 读取。"
@@ -41,9 +41,6 @@ msgstr "未保存"
 
 msgid "Load Template"
 msgstr "载入模板"
-
-msgid "Saving checks for changes made elsewhere and validates the YAML before applying it."
-msgstr "保存时会检查文件是否已被其他操作修改，并校验 YAML 后再应用。"
 
 msgid "Load Template changes only the editor. The active configuration stays unchanged until Validate, Save & Apply."
 msgstr "载入模板仅替换编辑内容，点击“校验、保存并应用”前不会修改运行配置。"
@@ -105,35 +102,11 @@ msgstr "未知"
 msgid "Unavailable"
 msgstr "不可用"
 
-msgid "Management interface"
-msgstr "管理界面"
-
 msgid "Open Web Interface"
 msgstr "打开 Web 管理界面"
 
-msgid "Enable AdGuard Home and click Save & Apply; the management interface becomes available after the service is running."
-msgstr "请启用 AdGuard Home 并点击“保存并应用”；服务运行后方可打开管理界面。"
-
-msgid "The YAML management endpoint is unavailable or invalid."
-msgstr "YAML 中的管理端点不可用或无效。"
-
-msgid "HTTP keeps the host used to access LuCI and uses the port from YAML http.address. HTTPS uses YAML tls.server_name and tls.port_https."
-msgstr "HTTP 沿用访问 LuCI 时的主机地址并使用 YAML http.address 中的端口；HTTPS 使用 YAML tls.server_name 和 tls.port_https。"
-
 msgid "Settings"
 msgstr "设置"
-
-msgid "DNS and memory integration"
-msgstr "DNS 与内存运行集成"
-
-msgid "General Settings"
-msgstr "常规设置"
-
-msgid "DNS Integration"
-msgstr "DNS 集成"
-
-msgid "Paths"
-msgstr "路径"
 
 msgid "Enable"
 msgstr "启用"
@@ -143,9 +116,6 @@ msgstr "监听端口"
 
 msgid "DNS redirect mode"
 msgstr "DNS 重定向模式"
-
-msgid "Choose how LAN DNS traffic is routed to the DNS port read dynamically from WORKDIR/AdGuardHome.yaml."
-msgstr "选择如何将 LAN 的 DNS 流量转发到从 WORKDIR/AdGuardHome.yaml 动态读取的 DNS 端口。"
 
 msgid "None"
 msgstr "无"
@@ -159,26 +129,17 @@ msgstr "重定向 53 端口"
 msgid "Working directory"
 msgstr "工作目录"
 
-msgid "Runtime data is stored here. The YAML configuration is fixed at WORKDIR/AdGuardHome.yaml."
-msgstr "运行数据存放于此目录；YAML 配置固定为 WORKDIR/AdGuardHome.yaml。"
-
 msgid "Verbose logging"
 msgstr "详细日志"
 
 msgid "Run from memory"
 msgstr "从内存运行"
 
-msgid "At startup, copies only the persistent data directory into RAM and runs the official core there. AdGuardHome.yaml always remains in and is read from the persistent work directory. Manual and periodic write-back copy the live RAM data directly to persistent storage without restarting the core or DNS service and do not guarantee consistency during concurrent changes or an unexpected power loss. A normal stop or restart still performs a complete write-back."
-msgstr "启动时只把持久化 data 目录复制到内存，并让官方核心在内存副本中运行；AdGuardHome.yaml 始终保留在持久化工作目录并从该处读取。手动及周期回写会直接把实时内存 data 复制到持久化存储，不重启核心或 DNS 服务，也不保证并发变更或极端断电情况下的一致性。正常停止或重启时仍会执行完整回写。"
-
 msgid "Memory write-back interval (minutes)"
 msgstr "内存数据回写周期（分钟）"
 
 msgid "The memory write-back interval is invalid."
 msgstr "内存数据回写周期无效。"
-
-msgid "At each interval, the plugin directly copies the live RAM data to the persistent working directory without restarting the core or DNS service. This copy does not guarantee consistency during concurrent changes or an unexpected power loss. Use 60 minutes or longer to reduce flash wear. Set 0 to disable periodic write-back; a normal stop or restart still performs a complete write-back."
-msgstr "每到设定周期，插件会直接把实时内存 data 复制到持久化工作目录，不重启核心或 DNS 服务。该复制不保证并发变更或极端断电情况下的一致性。建议设置为 60 分钟或更长以减少闪存磨损。设为 0 可停用周期回写；正常停止或重启时仍会执行完整回写。"
 
 msgid "Enter 0 to disable periodic write-back, or a whole number from 1 to 10080."
 msgstr "请输入 0 以停用周期回写，或输入 1 到 10080 之间的整数。"
@@ -291,15 +252,6 @@ msgstr "路径包含当前服务脚本不接受的字符。"
 msgid "Path must not contain \".\" or \"..\" components."
 msgstr "路径不能包含“.”或“..”路径段。"
 
-msgid "The working directory must contain at least two path components below the filesystem root (for example, /etc/AdGuardHome)."
-msgstr "工作目录必须在文件系统根目录下至少包含两级路径（例如 /etc/AdGuardHome）。"
-
-msgid "Working directories under /tmp or /var are volatile on ImmortalWrt and are not allowed."
-msgstr "ImmortalWrt 中 /tmp 或 /var 下的目录是易失存储，不能用作工作目录。"
-
-msgid "Use /etc/AdGuardHome, an /etc/AdGuardHome-* directory, or a dedicated AdGuardHome[-*] directory below /mnt."
-msgstr "请使用 /etc/AdGuardHome、/etc/AdGuardHome-*，或 /mnt 下以 AdGuardHome[-*] 命名的专用目录。"
-
 msgid "Runtime Log"
 msgstr "运行日志"
 
@@ -336,9 +288,6 @@ msgstr "无法读取插件运行日志：%s"
 msgid "The log source response was invalid."
 msgstr "日志来源响应无效。"
 
-msgid "Logs refreshed."
-msgstr "日志已刷新。"
-
 msgid "Unknown error"
 msgstr "未知错误"
 
@@ -351,44 +300,20 @@ msgstr "直接编辑当前生效的 AdGuard Home 配置文件。"
 msgid "Saving validates and atomically applies the YAML. A running service is restarted; a disabled service remains stopped."
 msgstr "保存时会校验并原子应用 YAML；服务原本运行时会重启，原本停用时会保持停用。"
 
-msgid "Path"
-msgstr "路径"
-
-msgid "A content hash prevents overwriting changes made after this page was loaded. If a conflict is reported, reload the file and merge your changes before saving. Invalid YAML is rejected without replacing the current file."
-msgstr "内容哈希会防止覆盖页面加载后产生的新改动。若报告冲突，请重新载入文件并合并改动后再保存。无效 YAML 会被拒绝，不会替换当前文件。"
-
 msgid "Validate, Save & Apply"
 msgstr "校验、保存并应用"
 
 msgid "Reload from disk"
 msgstr "从磁盘重新载入"
 
-msgid "Restore Template"
-msgstr "恢复模板"
-
-msgid "Restore YAML Template"
-msgstr "恢复 YAML 模板"
-
-msgid "This replaces only the text currently shown in the editor with the packaged template."
-msgstr "此操作只会用软件包模板替换编辑器中当前显示的文本。"
-
-msgid "The active YAML file, service and data remain unchanged until you choose Validate, Save & Apply. Continue editing after the template is loaded, or reload from disk to discard it."
-msgstr "在点击“校验、保存并应用”前，当前 YAML 文件、服务和数据都不会改变。模板载入后可继续编辑，也可从磁盘重新载入以放弃这些内容。"
-
 msgid "The packaged YAML template is unavailable."
 msgstr "软件包自带的 YAML 模板不可用。"
-
-msgid "Unable to restore the YAML template: %s"
-msgstr "无法恢复 YAML 模板：%s"
 
 msgid "Unable to read the YAML configuration: %s"
 msgstr "无法读取 YAML 配置：%s"
 
 msgid "The YAML configuration is unavailable."
 msgstr "YAML 配置不可用。"
-
-msgid "The YAML configuration was reloaded from disk."
-msgstr "已从磁盘重新载入 YAML 配置。"
 
 msgid "Save YAML Configuration"
 msgstr "保存 YAML 配置"
@@ -408,14 +333,8 @@ msgstr "无法保存 YAML 配置：%s"
 msgid "The YAML configuration was saved and applied, but the editor could not reload it: %s. Refresh this page before editing again."
 msgstr "YAML 配置已保存并应用，但编辑器无法重新载入：%s。请刷新此页面后再继续编辑。"
 
-msgid "If the file changed since it was loaded, reload it and merge your changes. Otherwise, check the YAML syntax and protected settings."
-msgstr "若文件在加载后已发生变化，请重新载入并合并改动；否则请检查 YAML 语法和受保护的设置。"
-
 msgid "The server did not accept the YAML update job."
 msgstr "服务器未接受 YAML 更新任务。"
-
-msgid "The YAML update was accepted and is being applied in the background."
-msgstr "YAML 更新任务已接受，正在后台应用。"
 
 msgid "The YAML update returned an unknown job state."
 msgstr "YAML 更新任务返回了未知状态。"

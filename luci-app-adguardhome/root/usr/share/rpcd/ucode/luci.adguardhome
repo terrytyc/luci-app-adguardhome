@@ -354,7 +354,9 @@ function service_running() {
 		}
 	}
 
-	return service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true;
+	return type(service) == 'object'
+		? service?.[SERVICE_NAME]?.instances?.[INSTANCE_NAME]?.running === true
+		: null;
 }
 
 function service_status(configuration) {
@@ -1873,14 +1875,17 @@ function overview_info() {
 	// YAML is always freshly read; no state is cached between page polls.
 	let lock = open_yaml_job_lock();
 	let result = {
-		status: { running: false, memory_requested: false, memory_active: false },
+		status: { running: null, memory_requested: false, memory_active: false },
 		config: { dns_port: null, web: null },
 	};
 	try {
 		let configuration = configuration_state();
 		result.status = service_status(configuration);
-		let can_probe = !!lock.file && result.status.running && !yaml_job_active();
-		result.config = config_info(read_config(configuration), can_probe);
+		let can_probe = !!lock.file &&
+			(result.status.running === true || configuration.redirect == 'none') &&
+			!yaml_job_active();
+		result.config = config_info(read_config(configuration),
+			can_probe && result.status.running === true);
 		result.status.dns_integration = 'unknown';
 		if (can_probe && result.config.dns_port &&
 		    match(configuration.redirect || '', /^(none|redirect|dnsmasq-upstream)$/)) {

@@ -184,7 +184,7 @@ return baseclass.extend({
 		if (spinning)
 			classes.push('spinning');
 
-		const content = E('p', {}, message);
+		const content = E('p', {}, [ message ]);
 		const generation = this._generation;
 		ui.showModal('', type === 'error' ? [ content,
 			E('div', { class: 'right' }, E('button', {

@@ -110,7 +110,7 @@ assert.match(css, /\.adguardhome-yaml-editor:focus-within\s*\{[^}]*border-color:
 	'the transparent native editor must retain a visible focus indicator');
 assert.match(css, /\.adguardhome-yaml-editor\s*\{[^}]*background-color:\s*var\(--background-color-high, inherit\)/,
 	'the editor must inherit the actual section background in light and dark themes');
-assert.match(css, /\.adguardhome-yaml-editor::before\s*\{[^}]*z-index:\s*1;[^}]*width:\s*3rem;[^}]*background-color:\s*inherit;[^}]*background-image:\s*linear-gradient/,
+assert.match(css, /\.adguardhome-yaml-editor::before\s*\{[^}]*z-index:\s*1;[^}]*width:\s*var\(--adguardhome-yaml-gutter\);[^}]*background-color:\s*inherit;[^}]*background-image:\s*linear-gradient/,
 	'the fixed gutter must paint its neutral tint over the opaque editor background');
 assert.match(css, /\.adguardhome-yaml-line\s*\{[^}]*display:\s*block;[^}]*background:\s*transparent/);
 assert.match(css, /\.adguardhome-yaml-line\.active\s*\{[^}]*background:\s*rgba\(80, 120, 220, \.08\)/);
@@ -118,6 +118,11 @@ assert.match(css, /\.adguardhome-editor\s*\{[^}]*color:\s*transparent;[^}]*caret
 	'the transparent textarea needs an explicit theme caret color with a visible fallback');
 assert.doesNotMatch(css, /caret-color:\s*(?:inherit|currentColor|transparent)\s*;/i,
 	'the caret must not resolve to the transparent textarea text color');
+assert.match(css, /\.adguardhome-yaml-plain \.adguardhome-yaml-highlight\s*\{[^}]*display:\s*none/);
+assert.match(css, /\.adguardhome-yaml-plain \.adguardhome-editor\s*\{[^}]*left:\s*var\(--adguardhome-yaml-gutter\);[^}]*width:\s*calc\(100% - var\(--adguardhome-yaml-gutter\)\);[^}]*color:\s*inherit;[^}]*-webkit-text-fill-color:\s*currentColor/,
+	'native large-file text must stay readable and clip horizontally outside the line-number gutter');
+assert.match(css, /\.adguardhome-yaml-plain \.adguardhome-editor::selection\s*\{[^}]*-webkit-text-fill-color:\s*currentColor/,
+	'native selected text must not inherit the transparent overlay selection style');
 assert.match(css, /@media\s*\(forced-colors:\s*active\)[\s\S]*\.adguardhome-editor\s*\{[^}]*color:\s*CanvasText;[^}]*caret-color:\s*CanvasText;[^}]*-webkit-text-fill-color:\s*CanvasText/,
 	'forced-colors mode must restore both native textarea text and caret to the system text color');
 assert.match(yamlSource, /class:\s*'adguardhome-editor'/);

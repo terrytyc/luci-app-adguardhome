@@ -18,14 +18,14 @@ awk -v helper_dir="$helper_dir" -f "$helper_dir/expand-helpers.awk" \
 	"$defaults" >"$temporary/defaults.sh"
 busybox ash -n "$temporary/defaults.sh"
 for name in official_delta_is_clean validate_original_snapshot \
-	cleanup_snapshot_stage create_original_snapshot; do
+	cleanup_snapshot_stage create_original_snapshot ensure_original_snapshot; do
 	[ "$(grep -Fc "$name() {" "$temporary/helper.sh")" = 1 ]
 	[ "$(grep -Fc "$name() {" "$temporary/defaults.sh")" = 1 ]
 done
 
 [ "$(grep -Fc '$(AdGuardHome/OriginalSnapshot)' "$makefile")" = 1 ]
 grep -Fq 'include $(ADGUARDHOME_SOURCE_DIR)scripts/original-snapshot.mk' "$makefile"
-! grep -Eq '^official_delta_is_clean\(\)|^validate_original_snapshot\(\)|^cleanup_snapshot_stage\(\)|^create_original_snapshot\(\)' \
+! grep -Eq '^official_delta_is_clean\(\)|^validate_original_snapshot\(\)|^cleanup_snapshot_stage\(\)|^create_original_snapshot\(\)|^ensure_original_snapshot\(\)' \
 	"$makefile" "$defaults"
 ! grep -Fq '# @include original-snapshot' "$temporary/defaults.sh"
 
@@ -53,6 +53,14 @@ if [ "$(id -u):$(id -g)" = 0:0 ]; then
 	: >"$SNAPSHOT_STAGE/snapshot-version"
 	cleanup_snapshot_stage
 	[ -z "$SNAPSHOT_STAGE" ] && [ ! -e "$temporary/stage" ]
+
+	events="$temporary/ensure-events"
+	validate_original_snapshot() { printf 'validate\n' >>"$events"; }
+	create_original_snapshot() { printf 'create\n' >>"$events"; }
+	ensure_original_snapshot
+	rm -rf "$SNAPSHOT_DIR"
+	ensure_original_snapshot
+	[ "$(cat "$events")" = "$(printf 'validate\ncreate')" ]
 fi
 
 printf 'ok - single-source original snapshot lifecycle\n'

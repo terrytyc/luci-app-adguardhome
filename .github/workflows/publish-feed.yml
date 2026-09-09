@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  actions: read
   pages: write
   id-token: write
 
@@ -58,6 +59,28 @@ jobs:
 
           printf 'current=%s\nprevious=%s\n' "$current" "$previous" >>"$GITHUB_OUTPUT"
 
+      - name: Require passing tests for release commit
+        if: steps.releases.outputs.current != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_TAG: ${{ steps.releases.outputs.current }}
+        run: |
+          set -Eeuo pipefail
+          commit=$(gh api "repos/$GITHUB_REPOSITORY/commits/$CURRENT_TAG" --jq .sha)
+          [[ $commit =~ ^[0-9a-f]{40}$ ]] || {
+            printf 'Unable to resolve release commit: %s\n' "$CURRENT_TAG" >&2
+            exit 1
+          }
+          conclusion=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?head_sha=$commit&event=push&per_page=1" \
+            --jq '.workflow_runs[0] | if .status == "completed" then .conclusion else .status end')
+          [[ $conclusion == success ]] || {
+            printf 'Release %s has no passing Test run for %s (status: %s).\n' \
+              "$CURRENT_TAG" "$commit" "${conclusion:-missing}" >&2
+            exit 1
+          }
+
       - name: Download release APKs
         if: steps.releases.outputs.current != ''
         shell: bash
@@ -82,18 +105,22 @@ jobs:
         shell: bash
         env:
           APK_SIGNING_KEY_B64: ${{ secrets.APK_SIGNING_KEY_B64 }}
+          CURRENT_TAG: ${{ steps.releases.outputs.current }}
+          PREVIOUS_TAG: ${{ steps.releases.outputs.previous }}
         run: |
           set -Eeuo pipefail
           mkdir -p site
           cp keys/public-key.pem site/public-key.pem
           docker run --rm \
             -e APK_SIGNING_KEY_B64 \
+            -e CURRENT_TAG -e PREVIOUS_TAG \
             -v "$PWD:/work" \
             -w /work \
             alpine:3.23 sh -ec '
               apk add --no-cache openssl
-              exec sh scripts/publish-feed.sh /sbin/apk \
-                keys/public-key.pem release/current site/packages release/previous
+              set -- /sbin/apk keys/public-key.pem "$CURRENT_TAG" release/current site/packages
+              [ -z "$PREVIOUS_TAG" ] || set -- "$@" "$PREVIOUS_TAG" release/previous
+              exec sh scripts/publish-feed.sh "$@"
             '
 
       - name: Configure GitHub Pages

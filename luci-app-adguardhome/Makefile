@@ -9,7 +9,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/original-snapshot.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.0.0
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -73,19 +73,6 @@ $(AdGuardHome/RunBounded)
 
 $(AdGuardHome/PrivateFiles)
 
-if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
-	[ -f /etc/init.d/AdGuardHome ] && [ ! -L /etc/init.d/AdGuardHome ] &&
-		[ -x /etc/init.d/AdGuardHome ] || {
-		echo "The installed AdGuard Home coordinator is unsafe." >&2
-		exit 1
-	}
-	run_bounded 180 5 /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || {
-		echo "Unable to stop the installed AdGuard Home coordinator." >&2
-		exit 1
-	}
-	exit 0
-fi
-
 SNAPSHOT_DIR=/root/.luci-app-adguardhome
 SNAPSHOT_CONFIG="$$SNAPSHOT_DIR/official-adguardhome.config"
 SNAPSHOT_STATE="$$SNAPSHOT_DIR/official-adguardhome.state"
@@ -94,6 +81,22 @@ SNAPSHOT_STAGE=""
 
 $(AdGuardHome/OriginalSnapshot)
 
+if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
+	[ -f /etc/init.d/AdGuardHome ] && [ ! -L /etc/init.d/AdGuardHome ] &&
+		[ -x /etc/init.d/AdGuardHome ] || {
+		echo "The installed AdGuard Home coordinator is unsafe." >&2
+		exit 1
+	}
+	validate_original_snapshot || {
+		echo "Original official adguardhome snapshot is unavailable or unsafe." >&2
+		exit 1
+	}
+	run_bounded 180 5 /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || {
+		echo "Unable to stop the installed AdGuard Home coordinator." >&2
+		exit 1
+	}
+	exit 0
+fi
 rollback_preinst() {
 	local rc=$$?
 	cleanup_snapshot_stage
@@ -102,7 +105,7 @@ rollback_preinst() {
 trap rollback_preinst 0
 trap 'exit 1' HUP INT TERM
 
-create_original_snapshot || {
+ensure_original_snapshot || {
 	echo "Unable to preserve the original official adguardhome state." >&2
 	exit 1
 }
@@ -145,7 +148,6 @@ snapshot_dir=/root/.luci-app-adguardhome
 snapshot_config="$$snapshot_dir/official-adguardhome.config"
 snapshot_state="$$snapshot_dir/official-adguardhome.state"
 snapshot_version="$$snapshot_dir/snapshot-version"
-managed_snapshot="$$snapshot_dir/managed-adguardhome.config"
 runtime_dir=/var/run/luci-app-adguardhome
 remove_state="$$runtime_dir/remove-ok"
 
@@ -153,7 +155,6 @@ root_private_directory "$$snapshot_dir" &&
 	bounded_private_file "$$snapshot_config" &&
 	root_private_file "$$snapshot_state" &&
 	root_private_file "$$snapshot_version" &&
-	bounded_private_file "$$managed_snapshot" &&
 	grep -qx '1' "$$snapshot_version" &&
 	grep -Eq '^was_running=[01]$$' "$$snapshot_state" || {
 	echo "Original official adguardhome snapshot is unavailable or unsafe." >&2
@@ -243,10 +244,15 @@ root_private_directory "$$runtime_dir" && root_private_file "$$remove_state" &&
 root_private_directory "$$snapshot_dir" || exit 1
 for snapshot_file in \
 	official-adguardhome.config official-adguardhome.state \
-	snapshot-version managed-adguardhome.config; do
+	snapshot-version; do
 	root_private_file "$$snapshot_dir/$$snapshot_file" || exit 1
 	rm -f "$$snapshot_dir/$$snapshot_file" || exit 1
 done
+managed_snapshot="$$snapshot_dir/managed-adguardhome.config"
+if [ -e "$$managed_snapshot" ] || [ -L "$$managed_snapshot" ]; then
+	root_private_file "$$managed_snapshot" || exit 1
+	rm -f "$$managed_snapshot" || exit 1
+fi
 rmdir "$$snapshot_dir" 2>/dev/null || true
 rm -f "$$remove_state" || exit 1
 rmdir "$$runtime_dir" 2>/dev/null || true

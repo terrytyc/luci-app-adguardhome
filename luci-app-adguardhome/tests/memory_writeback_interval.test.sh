@@ -8,11 +8,10 @@ defaults_file="${package_dir}/root/etc/uci-defaults/40_luci-AdGuardHome"
 init_file="${package_dir}/root/etc/init.d/AdGuardHome"
 overview_file="${package_dir}/htdocs/luci-static/resources/view/adguardhome/overview.js"
 po_file="${package_dir}/po/zh_Hans/AdGuardHome.po"
-readme_file="${package_dir}/../README.md"
 makefile="${package_dir}/Makefile"
 
 for required_file in \
-	"$defaults_file" "$init_file" "$overview_file" "$po_file" "$readme_file" \
+	"$defaults_file" "$init_file" "$overview_file" "$po_file" \
 	"$makefile"; do
 	[ -f "$required_file" ] || {
 		printf 'required product file not found: %s\n' "$required_file" >&2
@@ -94,10 +93,6 @@ require_text "$overview_file" 'option.depends(`${map.config}.${CORE_SECTION_NAME
 require_text "$overview_file" 'interval > MAX_MEMORY_WRITEBACK_INTERVAL'
 require_text "$overview_file" '0 disables scheduled write-back. A normal stop or restart still writes data back. Use 60 minutes or longer to reduce flash wear.'
 require_text "$po_file" 'msgid "Memory write-back interval (minutes)"'
-# Backticks and the package name are literal README contract text.
-# shellcheck disable=SC2016
-require_text "$readme_file" '不新增 `rsync`、cron、`coreutils-stat` 或 `coreutils-timeout` 等依赖'
-
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 

@@ -7,6 +7,10 @@
 'require ui';
 'require view';
 
+// ponytail: keep large files on the native textarea instead of rebuilding a full syntax DOM.
+const MAX_HIGHLIGHT_LENGTH = 128 * 1024;
+const MAX_HIGHLIGHT_LINES = 5000;
+
 const callGetYaml = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_yaml',
@@ -179,6 +183,9 @@ return view.extend({
 		}, { once: true });
 		this.editorNotice = E('p', { class: 'alert-message error', role: 'status', hidden: true });
 		this.draftStatus = E('span', { class: 'adguardhome-yaml-draft', role: 'status', hidden: true }, _('Unsaved changes'));
+		this.highlightNotice = E('span', { hidden: true }, [
+			_('Syntax highlighting is disabled for large files; editing and validation are unchanged.'), ' ',
+		]);
 		this.yamlLineNumbers = E('pre', {
 			class: 'adguardhome-yaml-lines',
 			'aria-hidden': 'true',
@@ -209,7 +216,7 @@ return view.extend({
 		]);
 		this.yamlLineCount = null;
 		this.refreshYamlEditor();
-		this.pathValue = E('span', {}, result.path || _('Unavailable'));
+		this.pathValue = E('span', {}, [ result.path || _('Unavailable') ]);
 		this.saveButton = E('button', {
 			class: 'cbi-button cbi-button-positive',
 			type: 'button',
@@ -229,8 +236,8 @@ return view.extend({
 		}, _('Reload from disk'));
 
 		if (result.error && operation.isPageActive(pageScope)) {
-			ui.addNotification(null, E('p', {},
-				_('Unable to read the YAML configuration: %s').format(errorMessage(result.error))), 'error');
+			ui.addNotification(null, E('p', {}, [
+				_('Unable to read the YAML configuration: %s').format(errorMessage(result.error)) ]), 'error');
 		}
 		if (result.error || !result.sha256)
 			this.invalidateYamlEditor(result.error
@@ -253,8 +260,8 @@ return view.extend({
 				E('p', { class: 'adguardhome-yaml-path' }, this.pathValue),
 				this.editorNotice,
 				this.yamlEditorFrame,
-				E('p', { class: 'adguardhome-help' },
-					_('Load Template changes only the editor. The active configuration stays unchanged until Validate, Save & Apply.')),
+				E('p', { class: 'adguardhome-help' }, [ this.highlightNotice,
+					_('Load Template changes only the editor. The active configuration stays unchanged until Validate, Save & Apply.') ]),
 				E('div', { class: 'cbi-page-actions adguardhome-actions' }, [
 					E('div', { class: 'adguardhome-actions-secondary' }, [
 						this.reloadButton,
@@ -292,8 +299,8 @@ return view.extend({
 			if (operation.isPageInactiveError(error))
 				return;
 			this.invalidateYamlEditor(_('Unable to read the YAML configuration: %s').format(errorMessage(error)));
-			ui.addNotification(null, E('p', {},
-				_('Unable to read the YAML configuration: %s').format(errorMessage(error))), 'error');
+			ui.addNotification(null, E('p', {}, [
+				_('Unable to read the YAML configuration: %s').format(errorMessage(error)) ]), 'error');
 		} finally {
 			if (operation.isPageActive(scope))
 				this.setBusy(false);
@@ -363,9 +370,14 @@ return view.extend({
 
 		if (lines.length !== this.yamlLineCount) {
 			this.yamlLineNumbers.textContent = Array.from({ length: lines.length }, (_, index) => index + 1).join('\n');
+			this.yamlEditorFrame.style.setProperty('--adguardhome-yaml-gutter',
+				`max(3rem, calc(${String(lines.length).length}ch + 1rem))`);
 			this.yamlLineCount = lines.length;
 		}
-		this.yamlHighlight.innerHTML = highlightYaml(lines, activeLine);
+		this.yamlPlainText = content.length > MAX_HIGHLIGHT_LENGTH || lines.length > MAX_HIGHLIGHT_LINES;
+		this.yamlEditorFrame.classList.toggle('adguardhome-yaml-plain', this.yamlPlainText);
+		this.highlightNotice.hidden = !this.yamlPlainText;
+		this.yamlHighlight.innerHTML = this.yamlPlainText ? '' : highlightYaml(lines, activeLine);
 		this.activeYamlLine = activeLine;
 		this.syncYamlEditorScroll();
 		this.updateDraftStatus();
@@ -383,8 +395,10 @@ return view.extend({
 
 		if (activeLine === this.activeYamlLine)
 			return;
-		this.yamlHighlight.children[this.activeYamlLine]?.classList.remove('active');
-		this.yamlHighlight.children[activeLine]?.classList.add('active');
+		if (!this.yamlPlainText) {
+			this.yamlHighlight.children[this.activeYamlLine]?.classList.remove('active');
+			this.yamlHighlight.children[activeLine]?.classList.add('active');
+		}
 		this.activeYamlLine = activeLine;
 	},
 

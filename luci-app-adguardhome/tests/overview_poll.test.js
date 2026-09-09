@@ -105,7 +105,12 @@ function loadOverview() {
 			node.child = value;
 			updates.push({ node, value });
 		} },
-		ui: { createHandlerFn: () => () => {} },
+		ui: { createHandlerFn: (owner, method) => event => {
+			// LuCI ui.createHandlerFn always re-enables currentTarget after completion.
+			const target = event.currentTarget;
+			target.disabled = true;
+			Promise.resolve(owner[method](event)).finally(() => { target.disabled = false; });
+		} },
 		view: { extend: definition => definition },
 		E(tag, attrs, child) {
 			const node = { tag, attrs, child };
@@ -122,10 +127,11 @@ function loadOverview() {
 		document,
 	};
 	vm.createContext(context);
+	vm.runInContext("String.prototype.format = function(value) { return this.replace('%s', value); };", context);
 	const view = vm.runInContext('(function() {\n' + source + '\n})()', context,
 		{ filename: overviewPath });
 	return {
-		view, calls, updates, errors, urlBuilds, polls, handlers, document, elements,
+		view, operation, calls, updates, errors, urlBuilds, polls, handlers, document, elements,
 		setActive: value => { active = value; },
 		setWritable: value => { writable = value; },
 		setOverview: value => { overviewResult = value; },
@@ -251,6 +257,30 @@ async function testDnsAndWritebackAvailability() {
 	state.calls.length = 0;
 	await state.view.statusPollCallback();
 	assert.deepEqual(state.calls, [], 'write-back pauses the existing status poll without adding a timer');
+}
+
+async function testWritebackClickUncertainty() {
+	const state = loadOverview();
+	state.setOverview({ status: { running: true, memory_active: true } });
+	await state.view.render(await state.view.load());
+	Object.assign(state.operation, { start() {}, failure() {} });
+	state.handlers.memory_writeback = () => { throw new Error('response lost'); };
+	state.handlers.get_overview = () => new Promise(() => {});
+	const button = state.view.memoryWritebackButton;
+	button.attrs.click({ currentTarget: button });
+	await new Promise(setImmediate);
+	assert.equal(state.view.memoryWritebackUncertain, true);
+	assert.equal(button.disabled, true,
+		'the rendered click handler must preserve unknown-outcome disabling, without waiting for the next overview reply');
+	await button.attrs.click({ currentTarget: button });
+	assert.equal(state.calls.filter(method => method === 'memory_writeback').length, 1);
+
+	const versionState = loadOverview();
+	const text = '<img src=x onerror=alert(1)> & text';
+	versionState.handlers.get_version = () => ({ version: text, plugin_version: text });
+	const root = await versionState.view.render(await versionState.view.load());
+	assert.deepEqual(Array.from(root.child[2].child), [ `Plugin version: ${text} · Core version: ${text}` ],
+		'version strings must remain literal text instead of LuCI HTML children');
 }
 
 async function testApplyRefresh() {
@@ -405,7 +435,8 @@ async function main() {
 		[ 'Service status', 'Active storage', 'Listening port', 'DNS integration', '' ]);
 	assert.equal(root.child[2].attrs.class, 'adguardhome-version adguardhome-help',
 		'the core version must follow the rendered form instead of occupying the overview card');
-	assert.equal(root.child[2].child, 'Plugin version: 3.0.0-r5 · Core version: v0.107.76');
+	assert.deepEqual(Array.from(root.child[2].child), [ 'Plugin version: 3.0.0-r5 · Core version: v0.107.76' ],
+		'version output must use LuCI text children, not scalar HTML content');
 	assert.equal(state.urlBuilds.length, 1, 'rendering must reuse the already validated management URL');
 	assert.equal(state.polls.size, 1);
 	const callback = state.view.statusPollCallback;
@@ -574,6 +605,7 @@ async function main() {
 	await testUnavailableStatus();
 	await testManagementURLValidation();
 	await testDnsAndWritebackAvailability();
+	await testWritebackClickUncertainty();
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

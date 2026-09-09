@@ -69,7 +69,12 @@ require_text "$defaults" 'SOURCE_WORK_DIR="$(resolve_source_work_dir "$configure
 
 managed_block="$(sed -n '/^if \[ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci \]; then$/,/^fi$/p' "$defaults")"
 printf '%s\n' "$managed_block" | grep -Fq 'managed_config_is_valid'
+printf '%s\n' "$managed_block" | grep -Fq 'validate_original_snapshot'
 printf '%s\n' "$managed_block" | grep -Fq 'refresh_managed_config_snapshot'
+if printf '%s\n' "$managed_block" | grep -Fq 'ensure_original_snapshot'; then
+	printf 'the overwrite path recreates a missing original snapshot\n' >&2
+	exit 1
+fi
 if printf '%s\n' "$managed_block" | grep -Eq 'uci[[:space:]]+-q[[:space:]]+(set|delete|commit)'; then
 	printf 'the overwrite path mutates UCI instead of preserving it\n' >&2
 	exit 1
@@ -101,6 +106,14 @@ for removed in \
 	reject_text "$makefile" "$removed"
 	reject_text "$defaults" "$removed"
 done
+
+prerm="$(sed -n '/^define Package\/$(PKG_NAME)\/prerm$/,/^endef$/p' "$makefile")"
+postrm="$(sed -n '/^define Package\/$(PKG_NAME)\/postrm$/,/^endef$/p' "$makefile")"
+if printf '%s\n' "$prerm" | grep -Fq 'managed-adguardhome.config'; then
+	printf 'uninstall still requires the optional managed recovery snapshot\n' >&2
+	exit 1
+fi
+printf '%s\n' "$postrm" | grep -Fq 'if [ -e "$$managed_snapshot" ] || [ -L "$$managed_snapshot" ]; then'
 
 make_lines="$(wc -l <"$makefile")"
 defaults_lines="$(wc -l <"$defaults")"

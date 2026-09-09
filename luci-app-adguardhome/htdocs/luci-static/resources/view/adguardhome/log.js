@@ -132,8 +132,8 @@ return view.extend({
 			    !operation.isPageActive(pageScope))
 				continue;
 
-			ui.addNotification(null, E('p', {},
-				sourceErrorMessage(source, result[source].error)), 'error');
+			ui.addNotification(null, E('p', {}, [
+				sourceErrorMessage(source, result[source].error) ]), 'error');
 		}
 
 		const root = E('div', { class: 'adguardhome-view' }, [
@@ -196,11 +196,11 @@ return view.extend({
 			}
 
 			if (failures.length)
-				ui.addNotification(null, E('p', {}, failures.join(' ')), 'error');
+				ui.addNotification(null, E('p', {}, [ failures.join(' ') ]), 'error');
 		} catch (error) {
 			if (operation.isPageInactiveError(error))
 				return;
-			ui.addNotification(null, E('p', {}, errorMessage(error)), 'error');
+			ui.addNotification(null, E('p', {}, [ errorMessage(error) ]), 'error');
 		} finally {
 			if (operation.isPageActive(scope))
 				this.refreshButton.disabled = false;

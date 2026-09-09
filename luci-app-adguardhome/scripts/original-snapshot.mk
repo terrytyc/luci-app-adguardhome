@@ -53,4 +53,12 @@ create_original_snapshot() {
 	SNAPSHOT_STAGE=""
 	validate_original_snapshot
 }
+
+ensure_original_snapshot() {
+	if [ -e "$$SNAPSHOT_DIR" ] || [ -L "$$SNAPSHOT_DIR" ]; then
+		validate_original_snapshot
+	else
+		create_original_snapshot
+	fi
+}
 endef

@@ -131,8 +131,12 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		E: (tag, attrs = {}, children = []) => {
 			const childList = Array.isArray(children) ? children : [ children ];
 			const text = childList.map(child => String(child?.textContent ?? child ?? '')).join('');
+			const classes = new Set();
 			return { tag, attrs, children: childList, textContent: text, value: text,
-				innerHTML: '', style: {}, scrollLeft: 0, scrollTop: 0, selectionStart: 0,
+				classList: { toggle(name, enabled) { enabled ? classes.add(name) : classes.delete(name); },
+					contains: name => classes.has(name) },
+				innerHTML: '', style: { setProperty(name, value) { this[name] = value; } },
+				scrollLeft: 0, scrollTop: 0, selectionStart: 0,
 				hidden: attrs.hidden === true, readOnly: attrs.readonly != null, disabled: attrs.disabled != null };
 		},
 		L: { env: {}, hasViewPermission: () => true, resource: value => value },
@@ -334,6 +338,7 @@ async function testYamlTemplateReset() {
 		Object.assign(view, {
 			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
 			yamlLineNumbers: { style: {} }, yamlHighlight: { children: [], style: {} },
+			yamlEditorFrame: { style: { setProperty() {} }, classList: { toggle() {} } }, highlightNotice: {},
 			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
@@ -398,6 +403,7 @@ async function testYamlSubmissions() {
 		Object.assign(view, {
 			pageScope: scope, yamlHash: oldHash, yamlEditor: { value: draft },
 			yamlLineNumbers: { style: {} }, yamlHighlight: { children: [], style: {} },
+			yamlEditorFrame: { style: { setProperty() {} }, classList: { toggle() {} } }, highlightNotice: {},
 			loadedYaml: '# active YAML\n', editorNotice: {}, draftStatus: {},
 			pathValue: {}, reloadButton: {}, saveButton: {}, resetButton: {},
 		});
@@ -620,7 +626,7 @@ async function testYamlEditing() {
 	view.yamlEditor.attrs.scroll();
 	assert.equal(view.yamlLineNumbers.style.transform, 'translateY(-27px)');
 	assert.equal(view.yamlHighlight.style.transform, 'translate(-13px, -27px)');
-	const whitespace = ' \t'.repeat(65536);
+	const whitespace = ' \t'.repeat(32768);
 	const highlightCases = [
 		[ whitespace, whitespace ],
 		[ whitespace + 'value', whitespace + '<span class="adguardhome-yaml-scalar">value</span>' ],
@@ -658,6 +664,41 @@ async function testYamlEditing() {
 	view.flushAnimationFrames();
 	assert.equal(lineNumberWrites, 1, 'changing the line count must rebuild line numbers once');
 	assert.equal(view.draftStatus.hidden, false);
+	for (const content of [ '# ' + 'x'.repeat(128 * 1024),
+		Array.from({ length: 18001 }, (_, i) => `  - ||ads${i}.example^`).join('\n') ]) {
+		view.yamlEditor.value = content;
+		view.yamlEditor.selectionStart = content.length;
+		view.yamlEditor.scrollTop = 210;
+		view.yamlEditor.scrollLeft = 27;
+		view.yamlEditor.attrs.input();
+		view.flushAnimationFrames();
+		assert.equal(view.yamlPlainText, true, 'large content and large line counts must both use native text');
+		assert.equal(view.yamlEditorFrame.classList.contains('adguardhome-yaml-plain'), true);
+		assert.equal(view.highlightNotice.hidden, false);
+		assert.equal(view.yamlHighlight.innerHTML, '', 'large files must not construct the syntax DOM');
+		assert.equal(view.yamlEditor.value, content);
+		assert.equal(view.yamlEditor.selectionStart, content.length, 'changing presentation must preserve the cursor');
+		assert.equal(view.yamlEditor.scrollLeft, 27);
+		assert.equal(view.yamlEditor.scrollTop, 210);
+		assert.equal(view.yamlLineNumbers.style.transform, 'translateY(-210px)');
+		assert.equal(view.yamlEditor.readOnly, false);
+		assert.equal(view.saveButton.disabled, false, 'plain presentation must retain save and validation');
+		assert.equal(view.hasDraft(), true);
+		assert.equal(view.beforeUnloadListenerCount(), 1);
+		const lineCount = content.split('\n').length;
+		assert.equal(view.yamlLineNumbers.textContent.split('\n').at(-1), String(lineCount));
+		assert.equal(view.yamlEditorFrame.style['--adguardhome-yaml-gutter'],
+			`max(3rem, calc(${String(lineCount).length}ch + 1rem))`, 'all line number digits must fit the gutter');
+		view.yamlEditor.selectionStart = 0;
+		view.updateActiveYamlLine();
+		assert.equal(view.activeYamlLine, 0, 'plain mode must not access nonexistent highlight children');
+	}
+	view.yamlEditor.value = '# draft\n';
+	view.refreshYamlEditor();
+	assert.equal(view.yamlPlainText, false, 'shrinking a draft restores syntax highlighting');
+	assert.equal(view.yamlEditorFrame.classList.contains('adguardhome-yaml-plain'), false);
+	assert.equal(view.highlightNotice.hidden, true);
+	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-comment/);
 	await view.handleReload();
 	assert.equal(modals.at(-1).title, 'Discard unsaved changes?');
 	assert.equal(calls.length, 2, 'showing confirmation must not read or overwrite a draft');

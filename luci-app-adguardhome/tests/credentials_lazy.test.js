@@ -23,6 +23,7 @@ function loadOverview() {
 	const modals = [];
 	const failures = [];
 	const timers = [];
+	const preparations = [];
 	const credentialReply = deferred();
 	const moduleReply = deferred();
 	let active = true;
@@ -44,7 +45,11 @@ function loadOverview() {
 				throw error;
 			}
 		},
-		start() { events.push('operation-start'); return scope; },
+		start(message) {
+			events.push('operation-start');
+			if (message) preparations.push(String(message));
+			return scope;
+		},
 		success(_message, ticket) { assert.equal(ticket, scope); events.push('operation-success'); },
 		failure(message) { failures.push(String(message)); },
 		async waitForJob(statusFn, token, currentScope) {
@@ -107,6 +112,7 @@ function loadOverview() {
 			return translated;
 		},
 		L: {
+			hasViewPermission: () => true,
 			require(name) {
 				assert.equal(name, 'adguardhome.bcrypt');
 				events.push('require-bcrypt');
@@ -120,7 +126,7 @@ function loadOverview() {
 		{ filename: overviewPath });
 	view.pageScope = scope;
 	return {
-		view, bcrypt, credentialReply, moduleReply, handlers, events, nodes, modals, failures, timers,
+		view, bcrypt, credentialReply, moduleReply, handlers, events, nodes, modals, failures, timers, preparations,
 		setActive(value) { active = value; },
 		inputs() { return nodes.filter(node => node.tag === 'input'); },
 		submit() { return nodes.find(node => node.tag === 'button' && node.events.click).events.click(); },
@@ -131,8 +137,22 @@ async function readyDialog() {
 	const state = loadOverview();
 	assert.deepEqual(state.events, [], 'overview module initialization must not load bcrypt');
 	const pending = state.view.openCredentialsDialog();
-	assert.deepEqual(state.events, [ 'get_credentials', 'require-bcrypt' ],
-		'credentials and the optional class must load in parallel only when opening the dialog');
+	assert.deepEqual(state.events, [ 'operation-start', 'get_credentials', 'require-bcrypt' ],
+		'the waiting modal must open before credentials and the optional class load in parallel');
+	assert.deepEqual(state.preparations, [ 'Preparing account change…' ]);
+	assert.equal(state.view.credentialsPreparing, true);
+	Object.assign(state.view, {
+		memoryWritebackAvailable: true, memoryWritebackButton: {},
+		committedSettings: { revision: 'a'.repeat(64) },
+		submitSettings() { assert.fail('Apply must not replace the pending credential preparation'); },
+	});
+	state.view.updateMemoryWritebackButton();
+	assert.equal(state.view.memoryWritebackButton.disabled, true);
+	await state.view.openCredentialsDialog();
+	await state.view.handleSaveApply();
+	await state.view.handleMemoryWriteback();
+	assert.deepEqual(state.events, [ 'operation-start', 'get_credentials', 'require-bcrypt' ],
+		'duplicate clicks, Apply and write-back must not overlap delayed credential preparation');
 	state.credentialReply.resolve(info);
 	await Promise.resolve();
 	assert.equal(state.modals.length, 0, 'the dialog must wait for its hashing dependency');
@@ -142,10 +162,18 @@ async function readyDialog() {
 	assert.equal(state.modals[0].title, 'Change AdGuard Home Account');
 	assert.equal(state.inputs().length, 3);
 	assert.equal(state.failures.length, 0);
+	assert.equal(state.view.credentialsPreparing, false);
+	assert.equal(state.view.memoryWritebackButton.disabled, false);
 	return state;
 }
 
 async function main() {
+	for (const busy of [ 'credentialsPreparing', 'settingsSubmission', 'memoryWritebackBusy', 'memoryWritebackUncertain' ]) {
+		const state = loadOverview();
+		state.view[busy] = true;
+		await state.view.openCredentialsDialog();
+		assert.deepEqual(state.events, [], `${busy}: credential preparation must not replace another operation`);
+	}
 	const success = await readyDialog();
 	const [ username, password, confirmation ] = success.inputs();
 	username.value = 'operator';
@@ -224,6 +252,7 @@ async function main() {
 		await pending;
 		assert.equal(state.modals.length, 0);
 		assert.equal(state.failures.length, 1);
+		assert.equal(state.view.credentialsPreparing, false, 'failed preparation must release its action guard');
 		assert.match(state.failures[0], /Unable to prepare.*load failed/);
 		state.moduleReply.resolve(state.bcrypt);
 		state.credentialReply.resolve(info);

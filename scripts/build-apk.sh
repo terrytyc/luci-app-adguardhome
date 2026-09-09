@@ -7,6 +7,7 @@ umask 022
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO=$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel)
+APK_VERIFIER=$SCRIPT_DIR/verify-apk.sh
 PACKAGE_REL=luci-app-adguardhome
 SDK=${SDK:-/root/sdk-x86-64}
 OUTPUT_DIR=${OUTPUT_DIR:-$REPO/dist}
@@ -23,6 +24,7 @@ for command_name in awk cp git gzip make mktemp nproc readlink sha256sum tar; do
 done
 
 [[ -d $SDK && -f $SDK/.config ]] || die "initialized SDK is missing: $SDK"
+[[ -f $APK_VERIFIER ]] || die "APK verifier is missing: $APK_VERIFIER"
 SDK=$(cd -- "$SDK" && pwd -P)
 grep -Fqx 'CONFIG_TARGET_ARCH_PACKAGES="x86_64"' "$SDK/.config" ||
 	die 'SDK is not configured for x86_64 packages'
@@ -97,13 +99,7 @@ i18n_apk=$package_output/$i18n_name
 
 apk_host=$SDK/staging_dir/host/bin/apk
 [[ -x $apk_host ]] || die "SDK APK verifier is missing: $apk_host"
-for artifact in "$main_apk" "$i18n_apk"; do
-	"$apk_host" verify --allow-untrusted "$artifact"
-	metadata=$("$apk_host" adbdump "$artifact")
-	grep -Fqx "  version: $package_version" <<<"$metadata" ||
-		die "APK version mismatch: $artifact"
-	grep -Fqx '  arch: noarch' <<<"$metadata" || die "APK is not noarch: $artifact"
-done
+sh "$APK_VERIFIER" "$apk_host" "$package_version" "$main_apk" "$i18n_apk"
 
 mkdir -p "$OUTPUT_DIR"
 cp -p "$source_tar" "$OUTPUT_DIR/$source_name"

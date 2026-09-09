@@ -4322,15 +4322,16 @@ tls_refresh_locked() {
 	[ "$service_enabled" = 1 ] || return 0
 	official_running && was_running=1
 
+	# Recovery also syncs TLS access; restore the retry fingerprint afterwards.
 	if ! clear_recorded_integration_locked; then
-		restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 || true
 		resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
+		restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 || true
 		return 1
 	fi
 	if official_running; then
 		if ! "$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || ! wait_for_core_stopped; then
-			restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 || true
 			resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
+			restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 || true
 			return 1
 		fi
 	fi
@@ -4339,9 +4340,9 @@ tls_refresh_locked() {
 	   ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" ||
 	   ! apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; then
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
+		resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
 		restore_tls_fingerprint "$old_fingerprint" >/dev/null 2>&1 ||
 			log_error "Unable to restore the previous ACME retry fingerprint"
-		resume_yaml_runtime "$was_running" >/dev/null 2>&1 || true
 		log_error "Unable to restart AdGuard Home after ACME renewal"
 		return 1
 	fi
@@ -4530,8 +4531,11 @@ memory_writeback_job_locked() {
 		write_yaml_job_state "$token" \
 			"success:${candidate_hash}:0:${expected_revision}:${candidate_hash}"
 	else
-		[ "$writeback_rc" != 2 ] ||
+		if [ "$writeback_rc" = 2 ]; then
 			log_error "Requested RAM data write-back is stale or RAM data is no longer running"
+		else
+			log_error "Requested RAM data write-back failed"
+		fi
 		write_yaml_job_state "$token" \
 			"failure:${expected_revision}:${candidate_hash}" >/dev/null 2>&1 || true
 		return 1
@@ -5111,15 +5115,11 @@ stop_service() {
 		log_error "AdGuard Home coordinator stopped"
 	else
 		log_error "AdGuard Home coordinator stop failed"
+		# rc.common ignores this hook's return value and would delete the monitor.
+		# Abort its action so a failed stop also blocks package replacement.
+		exit "$rc"
 	fi
 	return "$rc"
-}
-
-service_triggers() {
-	# The official lowercase service already owns this merged UCI package.
-	# LuCI settings use the coordinator's locked RPC transaction, so registering
-	# a second reload trigger here would restart both services for one change.
-	return 0
 }
 
 reload_service() {

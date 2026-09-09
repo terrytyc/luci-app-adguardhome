@@ -55,17 +55,33 @@ START_DISABLED=1
 service_started
 [ ! -s "$log_file" ]
 
-: >"$log_file"
-STOP_RC=0
-stop_service
-expect_log 'AdGuard Home coordinator stopped'
-
-: >"$log_file"
-STOP_RC=6
-rc=0
-stop_service || rc=$?
-[ "$rc" = 6 ]
-expect_log 'AdGuard Home coordinator stop failed'
+# Target rc.common's stop action deliberately continues after the hook. Test
+# this complete dispatch, not merely the return value of stop_service().
+stop() {
+	procd_lock
+	stop_service "$@"
+	procd_kill "$(basename ${basescript:-$initscript})" "$1"
+	if eval "type service_stopped" 2>/dev/null >/dev/null; then
+		service_stopped
+	fi
+}
+initscript=/etc/init.d/AdGuardHome
+procd_lock() { :; }
+procd_kill() { printf '%s\n' "$1" >>"$test_tmp/monitor-deletions"; }
+for STOP_RC in 0 6; do
+	: >"$log_file"
+	: >"$test_tmp/monitor-deletions"
+	rc=0
+	( stop '' ) || rc=$?
+	[ "$rc" = "$STOP_RC" ]
+	if [ "$STOP_RC" = 0 ]; then
+		expect_log 'AdGuard Home coordinator stopped'
+		[ "$(cat "$test_tmp/monitor-deletions")" = AdGuardHome ]
+	else
+		expect_log 'AdGuard Home coordinator stop failed'
+		[ ! -s "$test_tmp/monitor-deletions" ]
+	fi
+done
 
 sleep() { :; }
 official_running() { return 0; }
@@ -202,5 +218,50 @@ UCI_FINGERPRINT=same SYNC_FINGERPRINT=same tls_refresh_locked
 [ ! -s "$official_log" ]
 UCI_FINGERPRINT=old SYNC_FINGERPRINT=new tls_refresh_locked
 [ "$(cat "$official_log")" = start ]
+
+# Keep the actual recovery chain: resume_yaml_runtime syncs TLS access, which
+# republishes the new fingerprint even when it cannot restart the old core.
+# Every failure branch must restore the retry marker after that attempt.
+(
+	eval "$(function_body "$init_file" resume_yaml_runtime)"
+	eval "$(function_body "$init_file" restore_tls_fingerprint)"
+	uci() {
+		[ "$1" = -q ] && shift
+		case "$1" in
+			get) printf '%s\n' "$UCI_FINGERPRINT" ;;
+			set) UCI_FINGERPRINT="${2#*=}" ;;
+			delete) UCI_FINGERPRINT='' ;;
+			commit) return 0 ;;
+			*) return 1 ;;
+		esac
+	}
+	sync_official_uci() { sync_tls_access; }
+	official_running() { [ "$CORE_RUNNING" = 1 ]; }
+	clear_recorded_integration_locked() { [ "$TLS_FAILURE" != cleanup ]; }
+	wait_for_core_stopped() { [ "$CORE_RUNNING" = 0 ]; }
+	OFFICIAL_SERVICE=acme_test_service
+	acme_test_service() {
+		printf '%s\n' "$1" >>"$official_log"
+		[ "$1" != "$TLS_FAILURE" ] || return 1
+		case "$1" in stop) CORE_RUNNING=0 ;; start) CORE_RUNNING=1 ;; esac
+	}
+	for TLS_FAILURE in cleanup stop start; do
+		CORE_RUNNING=1 UCI_FINGERPRINT=old SYNC_FINGERPRINT=new
+		: >"$official_log"
+		rc=0
+		tls_refresh_locked || rc=$?
+		[ "$rc" = 1 ] && [ "$UCI_FINGERPRINT" = old ]
+		if [ "$TLS_FAILURE" = start ]; then
+			expected_retry=start
+		else
+			expected_retry="$(printf 'stop\nstart')"
+		fi
+		TLS_FAILURE=''
+		: >"$official_log"
+		tls_refresh_locked
+		[ "$UCI_FINGERPRINT" = new ] && [ "$CORE_RUNNING" = 1 ]
+		[ "$(cat "$official_log")" = "$expected_retry" ]
+	done
+)
 
 printf 'ok - sparse plugin events, ACME refresh ordering and shared RAM write-back logging\n'

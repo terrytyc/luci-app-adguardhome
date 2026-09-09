@@ -3,8 +3,11 @@
 
 set -eu
 
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+apk_verifier=$script_dir/verify-apk.sh
+
 usage() {
-	printf 'Usage: APK_SIGNING_KEY_B64=... %s APK_BIN PUBLIC_KEY CURRENT_DIR OUTPUT_DIR [PREVIOUS_DIR]\n' "$0" >&2
+	printf 'Usage: APK_SIGNING_KEY_B64=... %s APK_BIN PUBLIC_KEY CURRENT_TAG CURRENT_DIR OUTPUT_DIR [PREVIOUS_TAG PREVIOUS_DIR]\n' "$0" >&2
 	exit 2
 }
 
@@ -13,21 +16,43 @@ die() {
 	exit 1
 }
 
-if [ "$#" -lt 4 ] || [ "$#" -gt 5 ]; then
+if [ "$#" -ne 5 ] && [ "$#" -ne 7 ]; then
 	usage
 fi
 
 apk_bin=$1
 public_key=$2
-current_dir=$3
-output_dir=$4
-previous_dir=${5:-}
+current_tag=$3
+current_dir=$4
+output_dir=$5
+previous_tag=${6:-}
+previous_dir=${7:-}
+
+tag_version() {
+	case "$1" in
+		v3.?*) version=${1#v} ;;
+		*) die "not a stable v3 release tag: $1" ;;
+	esac
+	case "$version" in
+		*[!0-9A-Za-z.+_~-]*) die "unsafe release tag: $1" ;;
+	esac
+	printf '%s\n' "$version"
+}
+
+current_version=$(tag_version "$current_tag")
+previous_version=
+[ -z "$previous_tag" ] || previous_version=$(tag_version "$previous_tag")
+[ -z "$previous_tag" ] || [ "$previous_tag" != "$current_tag" ] ||
+	die 'current and previous release tags are identical'
 
 [ -x "$apk_bin" ] || die "APK tool is not executable: $apk_bin"
+[ -f "$apk_verifier" ] || die "APK verifier is missing: $apk_verifier"
 if [ ! -f "$public_key" ] || [ -L "$public_key" ]; then
 	die "public key is missing or unsafe: $public_key"
 fi
 [ -d "$current_dir" ] || die "current package directory is missing: $current_dir"
+[ -z "$previous_tag" ] || [ -n "$previous_dir" ] ||
+	die 'previous release directory is empty'
 [ -z "$previous_dir" ] || [ -d "$previous_dir" ] ||
 	die "previous package directory is missing: $previous_dir"
 [ -n "${APK_SIGNING_KEY_B64:-}" ] || die 'APK_SIGNING_KEY_B64 is empty'
@@ -85,80 +110,33 @@ current_i18n=
 copy_package_set() {
 	set_name=$1
 	set_dir=$2
-	allow_empty=$3
+	expected_version=$3
 	package_count=0
-	main_count=0
-	i18n_count=0
-	main_version=
-	i18n_version=
 
 	for package_path in "$set_dir"/*.apk; do
-		[ -e "$package_path" ] || continue
-		if [ ! -f "$package_path" ] || [ -L "$package_path" ]; then
-			die "unsafe APK asset: $package_path"
-		fi
+		[ -e "$package_path" ] || [ -L "$package_path" ] || continue
 		package_count=$((package_count + 1))
-		metadata=$key_dir/metadata-$set_name-$package_count.json
-		"$apk_bin" verify --allow-untrusted "$package_path" >/dev/null ||
-			die "invalid APK asset: $package_path"
-		"$apk_bin" adbdump --format json "$package_path" >"$metadata" ||
-			die "unable to read APK metadata: $package_path"
-		package_name=$(sed -n 's/^[[:space:]]*"name":[[:space:]]*"\([^"]*\)",[[:space:]]*$/\1/p' "$metadata" | sed -n '1p')
-		package_version=$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)",[[:space:]]*$/\1/p' "$metadata" | sed -n '1p')
-		package_arch=$(sed -n 's/^[[:space:]]*"arch":[[:space:]]*"\([^"]*\)",[[:space:]]*$/\1/p' "$metadata" | sed -n '1p')
-		[ "$package_arch" = noarch ] || die "APK is not noarch: $package_path"
-
-		case "$package_name" in
-			luci-app-adguardhome)
-				main_count=$((main_count + 1))
-				main_version=$package_version
-				case "$package_version" in
-					3.*) ;;
-					*) die "main APK is not a 3.x release: $package_path" ;;
-				esac
-				;;
-			luci-i18n-adguardhome-zh-cn)
-				i18n_count=$((i18n_count + 1))
-				i18n_version=$package_version
-				;;
-			*) die "unexpected APK package: $package_name" ;;
-		esac
-
-		case "$package_version" in
-			''|*[!0-9A-Za-z.+_~-]*) die "unsafe APK version: $package_version" ;;
-		esac
-		expected_name=$package_name-$package_version.apk
-		[ "$(basename "$package_path")" = "$expected_name" ] ||
-			die "APK filename does not match metadata: $package_path"
-		target=$stage_dir/$expected_name
-		if [ -e "$target" ]; then
-			cmp -s "$package_path" "$target" ||
-				die "conflicting APK assets named $expected_name"
-		else
-			cp -p "$package_path" "$target"
-		fi
-
-		if [ "$set_name" = current ]; then
-			case "$package_name" in
-				luci-app-adguardhome) current_main=$target ;;
-				luci-i18n-adguardhome-zh-cn) current_i18n=$target ;;
-			esac
-		fi
 	done
-
-	if [ "$package_count" -eq 0 ] && [ "$allow_empty" = yes ]; then
-		return 0
-	fi
-	if [ "$package_count" -ne 2 ] || [ "$main_count" -ne 1 ] ||
-		[ "$i18n_count" -ne 1 ]; then
+	if [ "$package_count" -ne 2 ]; then
 		die "$set_name release must contain exactly one main and one zh-cn APK"
 	fi
-	[ "$main_version" = "$i18n_version" ] ||
-		die "$set_name main and zh-cn APK versions differ"
+	main_package=$set_dir/luci-app-adguardhome-$expected_version.apk
+	i18n_package=$set_dir/luci-i18n-adguardhome-zh-cn-$expected_version.apk
+	if [ ! -f "$main_package" ] || [ -L "$main_package" ] ||
+	   [ ! -f "$i18n_package" ] || [ -L "$i18n_package" ]; then
+		die "$set_name APK version does not match its release tag"
+	fi
+	sh "$apk_verifier" "$apk_bin" "$expected_version" \
+		"$main_package" "$i18n_package"
+	cp -p "$main_package" "$i18n_package" "$stage_dir/"
+	if [ "$set_name" = current ]; then
+		current_main=$stage_dir/${main_package##*/}
+		current_i18n=$stage_dir/${i18n_package##*/}
+	fi
 }
 
-copy_package_set current "$current_dir" no
-[ -z "$previous_dir" ] || copy_package_set previous "$previous_dir" yes
+copy_package_set current "$current_dir" "$current_version"
+[ -z "$previous_dir" ] || copy_package_set previous "$previous_dir" "$previous_version"
 
 "$apk_bin" mkndx --allow-untrusted --sign-key "$private_key" \
 	--output "$stage_dir/packages.adb" "$current_main" "$current_i18n"

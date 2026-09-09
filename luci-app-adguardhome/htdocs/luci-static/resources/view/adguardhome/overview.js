@@ -561,7 +561,7 @@ return view.extend({
 			this.memoryWritebackButton = E('button', {
 				class: 'cbi-button cbi-button-action adguardhome-action-button',
 				type: 'button',
-				click: ui.createHandlerFn(this, 'handleMemoryWriteback'),
+				click: this.handleMemoryWriteback.bind(this),
 			}, _('Write back now'));
 			this.updateMemoryWritebackButton();
 			return this.memoryWritebackButton;
@@ -638,21 +638,21 @@ return view.extend({
 		return pageScope.attach(E('div', { class: 'adguardhome-view' }, [
 			E('link', { rel: 'stylesheet', href: L.resource('adguardhome/style.css') }),
 			rendered,
-			E('p', { class: 'adguardhome-version adguardhome-help' },
-				`${_('Plugin version')}: ${versions.plugin} · ${_('Core version')}: ${versions.core}`),
+			E('p', { class: 'adguardhome-version adguardhome-help' }, [
+				`${_('Plugin version')}: ${versions.plugin} · ${_('Core version')}: ${versions.core}` ]),
 		]));
 	},
 
 	updateMemoryWritebackButton() {
 		if (this.memoryWritebackButton)
 			this.memoryWritebackButton.disabled = !this.memoryWritebackAvailable ||
-				!!this.memoryWritebackBusy || !!this.settingsSubmission ||
+				!!this.memoryWritebackBusy || !!this.settingsSubmission || !!this.credentialsPreparing ||
 				!!this.memoryWritebackUncertain || !this.committedSettings || !L.hasViewPermission();
 	},
 
 	async handleMemoryWriteback() {
 		const scope = this.pageScope;
-		if (!this.memoryWritebackAvailable || this.memoryWritebackBusy || this.settingsSubmission ||
+		if (!this.memoryWritebackAvailable || this.memoryWritebackBusy || this.settingsSubmission || this.credentialsPreparing ||
 		    this.memoryWritebackUncertain || !L.hasViewPermission() || !operation.isPageActive(scope))
 			return;
 
@@ -719,6 +719,13 @@ return view.extend({
 
 	async openCredentialsDialog() {
 		const scope = this.pageScope;
+		if (this.credentialsPreparing || this.settingsSubmission || this.memoryWritebackBusy ||
+		    this.memoryWritebackUncertain || !L.hasViewPermission() || !operation.isPageActive(scope))
+			return;
+
+		this.credentialsPreparing = true;
+		this.updateMemoryWritebackButton();
+		const operationTicket = operation.start(_('Preparing account change…'));
 		let info = null;
 		let bcrypt = null;
 		try {
@@ -737,8 +744,14 @@ return view.extend({
 				return;
 			operation.failure(
 				_('Unable to prepare the username or password change: %s').format(errorMessage(error)),
+				operationTicket,
 			);
 			return;
+		} finally {
+			if (operation.isPageActive(scope)) {
+				this.credentialsPreparing = false;
+				this.updateMemoryWritebackButton();
+			}
 		}
 
 		const usernameInput = E('input', {
@@ -794,7 +807,7 @@ return view.extend({
 		ui.showModal(_('Change AdGuard Home Account'), [
 			E('p', {}, [
 				`${_('Current username')}: `,
-				E('strong', {}, info.username),
+				E('strong', {}, [ info.username ]),
 			]),
 			E('p', {}, _('Leave either field empty to keep it unchanged. A new password must contain at least 8 characters and no more than 72 UTF-8 bytes.')),
 			credentialField(_('New username'), usernameInput),
@@ -1022,7 +1035,7 @@ return view.extend({
 	handleSaveApply() {
 		if (this.settingsSubmission)
 			return this.settingsSubmission;
-		if (this.memoryWritebackBusy)
+		if (this.memoryWritebackBusy || this.credentialsPreparing)
 			return Promise.resolve();
 		if (this.memoryWritebackUncertain) {
 			operation.failure(_('The memory write-back outcome is unknown. Reload this page before trying again.'));
