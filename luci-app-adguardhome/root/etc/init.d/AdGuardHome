@@ -3285,14 +3285,24 @@ load_dnsmasq_section() {
 	DNSMASQ_UCI="dhcp.${DNSMASQ_SECTION}"
 }
 
-# Entries beginning with /domain/ are conditional.  /#/ is dnsmasq's catch-all
-# syntax, so it is a generic upstream and must not bypass AdGuard Home.
+# Check every domain: dnsmasq treats #, bare * and all-dot domains as catch-all.
+# An empty domain (//) still means unqualified names only.
 is_conditional_dnsmasq_server() {
+	local remaining="${1#/}" domain
 	case "$1" in
-		/#/*) return 1 ;;
-		/*/*) return 0 ;;
+		/*/*) ;;
 		*) return 1 ;;
 	esac
+	while [ "${remaining#*/}" != "$remaining" ]; do
+		domain="${remaining%%/*}"
+		remaining="${remaining#*/}"
+		case "$domain" in
+			'#'|'*') return 1 ;;
+			''|*[!.]*) ;;
+			*) return 1 ;;
+		esac
+	done
+	return 0
 }
 
 mark_generic_server() {
@@ -4654,6 +4664,13 @@ prepare_wrapper_locked() {
 	# stopped.  A pre-existing disk core reaches only this non-writing check.
 	check_core_config || return 1
 	sync_official_uci || return 1
+	# Carry the idle-monitor decision across run_locked's subshell without
+	# suppressing service_started(), which still starts the official core.
+	if [ "$redirect_mode" = none ] && [ "$memory_requested" = 0 ]; then
+		clear_recorded_integration_locked || return 1
+		return 3
+	fi
+	return 0
 }
 
 settings_update_locked() {
@@ -5019,7 +5036,10 @@ sync_monitor_instance() (
 	# Submit only the instance definition, never recurse through start/restart
 	# while holding the integration lock.  An unchanged instance keeps its PID.
 	procd_open_service AdGuardHome "$initscript"
-	[ "$service_enabled" != 1 ] || declare_monitor_instance
+	if [ "$service_enabled" = 1 ] &&
+	   { [ "$redirect_mode" != none ] || [ "$memory_requested" != 0 ]; }; then
+		declare_monitor_instance
+	fi
 	# The procd_close_service wrapper loses the ubus exit status.
 	# Send its already-built instance map directly so apply can reject failure.
 	json_set_namespace procd
@@ -5047,9 +5067,9 @@ start_service() {
 		run_locked prepare_wrapper_locked || prepare_rc=$?
 		case "$prepare_rc" in
 			0) START_PREPARED=1 ;;
-			2)
+			2|3)
 				START_PREPARED=1
-				START_DISABLED=1
+				[ "$prepare_rc" != 2 ] || START_DISABLED=1
 				return 0
 				;;
 		esac

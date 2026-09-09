@@ -18,8 +18,10 @@ const functions = [
 	'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
 	'valid_port', 'yaml_bool', 'valid_dns_name', 'http_port', 'yaml_material_value',
 	'tls_material_complete', 'web_port_listening', 'config_info', 'overview_info',
+	'root_private_temporary_file', 'root_private_lock_file', 'scan_yaml_jobs',
+	'parse_yaml_job_state', 'mark_yaml_job_indeterminate',
 ].map(extractFunction).join('\n')
-	.replace(/for \(let (\w+) in (.+)\) \{/g, 'for (let $1 of $2) {');
+	.replace(/for \(let (\w+) in (.+)\)/g, 'for (let $1 of $2)');
 
 const fixture = {};
 function reset() {
@@ -27,7 +29,10 @@ function reset() {
 		workDir: '/etc/AdGuardHome', configFile: '/etc/AdGuardHome/AdGuardHome.yaml',
 		requested: '0', active: false, running: true, locked: false,
 		redirect: 'dnsmasq-upstream', integration: 0, integrationProbes: [],
-		busy: false, jobActive: false, closeSucceeds: true, throwRead: false,
+		busy: false, unsafeLock: false, closeSucceeds: true, throwRead: false,
+		jobEntries: [], jobRecords: {}, temporaryMetadata: null,
+		maintenanceMetadata: { type: 'file', uid: 0, gid: 0, mode: 0o600, nlink: 1, size: 0 },
+		recoverySucceeds: true, recoveries: [],
 		yaml: 'dns:\n  port: 53335\nhttp:\n  address: 0.0.0.0:3000\n',
 		listening: [ 3000 ], reads: 0, cursors: 0, serviceCalls: 0,
 		jobChecks: 0, locks: 0, closes: 0, probes: [], hashes: 0,
@@ -49,10 +54,14 @@ const sandbox = {
 	CONFIG_FILENAME: 'AdGuardHome.yaml', SERVICE_NAME: 'adguardhome',
 	INSTANCE_NAME: 'adguardhome', YAML_UPDATE_COMMAND: '/etc/init.d/AdGuardHome',
 	MAX_CONFIG_LENGTH: 512 * 1024,
+	YAML_JOB_DIRECTORY: '/var/run/luci-app-adguardhome-yaml',
+	YAML_MAINTENANCE_MARKER: '/var/run/luci-app-adguardhome-yaml/removing',
+	YAML_JOB_STATE_LIMIT: 256,
 	TEMPLATE_DIRECTORY: '/usr/share/luci-app-adguardhome',
 	core_version: () => 'AdGuard Home, version v0.107.76',
 	readfile: pathname => pathname === '/usr/share/luci-app-adguardhome/version' ? '3.0.0-r6\n' : null,
-	type: value => value == null ? 'null' : Number.isInteger(value) ? 'int' : typeof value,
+	type: value => value == null ? 'null' : Array.isArray(value) ? 'array' : Number.isInteger(value) ? 'int' : typeof value,
+	push: (values, value) => values.push(value),
 	lc: value => value.toLowerCase(), match: (value, expression) => value.match(expression),
 	int: value => Math.trunc(Number(value)), length: value => value?.length ?? 0,
 	split: (value, separator) => value.split(separator),
@@ -95,7 +104,15 @@ const sandbox = {
 		};
 	},
 	config_path: () => fixture.configFile,
-	lstat: pathname => pathname === fixture.configFile ? metadata() : null,
+	lstat(pathname) {
+		if (pathname === fixture.configFile)
+			return metadata();
+		if (pathname === '/var/run/luci-app-adguardhome-yaml/removing')
+			return fixture.maintenanceMetadata;
+		if (pathname.startsWith('/var/run/luci-app-adguardhome-yaml/.'))
+			return fixture.temporaryMetadata;
+		return null;
+	},
 	stat(pathname) {
 		assert.equal(pathname, '/proc/self/fd/42');
 		const value = metadata();
@@ -130,14 +147,27 @@ const sandbox = {
 	read_template: () => template,
 	open_yaml_job_lock() {
 		fixture.locks++;
-		fixture.locked = !fixture.busy;
+		fixture.locked = !fixture.busy && !fixture.unsafeLock;
 		return { file: fixture.locked ? {} : null };
 	},
-	yaml_job_active() {
+	lsdir(pathname) {
+		assert.equal(pathname, '/var/run/luci-app-adguardhome-yaml');
 		assert.equal(fixture.locked, true, 'job state must only be queried while holding the lock');
 		fixture.jobChecks++;
-		return fixture.jobActive;
+		return fixture.jobEntries;
 	},
+	read_yaml_job(token) {
+		return fixture.jobRecords[token] ?? null;
+	},
+	replace_yaml_job(token, content) {
+		assert.equal(fixture.locked, true, 'orphan recovery must hold the exclusive task lock');
+		fixture.recoveries.push(token);
+		if (fixture.recoverySucceeds)
+			fixture.jobRecords[token] = sandbox.parse_yaml_job_state(content);
+		return fixture.recoverySucceeds;
+	},
+	remove_yaml_stage() { assert.fail('read ACL overview must never remove a YAML stage'); },
+	unlink() { assert.fail('overview must leave file cleanup to the next write operation'); },
 	close_yaml_job_lock() {
 		fixture.closes++;
 		fixture.locked = false;
@@ -196,9 +226,9 @@ fixture.busy = true;
 assert.equal(sandbox.overview().status.dns_integration, 'unknown',
 	'none must still respect the shared transaction lock');
 fixture.busy = false;
-fixture.jobActive = true;
+fixture.jobEntries = [ 'removing' ];
 assert.equal(sandbox.overview().status.dns_integration, 'unknown',
-	'none must not probe during an active transaction');
+	'none must not probe during package maintenance');
 for (const unavailable of [ 'connectionUnavailable', 'serviceFailure' ]) {
 	reset();
 	fixture[unavailable] = true;
@@ -238,7 +268,7 @@ assert.equal(fixture.locks, 1, 'fallback must reuse the same task lock');
 assert.equal(fixture.jobChecks, 1, 'fallback must not rescan task records');
 assert.equal(fixture.serviceCalls, 1, 'fallback must not re-query the core service');
 
-for (const gate of [ 'busy', 'jobActive', 'stopped' ]) {
+for (const gate of [ 'busy', 'unsafeLock', 'stopped' ]) {
 	reset();
 	if (gate === 'stopped')
 		fixture.running = false;
@@ -250,6 +280,64 @@ for (const gate of [ 'busy', 'jobActive', 'stopped' ]) {
 	assert.deepEqual(fixture.probes, [], `${gate}: rc.common must not be invoked`);
 	assert.equal(fixture.closes, 1);
 }
+
+const jobToken = 'a'.repeat(32);
+const orphan = state => ({ state, expected_hash: 'b'.repeat(64), candidate_hash: 'c'.repeat(64) });
+for (const state of [ 'pending', 'running' ]) {
+	reset();
+	fixture.jobEntries = [ jobToken ];
+	fixture.jobRecords[jobToken] = orphan(state);
+	result = sandbox.overview();
+	assert.equal(result.config.web.port, 3000, `${state}: a free lock permits recovery and probing`);
+	assert.equal(result.status.dns_integration, 'ready');
+	assert.equal(fixture.jobRecords[jobToken].state, 'indeterminate',
+		'recovery must never infer transaction success from current service state');
+	assert.deepEqual(fixture.recoveries, [ jobToken ]);
+	assert.equal(sandbox.overview().config.web.port, 3000);
+	assert.deepEqual(fixture.recoveries, [ jobToken ], 'later polls must preserve the terminal record');
+}
+
+const temporary = `.${jobToken}.rpcd-${'d'.repeat(32)}`;
+for (const gate of [ 'busy', 'unsafeLock', 'maintenance', 'unsafe-marker', 'unsafe-entry',
+	'invalid-record', 'unavailable-directory', 'unsafe-temporary', 'recovery-failure' ]) {
+	reset();
+	fixture.jobEntries = [ jobToken ];
+	fixture.jobRecords[jobToken] = orphan('running');
+	if (gate === 'busy' || gate === 'unsafeLock')
+		fixture[gate] = true;
+	else if (gate === 'maintenance' || gate === 'unsafe-marker') {
+		fixture.jobEntries.push('removing');
+		if (gate === 'unsafe-marker')
+			fixture.maintenanceMetadata.mode = 0o644;
+	}
+	else if (gate === 'unsafe-entry')
+		fixture.jobEntries.push('unexpected');
+	else if (gate === 'invalid-record')
+		fixture.jobRecords[jobToken] = null;
+	else if (gate === 'unavailable-directory')
+		fixture.jobEntries = null;
+	else if (gate === 'unsafe-temporary') {
+		fixture.jobEntries.push(temporary);
+		fixture.temporaryMetadata = { type: 'link' };
+	}
+	else
+		fixture.recoverySucceeds = false;
+	result = sandbox.overview();
+	assert.equal(result.config.web, null, `${gate}: no endpoint should be advertised`);
+	assert.equal(result.status.dns_integration, 'unknown');
+	assert.deepEqual(fixture.probes, []);
+	assert.deepEqual(fixture.recoveries, gate === 'recovery-failure' ? [ jobToken ] : [],
+		`${gate}: an unsafe or active task must never be recovered`);
+	if (fixture.jobRecords[jobToken])
+		assert.equal(fixture.jobRecords[jobToken].state, 'running');
+}
+
+reset();
+fixture.jobEntries = [ temporary ];
+fixture.temporaryMetadata = { type: 'file', uid: 0, gid: 0, mode: 0o600, nlink: 1, size: 0 };
+assert.equal(sandbox.overview().config.web.port, 3000,
+	'an abandoned safe temporary task record must not suppress the management link');
+assert.deepEqual(fixture.jobEntries, [ temporary ], 'overview leaves temporary-file cleanup to a write request');
 
 reset();
 fixture.configFile = '/etc/AdGuardHome/other.yaml';

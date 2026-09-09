@@ -752,31 +752,6 @@ function read_yaml_job(token) {
 	return parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
 }
 
-function yaml_job_active() {
-	let metadata = lstat(YAML_JOB_DIRECTORY);
-	if (!metadata)
-		return false;
-	if (!root_private_directory(metadata))
-		return true;
-
-	let entries = lsdir(YAML_JOB_DIRECTORY);
-	if (type(entries) != 'array')
-		return true;
-	for (let name in entries) {
-		if (name == 'update.lock')
-			continue;
-		if (name == 'removing')
-			return true;
-		if (!match(name, /^[0-9a-f]{32}$/))
-			return true;
-		let record = read_yaml_job(name);
-		if (!record || record.state == 'pending' || record.state == 'running')
-			return true;
-	}
-
-	return false;
-}
-
 function write_yaml_job(token, content, create_only) {
 	let path = yaml_job_path(token);
 	let suffix = random_token();
@@ -895,11 +870,10 @@ function scan_yaml_jobs(clean_temporary) {
 			continue;
 		}
 		if (match(name, /^\.[0-9a-f]{32}(\.rpcd-[0-9a-f]{32}|\.[A-Za-z0-9]{6})$/)) {
-			if (clean_temporary) {
-				let temporary = `${YAML_JOB_DIRECTORY}/${name}`;
-				if (!root_private_temporary_file(lstat(temporary)) || !unlink(temporary))
-					return { error: 'YAML update state is unsafe' };
-			}
+			let temporary = `${YAML_JOB_DIRECTORY}/${name}`;
+			if (!root_private_temporary_file(lstat(temporary)) ||
+			    (clean_temporary && !unlink(temporary)))
+				return { error: 'YAML update state is unsafe' };
 			continue;
 		}
 		if (!match(name, /^[0-9a-f]{32}$/))
@@ -935,8 +909,7 @@ function mark_yaml_job_indeterminate(item) {
 	if (!item || !item.token || !item.record)
 		return false;
 
-	return remove_yaml_stage(item.token, null) &&
-		replace_yaml_job(item.token,
+	return replace_yaml_job(item.token,
 			`indeterminate:${item.record.expected_hash}:${item.record.candidate_hash}\n`);
 }
 
@@ -973,7 +946,8 @@ function prepare_yaml_job(token, expected_hash, candidate_hash) {
 	if (length(jobs.active)) {
 		let marked = true;
 		for (let item in jobs.active)
-			marked = mark_yaml_job_indeterminate(item) && marked;
+			marked = remove_yaml_stage(item.token, null) &&
+				mark_yaml_job_indeterminate(item) && marked;
 		close_yaml_job_lock(lock);
 		if (!marked)
 			return { error: 'Unable to recover interrupted YAML update state' };
@@ -982,15 +956,15 @@ function prepare_yaml_job(token, expected_hash, candidate_hash) {
 		return { error: 'A previous YAML update was interrupted; reload the YAML before editing it again' };
 	}
 
-	// Normally the editor consumes terminal records.  Bound abandoned results
-	// without making a recent result disappear merely because another editor
-	// begins a later, revision-checked transaction.
-	if (length(jobs.terminal) >= 16)
-		for (let item in jobs.terminal)
-			if (!discard_yaml_job(item.token)) {
-				close_yaml_job_lock(lock);
-				return { error: 'Unable to clean completed YAML update state' };
-			}
+	// Keep terminal results readable by every observer of a reused token.
+	// Clean stages left by read-only overview recovery before a workdir change,
+	// and bound retained records when a later transaction starts.
+	for (let item in jobs.terminal)
+		if ((item.record.state == 'indeterminate' && !remove_yaml_stage(item.token, null)) ||
+		    (length(jobs.terminal) >= 16 && !discard_yaml_job(item.token))) {
+			close_yaml_job_lock(lock);
+			return { error: 'Unable to clean completed YAML update state' };
+		}
 
 	if (!write_new_yaml_job(token, expected_hash, candidate_hash)) {
 		close_yaml_job_lock(lock);
@@ -1304,7 +1278,7 @@ function update_yaml(content, expected_hash) {
 	return { accepted: true, token, reused: false };
 }
 
-function update_job_status(token, consume, settings) {
+function update_job_status(token, settings) {
 	let writeback = settings == 'writeback';
 	let title = writeback ? 'Write-back' : settings ? 'Settings' : 'YAML';
 	let label = writeback ? 'write-back' : settings ? 'settings' : 'YAML';
@@ -1312,7 +1286,7 @@ function update_job_status(token, consume, settings) {
 	if (!record)
 		return { error: `${title} update job is unavailable` };
 
-	// Serialize terminal observation and consumption with both the worker and
+	// Serialize terminal observation with both the worker and
 	// set_yaml() directory scans.  A worker publishes its terminal bytes just
 	// before releasing this lock, so hide that short handoff as "running" until
 	// the complete transaction is quiescent.
@@ -1330,10 +1304,8 @@ function update_job_status(token, consume, settings) {
 	}
 	if (record.state == 'pending' || record.state == 'running') {
 		// YAML recovery also removes its staged file; settings have no stage.
-		let recovered = settings
-			? replace_yaml_job(token,
-				`indeterminate:${record.expected_hash}:${record.candidate_hash}\n`)
-			: mark_yaml_job_indeterminate({ token, record });
+		let recovered = (settings || remove_yaml_stage(token, null)) &&
+			mark_yaml_job_indeterminate({ token, record });
 		if (!recovered) {
 			close_yaml_job_lock(lock);
 			return { error: `Unable to recover interrupted ${label} update state` };
@@ -1374,10 +1346,6 @@ function update_job_status(token, consume, settings) {
 	if (result.ok && !writeback)
 		result[settings ? 'revision' : 'sha256'] = record.sha256;
 
-	if (consume === true && !discard_yaml_job(token)) {
-		close_yaml_job_lock(lock);
-		return { error: `Unable to consume ${label} update result` };
-	}
 	if (!close_yaml_job_lock(lock))
 		return { error: `Unable to release ${label} update lock` };
 
@@ -1881,9 +1849,15 @@ function overview_info() {
 	try {
 		let configuration = configuration_state();
 		result.status = service_status(configuration);
-		let can_probe = !!lock.file &&
-			(result.status.running === true || configuration.redirect == 'none') &&
-			!yaml_job_active();
+		let jobs = lock.file ? scan_yaml_jobs(false) : null;
+		let can_probe = !!jobs && !jobs.error && !jobs.maintenance;
+		// A free exclusive lock proves these workers are gone.  Recover only
+		// private task records here; this read ACL must never remove YAML stages.
+		if (can_probe)
+			for (let item in jobs.active)
+				can_probe = mark_yaml_job_indeterminate(item) && can_probe;
+		can_probe = can_probe &&
+			(result.status.running === true || configuration.redirect == 'none');
 		result.config = config_info(read_config(configuration),
 			can_probe && result.status.running === true);
 		result.status.dns_integration = 'unknown';
@@ -1999,9 +1973,9 @@ const methods = {
 		},
 	},
 	get_yaml_update: {
-		args: { token: '', consume: false },
+		args: { token: '' },
 		call: function(request) {
-			return update_job_status(request.args.token, request.args.consume, false);
+			return update_job_status(request.args.token, false);
 		},
 	},
 	set_settings: {
@@ -2027,9 +2001,9 @@ const methods = {
 		},
 	},
 	get_settings_update: {
-		args: { token: '', consume: false },
+		args: { token: '' },
 		call: function(request) {
-			return update_job_status(request.args.token, request.args.consume, true);
+			return update_job_status(request.args.token, true);
 		},
 	},
 	memory_writeback: {
@@ -2039,9 +2013,9 @@ const methods = {
 		},
 	},
 	get_memory_writeback: {
-		args: { token: '', consume: false },
+		args: { token: '' },
 		call: function(request) {
-			return update_job_status(request.args.token, request.args.consume, 'writeback');
+			return update_job_status(request.args.token, 'writeback');
 		},
 	},
 };

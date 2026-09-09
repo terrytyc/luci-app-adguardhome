@@ -384,9 +384,10 @@ async function testYamlSubmissions() {
 					throw new Error('accepted request response was lost');
 				return { accepted: true, token: kind === 'bad-token' ? 'invalid' : token };
 			},
-			async get_yaml_update(receivedToken, consume) {
+			async get_yaml_update(...args) {
+				const [ receivedToken ] = args;
 				assert.equal(receivedToken, token);
-				polls.push(consume);
+				polls.push(args);
 				if (kind === 'leave-status')
 					state.dispatch('pagehide');
 				return { state: 'done', ok: true, sha256: newHash };
@@ -415,7 +416,7 @@ async function testYamlSubmissions() {
 			assert.equal(view.yamlHash, newHash);
 			assert.equal(view.pathValue.textContent, '/etc/AdGuardHome/AdGuardHome.yaml');
 			assert.equal(reads, 1, 'reload the authoritative YAML after a confirmed save');
-			assert.deepEqual(polls, [ false, true ], 'read and consume the completed job once');
+			assert.deepEqual(polls, [ [ token ] ], 'read the completed job once without consuming it');
 			assert.equal(view.saveButton.disabled, false);
 			assert.equal(view.yamlEditor.readOnly, false);
 			assert.equal(state.rendered.at(-1).text, 'Configuration changes applied.');
@@ -423,7 +424,7 @@ async function testYamlSubmissions() {
 			assert.equal(view.yamlEditor.value, draft, 'failed post-save reload preserves the draft');
 			assert.equal(view.yamlHash, '');
 			assert.equal(reads, 1);
-			assert.deepEqual(polls, [ false, true ]);
+			assert.deepEqual(polls, [ [ token ] ]);
 			if (kind === 'leave-reload') {
 				assert.equal(state.rendered.length, 1, 'post-save reload must not report on an obsolete page');
 			} else {
@@ -438,7 +439,7 @@ async function testYamlSubmissions() {
 		} else {
 			assert.equal(view.yamlEditor.value, draft, `${kind}: preserve the editor draft`);
 			assert.equal(reads, 0, `${kind}: do not overwrite the draft with an unconfirmed reload`);
-			assert.deepEqual(polls, kind === 'leave-status' ? [ false ] : []);
+			assert.deepEqual(polls, kind === 'leave-status' ? [ [ token ] ] : []);
 			if (kind.startsWith('leave-')) {
 				assert.equal(state.rendered.length, 1, 'late replies must not display results on another page');
 				assert.equal(view.yamlHash, oldHash, 'an obsolete continuation must not mutate editor state');
@@ -486,9 +487,10 @@ async function testMemoryWriteback() {
 				if (kind === 'rejected') return { error: 'settings revision changed' };
 				return { accepted: true, token: kind === 'bad-token' ? '' : token, reused: kind === 'reused' };
 			},
-			async get_memory_writeback(receivedToken, consume) {
+			async get_memory_writeback(...args) {
+				const [ receivedToken ] = args;
 				assert.equal(receivedToken, token);
-				calls.push([ 'status', consume ]);
+				calls.push([ 'status', ...args ]);
 				if (kind === 'status-lost') throw new Error('status unavailable');
 				if (kind === 'inactive-status') state.dispatch('pagehide');
 				return { state: 'done', ok: ![ 'failed', 'indeterminate' ].includes(kind),
@@ -530,7 +532,7 @@ async function testMemoryWriteback() {
 			assert.equal(view.memoryWritebackButton.disabled, uncertain);
 			if (kind === 'success' || kind === 'reused') {
 				assert.equal(state.rendered.at(-1).text, 'Memory data written back.');
-				assert.deepEqual(calls, [ [ 'writeback', revision ], [ 'status', false ], [ 'status', true ] ]);
+				assert.deepEqual(calls, [ [ 'writeback', revision ], [ 'status', token ] ]);
 			} else {
 				assert.match(state.rendered.at(-1).text, /Unable to write back memory data:/);
 			}
@@ -633,10 +635,16 @@ async function testYamlEditing() {
 		[ whitespace + '# note', whitespace + '<span class="adguardhome-yaml-comment"># note</span>' ],
 	];
 	for (const separator of [ '\u2028', '\u2029' ]) {
-		for (const prefix of [ '', 'key: ', '- ' ])
+		for (const [ prefix, highlightedPrefix ] of [
+			[ '', '' ],
+			[ 'key: ', '<span class="adguardhome-yaml-key">key</span>: ' ],
+			[ '- ', '- ' ],
+			[ ' '.repeat(1024) + 'key: ', ' '.repeat(1024) + '<span class="adguardhome-yaml-key">key</span>: ' ],
+			[ ' '.repeat(1024) + '- ', ' '.repeat(1024) + '- ' ],
+		])
 			highlightCases.push([
 				`${prefix}before${separator}after &<>`,
-				`${prefix}before${separator}after &amp;&lt;&gt;`,
+				`${highlightedPrefix}before${separator}after &amp;&lt;&gt;`,
 			]);
 		highlightCases.push([
 			`"before${separator}after"`,
@@ -844,11 +852,8 @@ async function main() {
 	let jobReads = 0;
 	const beforeJobTimers = state.timerDelays.length;
 	state.document.hidden = true;
-	const completedJob = await state.operation.waitForJob(async (token, consume) => {
-		assert.equal(token, 'job-token');
-		jobEvents.push(consume ? 'consume' : 'read');
-		if (consume)
-			throw new Error('cleanup unavailable');
+	const completedJob = await state.operation.waitForJob(async (...args) => {
+		jobEvents.push(args);
 		jobReads++;
 		if (jobReads === 1)
 			return { state: 'pending' };
@@ -859,11 +864,25 @@ async function main() {
 		return { state: 'done', ok: true };
 	}, 'job-token', currentScope, jobMessages);
 	assert.equal(completedJob.ok, true);
-	assert.deepEqual(jobEvents, [ 'read', 'read', 'read', 'read', 'consume' ],
-		'terminal results must be consumed once, with best-effort cleanup');
+	assert.deepEqual(jobEvents, Array.from({ length: 4 }, () => [ 'job-token' ]),
+		'polling must send only the token and stop after reading a terminal result');
 	assert.deepEqual(state.timerDelays.slice(beforeJobTimers), [ 2000, 2000, 2000 ],
 		'job polling must continue every two seconds even while the document is hidden');
 	state.document.hidden = false;
+
+	const sharedResult = { state: 'done', ok: true };
+	const sharedReads = [];
+	const sharedStatus = async (...args) => {
+		sharedReads.push(args);
+		return sharedResult;
+	};
+	for (let observer = 0; observer < 2; observer++) {
+		const observerOperation = loadOperation().operation;
+		assert.equal(await observerOperation.waitForJob(sharedStatus, 'shared-token',
+			observerOperation.createPageScope(), jobMessages), sharedResult);
+	}
+	assert.deepEqual(sharedReads, [ [ 'shared-token' ], [ 'shared-token' ] ],
+		'two pages sharing a token must each read its terminal result without consuming it');
 
 	for (const result of [ null, {}, { state: 'invalid' } ]) {
 		await assert.rejects(
@@ -887,9 +906,7 @@ async function main() {
 		'the retry-delay budget stays at six minutes, excluding RPC response times');
 
 	let resettingReads = 0;
-	const resetErrorCount = await state.operation.waitForJob(async (_token, consume) => {
-		if (consume)
-			return {};
+	const resetErrorCount = await state.operation.waitForJob(async () => {
 		resettingReads++;
 		if (resettingReads === 6)
 			return { state: 'running' };
@@ -951,15 +968,14 @@ async function main() {
 	const jobScope = jobState.operation.createPageScope();
 	const jobRoot = { isConnected: true };
 	jobScope.attach(jobRoot);
-	let consumeCalls = 0;
-	await assert.rejects(jobState.operation.waitForJob(async (_token, consume) => {
-		if (consume)
-			consumeCalls++;
+	let terminalReads = 0;
+	await assert.rejects(jobState.operation.waitForJob(async () => {
+		terminalReads++;
 		jobRoot.isConnected = false;
 		return { state: 'done', ok: true };
 	}, 'token', jobScope, jobMessages), error => error?.pageInactive === true);
-	assert.equal(consumeCalls, 0,
-		'a terminal response owned by an inactive page must not continue its load chain');
+	assert.equal(terminalReads, 1,
+		'a terminal response owned by an inactive page must not continue polling');
 
 	const operationSource = fs.readFileSync(operationPath, 'utf8');
 	assert.doesNotMatch(operationSource,

@@ -20,6 +20,7 @@ OFFICIAL_SERVICE=/bin/true
 TEST_ENABLED=0
 TEST_RUNNING=0
 TEST_RAM=0
+TEST_MODE=dnsmasq-upstream
 TEST_BACKING=/etc/AdGuardHome
 TEST_COMMIT_FAIL=0
 PREPARE_CALLS=0
@@ -37,11 +38,12 @@ load_settings() {
 	persistent_config_file="$persistent_work_dir/AdGuardHome.yaml"
 	work_dir="$persistent_work_dir"
 	config_file="$persistent_config_file"
+	previous_work_dir="$persistent_work_dir"
 	MEMORY_ACTIVE="$TEST_RAM"
 	MEMORY_BACKING_WORK_DIR="$TEST_BACKING"
 	memory_requested="$TEST_RAM"
 	memory_writeback_interval=60
-	redirect_mode=dnsmasq-upstream
+	redirect_mode="$TEST_MODE"
 	MONITOR_SETTINGS_READY=1
 }
 prepare_yaml_job_runtime() { return 0; }
@@ -173,4 +175,54 @@ for action in enabled-apply disabled-apply disabled-reconcile; do
 	[ "$LIVE_DEFINITION" = "$expected" ] && [ "$MONITOR_STARTS:$MONITOR_PID" = 3:3 ]
 done
 
-printf 'ok - disabled/enabled monitor lifecycle, identical declarations and failed submission propagation\n'
+# Exercise the real preparation result across a subshell, as run_locked does.
+# No parent settings variables may be needed to select the monitor definition.
+(
+	for name in prepare_wrapper_locked service_started stop_wrapper_locked; do
+		eval "$(function_body "$init_file" "$name")"
+	done
+	run_locked() ( "$@"; )
+	check_core_config() { return 0; }
+	memory_discard_incomplete_runtime_locked() { return 0; }
+	events="$test_tmp/idle-monitor-events"
+	clear_recorded_integration_locked() { printf 'cleanup\n' >>"$events"; }
+	wait_for_core_ready() { printf 'start\n' >>"$events"; }
+	wait_for_core_stopped() { TEST_RUNNING=0; printf 'stop\n' >>"$events"; }
+	TEST_COMMIT_FAIL=0
+	TEST_ENABLED=1
+	TEST_RUNNING=0
+	TEST_BACKING=/etc/AdGuardHome
+	for TEST_MODE in dnsmasq-upstream redirect none; do
+		for TEST_RAM in 0 1; do
+			unset service_enabled redirect_mode memory_requested
+			: >"$events"
+			procd_open_service AdGuardHome "$initscript"
+			start_service
+			[ "$START_PREPARED:$START_DISABLED" = 1:0 ]
+			if [ "$TEST_MODE:$TEST_RAM" = none:0 ]; then
+				[ -z "$TX_DEFINITION" ]
+				# Withdraw old DNS takeover before removing its monitor.
+				grep -qx cleanup "$events"
+			else
+				[ "$TX_DEFINITION" = "$expected" ]
+			fi
+			procd_close_service
+			service_started
+			read_monitor_state
+			grep -qx start "$events"
+			grep -qx cleanup "$events"
+			if [ "$TEST_MODE:$TEST_RAM" = none:0 ]; then
+				[ -z "$LIVE_DEFINITION" ] && [ "$MONITOR_PID" = 0 ]
+			else
+				[ "$LIVE_DEFINITION" = "$expected" ] && [ "$MONITOR_PID" -gt 0 ]
+			fi
+		done
+	done
+	# A service without a monitor still runs its normal core-stop/cleanup hook.
+	TEST_MODE=none TEST_RAM=0 TEST_RUNNING=1
+	: >"$events"
+	run_locked stop_wrapper_locked 0
+	[ "$(cat "$events")" = "$(printf 'cleanup\nstop')" ]
+)
+
+printf 'ok - monitor duty selection, core start/stop, identical declarations and failed submission propagation\n'

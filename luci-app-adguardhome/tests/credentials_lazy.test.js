@@ -54,9 +54,7 @@ function loadOverview() {
 		failure(message) { failures.push(String(message)); },
 		async waitForJob(statusFn, token, currentScope) {
 			assert.equal(currentScope, scope);
-			const result = await statusFn(token, false);
-			await statusFn(token, true);
-			return result;
+			return statusFn(token);
 		},
 	};
 	class BcryptInstance {
@@ -77,8 +75,8 @@ function loadOverview() {
 			events.push([ 'set_credentials', ...args ]);
 			return { accepted: true, token: 'b'.repeat(32) };
 		},
-		get_yaml_update: (token, consume) => {
-			events.push([ 'get_yaml_update', token, consume ]);
+		get_yaml_update: token => {
+			events.push([ 'get_yaml_update', token ]);
 			return { state: 'done', ok: true };
 		},
 	};
@@ -182,8 +180,7 @@ async function main() {
 	assert.deepEqual(success.events.filter(Array.isArray), [
 		[ 'hash', 'eight-characters' ],
 		[ 'set_credentials', 'operator', encodedHash, info.sha256 ],
-		[ 'get_yaml_update', 'b'.repeat(32), false ],
-		[ 'get_yaml_update', 'b'.repeat(32), true ],
+		[ 'get_yaml_update', 'b'.repeat(32) ],
 	]);
 	assert.equal(success.events.includes('operation-success'), true);
 	assert.equal(success.inputs().every(input => input.value === ''), true,

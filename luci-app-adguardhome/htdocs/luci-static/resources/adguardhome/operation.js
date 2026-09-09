@@ -128,7 +128,7 @@ return baseclass.extend({
 		for (let attempt = 0; attempt < JOB_POLL_LIMIT; attempt++) {
 			let result = null;
 			try {
-				result = await this.requestActive(() => statusFn(token, false), scope);
+				result = await this.requestActive(() => statusFn(token), scope);
 				consecutiveErrors = 0;
 				lastError = null;
 			} catch (error) {
@@ -140,15 +140,8 @@ return baseclass.extend({
 			}
 
 			if (result != null) {
-				if (result.state === 'done') {
-					try { await this.requestActive(() => statusFn(token, true), scope); }
-					catch (error) {
-						// The terminal result is known; only page invalidation matters here.
-						if (this.isPageInactiveError(error))
-							throw error;
-					}
+				if (result.state === 'done')
 					return result;
-				}
 				if (typeof result.error === 'string' && result.error)
 					throw makeError(result.error);
 				if (result.state !== 'pending' && result.state !== 'running')

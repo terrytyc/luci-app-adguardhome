@@ -60,7 +60,7 @@ const callSetSettings = rpc.declare({
 const callGetSettingsUpdate = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_settings_update',
-	params: [ 'token', 'consume' ],
+	params: [ 'token' ],
 	expect: { '': { state: '', ok: false, revision: '' } },
 	reject: true,
 });
@@ -76,7 +76,7 @@ const callMemoryWriteback = rpc.declare({
 const callGetMemoryWriteback = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_memory_writeback',
-	params: [ 'token', 'consume' ],
+	params: [ 'token' ],
 	expect: { '': { state: '', ok: false } },
 	reject: true,
 });
@@ -99,7 +99,7 @@ const callSetCredentials = rpc.declare({
 const callGetYamlUpdate = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_yaml_update',
-	params: [ 'token', 'consume' ],
+	params: [ 'token' ],
 	expect: { '': { state: '', ok: false, sha256: '', restarted: false } },
 	reject: true,
 });

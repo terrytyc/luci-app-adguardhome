@@ -37,7 +37,7 @@ const callResetYaml = rpc.declare({
 const callGetYamlUpdate = rpc.declare({
 	object: 'luci.adguardhome',
 	method: 'get_yaml_update',
-	params: [ 'token', 'consume' ],
+	params: [ 'token' ],
 	expect: { '': { state: '', ok: false, sha256: '', restarted: false } },
 	reject: true,
 });
@@ -113,8 +113,8 @@ function highlightYamlLine(line) {
 	const commentOffset = yamlCommentOffset(line);
 	const content = commentOffset < 0 ? line : line.slice(0, commentOffset);
 	const comment = commentOffset < 0 ? '' : line.slice(commentOffset);
-	const mapping = content.includes(':') && content.match(/^(\s*(?:-\s+)?)([^:#][^:]*?)(\s*:\s*)(.*)$/);
-	const sequence = mapping ? null : content.match(/^(\s*-\s+)(.*)$/);
+	const mapping = content.includes(':') && content.match(/^(\s*(?:-\s+)?)([^:#][^:]*?)(\s*:\s*)([\s\S]*)$/);
+	const sequence = mapping ? null : content.match(/^(\s*-\s+)([\s\S]*)$/);
 	let highlighted;
 
 	if (mapping) {

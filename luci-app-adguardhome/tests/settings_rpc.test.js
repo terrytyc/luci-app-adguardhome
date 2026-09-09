@@ -353,8 +353,9 @@ assert.equal(closes, 1);
 assert.match(source, /get_settings:\s*\{/);
 assert.match(source, /set_settings:\s*\{/);
 assert.match(source, /get_settings_update:\s*\{/);
-assert.match(source, /return update_job_status\(request.args.token, request.args.consume, false\);/);
-assert.match(source, /return update_job_status\(request.args.token, request.args.consume, true\);/);
+assert.match(source, /return update_job_status\(request.args.token, false\);/);
+assert.match(source, /return update_job_status\(request.args.token, true\);/);
+assert.doesNotMatch(source, /\bconsume\s*[:,)]|request\.args\.consume/);
 assert.doesNotMatch(source, /function (yaml_job_status|settings_job_status)\(/);
 
 const jobFixture = {
@@ -362,13 +363,12 @@ const jobFixture = {
 	lockAvailable: true,
 	lockError: null,
 	recoverySucceeds: true,
-	consumeSucceeds: true,
+	stageRemovalSucceeds: true,
 	closeSucceeds: true,
 	reads: 0,
 	closes: 0,
-	consumes: 0,
-	yamlRecoveries: 0,
-	settingsRecoveries: 0,
+	stageRemovals: 0,
+	recoveries: 0,
 };
 const jobSandbox = {
 	read_yaml_job() {
@@ -386,27 +386,25 @@ const jobSandbox = {
 		return jobFixture.closeSucceeds;
 	},
 	discard_yaml_job() {
-		jobFixture.consumes++;
-		return jobFixture.consumeSucceeds;
+		assert.fail('reading a shared result must never delete its record');
 	},
-	mark_yaml_job_indeterminate(item) {
-		assert.equal(item.token, token);
-		jobFixture.yamlRecoveries++;
-		if (jobFixture.recoverySucceeds)
-			jobFixture.record = { ...item.record, state: 'indeterminate' };
-		return jobFixture.recoverySucceeds;
+	remove_yaml_stage(jobToken) {
+		assert.equal(jobToken, token);
+		jobFixture.stageRemovals++;
+		return jobFixture.stageRemovalSucceeds;
 	},
 	replace_yaml_job(jobToken, content) {
 		assert.equal(jobToken, token);
 		assert.equal(content, `indeterminate:${expectedHash}:${candidateHash}\n`);
-		jobFixture.settingsRecoveries++;
+		jobFixture.recoveries++;
 		if (jobFixture.recoverySucceeds)
 			jobFixture.record = { ...jobFixture.record, state: 'indeterminate' };
 		return jobFixture.recoverySucceeds;
 	},
 };
 vm.createContext(jobSandbox);
-vm.runInContext(extractFunction('update_job_status') + '\nthis.query = update_job_status;',
+vm.runInContext(extractFunction('mark_yaml_job_indeterminate') + '\n' +
+extractFunction('update_job_status') + '\nthis.query = update_job_status;',
 jobSandbox, { filename: rpcPath });
 
 function resetJob(state) {
@@ -416,85 +414,87 @@ function resetJob(state) {
 			sha256: candidateHash, restarted: true,
 		} : null,
 		lockAvailable: true, lockError: null, recoverySucceeds: true,
-		consumeSucceeds: true, closeSucceeds: true,
-		reads: 0, closes: 0, consumes: 0,
-		yamlRecoveries: 0, settingsRecoveries: 0,
+		stageRemovalSucceeds: true, closeSucceeds: true,
+		reads: 0, closes: 0, stageRemovals: 0, recoveries: 0,
 	});
 }
 
 for (const settings of [ false, true ]) {
-	const query = (token, consume) => jobSandbox.query(token, consume, settings);
+	const query = token => jobSandbox.query(token, settings);
 	const label = settings ? 'settings' : 'YAML';
 	const title = settings ? 'Settings' : 'YAML';
 	resetJob(null);
-	assert.equal(query(token, false).error, `${title} update job is unavailable`);
+	assert.equal(query(token).error, `${title} update job is unavailable`);
 	assert.equal(jobFixture.closes, 0, 'an unavailable job must not acquire or close a lock');
 
 	for (const state of [ 'pending', 'running', 'success' ]) {
 		resetJob(state);
 		jobFixture.lockAvailable = false;
-		assert.equal(query(token, true).state, state === 'pending' ? 'pending' : 'running',
+		assert.equal(query(token).state, state === 'pending' ? 'pending' : 'running',
 			'a busy worker must hide terminal bytes until its lock is released');
-		assert.equal(jobFixture.consumes, 0, 'a busy result must never be consumed');
 		assert.equal(jobFixture.closes, 0);
 	}
 
 	resetJob('running');
 	jobFixture.lockAvailable = false;
 	jobFixture.lockError = 'unsafe lock';
-	assert.equal(query(token, false).error, 'unsafe lock');
+	assert.equal(query(token).error, 'unsafe lock');
 
 	for (const state of [ 'pending', 'running' ]) {
 		resetJob(state);
-		let result = query(token, false);
+		let result = query(token);
 		assert.equal(result.state, 'done');
 		assert.equal(result.ok, false);
 		assert.equal(result.indeterminate, true);
-		assert.equal(jobFixture.yamlRecoveries, settings ? 0 : 1,
+		assert.equal(jobFixture.stageRemovals, settings ? 0 : 1,
 			'only an interrupted YAML transaction must enter stage cleanup');
-		assert.equal(jobFixture.settingsRecoveries, settings ? 1 : 0,
-			'interrupted settings must recover without a YAML stage');
+		assert.equal(jobFixture.recoveries, 1,
+			'both job types must publish indeterminate through the shared helper');
 		assert.equal(jobFixture.reads, 3, 'recovery must re-read the authenticated terminal record');
 		assert.equal(jobFixture.closes, 1);
-		assert.equal(jobFixture.consumes, 0);
 	}
 
 	resetJob('running');
 	jobFixture.recoverySucceeds = false;
-	assert.equal(query(token, true).error, `Unable to recover interrupted ${label} update state`);
+	assert.equal(query(token).error, `Unable to recover interrupted ${label} update state`);
 	assert.equal(jobFixture.closes, 1);
-	assert.equal(jobFixture.consumes, 0);
 
 	resetJob('success');
-	let result = query(token, true);
+	let result = query(token);
 	assert.equal(result.ok, true);
 	assert.equal(result.restarted, true);
 	assert.equal(result[settings ? 'revision' : 'sha256'], candidateHash,
 		'the two public result shapes must retain their distinct revision field');
 	assert.equal(result[settings ? 'sha256' : 'revision'], undefined);
-	assert.equal(jobFixture.consumes, 1);
 	assert.equal(jobFixture.closes, 1);
+	assert.deepEqual(query(token), result,
+		'a second observer of the reused token must receive the same successful result');
 
 	resetJob('failure');
-	result = query(token, false);
+	result = query(token);
 	assert.equal(result.ok, false);
 	assert.equal(result.error, settings ? 'Settings were rejected or changed concurrently' :
 		'YAML was rejected or changed concurrently');
 
-	resetJob('success');
-	jobFixture.consumeSucceeds = false;
-	assert.equal(query(token, true).error, `Unable to consume ${label} update result`);
-	assert.equal(jobFixture.closes, 1);
+	assert.deepEqual(query(token), result, 'failure results must also remain readable');
+	resetJob('indeterminate');
+	result = query(token);
+	assert.deepEqual(query(token), result, 'unknown outcomes must remain unknown to every observer');
 
 	resetJob('success');
 	jobFixture.closeSucceeds = false;
-	assert.equal(query(token, false).error, `Unable to release ${label} update lock`);
+	assert.equal(query(token).error, `Unable to release ${label} update lock`);
 }
+
+resetJob('running');
+jobFixture.stageRemovalSucceeds = false;
+assert.match(jobSandbox.query(token, false).error, /Unable to recover interrupted YAML/);
+assert.equal(jobFixture.recoveries, 0, 'failed stage cleanup must retain the pending recovery record');
 
 for (const state of [ 'success', 'failure', 'running', 'indeterminate' ]) {
 	resetJob(state);
 	jobFixture.record.restarted = false;
-	const result = jobSandbox.query(token, true, 'writeback');
+	const result = jobSandbox.query(token, 'writeback');
 	assert.equal(result.state, 'done');
 	assert.equal(result.ok, state === 'success');
 	assert.equal(result.revision, undefined, 'write-back does not publish a new settings revision');
@@ -505,8 +505,9 @@ for (const state of [ 'success', 'failure', 'running', 'indeterminate' ]) {
 		assert.match(result.error, /Write-back failed/);
 	else
 		assert.equal(result.indeterminate, true);
-	assert.equal(jobFixture.yamlRecoveries, 0);
-	assert.equal(jobFixture.consumes, 1);
+	assert.equal(jobFixture.stageRemovals, 0);
+	assert.deepEqual(jobSandbox.query(token, 'writeback'), result,
+		'write-back results must survive repeated reads');
 }
 console.log('asynchronous settings and memory write-back RPC transaction tests passed');
 
@@ -522,6 +523,7 @@ function resetWrites() {
 	Object.assign(writeFixture, {
 		directory: true, entries: new Map(), ensureCalls: 0,
 		failure: null, unlinked: [], renamed: false,
+		busy: false, lockCloses: 0,
 	});
 }
 function jobMetadata(name) {
@@ -535,11 +537,21 @@ function jobMetadata(name) {
 const writeSandbox = {
 	YAML_JOB_DIRECTORY: jobDirectory,
 	YAML_JOB_STATE_LIMIT: 256,
-	type: value => typeof value,
+	MAX_CONFIG_LENGTH: 512 * 1024,
+	type: value => Array.isArray(value) ? 'array' : typeof value,
 	length: value => value.length,
 	match: (value, expression) => value.match(expression),
+	substr: (value, start) => value.substr(start),
+	push: (values, value) => values.push(value),
+	config_path: () => '/etc/AdGuardHome/AdGuardHome.yaml',
 	random_token: () => '4'.repeat(32),
 	lstat: jobMetadata,
+	lsdir: () => Array.from(writeFixture.entries.keys())
+		.filter(name => name.startsWith(`${jobDirectory}/`))
+		.map(name => name.slice(jobDirectory.length + 1)),
+	open_yaml_job_lock: () => writeFixture.busy
+		? { busy: true } : { file: {}, descriptor: 193 },
+	close_yaml_job_lock: () => { writeFixture.lockCloses++; return true; },
 	ensure_yaml_job_directory() {
 		writeFixture.ensureCalls++;
 		writeFixture.directory = true;
@@ -583,7 +595,11 @@ vm.createContext(writeSandbox);
 vm.runInContext([
 	'yaml_job_path', 'root_private_directory', 'root_private_file', 'parse_yaml_job_state',
 	'write_yaml_job', 'write_new_yaml_job', 'replace_yaml_job',
-].map(extractFunction).join('\n') + '\nthis.api = { write_new_yaml_job, replace_yaml_job };',
+	'root_private_temporary_file', 'root_private_lock_file', 'read_yaml_job',
+	'discard_yaml_job', 'yaml_stage_path', 'remove_yaml_stage', 'scan_yaml_jobs',
+	'mark_yaml_job_indeterminate', 'prepare_yaml_job', 'update_job_status',
+].map(extractFunction).join('\n').replace(/for \(let (\w+) in (.+)\)/g, 'for (let $1 of $2)') +
+'\nthis.api = { write_new_yaml_job, replace_yaml_job, prepare_yaml_job, update_job_status };',
 writeSandbox, { filename: rpcPath });
 
 resetWrites();
@@ -637,6 +653,48 @@ resetWrites();
 assert.equal(writeSandbox.api.replace_yaml_job(token, 'invalid'), false);
 assert.equal(writeFixture.entries.size, 0, 'invalid state bytes must be rejected before staging');
 console.log('shared atomic job writer creation/replacement policy tests passed');
+
+resetWrites();
+writeFixture.entries.set(jobPath, pending);
+writeFixture.busy = true;
+const reused = writeSandbox.api.prepare_yaml_job('5'.repeat(32), expectedHash, candidateHash);
+assert.equal(reused.token, token);
+assert.equal(reused.reused, true);
+writeFixture.entries.set(jobPath, `success:${candidateHash}:1:${expectedHash}:${candidateHash}\n`);
+writeFixture.busy = false;
+const firstObserver = writeSandbox.api.update_job_status(token, false);
+assert.equal(firstObserver.ok, true);
+assert.deepEqual(writeSandbox.api.update_job_status(reused.token, false), firstObserver,
+	'two callers sharing a real stored token must both read its terminal result');
+assert.equal(writeFixture.entries.has(jobPath), true);
+
+const activeYaml = '/etc/AdGuardHome/AdGuardHome.yaml';
+for (const retained of [ 1, 15, 16 ]) {
+	resetWrites();
+	writeFixture.entries.set(activeYaml, 'active YAML must survive');
+	const oldTokens = Array.from({ length: retained }, (_, index) => index.toString(16).padStart(32, '0'));
+	for (const oldToken of oldTokens)
+		writeFixture.entries.set(`${jobDirectory}/${oldToken}`, terminal);
+	const oldStage = `${activeYaml}.luci-${oldTokens[0]}`;
+	writeFixture.entries.set(oldStage, 'orphaned stage');
+	assert.equal(writeSandbox.api.prepare_yaml_job(token, expectedHash, candidateHash).reused, false);
+	assert.equal(writeFixture.entries.has(oldStage), false,
+		'orphaned YAML stages must be cleaned by the next write, before its workdir can change');
+	assert.equal(writeFixture.entries.get(activeYaml), 'active YAML must survive');
+	for (const oldToken of oldTokens)
+		assert.equal(writeFixture.entries.has(`${jobDirectory}/${oldToken}`), retained < 16,
+			'terminal records stay readable below the existing retention bound');
+}
+
+resetWrites();
+writeFixture.entries.set(jobPath, terminal);
+const oversizedStage = `${activeYaml}.luci-${token}`;
+writeFixture.entries.set(oversizedStage, 'x'.repeat(512 * 1024 + 1));
+assert.ok(writeSandbox.api.prepare_yaml_job('5'.repeat(32), expectedHash, candidateHash).error);
+assert.equal(writeFixture.entries.has(oversizedStage), true, 'unsafe stage files must never be removed');
+assert.equal(writeFixture.entries.get(jobPath), terminal, 'failed cleanup must retain the recovery record');
+assert.equal(writeFixture.lockCloses, 1);
+console.log('reused-token observations and bounded terminal/stage retention tests passed');
 
 let randomBytes;
 const randomSandbox = {

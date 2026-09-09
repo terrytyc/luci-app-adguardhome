@@ -140,12 +140,28 @@ uci() {
 
 TEST_SERVERS='/example.test/192.0.2.53'
 load_dnsmasq_section
-dnsmasq_takeover_is_safe
-for generic in '9.9.9.9' '/#/9.9.9.9'; do
+for conditional in '//9.9.9.9' '/example.test/' '/example.test/#' \
+	'/foo.test/bar.test/9.9.9.9' '/*.example.test/9.9.9.9' \
+	'/*example.test/9.9.9.9' '/.example.test/9.9.9.9'; do
+	TEST_SERVERS="$conditional"
+	dnsmasq_takeover_is_safe
+done
+TEST_MANAGED_PORT=53335
+TEST_NORESOLV=1
+dns_port=53335
+for generic in '9.9.9.9' '/#/9.9.9.9' '/*/9.9.9.9' '/./9.9.9.9' \
+	'/.../9.9.9.9' '/example.test/#/9.9.9.9' \
+	'/example.test/*/other.test/9.9.9.9' '/example.test/.../9.9.9.9'; do
 	TEST_SERVERS="/example.test/192.0.2.53
 ${generic}"
 	if dnsmasq_takeover_is_safe; then
 		printf 'generic dnsmasq upstream was accepted: %s\n' "$generic" >&2
+		exit 1
+	fi
+	TEST_SERVERS="${TEST_SERVERS}
+127.0.0.1#53335"
+	if dnsmasq_integration_matches; then
+		printf 'active DNS validation ignored a generic upstream: %s\n' "$generic" >&2
 		exit 1
 	fi
 done
