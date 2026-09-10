@@ -18,7 +18,7 @@ DNS、配置、日志，在路由器里一处管理。
 
 ## 🚀 安装
 
-适用于使用 **APK 的 OpenWrt / ImmortalWrt 25.12 及以上固件**，要求 LuCI ≥ 23.05、fw4 和官方 `adguardhome` ≥ 0.107.76-r1。不额外拦截系统版本，不提供 IPK。
+适用于使用 **APK 的 OpenWrt / ImmortalWrt 25.12 及以上固件**，要求 LuCI ≥ 23.05、fw4。不提供 IPK。
 
 软件源只提供本插件和中文翻译，均为 `noarch`；核心及依赖仍从固件官方源安装。
 
