@@ -48,7 +48,7 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 
 `@terrytyc` 指定使用本项目软件源，避免同名包被其他源替换。正常校验签名，无需 `--allow-untrusted`。保留配置升级固件时，请将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，一并保留公钥。
 
-## 🧭 DNS 怎么选
+## 🧭 DNS 模式
 
 | 模式 | 工作方式 |
 | --- | --- |
