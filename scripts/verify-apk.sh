@@ -146,8 +146,8 @@ for hook in post-install post-upgrade; do
 done
 grep -Fq default_prerm "$temporary/main-pre-deinstall" ||
 	die 'main APK pre-deinstall lost the platform removal hook'
-grep -Fq 'official-adguardhome.config' "$temporary/main-pre-deinstall" ||
-	die 'main APK pre-deinstall lost original configuration restore'
+grep -Fq '/etc/init.d/AdGuardHome memory_cleanup' "$temporary/main-pre-deinstall" ||
+	die 'main APK pre-deinstall lost safe memory cleanup'
 grep -Fq 'verified AdGuard Home removal state' "$temporary/main-post-deinstall" ||
 	die 'main APK post-deinstall lost verified cleanup state'
 

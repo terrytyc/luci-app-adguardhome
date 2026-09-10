@@ -18,7 +18,7 @@ awk -v helper_dir="$package_dir/scripts" -f "$package_dir/scripts/expand-helpers
 . "$script_dir/lib/function-body.sh"
 for name in entry_metadata root_private_directory root_private_file bounded_private_file \
 	yaml_job_runtime_is_private yaml_job_lock_file_is_private prepare_yaml_job_runtime \
-	core_package_fingerprint apk_reconcile_locked apk_commit network_ready service_triggers; do
+	core_package_fingerprint apk_reconcile_locked apk_commit coordinator_present network_ready service_triggers; do
 	eval "$(function_body "$test_tmp/init.sh" "$name")"
 done
 

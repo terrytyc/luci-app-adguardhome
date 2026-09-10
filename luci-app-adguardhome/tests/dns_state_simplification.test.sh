@@ -300,7 +300,7 @@ firewall_integration_matches
 # Status uses the same matching rules without reconciling or waiting.  Even
 # none mode verifies that no plugin-owned takeover remains, without DNS probes.
 (
-	for action in integration_status web_listening; do
+	for action in integration_status web_listening overview_status; do
 		. "$init_file"
 		[ -z "$USE_PROCD" ]
 	done

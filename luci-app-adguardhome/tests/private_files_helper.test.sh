@@ -10,7 +10,7 @@ init_file="$package_dir/root/etc/init.d/AdGuardHome"
 temporary="$(mktemp -d /tmp/luci-agh-private-helper.XXXXXX)"
 trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 
-# Make expands the same canonical source used by all four package hooks.
+# Make expands the same canonical source used by the removal hooks.
 printf 'include %s/private-files.mk\n$(info $(AdGuardHome/PrivateFiles))\nall:; @:\n' \
 	"$helper_dir" >"$temporary/helper.make"
 make --no-print-directory -s -f "$temporary/helper.make" >"$temporary/helper.sh"
@@ -37,7 +37,7 @@ done >"$temporary/init.helper"
 sed '/^$/d' "$temporary/helper.sh" >"$temporary/helper.compact"
 sed '/^$/d' "$temporary/init.helper" >"$temporary/init.compact"
 cmp "$temporary/helper.compact" "$temporary/init.compact"
-[ "$(grep -Fc '$(AdGuardHome/PrivateFiles)' "$makefile")" = 3 ]
+[ "$(grep -Fc '$(AdGuardHome/PrivateFiles)' "$makefile")" = 2 ]
 ! grep -Eq '^entry_metadata\(\)|^root_private_(directory|file)\(\)|^bounded_private_file\(\)' \
 	"$makefile" "$defaults"
 ! grep -Fq '# @include ' "$temporary/defaults.sh"

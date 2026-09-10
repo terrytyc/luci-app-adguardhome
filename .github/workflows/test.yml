@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -25,3 +26,27 @@ jobs:
           ln -s "$(command -v busybox)" "$RUNNER_TEMP/luci-test-bin/awk"
           sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
           sudo env "PATH=$RUNNER_TEMP/luci-test-bin:$PATH" bash scripts/test.sh --light
+
+  full:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install host test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y busybox-static python3-yaml
+
+      - name: Prepare pinned OpenWrt and APK test tools
+        run: bash scripts/prepare-test-runtime.sh "$RUNNER_TEMP/luci-full-runtime"
+
+      - name: Run full suite and isolated APK transactions
+        run: |
+          mkdir -p "$RUNNER_TEMP/luci-test-bin"
+          ln -s "$(command -v busybox)" "$RUNNER_TEMP/luci-test-bin/awk"
+          sudo git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          sudo env "PATH=$RUNNER_TEMP/luci-test-bin:$PATH" \
+            "TARGET_ROOT=$RUNNER_TEMP/luci-full-runtime/root" \
+            "APK_BIN=$RUNNER_TEMP/luci-full-runtime/apk/sbin/apk.static" \
+            "STATIC_BUSYBOX=$(command -v busybox)" bash scripts/test.sh --full

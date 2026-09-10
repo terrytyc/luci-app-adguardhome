@@ -4,18 +4,13 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { deferred } = require('./lib/helpers');
 
 const overviewPath = path.join(__dirname,
 	'../htdocs/luci-static/resources/view/adguardhome/overview.js');
 const source = fs.readFileSync(overviewPath, 'utf8');
 const info = { available: true, username: 'admin', sha256: 'a'.repeat(64) };
 const encodedHash = '$2b$10$' + 'a'.repeat(53);
-
-function deferred() {
-	let resolve, reject;
-	const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-	return { promise, resolve, reject };
-}
 
 function loadOverview() {
 	const events = [];
@@ -194,6 +189,7 @@ async function main() {
 		state.inputs()[1].value = state.inputs()[2].value = value;
 		await state.submit();
 		const error = state.nodes.find(node => node.tag === 'p' && node.className === 'alert-message error');
+		assert.equal(error?.attrs.role, 'alert', 'credential validation errors must be announced');
 		assert.equal(String(error?.textContent).includes(expected), true);
 		assert.equal(state.events.some(Array.isArray), false, 'invalid passwords must not hash or submit');
 	}

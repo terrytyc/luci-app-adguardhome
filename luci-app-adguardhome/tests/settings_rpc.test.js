@@ -369,8 +369,10 @@ const jobFixture = {
 	closes: 0,
 	stageRemovals: 0,
 	recoveries: 0,
+	jobs: { active: [] },
 };
 const jobSandbox = {
+	length: value => value.length,
 	read_yaml_job() {
 		jobFixture.reads++;
 		return jobFixture.record;
@@ -380,6 +382,10 @@ const jobSandbox = {
 			file: jobFixture.lockAvailable ? {} : null,
 			error: jobFixture.lockError,
 		};
+	},
+	scan_yaml_jobs(cleanTemporary) {
+		assert.equal(cleanTemporary, false, 'observing a later worker must not clean its files');
+		return jobFixture.jobs;
 	},
 	close_yaml_job_lock() {
 		jobFixture.closes++;
@@ -416,6 +422,7 @@ function resetJob(state) {
 		lockAvailable: true, lockError: null, recoverySucceeds: true,
 		stageRemovalSucceeds: true, closeSucceeds: true,
 		reads: 0, closes: 0, stageRemovals: 0, recoveries: 0,
+		jobs: { active: [] },
 	});
 }
 
@@ -484,6 +491,19 @@ for (const settings of [ false, true ]) {
 	resetJob('success');
 	jobFixture.closeSucceeds = false;
 	assert.equal(query(token).error, `Unable to release ${label} update lock`);
+}
+
+for (const jobs of [ { active: [] }, { active: [ { token } ] },
+	{ active: [ { token: 'other' }, { token: 'third' } ] },
+	{ active: [ { token: 'other' } ], error: 'unsafe state' },
+	{ active: [ { token: 'other' } ], maintenance: true } ]) {
+	resetJob('success');
+	jobFixture.lockAvailable = false;
+	jobFixture.jobs = jobs;
+	assert.equal(jobSandbox.query(token, true).state, 'running',
+		'without one distinct active worker, terminal bytes must remain hidden during lock handoff');
+	assert.equal(jobFixture.stageRemovals, 0);
+	assert.equal(jobFixture.recoveries, 0);
 }
 
 resetJob('running');
@@ -667,6 +687,27 @@ assert.equal(firstObserver.ok, true);
 assert.deepEqual(writeSandbox.api.update_job_status(reused.token, false), firstObserver,
 	'two callers sharing a real stored token must both read its terminal result');
 assert.equal(writeFixture.entries.has(jobPath), true);
+
+for (const settings of [ false, true, 'writeback' ]) {
+	for (const terminalState of [
+		`success:${candidateHash}:1:${expectedHash}:${candidateHash}\n`,
+		`failure:${expectedHash}:${candidateHash}\n`,
+		`indeterminate:${expectedHash}:${candidateHash}\n`,
+	]) {
+		resetWrites();
+		writeFixture.entries.set(jobPath, terminalState);
+		const completed = writeSandbox.api.update_job_status(token, settings);
+		const nextToken = '5'.repeat(32);
+		assert.equal(writeSandbox.api.prepare_yaml_job(
+			nextToken, candidateHash, '6'.repeat(64)).reused, false);
+		writeFixture.busy = true;
+		assert.deepEqual(writeSandbox.api.update_job_status(token, settings), completed,
+			'a later transaction must not turn a completed task back into running');
+		assert.equal(writeFixture.entries.get(jobPath), terminalState);
+		assert.match(writeFixture.entries.get(`${jobDirectory}/${nextToken}`), /^pending:/,
+			'observing the completed task must preserve the later worker');
+	}
+}
 
 const activeYaml = '/etc/AdGuardHome/AdGuardHome.yaml';
 for (const retained of [ 1, 15, 16 ]) {

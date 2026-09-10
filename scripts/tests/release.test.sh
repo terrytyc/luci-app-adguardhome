@@ -45,12 +45,24 @@ gate=$(awk '
  active { sub(/^          /, ""); print }
 ' "$workflow")
 [[ -n $gate ]] || die 'release commit test gate is missing'
-for outcome in success failure pending empty commit-error runs-error invalid-commit empty-commit; do
+for outcome in success failure pending empty commit-error runs-error invalid-commit empty-commit \
+	invalid-run full-missing full-skipped full-failure jobs-error; do
 	gate_rc=0
 	OUTCOME=$outcome GATE="$gate" CURRENT_TAG=v3.0.0-r2 \
 		GITHUB_REPOSITORY=test/project bash -c '
 		gh() {
 			[[ $1 == api ]] || return 9
+			if [[ $2 == --paginate ]]; then
+				[[ $3 == repos/test/project/actions/runs/123/jobs ]] || return 9
+				case "$OUTCOME" in
+					jobs-error) return 7 ;;
+					full-missing) return 0 ;;
+					full-skipped) printf "skipped\n" ;;
+					full-failure) printf "failure\n" ;;
+					*) printf "success\n" ;;
+				esac
+				return
+			fi
 			case "$2" in
 				repos/test/project/commits/v3.0.0-r2)
 					[[ $OUTCOME != commit-error ]] || return 7
@@ -59,7 +71,11 @@ for outcome in success failure pending empty commit-error runs-error invalid-com
 					else printf "%040d\n" 1; fi ;;
 				"repos/test/project/actions/workflows/test.yml/runs?head_sha=$(printf "%040d" 1)&event=push&per_page=1")
 					[[ $OUTCOME != runs-error ]] || return 7
-					[[ $OUTCOME == empty ]] || printf "%s\n" "$OUTCOME" ;;
+					case "$OUTCOME" in
+						failure|pending|empty) return 0 ;;
+						invalid-run) printf "not-a-run-id\n" ;;
+						*) printf "123\n" ;;
+					esac ;;
 				*) return 9 ;;
 			esac
 		}
@@ -132,7 +148,7 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 					[[ $name != luci-app-adguardhome ]] || printf '    run_bounded 180 5 /etc/init.d/AdGuardHome stop\n' ;;
 				post-install|post-upgrade)
 					printf '    default_postinst\n    # AdGuard Home initialization failed; package installation aborted.\n    /etc/init.d/rpcd reload\n' ;;
-				pre-deinstall) printf '    default_prerm\n    # restore official-adguardhome.config\n' ;;
+				pre-deinstall) printf '    default_prerm\n    /etc/init.d/AdGuardHome memory_cleanup\n' ;;
 				post-deinstall) printf '    # verified AdGuard Home removal state\n' ;;
 			esac
 		done
@@ -242,7 +258,7 @@ for hook in post-install post-upgrade; do
 	check_apk_failure main "$hook lost RPC reload" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /rpcd reload/d; }"
 done
 check_apk_failure main 'platform removal hook' '/default_prerm/d'
-check_apk_failure main 'original configuration restore' '/official-adguardhome.config/d'
+check_apk_failure main 'safe memory cleanup' '\|/etc/init.d/AdGuardHome memory_cleanup|d'
 check_apk_failure main 'verified cleanup state' '/verified AdGuard Home removal state/d'
 expect_failure 'versioned adguardhome dependency' env BAD_CORE_DEPENDENCY=1 \
 	OUTPUT_DIR="$temporary/rejected-build" bash "$script"

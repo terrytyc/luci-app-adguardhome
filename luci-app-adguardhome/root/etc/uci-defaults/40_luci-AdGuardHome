@@ -10,9 +10,6 @@ OFFICIAL_DEFAULT_CONFIG="/etc/adguardhome/adguardhome.yaml"
 OFFICIAL_DEFAULT_WORK_DIR="/var/lib/adguardhome"
 KEEP_FILE="/lib/upgrade/keep.d/luci-app-adguardhome"
 SNAPSHOT_DIR="/root/.luci-app-adguardhome"
-SNAPSHOT_CONFIG="$SNAPSHOT_DIR/official-adguardhome.config"
-SNAPSHOT_STATE="$SNAPSHOT_DIR/official-adguardhome.state"
-SNAPSHOT_VERSION="$SNAPSHOT_DIR/snapshot-version"
 MANAGED_CONFIG_SNAPSHOT="$SNAPSHOT_DIR/managed-adguardhome.config"
 RUNTIME_DIR="/var/run/luci-app-adguardhome"
 MAX_FILE_SIZE=524288
@@ -27,7 +24,8 @@ USING_TEMPLATE=0
 UCI_CHANGED=0
 INSTALL_COMMITTED=0
 INSTALL_STARTED=0
-SNAPSHOT_STAGE=""
+INSTALL_BACKUP=""
+INSTALL_WAS_RUNNING=0
 YAML_STAGE=""
 
 # @include run-bounded
@@ -99,7 +97,11 @@ resolve_source_work_dir() {
 	printf '%s\n' "$resolved"
 }
 
-# @include original-snapshot
+official_delta_is_clean() {
+	local changes
+	changes="$(uci -q changes adguardhome 2>/dev/null)" || return 1
+	[ -z "$changes" ]
+}
 
 set_official_option() {
 	local option="$1" value="$2" current
@@ -282,6 +284,9 @@ managed_config_is_valid() {
 
 refresh_managed_config_snapshot() {
 	local temporary
+	if [ ! -e "$SNAPSHOT_DIR" ] && [ ! -L "$SNAPSHOT_DIR" ]; then
+		mkdir -m 0700 "$SNAPSHOT_DIR" && chown 0:0 "$SNAPSHOT_DIR" || return 1
+	fi
 	root_private_directory "$SNAPSHOT_DIR" || return 1
 	temporary="$(mktemp "$SNAPSHOT_DIR/.managed-adguardhome.config.XXXXXX")" ||
 		return 1
@@ -298,29 +303,51 @@ refresh_managed_config_snapshot() {
 
 # @include keep-active-config
 
-restore_original_config() {
-	local temporary was_running
-	validate_original_snapshot || return 1
+capture_install_config() {
+	local running_rc=0
+	bounded_regular_file /etc/config/adguardhome && official_delta_is_clean || return 1
+	INSTALL_BACKUP="$(mktemp /etc/config/.adguardhome.install.XXXXXX)" || return 1
+	chown 0:0 "$INSTALL_BACKUP" && chmod 0600 "$INSTALL_BACKUP" || return 1
+	run_bounded 5 1 /bin/dd if=/etc/config/adguardhome of="$INSTALL_BACKUP" \
+		bs=4096 count=129 2>/dev/null || return 1
+	bounded_private_file "$INSTALL_BACKUP" &&
+		cmp -s /etc/config/adguardhome "$INSTALL_BACKUP" || return 1
+	run_bounded 5 1 /etc/init.d/adguardhome running >/dev/null 2>&1 || running_rc=$?
+	case "$running_rc" in
+		0) INSTALL_WAS_RUNNING=1 ;;
+		1) INSTALL_WAS_RUNNING=0 ;;
+		*) return 1 ;;
+	esac
+}
+
+restore_install_config() {
+	local temporary
+	bounded_private_file "$INSTALL_BACKUP" || return 1
 	uci -q revert "$UCI_CONFIG" >/dev/null 2>&1 || true
 	temporary="$(mktemp /etc/config/.adguardhome.rollback.XXXXXX)" || return 1
-	run_bounded 5 1 /bin/dd if="$SNAPSHOT_CONFIG" of="$temporary" \
-		bs=4096 count=129 2>/dev/null || return 1
-	chown 0:0 "$temporary" && chmod 0600 "$temporary" || return 1
-	mv -f "$temporary" /etc/config/adguardhome || return 1
-	cmp -s "$SNAPSHOT_CONFIG" /etc/config/adguardhome || return 1
-	was_running="$(sed -n 's/^was_running=//p' "$SNAPSHOT_STATE")"
-	if [ "$was_running" = 1 ] && [ -x /etc/init.d/adguardhome ]; then
-		/etc/init.d/adguardhome start >/dev/null 2>&1 || return 1
+	if ! run_bounded 5 1 /bin/dd if="$INSTALL_BACKUP" of="$temporary" \
+		bs=4096 count=129 2>/dev/null ||
+	   ! chown 0:0 "$temporary" || ! chmod 0600 "$temporary" ||
+	   ! mv -f "$temporary" /etc/config/adguardhome; then
+		rm -f "$temporary"
+		return 1
+	fi
+	cmp -s "$INSTALL_BACKUP" /etc/config/adguardhome || return 1
+	if [ "$INSTALL_WAS_RUNNING" = 1 ]; then
+		run_bounded 20 2 /etc/init.d/adguardhome start >/dev/null 2>&1 || return 1
 	fi
 }
 
 cleanup_install() {
 	local rc=$?
-	cleanup_snapshot_stage
 	[ -z "$YAML_STAGE" ] || rm -f "$YAML_STAGE" 2>/dev/null || true
 	if [ "$INSTALL_STARTED" = 1 ] && [ "$INSTALL_COMMITTED" != 1 ]; then
-		restore_original_config >/dev/null 2>&1 || true
+		if ! restore_install_config; then
+			echo "Unable to restore installation settings; previous UCI kept at $INSTALL_BACKUP" >&2
+			exit 1
+		fi
 	fi
+	[ -z "$INSTALL_BACKUP" ] || rm -f "$INSTALL_BACKUP"
 	exit "$rc"
 }
 trap cleanup_install 0
@@ -335,10 +362,6 @@ official_delta_is_clean || {
 	exit 1
 }
 if [ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci ]; then
-	validate_original_snapshot || {
-		echo "Original official adguardhome snapshot is unavailable or unsafe." >&2
-		exit 1
-	}
 	managed_config_is_valid || {
 		echo "The installed AdGuard Home configuration is invalid." >&2
 		exit 1
@@ -355,13 +378,12 @@ if [ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci ]; then
 	exit 0
 fi
 
-ensure_original_snapshot || {
-	echo "Unable to preserve the original official adguardhome state." >&2
-	exit 1
-}
-
 select_clean_install_source || {
 	echo "The official AdGuard Home source paths are outside the supported layout." >&2
+	exit 1
+}
+capture_install_config || {
+	echo "Unable to preserve settings for installation rollback." >&2
 	exit 1
 }
 INSTALL_STARTED=1
@@ -383,5 +405,4 @@ managed_config_is_valid && keep_active_config "$TARGET_CONFIG_FILE" "$SNAPSHOT_D
 }
 
 INSTALL_COMMITTED=1
-trap - 0 HUP INT TERM
 exit 0

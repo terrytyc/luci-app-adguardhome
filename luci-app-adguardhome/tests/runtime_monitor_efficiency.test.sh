@@ -41,6 +41,7 @@ wait_for_core_stopped() { record stopped; }
 memory_deactivate_locked() { record "deactivate:$*"; }
 sync_monitor_instance() { record monitor-sync; }
 load_runtime_dns_port() { record dns-port; dns_port=53335; }
+official_socket_snapshot() { record snapshot; }
 dns_port_listening() { record socket; }
 integration_matches_desired() { record integration; }
 fail_safe_locked() { record failsafe; }
@@ -72,7 +73,7 @@ reconcile_core_locked
 TEST_ENABLED=1
 TEST_MODE=dnsmasq-upstream
 reconcile_core_locked
-[ "$(cat "$events")" = "$(printf 'settings\ndns-port\nsocket\nintegration')" ]
+[ "$(cat "$events")" = "$(printf 'settings\ndns-port\nsnapshot\nsocket\nintegration')" ]
 
 # Start/apply readiness remains a short one-second stable-listener check,
 # including none mode.  Only the long-lived monitor skips none-mode probes.

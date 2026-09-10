@@ -271,4 +271,40 @@ if web_listening 53336; then
 fi
 [ "$dns_port" = 53335 ]
 
+# The complete read-only redirect round, not just one helper, reuses its
+# owned socket set. Every later round and every mutating boundary is fresh.
+(
+	eval "$(function_body "$init_file" reconcile_core_locked)"
+	load_settings() {
+		service_enabled=1 MEMORY_ACTIVE=0 memory_requested=0 redirect_mode=redirect
+		work_dir=/etc/AdGuardHome
+	}
+	load_runtime_dns_port() { dns_port=53335; }
+	clear_recorded_integration_locked() { printf 'cleanup\n' >>"$calls"; }
+	integration_matches_desired() { dns_ipv6_listening; [ "$MATCHES" = 1 ]; }
+	wait_for_core_ready() {
+		[ "$OFFICIAL_SOCKET_SNAPSHOT_READY" = 0 ] && dns_port_listening
+	}
+	apply_integration_locked() {
+		[ "$OFFICIAL_SOCKET_SNAPSHOT_READY" = 0 ] && dns_ipv6_listening
+	}
+	LIVE=1 MATCHES=1
+	table udp 00000000 07
+	table tcp 00000000 0A
+	table udp6 00000000000000000000000000000000 07
+	table tcp6 00000000000000000000000000000000 0A
+	: >"$calls"
+	reconcile_core_locked
+	[ "$(grep -cx service "$calls")" = 1 ]
+	reconcile_core_locked
+	[ "$(grep -cx service "$calls")" = 2 ]
+	MATCHES=0
+	reconcile_core_locked
+	[ "$(grep -cx service "$calls")" = 5 ]
+	LIVE=0
+	reconcile_core_locked
+	[ "$(grep -cx service "$calls")" = 6 ]
+	[ "$(grep -cx cleanup "$calls")" = 1 ]
+)
+
 printf 'ok - builtin PID readers, parent-chain bounds and fresh owned socket checks\n'

@@ -5,11 +5,10 @@ ADGUARDHOME_SOURCE_DIR:=$(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 include $(TOPDIR)/rules.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
-include $(ADGUARDHOME_SOURCE_DIR)scripts/original-snapshot.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.1.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -61,9 +60,8 @@ define Package/$(PKG_NAME)/conffiles
 /root/.luci-app-adguardhome/
 endef
 
-# A first installation captures the untouched official lowercase package state
-# for uninstall. An overwrite stops the installed coordinator before replacing
-# its files, leaving APK to preserve package conffiles.
+# Stop an installed coordinator before replacing its files. APK preserves
+# conffiles; first-install rollback is local to the initialization script.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
@@ -72,45 +70,17 @@ $(AdGuardHome/UciPendingGuard)
 
 $(AdGuardHome/RunBounded)
 
-$(AdGuardHome/PrivateFiles)
-
-SNAPSHOT_DIR=/root/.luci-app-adguardhome
-SNAPSHOT_CONFIG="$$SNAPSHOT_DIR/official-adguardhome.config"
-SNAPSHOT_STATE="$$SNAPSHOT_DIR/official-adguardhome.state"
-SNAPSHOT_VERSION="$$SNAPSHOT_DIR/snapshot-version"
-SNAPSHOT_STAGE=""
-
-$(AdGuardHome/OriginalSnapshot)
-
 if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
 	[ -f /etc/init.d/AdGuardHome ] && [ ! -L /etc/init.d/AdGuardHome ] &&
 		[ -x /etc/init.d/AdGuardHome ] || {
 		echo "The installed AdGuard Home coordinator is unsafe." >&2
 		exit 1
 	}
-	validate_original_snapshot || {
-		echo "Original official adguardhome snapshot is unavailable or unsafe." >&2
-		exit 1
-	}
 	run_bounded 180 5 /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || {
 		echo "Unable to stop the installed AdGuard Home coordinator." >&2
 		exit 1
 	}
-	exit 0
 fi
-rollback_preinst() {
-	local rc=$$?
-	cleanup_snapshot_stage
-	exit "$$rc"
-}
-trap rollback_preinst 0
-trap 'exit 1' HUP INT TERM
-
-ensure_original_snapshot || {
-	echo "Unable to preserve the original official adguardhome state." >&2
-	exit 1
-}
-trap - 0 HUP INT TERM
 exit 0
 endef
 
@@ -145,22 +115,9 @@ esac
 $(AdGuardHome/RunBounded)
 
 $(AdGuardHome/PrivateFiles)
-snapshot_dir=/root/.luci-app-adguardhome
-snapshot_config="$$snapshot_dir/official-adguardhome.config"
-snapshot_state="$$snapshot_dir/official-adguardhome.state"
-snapshot_version="$$snapshot_dir/snapshot-version"
 runtime_dir=/var/run/luci-app-adguardhome
 remove_state="$$runtime_dir/remove-ok"
 
-root_private_directory "$$snapshot_dir" &&
-	bounded_private_file "$$snapshot_config" &&
-	root_private_file "$$snapshot_state" &&
-	root_private_file "$$snapshot_version" &&
-	grep -qx '1' "$$snapshot_version" &&
-	grep -Eq '^was_running=[01]$$' "$$snapshot_state" || {
-	echo "Original official adguardhome snapshot is unavailable or unsafe." >&2
-	exit 1
-}
 changes="$$(uci -q changes adguardhome 2>/dev/null)" || exit 1
 [ -z "$$changes" ] || {
 	echo "Commit or revert pending adguardhome changes before uninstalling." >&2
@@ -184,34 +141,10 @@ if [ -x /etc/init.d/AdGuardHome ]; then
 fi
 if [ -x /etc/init.d/adguardhome ]; then
 	run_bounded 20 2 /etc/init.d/adguardhome stop >/dev/null 2>&1 || exit 1
+	/etc/init.d/adguardhome disable >/dev/null 2>&1 || exit 1
 fi
 
-uci -q revert adguardhome >/dev/null 2>&1 || true
-restore="$$(mktemp /etc/config/.adguardhome.restore.XXXXXX)" || exit 1
-trap 'rm -f "$$restore"' 0 HUP INT TERM
-run_bounded 5 1 /bin/dd if="$$snapshot_config" of="$$restore" \
-	bs=4096 count=129 2>/dev/null || exit 1
-chown 0:0 "$$restore" && chmod 0600 "$$restore" || exit 1
-mv -f "$$restore" /etc/config/adguardhome || exit 1
-restore=""
-cmp -s "$$snapshot_config" /etc/config/adguardhome || exit 1
-
-was_running="$$(sed -n 's/^was_running=//p' "$$snapshot_state")"
-case "$$was_running" in
-	1)
-		run_bounded 20 2 /etc/init.d/adguardhome start \
-			>/dev/null 2>&1 || exit 1
-		run_bounded 5 1 /etc/init.d/adguardhome running \
-			>/dev/null 2>&1 || exit 1
-		;;
-	0)
-		if /etc/init.d/adguardhome running >/dev/null 2>&1; then
-			exit 1
-		fi
-		;;
-	*) exit 1 ;;
-esac
-
+# Leave the current UCI, YAML and data in place for an explicit reinstall.
 if [ -e "$$runtime_dir" ] || [ -L "$$runtime_dir" ]; then
 	root_private_directory "$$runtime_dir" || exit 1
 else
@@ -220,7 +153,6 @@ else
 fi
 (umask 077; printf '1\n' >"$$remove_state") || exit 1
 chown 0:0 "$$remove_state" && chmod 0600 "$$remove_state" || exit 1
-trap - 0 HUP INT TERM
 exit 0
 endef
 
@@ -242,16 +174,9 @@ root_private_directory "$$runtime_dir" && root_private_file "$$remove_state" &&
 	echo "The verified AdGuard Home removal state is missing." >&2
 	exit 1
 }
-root_private_directory "$$snapshot_dir" || exit 1
-for snapshot_file in \
-	official-adguardhome.config official-adguardhome.state \
-	snapshot-version; do
-	root_private_file "$$snapshot_dir/$$snapshot_file" || exit 1
-	rm -f "$$snapshot_dir/$$snapshot_file" || exit 1
-done
 managed_snapshot="$$snapshot_dir/managed-adguardhome.config"
 if [ -e "$$managed_snapshot" ] || [ -L "$$managed_snapshot" ]; then
-	root_private_file "$$managed_snapshot" || exit 1
+	root_private_directory "$$snapshot_dir" && root_private_file "$$managed_snapshot" || exit 1
 	rm -f "$$managed_snapshot" || exit 1
 fi
 rmdir "$$snapshot_dir" 2>/dev/null || true

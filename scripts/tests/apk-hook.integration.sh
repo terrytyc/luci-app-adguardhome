@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
-# Manual SDK integration check; intentionally excluded from *.test.sh.
+# Isolated APK integration check; included by scripts/test.sh --full.
 # APK_BIN=/path/to/apk STATIC_BUSYBOX=/path/to/static/busybox bash "$0"
 set -Eeuo pipefail
 
@@ -106,18 +106,22 @@ SH
 	chmod 0755 "$payload/etc/init.d/adguardhome"
 	"$apk" mkpkg --info name:adguardhome-hook-test --info "version:$revision.0-r0" \
 		--info arch:noarch --files "$payload" --script "post-upgrade:$temporary/post-upgrade" \
-		--output "$temporary/core-$revision.apk" >"$temporary/mkpkg-$revision.log" 2>&1 || {
+		--output "$temporary/adguardhome-hook-test-$revision.0-r0.apk" >"$temporary/mkpkg-$revision.log" 2>&1 || {
 		cat "$temporary/mkpkg-$revision.log" >&2; die "could not build dummy core $revision";
 	}
 done
 
+"$apk" mkndx --allow-untrusted --output "$temporary/packages.adb" \
+	"$temporary"/adguardhome-hook-test-*.apk
+
 apk_transaction() {
 	"$apk" --root "$root" --arch x86_64 --allow-untrusted --network=no \
-		--repositories-file /dev/null --sync=no "$@" >"$temporary/apk.log" 2>&1 || {
+		--repositories-file /dev/null --repository "$temporary/packages.adb" \
+		--sync=no "$@" >"$temporary/apk.log" 2>&1 || {
 		cat "$temporary/apk.log" >&2; die 'native APK transaction failed';
 	}
 }
-apk_transaction add --initdb "$temporary/core-1.apk"
+apk_transaction add --initdb adguardhome-hook-test=1.0-r0
 cp "$hook" "$root/lib/apk/commit_hooks.d/90-luci-app-adguardhome"
 chmod 0755 "$root/lib/apk/commit_hooks.d/90-luci-app-adguardhome"
 
@@ -126,7 +130,7 @@ for enabled in 0 1; do
 	printf '%s\n' "$enabled" >"$root/etc/config/adguardhome"
 	chroot "$root" /etc/init.d/adguardhome enable
 	: >"$root/events"
-	apk_transaction add "$temporary/core-$revision.apk"
+	apk_transaction add "adguardhome-hook-test=$revision.0-r0"
 	expected=$(printf 'hook:pre-commit:enabled=%s\ncore:post-upgrade\ncore:start:v%s\nhook:post-commit:enabled=%s\ndecision:apk_reconcile_locked:changed=1\ncore:disable:v%s\n' \
 		"$enabled" "$revision" "$enabled" "$revision"
 		if [[ $enabled == 0 ]]; then printf 'core:stop:v%s\nmonitor:sync' "$revision"
@@ -150,7 +154,7 @@ before_metadata=$(LC_ALL=C ls -ln "$root/usr/bin/AdGuardHome" "$root/etc/init.d/
 before_inode=$(ls -i "$root/usr/bin/AdGuardHome" "$root/etc/init.d/adguardhome")
 chroot "$root" /etc/init.d/adguardhome enable
 : >"$root/events"
-apk_transaction add --force-reinstall "$temporary/core-3.apk"
+apk_transaction fix --reinstall adguardhome-hook-test
 [[ $(<"$root/events") == "$expected" ]] || {
 	cat "$root/events" >&2; cat "$temporary/apk.log" >&2;
 	die 'same-version reinstall did not detect and reconcile core replacement';

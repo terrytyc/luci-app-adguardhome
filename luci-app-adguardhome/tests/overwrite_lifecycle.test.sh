@@ -35,28 +35,17 @@ for required in \
 	'[ -f /etc/init.d/AdGuardHome ]' \
 	'[ ! -L /etc/init.d/AdGuardHome ]' \
 	'[ -x /etc/init.d/AdGuardHome ]' \
-	'validate_original_snapshot' \
-	'run_bounded 180 5 /etc/init.d/AdGuardHome stop' \
-	'exit 0'; do
+	'run_bounded 180 5 /etc/init.d/AdGuardHome stop'; do
 	printf '%s\n' "$overwrite_block" | grep -Fq "$required" || {
 		printf 'overwrite preflight missing: %s\n' "$required" >&2
 		exit 1
 	}
 done
 if printf '%s\n' "$overwrite_block" |
-	grep -Eq 'source_version|upgrade[_-]state|was_running'; then
+	grep -Eq 'source_version|upgrade[_-]state|was_running|original_snapshot'; then
 	printf 'overwrite preflight still carries versioned upgrade state\n' >&2
 	exit 1
 fi
-
-stop_line="$(printf '%s\n' "$preinst" |
-	grep -n 'run_bounded 180 5 /etc/init.d/AdGuardHome stop' | cut -d: -f1)"
-validate_line="$(printf '%s\n' "$preinst" |
-	grep -n '^[[:space:]]*validate_original_snapshot ||' | cut -d: -f1)"
-[ "$validate_line" -lt "$stop_line" ] || {
-	printf 'overwrite stops the coordinator before validating its original snapshot\n' >&2
-	exit 1
-}
 
 test_tmp="$(mktemp -d /tmp/luci-agh-overwrite.XXXXXX)"
 trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
@@ -68,14 +57,13 @@ chmod 0700 "$coordinator"
 runtime_overwrite="$(printf '%s\n' "$overwrite_block" |
 	sed 's|/etc/init.d/AdGuardHome|"$coordinator"|g')"
 (
-	validate_original_snapshot() { :; }
 	run_bounded() {
 		[ "$1:$2" = 180:5 ] || exit 1
 		shift 2
 		"$@"
 	}
 	eval "$runtime_overwrite"
-	exit 97
+	exit 0
 ) || {
 	printf 'overwrite preflight did not stop and exit cleanly\n' >&2
 	exit 1
@@ -85,7 +73,7 @@ runtime_overwrite="$(printf '%s\n' "$overwrite_block" |
 managed_block="$(sed -n \
 	'/^if \[ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci \]; then$/,/^fi$/p' \
 	"$defaults")"
-for required in validate_original_snapshot managed_config_is_valid keep_active_config \
+for required in managed_config_is_valid keep_active_config \
 	refresh_managed_config_snapshot 'exit 0'; do
 	printf '%s\n' "$managed_block" | grep -Fq "$required" || {
 		printf 'managed overwrite selection missing: %s\n' "$required" >&2
@@ -106,7 +94,6 @@ export managed_log
 	OFFICIAL_SECTION=config
 	SNAPSHOT_DIR=/root/.luci-app-adguardhome
 	INSTALL_COMMITTED=0
-	validate_original_snapshot() { printf 'snapshot-validated\n' >>"$managed_log"; }
 	uci() {
 		[ "$1:$2" = -q:get ] || return 1
 		case "$3" in
@@ -127,7 +114,7 @@ export managed_log
 	printf 'managed overwrite branch did not preserve and exit cleanly\n' >&2
 	exit 1
 }
-[ "$(cat "$managed_log")" = "$(printf 'snapshot-validated\nvalidated\nkept\nrefreshed')" ]
+[ "$(cat "$managed_log")" = "$(printf 'validated\nkept\nrefreshed')" ]
 
 start_body="$(function_body "$init_file" start_service)"
 printf '%s\n' "$start_body" |
@@ -159,10 +146,10 @@ printf '%s\n' "$postrm" | grep -Fq 'rmdir "$$snapshot_dir" 2>/dev/null || true'
 
 cleanup_body="$(function_body "$defaults" cleanup_install)"
 for required in \
-	'cleanup_snapshot_stage' \
+	'INSTALL_BACKUP' \
 	'[ "$INSTALL_STARTED" = 1 ]' \
 	'[ "$INSTALL_COMMITTED" != 1 ]' \
-	'restore_original_config'; do
+	'restore_install_config'; do
 	printf '%s\n' "$cleanup_body" | grep -Fq "$required" || {
 		printf 'first-install rollback contract missing: %s\n' "$required" >&2
 		exit 1

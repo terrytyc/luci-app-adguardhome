@@ -690,12 +690,12 @@ function parse_yaml_job_state(content) {
 		return null;
 
 	let fields = match(content,
-		/^pending:([0-9a-f]{64}):([0-9a-f]{64})\n$/);
+		/^(pending|failure|indeterminate):([0-9a-f]{64}):([0-9a-f]{64})\n$/);
 	if (fields)
 		return {
-			state: 'pending',
-			expected_hash: fields[1],
-			candidate_hash: fields[2],
+			state: fields[1],
+			expected_hash: fields[2],
+			candidate_hash: fields[3],
 		};
 
 	fields = match(content,
@@ -717,24 +717,6 @@ function parse_yaml_job_state(content) {
 			restarted: fields[2] == '1',
 			expected_hash: fields[3],
 			candidate_hash: fields[4],
-		};
-
-	fields = match(content,
-		/^failure:([0-9a-f]{64}):([0-9a-f]{64})\n$/);
-	if (fields)
-		return {
-			state: 'failure',
-			expected_hash: fields[1],
-			candidate_hash: fields[2],
-		};
-
-	fields = match(content,
-		/^indeterminate:([0-9a-f]{64}):([0-9a-f]{64})\n$/);
-	if (fields)
-		return {
-			state: 'indeterminate',
-			expected_hash: fields[1],
-			candidate_hash: fields[2],
 		};
 
 	return null;
@@ -1294,7 +1276,14 @@ function update_job_status(token, settings) {
 	if (!lock.file) {
 		if (lock.error)
 			return { error: lock.error };
-		return { state: record.state == 'pending' ? 'pending' : 'running' };
+		// A distinct worker can publish its pending record only after this
+		// terminal job released the shared lock. Its historical result is then
+		// stable even while that later transaction is still running.
+		let jobs = record.state != 'pending' && record.state != 'running'
+			? scan_yaml_jobs(false) : null;
+		if (!jobs || jobs.error || jobs.maintenance || length(jobs.active) != 1 ||
+		    jobs.active[0].token == token)
+			return { state: record.state == 'pending' ? 'pending' : 'running' };
 	}
 
 	record = read_yaml_job(token);
@@ -1788,23 +1777,8 @@ function tls_material_complete(config) {
 	       !!yaml_material_value(config, 'private_key');
 }
 
-function web_port_listening(port) {
-	if (type(port) != 'int')
-		return false;
-
-	// overview_info holds the transaction lock across every endpoint probe.
-	try {
-		return system([
-			YAML_UPDATE_COMMAND, 'web_listening', `${port}`,
-		]) == 0;
-	}
-	catch (error) {
-		return false;
-	}
-}
-
-function config_info(content, can_probe) {
-	let result = { dns_port: null, web: null };
+function config_info(content) {
+	let result = { dns_port: null, https: null, http: null };
 	if (!content)
 		return result;
 
@@ -1819,11 +1793,9 @@ function config_info(content, can_probe) {
 	if (tls_enabled) {
 		let host = valid_dns_name(yaml_section_value(config, 'tls', 'server_name'));
 		let port = valid_port(yaml_section_value(config, 'tls', 'port_https'));
-		if (can_probe && host && port && tls_material_complete(config) &&
-		    web_port_listening(port))
-			result.web = { scheme: 'https', host, port };
-		if (result.web ||
-		    yaml_bool(yaml_section_value(config, 'tls', 'force_https')) === true)
+		if (host && port && tls_material_complete(config))
+			result.https = { scheme: 'https', host, port };
+		if (yaml_bool(yaml_section_value(config, 'tls', 'force_https')) === true)
 			return result;
 	}
 
@@ -1831,10 +1803,40 @@ function config_info(content, can_probe) {
 	// its HTTP endpoint unless force_https is explicitly enabled.  The frontend
 	// intentionally reuses the LuCI page host for this result.
 	let port = http_port(config);
-	if (can_probe && port && web_port_listening(port))
-		result.web = { scheme: 'http', host: null, port };
+	if (port)
+		result.http = { scheme: 'http', host: null, port };
 
 	return result;
+}
+
+function probe_overview(config, redirect, running) {
+	let mode = match(redirect || '', /^(none|redirect|dnsmasq-upstream)$/)
+		? redirect : 'unknown';
+	let pipe = null;
+	try {
+		// Only validated integer ports and a fixed mode literal enter this
+		// command. One child shares its socket snapshot across all probes.
+		pipe = popen(`${YAML_UPDATE_COMMAND} overview_status ${config.dns_port || 0} ` +
+			`${mode} ${running ? config.https?.port || 0 : 0} ` +
+			`${running ? config.http?.port || 0 : 0} 2>/dev/null`, 'r');
+		if (!pipe)
+			return null;
+		let output = pipe.read(128);
+		let status = pipe.close();
+		pipe = null;
+		let fields = type(output) == 'string' ? match(output,
+			/^integration=(none|ready|pending|unknown)\nhttps=([01])\nhttp=([01])\n$/) : null;
+		return status == 0 && fields
+			? { integration: fields[1], https: fields[2] == '1', http: fields[3] == '1' }
+			: null;
+	}
+	catch (error) {
+		if (pipe) {
+			try { pipe.close(); }
+			catch (close_error) { }
+		}
+		return null;
+	}
 }
 
 function overview_info() {
@@ -1858,16 +1860,18 @@ function overview_info() {
 				can_probe = mark_yaml_job_indeterminate(item) && can_probe;
 		can_probe = can_probe &&
 			(result.status.running === true || configuration.redirect == 'none');
-		result.config = config_info(read_config(configuration),
-			can_probe && result.status.running === true);
+		let config = config_info(read_config(configuration));
+		result.config.dns_port = config.dns_port;
 		result.status.dns_integration = 'unknown';
-		if (can_probe && result.config.dns_port &&
-		    match(configuration.redirect || '', /^(none|redirect|dnsmasq-upstream)$/)) {
-			let status = system([ YAML_UPDATE_COMMAND, 'integration_status',
-				`${result.config.dns_port}`, configuration.redirect ]);
-			result.status.dns_integration = status == 0
-				? (configuration.redirect == 'none' ? 'none' : 'ready')
-				: status == 1 ? 'pending' : 'unknown';
+		if (can_probe && (config.dns_port || config.https || config.http)) {
+			let probe = probe_overview(config, configuration.redirect,
+				result.status.running === true);
+			if (probe) {
+				result.status.dns_integration = probe.integration;
+				if (result.status.running === true)
+					result.config.web = probe.https && config.https
+						? config.https : probe.http ? config.http : null;
+			}
 		}
 	}
 	catch (error) { }

@@ -64,6 +64,7 @@ ensure_config_file() { return 0; }
 sync_yaml_managed_fields_checked() { return 0; }
 memory_prepare_or_fallback_locked() { MEMORY_BACKING_WORK_DIR="$persistent_work_dir"; }
 load_runtime_dns_port() { dns_port=53335; }
+official_socket_snapshot() { return 0; }
 sync_official_uci() { return 0; }
 apply_integration_locked() { return 0; }
 dns_port_listening() { return 0; }

@@ -776,7 +776,7 @@ return view.extend({
 			maxlength: '256',
 			style: 'width: 100%; max-width: 100%; min-width: 0; box-sizing: border-box',
 		});
-		const status = E('p', { class: 'alert-message', style: 'display: none' });
+		const status = E('p', { class: 'alert-message', role: 'alert', style: 'display: none' });
 		const cancelButton = E('button', {
 			class: 'cbi-button',
 			type: 'button',

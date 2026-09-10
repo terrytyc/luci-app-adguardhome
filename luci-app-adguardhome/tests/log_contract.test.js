@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const { extractFunction } = require('./lib/source');
+const { translated } = require('./lib/helpers');
 
 const packageRoot = path.resolve(__dirname, '..');
 const rpcPath = path.join(
@@ -18,15 +19,6 @@ const viewPath = path.join(
 );
 const rpcSource = fs.readFileSync(rpcPath, 'utf8');
 const viewSource = fs.readFileSync(viewPath, 'utf8');
-
-function translated(value) {
-	const result = new String(value);
-	result.format = (...args) => {
-		let offset = 0;
-		return value.replace(/%[sd]/g, () => String(args[offset++]));
-	};
-	return result;
-}
 
 function loadLogView(handler) {
 	const failures = [];

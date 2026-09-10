@@ -205,24 +205,32 @@ load_settings() { service_enabled=1; work_dir=/etc/AdGuardHome; redirect_mode=no
 load_active_tls_access() { TLS_USES_ACME=1; TLS_FINGERPRINT=loaded; }
 check_core_config() { TLS_FINGERPRINT=; }
 sync_tls_access() { UCI_FINGERPRINT="$SYNC_FINGERPRINT"; }
-official_running() { return 1; }
-clear_recorded_integration_locked() { :; }
+CORE_RUNNING=0
+official_running() { [ "$CORE_RUNNING" = 1 ]; }
+coordinator_present() { [ "${TEST_COORDINATOR_PRESENT:-0}" = 1 ]; }
+DNS_CHANGES=0
+clear_recorded_integration_locked() { DNS_CHANGES=$((DNS_CHANGES + 1)); }
 load_runtime_dns_port() { dns_port=53335; }
 wait_for_core_ready() { :; }
-apply_integration_locked() { :; }
+apply_integration_locked() { DNS_CHANGES=$((DNS_CHANGES + 1)); }
 restore_tls_fingerprint() { :; }
 resume_yaml_runtime() { :; }
 
 : >"$official_log"
 UCI_FINGERPRINT=same SYNC_FINGERPRINT=same tls_refresh_locked
 [ ! -s "$official_log" ]
-UCI_FINGERPRINT=old SYNC_FINGERPRINT=new tls_refresh_locked
-[ "$(cat "$official_log")" = start ]
+# A renewed certificate may refresh access while stopped, but must not undo
+# a manual coordinator stop (which also removed its DNS monitor).
+for CORE_RUNNING in 0 1; do
+	UCI_FINGERPRINT=old SYNC_FINGERPRINT=new tls_refresh_locked
+	[ ! -s "$official_log" ] && [ "$DNS_CHANGES" = 0 ]
+done
 
 # Keep the actual recovery chain: resume_yaml_runtime syncs TLS access, which
 # republishes the new fingerprint even when it cannot restart the old core.
 # Every failure branch must restore the retry marker after that attempt.
 (
+	TEST_COORDINATOR_PRESENT=1
 	eval "$(function_body "$init_file" resume_yaml_runtime)"
 	eval "$(function_body "$init_file" restore_tls_fingerprint)"
 	uci() {

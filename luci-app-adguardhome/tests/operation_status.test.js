@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { translated } = require('./lib/helpers');
 
 const packageRoot = path.resolve(__dirname, '..');
 const modulePath = path.join(
@@ -23,15 +24,6 @@ function createLuCIClass() {
 	LuCIClass.isSubclass = candidate =>
 		typeof candidate === 'function' && candidate.prototype instanceof LuCIClass;
 	return LuCIClass;
-}
-
-function translated(value) {
-	const result = new String(value);
-	result.format = (...args) => {
-		let offset = 0;
-		return value.replace(/%[sd]/g, () => String(args[offset++]));
-	};
-	return result;
 }
 
 function loadOperation() {

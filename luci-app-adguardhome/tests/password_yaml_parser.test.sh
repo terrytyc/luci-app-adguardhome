@@ -47,15 +47,7 @@ trap 'exit 1' HUP INT TERM
 const TEST_CANDIDATE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 let mock_yaml = null;
 let updated_content = null;
-let listening_ports = [];
 let no_op_hashes = 0;
-
-function web_port_listening(port) {
-	for (let listening in listening_ports)
-		if (listening == port)
-			return true;
-	return false;
-}
 
 function read_yaml() {
 	return mock_yaml;
@@ -83,9 +75,7 @@ UCODE_STUBS
 		/^function yaml_scalar\(value\)/ { copying = 1 }
 		/^function yaml_simple_scalar\(value\)/ { copying = 0 }
 		/^function yaml_config_values\(content\)/ { copying = 1 }
-		/^function web_port_listening\(port\)/ { copying = 0 }
-		/^function config_info\(content, can_probe\)/ { copying = 1 }
-		/^function overview_info\(\)/ { copying = 0 }
+		/^function probe_overview\(/ { copying = 0 }
 		copying { print }
 	' "$source_file"
 
@@ -348,16 +338,22 @@ if (no_op_hashes != 0)
 print('credential YAML parser fixture tests passed\n');
 
 function expect_config(name, content, ports, dns_port, scheme, host, port) {
-	listening_ports = ports;
-	let result = config_info(content, true);
+	let result = config_info(content);
+	// Socket selection is covered by the overview RPC test; these fixtures
+	// exercise the native parser's ordered, independently valid candidates.
+	let web = null;
+	for (let candidate in [ result.https, result.http ])
+		if (candidate && index(ports, candidate.port) >= 0) {
+			web = candidate;
+			break;
+		}
 	if (result.dns_port !== dns_port)
 		fail(name, 'DNS port differs');
 	if (scheme == null) {
-		if (result.web != null)
+		if (web != null)
 			fail(name, 'ambiguous or unavailable web endpoint was exposed');
 	}
-	else if (result.web?.scheme !== scheme || result.web?.host !== host ||
-	         result.web?.port !== port)
+	else if (web?.scheme !== scheme || web?.host !== host || web?.port !== port)
 		fail(name, 'web endpoint differs from the expected YAML values');
 	print(`ok - ${name}\n`);
 }

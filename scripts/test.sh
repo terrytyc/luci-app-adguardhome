@@ -7,7 +7,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO=$(git -C "$SCRIPT_DIR/.." rev-parse --show-toplevel)
 PACKAGE_DIR=$REPO/luci-app-adguardhome
 SDK=${SDK:-/root/sdk-x86-64}
-TARGET_ROOT=$SDK/staging_dir/target-x86_64_musl/root-x86
+TARGET_ROOT=${TARGET_ROOT:-$SDK/staging_dir/target-x86_64_musl/root-x86}
 UCODE_BIN=${UCODE_BIN:-$TARGET_ROOT/usr/bin/ucode}
 UCODE_LOADER=${UCODE_LOADER:-$TARGET_ROOT/lib/ld-musl-x86_64.so.1}
 
@@ -20,10 +20,13 @@ mode=full
 case "$#" in
 	0) ;;
 	1)
-		[ "$1" = --light ] || die "unknown option: $1"
-		mode=light
+		case "$1" in
+			--light) mode=light ;;
+			--full) ;;
+			*) die "unknown option: $1" ;;
+		esac
 		;;
-	*) die 'usage: scripts/test.sh [--light]' ;;
+	*) die 'usage: scripts/test.sh [--light|--full]' ;;
 esac
 
 for command_name in busybox git mktemp; do
@@ -60,7 +63,11 @@ trap 'exit 143' TERM
 
 if [[ $mode == full ]]; then
 	[[ -x $UCODE_BIN && -x $UCODE_LOADER ]] ||
-		die "SDK target ucode runtime is missing: $SDK"
+		die "target ucode runtime is missing: $TARGET_ROOT"
+	[[ -x $TARGET_ROOT/sbin/uci ]] || die "target UCI is missing: $TARGET_ROOT"
+	export APK_BIN=${APK_BIN:-$SDK/staging_dir/host/bin/apk}
+	export STATIC_BUSYBOX=${STATIC_BUSYBOX:-$(command -v busybox)}
+	[[ -x $APK_BIN ]] || die "APK v3 test tool is missing: $APK_BIN"
 	ucode_library_path=$TARGET_ROOT/lib:$TARGET_ROOT/usr/lib
 	"$UCODE_LOADER" --library-path "$ucode_library_path" \
 		"$UCODE_BIN" -L "$TARGET_ROOT/usr/lib/ucode" -S -c \
@@ -107,6 +114,8 @@ if [[ $mode == light ]]; then
 	printf 'LIGHT_TEST_OK shell=%d javascript=%d skipped=%d\n' \
 		"$shell_count" "${#js_tests[@]}" "$((${#shell_tests[@]} - shell_count))"
 else
-	printf 'TEST_OK shell=%d javascript=%d\n' \
+	printf 'TEST scripts/tests/apk-hook.integration.sh\n'
+	bash "$SCRIPT_DIR/tests/apk-hook.integration.sh"
+	printf 'TEST_OK shell=%d javascript=%d apk_integration=1\n' \
 		"${#shell_tests[@]}" "${#js_tests[@]}"
 fi

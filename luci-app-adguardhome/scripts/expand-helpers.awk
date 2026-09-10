@@ -19,8 +19,6 @@ function read_helper(path, name, line, copying, complete, body) {
 		printf "%s", read_helper(helper_dir "/run-bounded.mk", "RunBounded")
 	else if (name == "private-files")
 		printf "%s", read_helper(helper_dir "/private-files.mk", "PrivateFiles")
-	else if (name == "original-snapshot")
-		printf "%s", read_helper(helper_dir "/original-snapshot.mk", "OriginalSnapshot")
 	else if (name == "keep-active-config")
 		printf "%s", read_helper(helper_dir "/keep-active-config.mk", "KeepActiveConfig")
 	else { failed = 1; exit 1 }

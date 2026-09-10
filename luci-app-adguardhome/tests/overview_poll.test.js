@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const { deferred } = require('./lib/helpers');
 
 const overviewPath = path.join(__dirname,
 	'../htdocs/luci-static/resources/view/adguardhome/overview.js');
@@ -136,12 +137,6 @@ function loadOverview() {
 		setWritable: value => { writable = value; },
 		setOverview: value => { overviewResult = value; },
 	};
-}
-
-function deferred() {
-	let resolve, reject;
-	const promise = new Promise((yes, no) => { resolve = yes; reject = no; });
-	return { promise, resolve, reject };
 }
 
 function managementContainer(state) {

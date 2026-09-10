@@ -17,7 +17,7 @@ const functions = [
 	'same_inode', 'read_yaml', 'read_config', 'credentials_info', 'update_credentials', 'reset_yaml',
 	'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
 	'valid_port', 'yaml_bool', 'valid_dns_name', 'http_port', 'yaml_material_value',
-	'tls_material_complete', 'web_port_listening', 'config_info', 'overview_info',
+	'tls_material_complete', 'config_info', 'probe_overview', 'overview_info',
 	'root_private_temporary_file', 'root_private_lock_file', 'scan_yaml_jobs',
 	'parse_yaml_job_state', 'mark_yaml_job_indeterminate',
 ].map(extractFunction).join('\n')
@@ -39,6 +39,7 @@ function reset() {
 		badInode: false, badDevice: false, badSize: false, fileCloseSucceeds: true,
 		hashUnavailable: false, connectionUnavailable: false, serviceFailure: false,
 		emptyService: false,
+		probeCalls: [], probeFailure: null, probeOutput: null, probeCloses: 0,
 	});
 }
 reset();
@@ -173,17 +174,33 @@ const sandbox = {
 		fixture.locked = false;
 		return fixture.closeSucceeds;
 	},
-	system(args) {
-		assert.equal(fixture.locked, true, 'every core endpoint probe must hold the same job lock');
-		assert.equal(args[0], '/etc/init.d/AdGuardHome');
-		if (args[1] === 'integration_status') {
-			fixture.integrationProbes.push(args.slice(2));
-			return fixture.integration;
-		}
-		assert.equal(args[1], 'web_listening');
-		const port = Number(args[2]);
-		fixture.probes.push(port);
-		return fixture.listening.includes(port) ? 0 : 1;
+	popen(command, mode) {
+		assert.equal(fixture.locked, true, 'the combined probe must hold the task lock');
+		assert.equal(mode, 'r');
+		const args = command.match(/^\/etc\/init\.d\/AdGuardHome overview_status (\d+) (none|redirect|dnsmasq-upstream|unknown) (\d+) (\d+) 2>\/dev\/null$/);
+		assert.ok(args, 'the shell command may contain only validated ports and a fixed mode');
+		const [ dns, redirect, https, http ] = args.slice(1);
+		fixture.probeCalls.push(args.slice(1));
+		if (fixture.probeFailure === 'open')
+			return null;
+		if (Number(dns) && redirect !== 'unknown')
+			fixture.integrationProbes.push([ dns, redirect ]);
+		for (const port of [ https, http ])
+			if (Number(port)) fixture.probes.push(Number(port));
+		const integration = !Number(dns) || redirect === 'unknown' ? 'unknown' :
+			fixture.integration === 0 ? redirect === 'none' ? 'none' : 'ready' :
+			fixture.integration === 1 ? 'pending' : 'unknown';
+		return {
+			read(limit) {
+				assert.equal(limit, 128, 'combined status output must remain bounded');
+				if (fixture.probeFailure === 'read') throw new Error('probe read failed');
+				return fixture.probeOutput ?? `integration=${integration}\nhttps=${fixture.listening.includes(Number(https)) ? 1 : 0}\nhttp=${fixture.listening.includes(Number(http)) ? 1 : 0}\n`;
+			},
+			close() {
+				fixture.probeCloses++;
+				return fixture.probeFailure === 'exit' ? 2 : 0;
+			},
+		};
 	},
 };
 vm.createContext(sandbox);
@@ -210,6 +227,7 @@ assert.equal(fixture.locks, 1);
 assert.equal(fixture.closes, 1);
 assert.equal(fixture.jobChecks, 1);
 assert.deepEqual(fixture.probes, [ 3000 ]);
+assert.equal(fixture.probeCalls.length, 1, 'Web and DNS status must use one init process');
 assert.deepEqual(Array.from(fixture.integrationProbes[0]), [ '53335', 'dnsmasq-upstream' ]);
 fixture.integration = 1;
 assert.equal(sandbox.overview().status.dns_integration, 'pending');
@@ -267,6 +285,43 @@ assert.equal(result.config.web.scheme, 'http');
 assert.equal(fixture.locks, 1, 'fallback must reuse the same task lock');
 assert.equal(fixture.jobChecks, 1, 'fallback must not rescan task records');
 assert.equal(fixture.serviceCalls, 1, 'fallback must not re-query the core service');
+assert.equal(fixture.probeCalls.length, 1, 'HTTPS, HTTP fallback and DNS must share one init process');
+
+fixture.listening = [ 1029, 3000 ];
+assert.equal(sandbox.overview().config.web.scheme, 'https', 'a listening HTTPS candidate must take precedence');
+fixture.yaml += '  force_https: true\n';
+fixture.listening = [ 3000 ];
+assert.equal(sandbox.overview().config.web, null, 'forced HTTPS must never fall back to HTTP');
+assert.equal(fixture.probeCalls[fixture.probeCalls.length - 1][3], '0', 'forced HTTPS must not request an HTTP probe');
+
+for (const failure of [ 'open', 'read', 'exit' ]) {
+	reset();
+	fixture.probeFailure = failure;
+	const failed = sandbox.overview();
+	assert.equal(failed.status.running, true);
+	assert.equal(failed.config.dns_port, 53335);
+	assert.equal(failed.status.dns_integration, 'unknown');
+	assert.equal(failed.config.web, null, `${failure}: failed combined probes must not advertise endpoints`);
+	assert.equal(fixture.probeCloses, failure === 'open' ? 0 : 1);
+}
+for (const output of [ '', 'integration=ready\nhttps=0\nhttp=1\nextra',
+	'integration=invalid\nhttps=0\nhttp=1\n', 'integration=ready\nhttps=0\nhttp=2\n' ]) {
+	reset();
+	fixture.probeOutput = output;
+	const failed = sandbox.overview();
+	assert.equal(failed.status.dns_integration, 'unknown', 'malformed output must fail closed');
+	assert.equal(failed.config.web, null);
+}
+reset();
+fixture.redirect = 'none; injected-command';
+assert.equal(sandbox.overview().config.web.port, 3000, 'invalid DNS mode may still expose a verified Web endpoint');
+assert.equal(fixture.probeCalls[0][1], 'unknown', 'untrusted redirect bytes must never enter a shell command');
+reset();
+fixture.yaml = 'http:\n  address: 0.0.0.0:3000\n';
+result = sandbox.overview();
+assert.equal(result.config.web.port, 3000, 'unavailable DNS port must not suppress an independent Web probe');
+assert.equal(result.status.dns_integration, 'unknown');
+assert.equal(fixture.probeCalls[0][0], '0');
 
 for (const gate of [ 'busy', 'unsafeLock', 'stopped' ]) {
 	reset();

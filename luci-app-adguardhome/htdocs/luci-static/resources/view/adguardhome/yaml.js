@@ -95,8 +95,10 @@ function yamlToken(type, value) {
 
 // ponytail: presentation-only common scalars; the backend remains the YAML parser.
 function highlightYamlScalar(value) {
-	const match = String(value).match(/^(\s*)([\s\S]*?)(\s*)$/);
-	const scalar = match[2];
+	value = String(value);
+	const trimmed = value.trimStart();
+	const leading = value.slice(0, value.length - trimmed.length);
+	const scalar = trimmed.trimEnd();
 	let type = '';
 
 	if (/^(?:true|false|null|~)$/i.test(scalar))
@@ -106,7 +108,7 @@ function highlightYamlScalar(value) {
 	else if (/^(?:"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^\s,[\]{}]+)$/.test(scalar))
 		type = 'scalar';
 
-	return escapeHtml(match[1]) + (type ? yamlToken(type, scalar) : escapeHtml(scalar)) + escapeHtml(match[3]);
+	return escapeHtml(leading) + (type ? yamlToken(type, scalar) : escapeHtml(scalar)) + escapeHtml(trimmed.slice(scalar.length));
 }
 
 function highlightYamlLine(line) {

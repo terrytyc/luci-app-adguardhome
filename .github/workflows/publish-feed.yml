@@ -72,12 +72,18 @@ jobs:
             printf 'Unable to resolve release commit: %s\n' "$CURRENT_TAG" >&2
             exit 1
           }
-          conclusion=$(gh api \
+          run_id=$(gh api \
             "repos/$GITHUB_REPOSITORY/actions/workflows/test.yml/runs?head_sha=$commit&event=push&per_page=1" \
-            --jq '.workflow_runs[0] | if .status == "completed" then .conclusion else .status end')
+            --jq '.workflow_runs[0] | select(.status == "completed" and .conclusion == "success") | .id')
+          [[ $run_id =~ ^[0-9]+$ ]] || {
+            printf 'Release %s has no passing Test run for %s.\n' "$CURRENT_TAG" "$commit" >&2
+            exit 1
+          }
+          conclusion=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs" \
+            --jq '.jobs[] | select(.name == "full") | .conclusion')
           [[ $conclusion == success ]] || {
-            printf 'Release %s has no passing Test run for %s (status: %s).\n' \
-              "$CURRENT_TAG" "$commit" "${conclusion:-missing}" >&2
+            printf 'Release %s has no passing full test job (status: %s).\n' \
+              "$CURRENT_TAG" "${conclusion:-missing}" >&2
             exit 1
           }
 
