@@ -1,5 +1,7 @@
 # AdGuard Home for LuCI
 
+觉得好用点个小星星吧！
+
 DNS、配置、日志，在路由器里一处管理。
 
 给官方 AdGuard Home 配上顺手的 LuCI 界面：切换 DNS 模式、编辑 YAML、查看运行日志，也能把 data 放进内存，减少持久存储写入。核心仍用官方包，插件通过 APK 软件源更新。
