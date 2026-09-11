@@ -91,8 +91,9 @@ grep -Fq 'name: release-apks-${{ github.run_attempt }}' "$repo/.github/workflows
 	die 'release artifact name does not distinguish rerun attempts'
 grep -Fq 'path: ${{ runner.temp }}/real-apks/*.apk' "$repo/.github/workflows/test.yml" ||
 	die 'CI does not upload its verified APKs'
-grep -Eq '^PKG_RELEASE:=10$' "$repo/luci-app-adguardhome/Makefile" ||
-	die 'package release was not advanced to r10'
+grep -Eq '^PKG_VERSION:=3\.2\.0$' "$repo/luci-app-adguardhome/Makefile" &&
+	grep -Eq '^PKG_RELEASE:=1$' "$repo/luci-app-adguardhome/Makefile" ||
+	die 'package version was not advanced to 3.2.0-r1'
 grep -Eq '^LUCI_DEPENDS:=.*\+dnsmasq .*\+firewall4 ' "$repo/luci-app-adguardhome/Makefile" ||
 	die 'runtime DNS dependencies are incomplete'
 grep -Fq 'openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' \
@@ -214,20 +215,16 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 		if [[ $name == luci-app-adguardhome ]]; then
 			printf '    - adguardhome>=0.107.76-r1\n    - dnsmasq\n    - firewall4\n'
 			hooks='pre-install post-install pre-deinstall post-deinstall pre-upgrade post-upgrade'
-			uci_configs='adguardhome dhcp firewall'
 		else
 			printf '    - luci-app-adguardhome\n'
 			hooks='pre-install pre-upgrade'
-			uci_configs=luci
 		fi
 		printf 'scripts:\n'
 		for hook in $hooks; do
 			printf '  %s: |\n    #!/bin/sh\n' "$hook"
 			case "$hook" in
 				pre-install|pre-upgrade)
-					printf '    for uci_config in %s; do\n' "$uci_configs"
-					printf '      pending_uci_changes="$(uci -q changes "$uci_config" 2>/dev/null)"\n'
-					printf '    done\n'
+					printf '    pending_uci_changes="$(uci -q changes 2>/dev/null)"\n'
 					[[ $name != luci-app-adguardhome ]] || printf '    run_bounded 180 5 /etc/init.d/AdGuardHome stop\n' ;;
 				post-install|post-upgrade)
 					printf '    default_postinst\n    # AdGuard Home initialization failed; package installation aborted.\n    /etc/init.d/rpcd reload\n' ;;
@@ -359,8 +356,8 @@ done
 check_apk_failure main 'empty post-install hook' '/^  post-install: |$/,/^  [-a-z]*: |$/{ /^    /d; }'
 for hook in pre-install pre-upgrade; do
 	check_apk_failure i18n "missing its $hook hook" "/^  $hook: |$/d"
-	check_apk_failure main "main APK $hook lost its scoped UCI guard" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /for uci_config in/d; }"
-	check_apk_failure i18n "zh-cn APK $hook lost its scoped UCI guard" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /for uci_config in/d; }"
+	check_apk_failure main "$hook UCI guard no longer checks all default deltas" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /pending_uci_changes=/d; }"
+	check_apk_failure i18n "$hook UCI guard no longer checks all default deltas" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /pending_uci_changes=/d; }"
 	check_apk_failure main "$hook lost safe coordinator stop" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /run_bounded /d; }"
 done
 for hook in post-install post-upgrade; do
@@ -403,8 +400,8 @@ expect_failure 'current APK version does not match its release tag' sh "$publish
 	"$temporary/public-key.pem" v3.0.0-r1 "$temporary/first" "$temporary/rejected-current"
 expect_failure 'Usage:' sh "$publish" "$apk" "$temporary/public-key.pem" v3.0.0-r2 \
 	"$temporary/first" "$temporary/rejected-history" v3.0.0-r1 "$temporary/tag"
-check_apk_failure main 'main APK pre-upgrade lost its scoped UCI guard' '/^  pre-upgrade: |$/,/^  [-a-z]*: |$/{ /for uci_config in/d; }'
-expect_failure 'main APK pre-upgrade lost its scoped UCI guard' sh "$publish" "$apk" \
+check_apk_failure main 'pre-upgrade UCI guard no longer checks all default deltas' '/^  pre-upgrade: |$/,/^  [-a-z]*: |$/{ /pending_uci_changes=/d; }'
+expect_failure 'pre-upgrade UCI guard no longer checks all default deltas' sh "$publish" "$apk" \
 	"$temporary/public-key.pem" v3.0.0-r2 "$bad_dir" "$temporary/rejected-hook"
 for rejected in current history hook; do
 	[[ ! -e $temporary/rejected-$rejected ]] || die "invalid $rejected feed was published"

@@ -326,6 +326,54 @@ if uci -q get dhcp.main.server ||
 	exit 1
 fi
 
+# OpenWrt config_get reads the last config_load snapshot. A failed restart
+# occurs after commit, so rollback must refresh that snapshot before deleting
+# its newly-added upstream, then restart with the original resolver settings.
+(
+	config_load() {
+		[ "$1" = dhcp ] || return 1
+		loaded_servers="$(uci -q get dhcp.main.server || true)"
+	}
+	config_get() {
+		local actual="${4:-}"
+		case "$3" in
+			TYPE) actual=dnsmasq ;;
+			server_LENGTH) actual=1 ;;
+			server) actual="$loaded_servers" ;;
+			*) return 1 ;;
+		esac
+		eval "$1=\$actual"
+	}
+	config_list_foreach() {
+		local value
+		for value in $loaded_servers; do "$3" "$value"; done
+	}
+	reload_service_if_present() {
+		[ "$*" = '/etc/init.d/dnsmasq restart' ] || return 1
+		restart_calls=$((restart_calls + 1))
+		[ "$restart_calls" -gt 1 ]
+	}
+	for previous_noresolv in absent 0 1; do
+		printf "config dnsmasq 'main'\n list server '/example.test/192.0.2.53'\n" | uci import dhcp
+		if [ "$previous_noresolv" != absent ]; then
+			uci set "dhcp.main.noresolv=$previous_noresolv"
+			uci commit dhcp
+		fi
+		printf "config luci 'luci'\n" | uci import adguardhome
+		restart_calls=0
+		if set_dnsmasq_upstream; then exit 1; fi
+		[ "$restart_calls" = 2 ]
+		[ "$(uci get dhcp.main.server)" = /example.test/192.0.2.53 ]
+		if [ "$previous_noresolv" = absent ]; then
+			if uci -q get dhcp.main.noresolv; then exit 1; fi
+		else
+			[ "$(uci get dhcp.main.noresolv)" = "$previous_noresolv" ]
+		fi
+		if uci -q get adguardhome.luci.managed_dnsmasq_upstream; then exit 1; fi
+		[ -z "$(uci changes dhcp)" ] && [ -z "$(uci changes adguardhome)" ]
+	done
+)
+
 # The real settings loader must tell monitoring that an ordinary pending edit
 # is busy, without stopping a healthy core or touching DNS/the user's delta.
 printf "config adguardhome 'config'\n option enabled '1'\n option work_dir '/etc/AdGuardHome'\nconfig luci 'luci'\n option redirect 'none'\n" | uci import adguardhome

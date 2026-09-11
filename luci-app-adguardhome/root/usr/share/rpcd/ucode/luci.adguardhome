@@ -851,6 +851,10 @@ function yaml_stage_path(token) {
 
 function remove_yaml_stage(token, original, explicit_stage) {
 	let stage = explicit_stage || yaml_stage_path(token);
+	// An offline work directory has no accessible stage to clean. Keep its
+	// files untouched while allowing settings recovery (disable/change path).
+	if (!stage && !explicit_stage)
+		return !!yaml_job_path(token);
 	let suffix = `/AdGuardHome.yaml.luci-${token}`;
 	let metadata = stage ? lstat(stage) : null;
 

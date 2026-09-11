@@ -623,6 +623,7 @@ function resetWrites() {
 		directory: true, entries: new Map(), ensureCalls: 0,
 		failure: null, unlinked: [], renamed: false,
 		busy: false, lockCloses: 0, stats: 0, reads: 0,
+		pathUnavailable: false,
 	});
 }
 function jobMetadata(name) {
@@ -643,7 +644,7 @@ const writeSandbox = {
 	match: (value, expression) => value.match(expression),
 	substr: (value, start) => value.substr(start),
 	push: (values, value) => values.push(value),
-	config_path: () => '/etc/AdGuardHome/AdGuardHome.yaml',
+	config_path: () => writeFixture.pathUnavailable ? null : '/etc/AdGuardHome/AdGuardHome.yaml',
 	random_token: () => '4'.repeat(32),
 	lstat(name) { writeFixture.stats++; return jobMetadata(name); },
 	lsdir: () => Array.from(writeFixture.entries.keys())
@@ -814,6 +815,19 @@ for (const settings of [ false, true, 'writeback' ]) {
 }
 
 const activeYaml = '/etc/AdGuardHome/AdGuardHome.yaml';
+resetWrites();
+writeFixture.pathUnavailable = true;
+writeFixture.entries.set(jobPath, terminal);
+const offlineStage = `${activeYaml}.luci-${token}`;
+writeFixture.entries.set(offlineStage, 'underlying storage must stay untouched');
+assert.equal(writeSandbox.api.prepare_yaml_job('5'.repeat(32), expectedHash, candidateHash).reused, false,
+	'an interrupted task must not block settings recovery while its disk is offline');
+assert.equal(writeFixture.entries.has(offlineStage), true,
+	'offline cleanup must not remove a same-named file in the underlying filesystem');
+writeFixture.pathUnavailable = false;
+writeFixture.entries.delete(`${jobDirectory}/${'5'.repeat(32)}`);
+assert.equal(writeSandbox.api.prepare_yaml_job('6'.repeat(32), expectedHash, candidateHash).reused, false);
+assert.equal(writeFixture.entries.has(offlineStage), false, 'an accessible stage is cleaned on the next submission');
 for (const retained of [ 1, 15, 16 ]) {
 	resetWrites();
 	writeFixture.entries.set(activeYaml, 'active YAML must survive');

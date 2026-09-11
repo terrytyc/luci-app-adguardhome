@@ -2004,18 +2004,21 @@ normalize_installer_config() (
 	local validation_dir validation_config_dir validation_work validation
 	local normalized normalized_verify source_verify config_dir_fd output_fd
 	local original_certificate_path original_private_key_path tls_paths_rewritten=0
-	local normalized_hash replacement="" replacement_fd metadata mode links
-	local owner group size remainder rc=0 pattern_rc=0 lock_held=0
+	local normalized_hash replacement replacement_fd metadata mode links
+	local owner group size remainder rc=0 pattern_rc=0
 	local account_groups
+	# ash restores function locals before EXIT; the subshell isolates cleanup state.
+	normalizer_cleanup_candidate="$candidate"
+	normalizer_cleanup_directory="" normalizer_cleanup_replacement="" normalizer_cleanup_lock_held=0
 
 	cleanup_installer_normalizer() {
-		case "$replacement" in
-			"${candidate}.normalized."??????) rm -f "$replacement" ;;
+		case "$normalizer_cleanup_replacement" in
+			"${normalizer_cleanup_candidate}.normalized."??????) rm -f "$normalizer_cleanup_replacement" ;;
 		esac
-		case "$validation_dir" in
-			/tmp/AdGuardHome-normalize.??????) rm -rf "$validation_dir" ;;
+		case "$normalizer_cleanup_directory" in
+			/tmp/AdGuardHome-normalize.??????) rm -rf "$normalizer_cleanup_directory" ;;
 		esac
-		if [ "$lock_held" = 1 ]; then
+		if [ "$normalizer_cleanup_lock_held" = 1 ]; then
 			rmdir "$NORMALIZER_LOCK" >/dev/null 2>&1 || true
 		fi
 	}
@@ -2035,7 +2038,7 @@ normalize_installer_config() (
 	# successful creator removes this exact directory on exit.  Unlike unlinking
 	# a flock file, this cannot split contenders across two locked inodes.
 	mkdir -m 0700 "$NORMALIZER_LOCK" || exit 1
-	lock_held=1
+	normalizer_cleanup_lock_held=1
 	chown 0:0 "$NORMALIZER_LOCK" && chmod 0700 "$NORMALIZER_LOCK" || exit 1
 	normalizer_lock_is_private || exit 1
 	if adguard_uid_process_exists; then
@@ -2047,6 +2050,7 @@ normalize_installer_config() (
 	[ -f "$source_fd" ] && [ "$source_fd" -ef "$candidate" ] || exit 1
 
 	validation_dir="$(mktemp -d /tmp/AdGuardHome-normalize.XXXXXX)" || exit 1
+	normalizer_cleanup_directory="$validation_dir"
 	validation_config_dir="${validation_dir}/config"
 	validation_work="${validation_dir}/work"
 	validation="${validation_config_dir}/AdGuardHome.yaml"
@@ -2151,6 +2155,7 @@ normalize_installer_config() (
 		[ "$source_fd" -ef "$candidate" ] || exit 1
 	root_private_config_source "$candidate" || exit 1
 	replacement="$(mktemp "${candidate}.normalized.XXXXXX")" || exit 1
+	normalizer_cleanup_replacement="$replacement"
 	exec 6<>"$replacement" || exit 1
 	replacement_fd=/proc/self/fd/6
 	[ -f "$replacement_fd" ] && [ "$replacement_fd" -ef "$replacement" ] || exit 1
@@ -2169,7 +2174,7 @@ normalize_installer_config() (
 	[ -f "$candidate" ] && [ ! -L "$candidate" ] && \
 		[ "$source_fd" -ef "$candidate" ] || exit 1
 	mv "$replacement" "$candidate" || exit 1
-	replacement=""
+	normalizer_cleanup_replacement=""
 	[ "$replacement_fd" -ef "$candidate" ] || exit 1
 	[ "$(open_fd_hash "$replacement_fd")" = "$normalized_hash" ] || exit 1
 	exec 6>&-
@@ -2226,15 +2231,16 @@ open_fd_hash() {
 
 install_config_candidate_attempt() (
 	local source="$1" source_hash="$2" expected_active="$3" stage="$4"
-	local replacement_marker="$5" fd_path size installed_hash current_hash cleanup_stage=""
-	trap '[ -z "$cleanup_stage" ] || rm -f "$cleanup_stage"' EXIT
+	local replacement_marker="$5" fd_path size installed_hash current_hash
+	install_cleanup_stage=""
+	trap '[ -z "$install_cleanup_stage" ] || rm -f "$install_cleanup_stage"' EXIT
 	# noclobber makes the redirection an exclusive create.  Keep descriptor 9
 	# open through the pathname identity checks and atomic rename, so root never
 	# writes a stage pathname that uid 853 replaced with a symlink.
 	set -C
 	exec 9>"$stage" || exit 1
 	set +C
-	cleanup_stage="$stage"
+	install_cleanup_stage="$stage"
 	fd_path=/proc/self/fd/9
 	/bin/cat "$source" >&9 || exit 1
 	[ -f "$fd_path" ] || exit 1
@@ -2254,7 +2260,7 @@ install_config_candidate_attempt() (
 	[ -f "$stage" ] && [ ! -L "$stage" ] && [ "$fd_path" -ef "$stage" ] || exit 1
 	[ -z "$replacement_marker" ] || : >"$replacement_marker" || exit 1
 	mv "$stage" "$config_file" || exit 1
-	cleanup_stage=""
+	install_cleanup_stage=""
 	[ "$fd_path" -ef "$config_file" ] || exit 1
 	current_hash="$(active_config_hash)" || exit 1
 	[ "$current_hash" = "$source_hash" ] || exit 1
@@ -3500,6 +3506,7 @@ clear_managed_dnsmasq_upstream() {
 rollback_new_dnsmasq_upstream() {
 	local previous_present="$1" previous_value="$2"
 	local upstream="127.0.0.1#${dns_port}"
+	config_load dhcp || return 1
 	remove_managed_dnsmasq_upstream "$upstream" || return 1
 	if [ "$previous_present" = 1 ]; then
 		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" >/dev/null 2>&1 || {
@@ -4067,20 +4074,20 @@ validate_yaml_stage() {
 }
 
 active_config_hash() (
-	local directory snapshot
-	directory="$(mktemp -d /tmp/AdGuardHome-hash.XXXXXX)" || exit 1
-	trap 'rm -rf "$directory"' EXIT
-	snapshot="${directory}/AdGuardHome.yaml"
+	local snapshot
+	hash_snapshot_directory="$(mktemp -d /tmp/AdGuardHome-hash.XXXXXX)" || exit 1
+	trap 'rm -rf "$hash_snapshot_directory"' EXIT
+	snapshot="${hash_snapshot_directory}/AdGuardHome.yaml"
 	snapshot_config_file "$config_file" "$snapshot" "" "" || exit 1
 	printf '%s\n' "$SNAPSHOT_CONFIG_HASH"
 )
 
 held_config_hash() (
 	local expected_hash="$1" inherited_fd="$2" allow_detached="$3"
-	local directory snapshot
-	directory="$(mktemp -d /tmp/AdGuardHome-held-hash.XXXXXX)" || exit 1
-	trap 'rm -rf "$directory"' EXIT
-	snapshot="${directory}/AdGuardHome.yaml"
+	local snapshot
+	held_hash_snapshot_directory="$(mktemp -d /tmp/AdGuardHome-held-hash.XXXXXX)" || exit 1
+	trap 'rm -rf "$held_hash_snapshot_directory"' EXIT
+	snapshot="${held_hash_snapshot_directory}/AdGuardHome.yaml"
 	snapshot_config_file "$config_file" "$snapshot" \
 		"$expected_hash" "$inherited_fd" "$allow_detached" || exit 1
 	printf '%s\n' "$SNAPSHOT_CONFIG_HASH"

@@ -55,13 +55,13 @@ normalize_bool() {
 path_contains_symlink() {
 	local value="$1" remaining component current=""
 	case "$value" in /*) ;; *) return 1 ;; esac
-	remaining="$(printf '%s\n' "$value" | sed 's:^/::')"
+	remaining="${value#/}"
 	while [ -n "$remaining" ]; do
-		component="$(printf '%s\n' "$remaining" | cut -d/ -f1)"
+		component="${remaining%%/*}"
 		current="$current/$component"
 		[ ! -L "$current" ] || return 0
 		[ "$remaining" = "$component" ] && break
-		remaining="$(printf '%s\n' "$remaining" | sed 's:^[^/]*/::')"
+		remaining="${remaining#*/}"
 	done
 	return 1
 }

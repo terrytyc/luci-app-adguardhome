@@ -398,6 +398,7 @@ for rollback_failure in commit restart; do
 	: >"$events"
 	(
 		eval "$dnsmasq_rollback_body"
+		config_load() { [ "$1" = dhcp ]; }
 		eval "$dnsmasq_marker_body"
 		PLUGIN_CONFIG=adguardhome
 		PLUGIN_SECTION=luci

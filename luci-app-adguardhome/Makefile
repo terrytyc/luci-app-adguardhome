@@ -7,8 +7,8 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
-PKG_VERSION:=3.1.0
-PKG_RELEASE:=10
+PKG_VERSION:=3.2.0
+PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -20,16 +20,15 @@ LUCI_MAINTAINER:=terrytyc
 LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
 define AdGuardHome/UciPendingGuard
-for uci_config in $(1); do
-	pending_uci_changes="$$(uci -q changes "$$uci_config" 2>/dev/null)" || {
-		echo "Unable to inspect pending $$uci_config UCI changes; package installation aborted." >&2
-		exit 1
-	}
-	[ -z "$$pending_uci_changes" ] || {
-		echo "Commit or revert pending $$uci_config changes before installing this package." >&2
-		exit 1
-	}
-done
+# The platform default_postinst commits all default UCI deltas.
+pending_uci_changes="$$(uci -q changes 2>/dev/null)" || {
+	echo "Unable to inspect pending UCI changes; package installation aborted." >&2
+	exit 1
+}
+[ -z "$$pending_uci_changes" ] || {
+	echo "Commit or revert pending UCI changes before installing this package." >&2
+	exit 1
+}
 endef
 
 define AdGuardHome/YamlMaintenance
@@ -137,7 +136,7 @@ begin_yaml_maintenance || {
 	exit 1
 }
 
-$(call AdGuardHome/UciPendingGuard,adguardhome dhcp firewall)
+$(AdGuardHome/UciPendingGuard)
 
 $(AdGuardHome/RunBounded)
 
@@ -295,7 +294,7 @@ define Package/luci-i18n-adguardhome-zh-cn/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
-$(call AdGuardHome/UciPendingGuard,luci)
+$(AdGuardHome/UciPendingGuard)
 exit 0
 endef
 

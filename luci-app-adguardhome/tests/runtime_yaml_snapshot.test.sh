@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 for name in yaml_runtime_ports yaml_get_section_value load_runtime_dns_port \
-	snapshot_config_file secure_active_config is_valid_port; do
+	snapshot_config_file secure_active_config active_config_hash held_config_hash is_valid_port; do
 	eval "$(function_body "$init_file" "$name")"
 done
 
@@ -230,6 +230,31 @@ fi
 	if secure_active_config; then exit 1; fi
 	[ ! -e "$(cat "${test_tmp}/secure-directory")" ]
 	! grep -q '^hash$' "$calls" || exit 1
+)
+
+# Hash readers dispose of the captured YAML on success and on a rejected read.
+# BusyBox ash unwinds function locals before a subshell's EXIT trap runs.
+(
+	set +u
+	config_file="$yaml"
+	ROOT_PRIVATE=1
+	mktemp() {
+		local created
+		created="$(command mktemp "$@")" || return 1
+		printf '%s\n' "$created" >"${test_tmp}/hash-directory"
+		printf '%s\n' "$created"
+	}
+	[ "$(active_config_hash)" = "$expected_hash" ]
+	[ ! -e "$(cat "${test_tmp}/hash-directory")" ]
+	exec 8<"$yaml"
+	[ "$(held_config_hash "$expected_hash" 8 '')" = "$expected_hash" ]
+	[ ! -e "$(cat "${test_tmp}/hash-directory")" ]
+	if held_config_hash wrong 8 ''; then exit 1; fi
+	[ ! -e "$(cat "${test_tmp}/hash-directory")" ]
+	exec 8<&-
+	capture_root_file_bytes() { return 1; }
+	if active_config_hash; then exit 1; fi
+	[ ! -e "$(cat "${test_tmp}/hash-directory")" ]
 )
 ROOT_PRIVATE=0
 snapshot_config_file "$yaml" "$target" '' '' '' skip-hash
