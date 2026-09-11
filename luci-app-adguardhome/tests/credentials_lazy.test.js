@@ -193,6 +193,7 @@ async function main() {
 		[ 'get_yaml_update', 'b'.repeat(32) ],
 	]);
 	assert.equal(success.events.includes('operation-success'), true);
+	assert.equal(success.view.credentialsPreparing, false, 'successful submission must release its action guard');
 	assert.equal(success.inputs().every(input => input.value === ''), true,
 		'credential inputs must still be cleared after submission');
 
@@ -269,6 +270,7 @@ async function main() {
 		state.inputs()[0].value = 'operator';
 		await state.submit();
 		assert.equal(state.failures.length, 1, `${scenario.name}: report one result`);
+		assert.equal(state.view.credentialsPreparing, false, `${scenario.name}: completed submission must release its action guard`);
 		assert.match(state.failures[0], scenario.expected);
 		assert.equal(state.view.credentialsUncertain === true, scenario.uncertain,
 			`${scenario.name}: retain an uncertain outcome until reload`);
@@ -323,6 +325,7 @@ async function main() {
 	hashing.bcrypt.hash = () => hashReply.promise;
 	hashing.inputs()[1].value = hashing.inputs()[2].value = 'eight-characters';
 	const pendingHash = hashing.submit();
+	assert.equal(hashing.view.credentialsPreparing, true, 'hashing must hold the same guard as the credential worker');
 	hashing.setActive(false);
 	hashReply.resolve(encodedHash);
 	await pendingHash;

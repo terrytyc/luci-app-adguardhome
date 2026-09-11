@@ -9,7 +9,7 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-for name in service_started stop_service wait_for_core_stopped settings_update_locked \
+for name in record_ready_core_runtime service_started stop_service wait_for_core_stopped settings_update_locked \
 	tls_refresh_locked start_official_core; do
 	eval "$(function_body "$init_file" "$name")"
 done
@@ -216,6 +216,8 @@ wait_for_core_ready() { :; }
 apply_integration_locked() { DNS_CHANGES=$((DNS_CHANGES + 1)); }
 restore_tls_fingerprint() { :; }
 resume_yaml_runtime() { :; }
+core_runtime_fingerprint() { printf 'fixture\n'; }
+remember_core_runtime() { return 0; }
 
 : >"$official_log"
 UCI_FINGERPRINT=same SYNC_FINGERPRINT=same tls_refresh_locked

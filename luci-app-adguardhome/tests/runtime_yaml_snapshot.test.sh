@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 for name in yaml_runtime_ports yaml_get_section_value load_runtime_dns_port \
-	snapshot_config_file is_valid_port; do
+	snapshot_config_file secure_active_config is_valid_port; do
 	eval "$(function_body "$init_file" "$name")"
 done
 
@@ -201,6 +201,36 @@ if snapshot_config_file "$yaml" "$target" wrong '' '' skip-hash; then
 	printf 'skip-hash bypassed an expected CAS digest\n' >&2
 	exit 1
 fi
+
+# Permission preparation consumes bounded bytes, not a revision hash. The real
+# snapshot still rejects a missing/empty source and failed capture.
+(
+	config_file="$yaml"
+	secure_active_paths() { :; }
+	mktemp() {
+		local created
+		created="$(command mktemp "$@")" || return 1
+		printf '%s\n' "$created" >"${test_tmp}/secure-directory"
+		printf '%s\n' "$created"
+	}
+	: >"$calls"
+	secure_active_config
+	[ ! -e "$(cat "${test_tmp}/secure-directory")" ]
+	[ "$(grep -c '^root-read$' "$calls")" = 1 ]
+	! grep -q '^hash$' "$calls" || exit 1
+	config_file="${test_tmp}/missing"
+	if secure_active_config; then exit 1; fi
+	[ ! -e "$(cat "${test_tmp}/secure-directory")" ]
+	: >"${test_tmp}/empty"
+	config_file="${test_tmp}/empty"
+	if secure_active_config; then exit 1; fi
+	[ ! -e "$(cat "${test_tmp}/secure-directory")" ]
+	config_file="$yaml"
+	capture_root_file_bytes() { return 1; }
+	if secure_active_config; then exit 1; fi
+	[ ! -e "$(cat "${test_tmp}/secure-directory")" ]
+	! grep -q '^hash$' "$calls" || exit 1
+)
 ROOT_PRIVATE=0
 snapshot_config_file "$yaml" "$target" '' '' '' skip-hash
 grep -q '^uid-read$' "$calls"

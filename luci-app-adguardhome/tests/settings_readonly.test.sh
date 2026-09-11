@@ -18,12 +18,15 @@ DEFAULT_WORK_DIR=/persistent
 WORK_READS=0
 TEST_STATE=1
 TEST_DELTA=0
-TEST_DELTA_AFTER_STATE=0
+GUARD_CALLS=0
 uci_calls="$temporary/uci-calls"
 : >"$uci_calls"
 
 uci_guard_config_file_valid() { [ -f "$1" ]; }
-uci_guard_no_delta() { [ "$TEST_DELTA" = 0 ]; }
+uci_guard_no_delta() {
+	GUARD_CALLS=$((GUARD_CALLS + 1))
+	[ "$TEST_DELTA" = 0 ] || return 2
+}
 uci() { printf '%s\n' "$*" >>"$uci_calls"; return 1; }
 config_load() { [ -f "$temporary/adguardhome" ]; }
 validate_loaded_merged_sections() { return 0; }
@@ -48,26 +51,30 @@ validate_managed_work_dir_namespace() {
 memory_state_load() {
 	MEMORY_STATE_VALIDATED=1
 	MEMORY_STATE_PERSISTENT_WORK_DIR=/active-old
-	[ "$TEST_DELTA_AFTER_STATE" = 0 ] || TEST_DELTA=1
 	return "$TEST_STATE"
 }
 log_error() { :; }
-ensure_managed_config_present() { printf 'restore\n' >>"$events"; }
+restore_managed_config_snapshot() {
+	printf 'restore\n' >>"$events"
+	: >"$temporary/adguardhome"
+}
 normalize_managed_config_file() { printf 'normalize\n' >>"$events"; }
 memory_discard_incomplete_runtime_locked() { printf 'cleanup\n' >>"$events"; }
 
 read_settings
 [ "$WORK_READS" = 1 ]
+[ "$GUARD_CALLS" = 1 ]
 [ "$service_enabled:$MEMORY_ACTIVE:$work_dir" = 1:0:/persistent ]
 [ ! -s "$events" ]
 result="$(memory_status)"
 [ "$result" = "$(printf 'requested=0\nactive=0\npersistent_work_dir=/persistent\nactive_work_dir=/persistent\nactive_config_file=/persistent/AdGuardHome.yaml')" ]
 
 # An active generation accepts this already-loaded next workdir pair while
-# keeping the old YAML, with no second UCI field read. Pending edits that appear
-# during state validation still fail the fresh guard at the end of the loader.
+# keeping the old YAML, with no second UCI field read or pending-edit check.
 TEST_STATE=0
+GUARD_CALLS=0
 read_settings
+[ "$GUARD_CALLS" = 1 ]
 [ "$MEMORY_ACTIVE:$work_dir:$config_file" = 1:/persistent:/active-old/AdGuardHome.yaml ]
 [ ! -s "$uci_calls" ]
 TEST_WORK=/active-old/
@@ -89,14 +96,19 @@ TEST_STATE=1
 read_settings
 [ "$work_dir" = /persistent ]
 TEST_WORK=/persistent
-TEST_STATE=0
-TEST_DELTA_AFTER_STATE=1
-if read_settings; then
-	printf 'an edit appearing during RAM validation was accepted\n' >&2
-	exit 1
-fi
-[ "$MONITOR_SETTINGS_READY" = 0 ]
-TEST_DELTA_AFTER_STATE=0
+# A pending edit is rejected at either entry before loading any fields, whether
+# disk or RAM is requested. Management operations remain serialized thereafter.
+TEST_DELTA=1
+for TEST_STATE in 1 0; do
+	for action in read_settings load_settings; do
+		GUARD_CALLS=0
+		WORK_READS=0
+		rc=0
+		"$action" light || rc=$?
+		[ "$rc:$MONITOR_SETTINGS_READY:$GUARD_CALLS:$WORK_READS" = 2:0:1:0 ]
+	done
+done
+[ ! -s "$events" ]
 TEST_DELTA=0
 TEST_STATE=1
 
@@ -128,7 +140,29 @@ memory_status >/dev/null || rc=$?
 [ "$rc" = 2 ] && [ ! -e "$INTEGRATION_LOCK" ]
 [ ! -s "$events" ]
 
-# Lifecycle callers retain explicit repair behavior.
+# Disk and RAM lifecycle loads each check pending edits once at entry.
+for TEST_STATE in 1 0; do
+	: >"$events"
+	GUARD_CALLS=0
+	load_settings light
+	[ "$GUARD_CALLS" = 1 ]
+	[ "$(cat "$events")" = "$(printf 'normalize\ncleanup')" ]
+done
+
+# The missing-file recovery entry retains its own pending-edit guard. A busy
+# configuration must never be restored underneath that already-pending edit.
+TEST_STATE=1
+mv "$temporary/adguardhome" "$temporary/saved"
+: >"$events"
+TEST_DELTA=1
+GUARD_CALLS=0
+rc=0
+load_settings light || rc=$?
+[ "$rc:$GUARD_CALLS" = 2:1 ]
+[ ! -e "$temporary/adguardhome" ] && [ ! -s "$events" ]
+TEST_DELTA=0
+GUARD_CALLS=0
 load_settings light
+[ "$GUARD_CALLS" = 1 ]
 [ "$(cat "$events")" = "$(printf 'restore\nnormalize\ncleanup')" ]
 printf 'ok - shared settings reader is read-only and status observes the integration lock\n'

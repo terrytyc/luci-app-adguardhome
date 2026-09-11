@@ -110,7 +110,7 @@ done
 # that was previously running and remains enabled. Ordinary resume keeps its
 # earlier no-op cases, including a core that is already running.
 (
-	for name in resume_core_and_dns resume_yaml_runtime rollback_yaml_update attempt_yaml_rollback; do
+	for name in record_ready_core_runtime resume_core_and_dns resume_yaml_runtime rollback_yaml_update attempt_yaml_rollback; do
 		eval "$(function_body "$init_file" "$name")"
 	done
 	events="$test_tmp/yaml-recovery.events"
@@ -128,6 +128,8 @@ done
 	official_running() { [ "$CORE_RUNNING" = 1 ]; }
 	recovery_service() { step "$1" || return 1; CORE_RUNNING=0; }
 	start_official_core() { step start || return 1; CORE_RUNNING=1; }
+	core_runtime_fingerprint() { printf 'fixture\n'; }
+	remember_core_runtime() { return 0; }
 	wait_for_core_stopped() { step stopped; }
 	wait_for_core_ready() {
 		[ "$*" = '53335 dnsmasq-upstream /persistent' ] && step ready

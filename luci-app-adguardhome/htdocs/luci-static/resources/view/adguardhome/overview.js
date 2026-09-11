@@ -605,7 +605,7 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
-			if (document.hidden || this.settingsSubmission || this.memoryWritebackBusy)
+			if (document.hidden || this.settingsSubmission || this.memoryWritebackBusy || this.credentialsPreparing)
 				return;
 
 			const requestId = ++statusRequestId;
@@ -623,7 +623,7 @@ return view.extend({
 				removeStatusPoll();
 				return;
 			}
-			if (this.settingsSubmission || this.memoryWritebackBusy || requestId !== statusRequestId)
+			if (this.settingsSubmission || this.memoryWritebackBusy || this.credentialsPreparing || requestId !== statusRequestId)
 				return;
 
 			const next = overviewDisplayValues(current);
@@ -879,6 +879,8 @@ return view.extend({
 		}
 		confirmation = null;
 
+		this.credentialsPreparing = true;
+		this.updateMemoryWritebackButton();
 		submitButton.disabled = true;
 		cancelButton.disabled = true;
 		const operationTicket = operation.start();
@@ -939,9 +941,14 @@ return view.extend({
 			username = null;
 			password = null;
 			confirmation = null;
-			if (operation.isPageActive(scope) && !this.credentialsUncertain) {
-				submitButton.disabled = false;
-				cancelButton.disabled = false;
+			if (operation.isPageActive(scope)) {
+				this.credentialsPreparing = false;
+				this.updateMemoryWritebackButton();
+				if (!this.credentialsUncertain) {
+					submitButton.disabled = false;
+					cancelButton.disabled = false;
+				}
+				this.refreshOverviewStatus(scope);
 			}
 		}
 	},

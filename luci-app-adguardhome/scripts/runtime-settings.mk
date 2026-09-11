@@ -7,6 +7,7 @@ load_settings() {
 	MONITOR_SETTINGS_READY=0
 	if [ "$$read_only" = 1 ]; then
 		uci_guard_config_file_valid "$${UCI_CONFIG_DIRECTORY}/$${OFFICIAL_CONFIG}" || return 1
+		uci_guard_no_delta "$$OFFICIAL_CONFIG" || return $$?
 	else
 		ensure_managed_config_present || return $$?
 	fi
@@ -27,7 +28,6 @@ load_settings() {
 		"$$memory_writeback_interval")" || return 1
 	# Keep work_dir and config_file in the same loaded settings snapshot.
 	config_get official_config "$$OFFICIAL_SECTION" config_file ""
-	uci_guard_no_delta "$$OFFICIAL_CONFIG" || return $$?
 	previous_work_dir="$$official_work"
 	# config_file is never an independent YAML selector.  Validate the
 	# authoritative workdir first, then repair its derived field before any
@@ -74,7 +74,6 @@ load_settings() {
 		# State loading authenticated this generation; the paths above come from
 		# one UCI snapshot. Active RAM still requires an explicit work_dir.
 		[ -n "$$official_work" ] || return 1
-		uci_guard_no_delta "$$OFFICIAL_CONFIG" || return 1
 	fi
 
 	case "$$redirect_mode" in

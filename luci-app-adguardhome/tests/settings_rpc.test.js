@@ -622,7 +622,7 @@ function resetWrites() {
 	Object.assign(writeFixture, {
 		directory: true, entries: new Map(), ensureCalls: 0,
 		failure: null, unlinked: [], renamed: false,
-		busy: false, lockCloses: 0,
+		busy: false, lockCloses: 0, stats: 0, reads: 0,
 	});
 }
 function jobMetadata(name) {
@@ -645,7 +645,7 @@ const writeSandbox = {
 	push: (values, value) => values.push(value),
 	config_path: () => '/etc/AdGuardHome/AdGuardHome.yaml',
 	random_token: () => '4'.repeat(32),
-	lstat: jobMetadata,
+	lstat(name) { writeFixture.stats++; return jobMetadata(name); },
 	lsdir: () => Array.from(writeFixture.entries.keys())
 		.filter(name => name.startsWith(`${jobDirectory}/`))
 		.map(name => name.slice(jobDirectory.length + 1)),
@@ -658,6 +658,7 @@ const writeSandbox = {
 		return true;
 	},
 	readfile(name) {
+		writeFixture.reads++;
 		return writeFixture.renamed && writeFixture.failure === 'post-validation'
 			? 'broken' : writeFixture.entries.get(name);
 	},
@@ -695,12 +696,27 @@ vm.createContext(writeSandbox);
 vm.runInContext([
 	'yaml_job_path', 'root_private_directory', 'root_private_file', 'parse_yaml_job_state',
 	'write_yaml_job', 'write_new_yaml_job', 'replace_yaml_job',
-	'root_private_temporary_file', 'root_private_lock_file', 'read_yaml_job',
+	'root_private_temporary_file', 'root_private_lock_file', 'read_yaml_job', 'read_yaml_job_file',
 	'discard_yaml_job', 'yaml_stage_path', 'remove_yaml_stage', 'scan_yaml_jobs',
 	'mark_yaml_job_indeterminate', 'prepare_yaml_job', 'update_job_status',
 ].map(extractFunction).join('\n').replace(/for \(let (\w+) in (.+)\)/g, 'for (let $1 of $2)') +
-'\nthis.api = { write_new_yaml_job, replace_yaml_job, prepare_yaml_job, update_job_status };',
+'\nthis.api = { write_new_yaml_job, replace_yaml_job, prepare_yaml_job, update_job_status, read_yaml_job, scan_yaml_jobs };',
 writeSandbox, { filename: rpcPath });
+
+resetWrites();
+for (let index = 0; index < 16; index++)
+	writeFixture.entries.set(`${jobDirectory}/${index.toString(16).padStart(32, '0')}`, terminal);
+assert.equal(writeSandbox.api.scan_yaml_jobs(false).terminal.length, 16);
+assert.equal(writeFixture.stats, 17, '16 task records need one directory check and 16 file checks, previously 32 checks');
+assert.equal(writeFixture.reads, 16, 'each retained result is still freshly read');
+for (const read of [ () => writeSandbox.api.read_yaml_job(token), () => writeSandbox.api.scan_yaml_jobs(false) ]) {
+	resetWrites();
+	writeFixture.entries.set(jobPath, terminal);
+	writeFixture.directory = false;
+	const result = read();
+	assert.ok(result == null || result.error, 'standalone reads and scans must reject an unavailable parent directory');
+	assert.equal(writeFixture.reads, 0, 'an invalid parent directory must prevent state file reads');
+}
 
 resetWrites();
 writeFixture.directory = false;

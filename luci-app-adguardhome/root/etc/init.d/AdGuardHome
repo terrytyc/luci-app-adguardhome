@@ -907,13 +907,13 @@ secure_active_paths() {
 }
 
 secure_active_config() (
-	local directory snapshot
+	local snapshot
 	secure_active_paths || exit 1
 	umask 077
-	directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || exit 1
-	trap 'rm -rf "$directory"' EXIT
-	snapshot="${directory}/AdGuardHome.yaml"
-	snapshot_config_file "$config_file" "$snapshot" "" "" || exit 1
+	secure_snapshot_directory="$(mktemp -d /tmp/AdGuardHome-secure.XXXXXX)" || exit 1
+	trap 'rm -rf "$secure_snapshot_directory"' EXIT
+	snapshot="${secure_snapshot_directory}/AdGuardHome.yaml"
+	snapshot_config_file "$config_file" "$snapshot" "" "" "" skip-hash || exit 1
 )
 
 secure_config_inode() {
@@ -1099,9 +1099,8 @@ memory_binding_identities_match() {
 	actual_device="$MEMORY_IDENTITY_DEVICE"
 	actual_inode="$MEMORY_IDENTITY_INODE"
 	[ "$actual_device:$actual_inode" = "$memory_device:$memory_inode" ] || return 1
-	memory_backing_identity "$target" || return 1
-	[ "$MEMORY_IDENTITY_DEVICE:$MEMORY_IDENTITY_INODE" = \
-		"$memory_device:$memory_inode" ]
+	[ -d "$target" ] && [ ! -L "$target" ] &&
+		[ "$target" -ef "$MEMORY_DATA_DIR" ]
 }
 
 memory_suspended_identities_match() {
@@ -1758,10 +1757,11 @@ memory_prune_stopped_data_locked() (
 	[ "$MEMORY_ACTIVE" = 1 ] && [ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
 	official_running && exit 1
 	adguard_uid_process_exists && exit 1
-	memory_state_load || state_rc=$?
+	# The successful stopped copy already scanned the unchanged RAM source.
+	# State loading still checks mount layout and identities around deletion.
+	memory_state_load light || state_rc=$?
 	[ "$state_rc" = 0 ] || exit 1
 	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
-	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
 	uid853_mounted_tree_is_writable "$target" || exit 1
 	run_bounded 120 2 \
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
@@ -1781,9 +1781,8 @@ memory_prune_stopped_data_locked() (
 				fi || exit 1
 			done
 		' sh "$source" "$target" '{}' + || exit 1
-	memory_state_load || exit 1
+	memory_state_load light || exit 1
 	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
-	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
 	official_running && exit 1
 	adguard_uid_process_exists && exit 1
 	log_error "Pruned stale AdGuard Home persistent RAM data"
@@ -2302,12 +2301,12 @@ sync_yaml_managed_fields_checked() {
 	backup="${directory}/original.yaml"
 	candidate="${directory}/AdGuardHome.yaml"
 	replacement_marker="${directory}/install-replaced"
-	expected_hash="$(active_config_hash)" || {
+	snapshot_config_file "$config_file" "$backup" "" "" "" || {
 		rm -rf "$directory"
 		return 1
 	}
-	if ! snapshot_config_file "$config_file" "$backup" "$expected_hash" "" ||
-	   ! /bin/cp "$backup" "$candidate" ||
+	expected_hash="$SNAPSHOT_CONFIG_HASH"
+	if ! /bin/cp "$backup" "$candidate" ||
 	   ! chmod 0600 "$candidate" ||
 	   ! sync_yaml_workdir_pattern "$candidate"; then
 		rm -rf "$directory"
@@ -3381,7 +3380,6 @@ mark_generic_server() {
 }
 
 dnsmasq_takeover_is_safe() {
-	config_load dhcp || return 1
 	GENERIC_SERVER_FOUND=0
 	dnsmasq_server_foreach "$DNSMASQ_SECTION" mark_generic_server || return 1
 	if [ "$GENERIC_SERVER_FOUND" != 0 ]; then
@@ -4004,14 +4002,14 @@ wait_for_core_ready() {
 	redirect_mode="$expected_mode"
 	work_dir="$expected_work_dir"
 	while [ "$elapsed" -lt "$READY_TIMEOUT" ]; do
-		if ! runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir"; then
-			log_error "AdGuard Home runtime settings changed while waiting for DNS readiness"
-			return 1
-		fi
-		dns_port="$expected_port"
-		redirect_mode="$expected_mode"
-		work_dir="$expected_work_dir"
 		if dns_port_listening; then
+			if ! runtime_settings_match "$expected_port" "$expected_mode" "$expected_work_dir"; then
+				log_error "AdGuard Home runtime settings changed while waiting for DNS readiness"
+				return 1
+			fi
+			dns_port="$expected_port"
+			redirect_mode="$expected_mode"
+			work_dir="$expected_work_dir"
 			stable=$((stable + 1))
 			if [ "$stable" -ge "$READY_STABLE_COUNT" ]; then
 				return 0
@@ -4089,11 +4087,15 @@ held_config_hash() (
 )
 
 resume_core_and_dns() {
+	local started=0 runtime_fingerprint=""
 	if ! official_running; then
+		runtime_fingerprint="$(core_runtime_fingerprint)" || runtime_fingerprint=""
 		start_official_core || return 1
+		started=1
 	fi
 	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || return 1
-	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
+	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir" || return 1
+	[ "$started" != 1 ] || record_ready_core_runtime "$runtime_fingerprint"
 }
 
 resume_yaml_runtime() {
@@ -4201,7 +4203,7 @@ yaml_update_locked() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local before_hash final_hash verify_hash held_hash fd_path
 	local committed_port committed_mode committed_work_dir committed_tls_mounts
-	local was_running=0 backup="" backup_directory=""
+	local was_running=0 backup="" backup_directory="" runtime_fingerprint=""
 	load_settings || return 1
 	validate_work_dir_mount_dependency "${config_file%/*}" || return 2
 	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
@@ -4248,11 +4250,6 @@ yaml_update_locked() {
 		resume_paused_yaml_runtime >/dev/null 2>&1 || true
 		return 1
 	fi
-	check_core_config_file "$stage" "$candidate_hash" "$inherited_fd" || {
-		resume_paused_yaml_runtime >/dev/null 2>&1 || true
-		return 1
-	}
-
 	backup_directory="$(mktemp -d /tmp/AdGuardHome-yaml-backup.XXXXXX)" || {
 		resume_paused_yaml_runtime >/dev/null 2>&1 || true
 		return 1
@@ -4330,6 +4327,7 @@ yaml_update_locked() {
 		# byte hash.  Accept only a bounded, policy-checked, stable snapshot while
 		# its external TLS mount requirements and the expected supervised listener
 		# and resolver integration remain unchanged and live.
+		runtime_fingerprint="$(core_runtime_fingerprint)" || runtime_fingerprint=""
 		if ! secure_active_paths ||
 		   ! check_core_config_file "$config_file" "$final_hash" "" 1 ||
 		   [ "$TLS_DESIRED_MOUNTS" != "$committed_tls_mounts" ] ||
@@ -4355,6 +4353,7 @@ yaml_update_locked() {
 				log_error "Failed to restore the previous YAML runtime"
 			return 1
 		fi
+		record_ready_core_runtime "$runtime_fingerprint"
 	elif [ "$final_hash" != "$candidate_hash" ] ||
 	     [ ! "$fd_path" -ef "$config_file" ]; then
 		log_error "The stopped-service YAML changed after installation; restoring the previous file"
@@ -4568,7 +4567,7 @@ restore_tls_fingerprint() {
 }
 
 tls_refresh_locked() {
-	local old_fingerprint new_fingerprint was_running=0
+	local old_fingerprint new_fingerprint was_running=0 runtime_fingerprint=""
 	load_settings || return 1
 	validate_work_dir_mount_dependency "${config_file%/*}" || return 1
 	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 0
@@ -4599,6 +4598,7 @@ tls_refresh_locked() {
 			return 1
 		fi
 	fi
+	runtime_fingerprint="$(core_runtime_fingerprint)" || runtime_fingerprint=""
 	if ! start_official_core ||
 	   ! load_runtime_dns_port ||
 	   ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" ||
@@ -4610,6 +4610,7 @@ tls_refresh_locked() {
 		log_error "Unable to restart AdGuard Home after ACME renewal"
 		return 1
 	fi
+	record_ready_core_runtime "$runtime_fingerprint"
 }
 
 tls_refresh() {
@@ -5132,8 +5133,7 @@ orchestrate_core_locked() {
 		return 1
 	fi
 	sync_monitor_instance || return 1
-	remember_core_runtime "$runtime_fingerprint" ||
-		log_error "Runtime baseline unavailable; the next settings Apply will recheck and restart the core"
+	record_ready_core_runtime "$runtime_fingerprint"
 	return 0
 }
 

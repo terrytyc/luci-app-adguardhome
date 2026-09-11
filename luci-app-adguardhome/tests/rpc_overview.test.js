@@ -18,7 +18,7 @@ const functions = [
 	'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
 	'valid_port', 'yaml_bool', 'valid_dns_name', 'http_port', 'yaml_material_value',
 	'tls_material_complete', 'config_info', 'probe_overview', 'overview_info',
-	'root_private_temporary_file', 'root_private_lock_file', 'scan_yaml_jobs',
+	'root_private_directory', 'root_private_temporary_file', 'root_private_lock_file', 'scan_yaml_jobs',
 	'parse_yaml_job_state', 'mark_yaml_job_indeterminate',
 ].map(extractFunction).join('\n')
 	.replace(/for \(let (\w+) in (.+)\)/g, 'for (let $1 of $2)');
@@ -108,6 +108,8 @@ const sandbox = {
 	lstat(pathname) {
 		if (pathname === fixture.configFile)
 			return metadata();
+		if (pathname === '/var/run/luci-app-adguardhome-yaml')
+			return { type: 'directory', uid: 0, gid: 0, mode: 0o700 };
 		if (pathname === '/var/run/luci-app-adguardhome-yaml/removing')
 			return fixture.maintenanceMetadata;
 		if (pathname.startsWith('/var/run/luci-app-adguardhome-yaml/.'))
@@ -157,8 +159,8 @@ const sandbox = {
 		fixture.jobChecks++;
 		return fixture.jobEntries;
 	},
-	read_yaml_job(token) {
-		return fixture.jobRecords[token] ?? null;
+	read_yaml_job_file(pathname) {
+		return fixture.jobRecords[pathname.slice(pathname.lastIndexOf('/') + 1)] ?? null;
 	},
 	replace_yaml_job(token, content) {
 		assert.equal(fixture.locked, true, 'orphan recovery must hold the exclusive task lock');

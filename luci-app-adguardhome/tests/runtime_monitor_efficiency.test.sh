@@ -88,8 +88,8 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 [ "$(grep -c '^runtime-settings$' "$events")" = 3 ]
 [ "$(grep -c '^socket$' "$events")" = 3 ]
 
-# A failed listener still resets the consecutive-success count.  Readiness
-# checks every round, but does not repeat the successful final round.
+# A failed listener resets the consecutive-success count without rereading
+# settings/YAML. Every successful listener probe still validates its inputs.
 (
 	: >"$events"
 	probes=0
@@ -99,9 +99,20 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 		[ "$probes" -ne 2 ]
 	}
 	wait_for_core_ready 53335 none /etc/AdGuardHome
-	[ "$(grep -c '^runtime-settings$' "$events")" = 5 ]
+	[ "$(grep -c '^runtime-settings$' "$events")" = 4 ]
 	[ "$(grep -c '^socket$' "$events")" = 5 ]
 	[ "$(grep -c '^sleep:1$' "$events")" = 4 ]
+	: >"$events"
+	probes=0
+	dns_port_listening() {
+		record socket
+		probes=$((probes + 1))
+		[ "$probes" -gt 30 ]
+	}
+	wait_for_core_ready 53335 none /etc/AdGuardHome
+	[ "$(grep -c '^runtime-settings$' "$events")" = 3 ]
+	[ "$(grep -c '^socket$' "$events")" = 33 ]
+	[ "$(grep -c '^sleep:1$' "$events")" = 32 ]
 	: >"$events"
 	READY_TIMEOUT=3
 	dns_port_listening() { record socket; return 1; }
@@ -109,7 +120,7 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 		printf 'an unavailable listener passed readiness\n' >&2
 		exit 1
 	fi
-	[ "$(grep -c '^runtime-settings$' "$events")" = 3 ]
+	! grep -q '^runtime-settings$' "$events" || exit 1
 	[ "$(grep -c '^socket$' "$events")" = 3 ]
 	[ "$(grep -c '^sleep:1$' "$events")" = 3 ]
 	: >"$events"
@@ -126,7 +137,7 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 		exit 1
 	fi
 	[ "$(grep -c '^runtime-settings$' "$events")" = 2 ]
-	[ "$(grep -c '^socket$' "$events")" = 1 ]
+	[ "$(grep -c '^socket$' "$events")" = 2 ]
 	[ "$(grep -c '^sleep:1$' "$events")" = 1 ]
 )
 

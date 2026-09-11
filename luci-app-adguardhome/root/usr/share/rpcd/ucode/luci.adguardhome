@@ -757,6 +757,10 @@ function read_yaml_job(token) {
 	if (!path || !root_private_directory(lstat(YAML_JOB_DIRECTORY)))
 		return null;
 
+	return read_yaml_job_file(path);
+}
+
+function read_yaml_job_file(path) {
 	let metadata = lstat(path);
 	if (!root_private_file(metadata))
 		return null;
@@ -866,6 +870,9 @@ function remove_yaml_stage(token, original, explicit_stage) {
 }
 
 function scan_yaml_jobs(clean_temporary) {
+	if (!root_private_directory(lstat(YAML_JOB_DIRECTORY)))
+		return { error: 'YAML update state is unavailable' };
+
 	let entries = lsdir(YAML_JOB_DIRECTORY);
 	let result = { active: [], terminal: [] };
 
@@ -891,7 +898,7 @@ function scan_yaml_jobs(clean_temporary) {
 		if (!match(name, /^[0-9a-f]{32}$/))
 			return { error: 'YAML update state is unsafe' };
 
-		let record = read_yaml_job(name);
+		let record = read_yaml_job_file(`${YAML_JOB_DIRECTORY}/${name}`);
 		if (!record)
 			return { error: 'YAML update state is unsafe' };
 

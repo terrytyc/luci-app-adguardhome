@@ -91,8 +91,8 @@ grep -Fq 'name: release-apks-${{ github.run_attempt }}' "$repo/.github/workflows
 	die 'release artifact name does not distinguish rerun attempts'
 grep -Fq 'path: ${{ runner.temp }}/real-apks/*.apk' "$repo/.github/workflows/test.yml" ||
 	die 'CI does not upload its verified APKs'
-grep -Eq '^PKG_RELEASE:=8$' "$repo/luci-app-adguardhome/Makefile" ||
-	die 'package release was not advanced to r8'
+grep -Eq '^PKG_RELEASE:=9$' "$repo/luci-app-adguardhome/Makefile" ||
+	die 'package release was not advanced to r9'
 grep -Eq '^LUCI_DEPENDS:=.*\+dnsmasq .*\+firewall4 ' "$repo/luci-app-adguardhome/Makefile" ||
 	die 'runtime DNS dependencies are incomplete'
 grep -Fq 'openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' \

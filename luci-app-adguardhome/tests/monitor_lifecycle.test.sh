@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 # Execute the real lifecycle entry points without launching a core or monitor.
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-for name in declare_monitor_instance sync_monitor_instance start_service service_triggers \
+for name in record_ready_core_runtime declare_monitor_instance sync_monitor_instance start_service service_triggers \
 	orchestrate_core_locked reconcile_core_locked monitor_interval_locked; do
 	eval "$(function_body "$init_file" "$name")"
 done

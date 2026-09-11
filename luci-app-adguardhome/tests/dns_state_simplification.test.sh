@@ -203,11 +203,11 @@ uci() {
 }
 
 TEST_SERVERS='/example.test/192.0.2.53'
-load_dnsmasq_section
 for conditional in '//9.9.9.9' '/example.test/' '/example.test/#' \
 	'/foo.test/bar.test/9.9.9.9' '/*.example.test/9.9.9.9' \
 	'/*example.test/9.9.9.9' '/.example.test/9.9.9.9'; do
 	TEST_SERVERS="$conditional"
+	load_dnsmasq_section
 	dnsmasq_takeover_is_safe
 done
 TEST_MANAGED_PORT=53335
@@ -218,6 +218,7 @@ for generic in '9.9.9.9' '/#/9.9.9.9' '/*/9.9.9.9' '/./9.9.9.9' \
 	'/example.test/*/other.test/9.9.9.9' '/example.test/.../9.9.9.9'; do
 	TEST_SERVERS="/example.test/192.0.2.53
 ${generic}"
+	load_dnsmasq_section
 	if dnsmasq_takeover_is_safe; then
 		printf 'generic dnsmasq upstream was accepted: %s\n' "$generic" >&2
 		exit 1
@@ -231,6 +232,7 @@ ${generic}"
 done
 TEST_SERVERS=''
 TEST_SCALAR_SERVER=9.9.9.9
+load_dnsmasq_section
 if dnsmasq_takeover_is_safe; then
 	printf 'scalar generic dnsmasq upstream was accepted\n' >&2
 	exit 1
@@ -245,6 +247,7 @@ if set_dnsmasq_upstream; then
 	printf 'DNS takeover succeeded despite an existing generic upstream\n' >&2
 	exit 1
 fi
+[ "$(grep -c '^load:dhcp$' "$uci_log")" = 1 ]
 if grep -Eq '^(add_list|set|delete|del_list|commit):' "$uci_log"; then
 	printf 'rejected DNS takeover changed UCI state\n' >&2
 	exit 1
@@ -254,6 +257,8 @@ fi
 TEST_SERVERS='/example.test/192.0.2.53'
 TEST_MANAGED_PORT=''
 set_dnsmasq_upstream
+[ "$(grep -c '^load:dhcp$' "$uci_log")" = 1 ]
+[ "$(grep -c '^reload:/etc/init.d/dnsmasq:restart$' "$uci_log")" = 1 ]
 for expected in \
 	'add_list:dhcp.cfg01411c.server=127.0.0.1#53335' \
 		'set:dhcp.cfg01411c.noresolv=1' \

@@ -8,6 +8,7 @@ init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 eval "$(function_body "$init_file" yaml_job_hash_valid)"
+eval "$(function_body "$init_file" record_ready_core_runtime)"
 
 normalize_persistent_body="$(function_body "$init_file" normalize_managed_config_file_persistent)"
 normalize_body="$(function_body "$init_file" normalize_managed_config_file)"

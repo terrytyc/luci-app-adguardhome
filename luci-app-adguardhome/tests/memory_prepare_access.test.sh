@@ -61,6 +61,7 @@ run_bounded() {
 			[ "${TEST_FAIL_SCAN:-0}" != 1 ] || [ "$4" != "$MEMORY_DATA_DIR" ] || return 1
 		fi
 		[ "$executable" != /bin/cp ] || [ "${TEST_FAIL_COPY:-0}" != 1 ] || return 1
+		[ "$operation" != AGHDataPrune ] || [ "${TEST_FAIL_PRUNE:-0}" != 1 ] || return 1
 		if [ "$executable" = /bin/sh ]; then
 			set -- busybox ash "$@"
 		else
@@ -106,6 +107,7 @@ set_fixture() {
 	MEMORY_MOUNTS_SUSPENDED=0
 	memory_requested=1
 	TEST_FAIL_COPY=0
+	TEST_FAIL_PRUNE=0
 	TEST_FAIL_SCAN=0
 	TEST_FAIL_MOUNT=""
 	: >"$test_tmp/scans"
@@ -159,6 +161,71 @@ for scenario in empty existing service-owned; do
 	[ "$scenario" = empty ] || [ "$(cat "$MEMORY_DATA_DIR/saved")" = 'saved data' ]
 	remove_prepared
 done
+
+# The complete stopped copy/prune chain scans the unchanged RAM source once.
+# Mount/state checks still bracket deletion, and failed writes retain active RAM.
+(
+	. "$script_dir/lib/function-body.sh"
+	for name in memory_state_load memory_bindings_valid memory_backing_identity; do
+		eval "$(function_body "$test_tmp/init" "$name" | sed "1s/^$name/original_$name/")"
+	done
+	memory_state_load() {
+		printf '%s\n' "${1:-full}" >>"$test_tmp/state-calls"
+		original_memory_state_load "$@"
+	}
+	memory_bindings_valid() {
+		printf '%s\n' "$1" >>"$test_tmp/binding-calls"
+		original_memory_bindings_valid "$@"
+	}
+	memory_backing_identity() {
+		printf '%s\n' "$1" >>"$test_tmp/identity-calls"
+		original_memory_backing_identity "$@"
+	}
+	set_fixture stopped-writeback
+	seed_data
+	memory_prepare_runtime_locked
+	chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_work_dir"
+	printf 'RAM update\n' >"$MEMORY_DATA_DIR/saved"
+	printf 'stale data\n' >"$MEMORY_BACKING_DATA_MOUNT/stale"
+	chown "$ADGUARD_UID:$ADGUARD_GID" "$MEMORY_BACKING_DATA_MOUNT/stale"
+	: >"$test_tmp/scans"
+	: >"$test_tmp/state-calls"
+	: >"$test_tmp/binding-calls"
+	: >"$test_tmp/identity-calls"
+	memory_copy_stopped_data_locked
+	[ "$(cat "$MEMORY_BACKING_DATA_MOUNT/saved")" = 'RAM update' ]
+	[ ! -e "$MEMORY_BACKING_DATA_MOUNT/stale" ]
+	[ "$(wc -l <"$test_tmp/scans")" = 1 ]
+	[ "$(cat "$test_tmp/state-calls")" = "$(printf 'full\nlight\nlight')" ]
+	[ "$(wc -l <"$test_tmp/binding-calls")" = 5 ]
+	[ "$(wc -l <"$test_tmp/identity-calls")" = 14 ]
+	remove_prepared
+
+	for failure in copy prune; do
+		set_fixture "writeback-$failure-failure"
+		seed_data
+		memory_prepare_runtime_locked
+		chown "$ADGUARD_UID:$ADGUARD_GID" "$persistent_work_dir"
+		printf 'RAM update\n' >"$MEMORY_DATA_DIR/saved"
+		printf 'keep on failure\n' >"$MEMORY_BACKING_DATA_MOUNT/stale"
+		chown "$ADGUARD_UID:$ADGUARD_GID" "$MEMORY_BACKING_DATA_MOUNT/stale"
+		case "$failure" in
+			copy) TEST_FAIL_COPY=1 ;;
+			prune) TEST_FAIL_PRUNE=1 ;;
+		esac
+		if memory_deactivate_locked; then
+			printf 'RAM was removed after a failed %s\n' "$failure" >&2
+			exit 1
+		fi
+		[ "$MEMORY_ACTIVE" = 1 ] && [ -f "$MEMORY_STATE_FILE" ]
+		[ "$persistent_work_dir/data" -ef "$MEMORY_DATA_DIR" ]
+		[ "$(cat "$MEMORY_DATA_DIR/saved")" = 'RAM update' ]
+		[ "$(cat "$MEMORY_BACKING_DATA_MOUNT/stale")" = 'keep on failure' ]
+		TEST_FAIL_COPY=0 TEST_FAIL_PRUNE=0
+		remove_prepared
+		[ "$(cat "$persistent_work_dir/data/saved")" = 'RAM update' ]
+	done
+)
 
 # Failed copies restore the original parent access and remove only unpublished
 # RAM preparation. They leave the persistent data and YAML intact.

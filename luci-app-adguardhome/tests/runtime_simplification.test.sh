@@ -83,6 +83,91 @@ parser_body="$(function_body "$init_file" yaml_runtime_ports)"
 port_body="$(function_body "$init_file" is_valid_port)"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT
+
+# A workdir move takes its revision from the actual backup, then retains the
+# post-validation compare and failed-install restoration boundaries.
+(
+	eval "$managed_body"
+	for name in sync_yaml_workdir_pattern yaml_replace_section_list_item install_yaml_temp; do
+		eval "$(function_body "$init_file" "$name")"
+	done
+	work_dir="$test_tmp/managed"
+	previous_work_dir=/etc/AdGuardHome-old
+	config_file="$work_dir/AdGuardHome.yaml"
+	mkdir "$work_dir"
+	events="$test_tmp/managed-events"
+	validate_work_dir_mount_dependency() { :; }
+	log_error() { :; }
+	yaml_file_hash() { sha256sum "$1" | cut -d ' ' -f 1; }
+	snapshot_config_file() {
+		printf 'snapshot\n' >>"$events"
+		MANAGED_DIRECTORY="${2%/*}"
+		cp "$1" "$2" || return 1
+		[ "$scenario" != snapshot-failure ] || return 1
+		SNAPSHOT_CONFIG_HASH="$(yaml_file_hash "$2")"
+	}
+	active_config_hash() {
+		printf 'active-hash\n' >>"$events"
+		yaml_file_hash "$config_file"
+	}
+	check_core_config_file() {
+		printf 'check\n' >>"$events"
+		[ "$2" = "$(yaml_file_hash "$1")" ] || return 1
+		[ "$scenario" != validation-failure ]
+	}
+	install_config_candidate() {
+		if [ "${1##*/}" = original.yaml ]; then
+			printf 'restore\n' >>"$events"
+			[ "$scenario" != restore-failure ] || return 1
+		else
+			printf 'install\n' >>"$events"
+			[ "$2" = "$(yaml_file_hash "$config_file")" ] || return 1
+			[ "$scenario" != install-before ] || return 1
+		fi
+		cp "$1" "$config_file" || return 1
+		if [ -n "$4" ] && { [ "$scenario" = install-after ] || [ "$scenario" = restore-failure ]; }; then
+			: >"$4"
+			return 1
+		fi
+	}
+	for scenario in success unchanged snapshot-failure validation-failure install-before install-after restore-failure; do
+		printf 'filtering:\n  safe_fs_patterns:\n    - %s/data/userfilters/*\n    - /custom/filters/*\n' \
+			"$previous_work_dir" >"$config_file"
+		if [ "$scenario" = unchanged ]; then
+			printf 'filtering:\n  safe_fs_patterns:\n    - /custom/filters/*\n' >"$config_file"
+		fi
+		cp "$config_file" "$test_tmp/original.yaml"
+		: >"$events"
+		rc=0
+		sync_yaml_managed_fields_checked || rc=$?
+		[ "$(grep -c '^snapshot$' "$events")" = 1 ]
+		case "$scenario" in
+			success)
+				[ "$rc" = 0 ]
+				grep -Fqx "    - $work_dir/data/userfilters/*" "$config_file"
+				grep -Fqx '    - /custom/filters/*' "$config_file"
+				;;
+			unchanged) [ "$rc" = 0 ]; cmp -s "$config_file" "$test_tmp/original.yaml" ;;
+			restore-failure)
+				[ "$rc" != 0 ]
+				cmp -s "$MANAGED_DIRECTORY/original.yaml" "$test_tmp/original.yaml"
+				[ "$(LC_ALL=C ls -ld "$MANAGED_DIRECTORY" | cut -d ' ' -f 1)" = drwx------ ]
+				rm -rf "$MANAGED_DIRECTORY"
+				;;
+			*) [ "$rc" != 0 ]; cmp -s "$config_file" "$test_tmp/original.yaml" ;;
+		esac
+		[ ! -e "$MANAGED_DIRECTORY" ]
+		case "$scenario" in
+			unchanged|snapshot-failure|validation-failure)
+				! grep -q '^active-hash$' "$events" || exit 1 ;;
+			*) [ "$(grep -c '^active-hash$' "$events")" = 1 ] ;;
+		esac
+		case "$scenario" in
+			install-after|restore-failure) grep -qx restore "$events" ;;
+			*) ! grep -q '^restore$' "$events" || exit 1 ;;
+		esac
+	done
+)
 (
 	eval "$runtime_body"
 	eval "$parser_body"

@@ -139,6 +139,37 @@ function loadOverview() {
 	};
 }
 
+async function testCredentialPolling() {
+	for (const result of [ { state: 'done', ok: true }, { state: 'done', ok: false },
+		{ state: 'done', ok: false, indeterminate: true } ]) {
+		const state = loadOverview();
+		await state.view.render(await state.view.load());
+		state.calls.length = 0;
+		const started = deferred();
+		const job = deferred();
+		const failures = [];
+		Object.assign(state.operation, {
+			start: () => ({}), success() {}, failure: message => failures.push(message),
+			waitForJob() { started.resolve(); return job.promise; },
+		});
+		state.handlers.set_credentials = () => ({ accepted: true, token: 'b'.repeat(32) });
+		const change = state.view.changeCredentials({}, { username: 'admin', sha256: 'a'.repeat(64) },
+			{ value: 'operator' }, { value: '' }, { value: '' }, { style: {} }, {}, {});
+		await started.promise;
+		assert.equal(state.view.credentialsPreparing, true, 'credential worker waiting must retain the existing action guard');
+		await state.view.statusPollCallback();
+		await state.view.statusPollCallback();
+		assert.deepEqual(state.calls, [ 'set_credentials' ], 'two ticks during a credential job must issue no overview RPC');
+		job.resolve(result);
+		await change;
+		assert.equal(state.view.credentialsPreparing, false, 'completion must release the action guard');
+		assert.deepEqual(state.calls, [ 'set_credentials', 'get_overview' ],
+			'success and failure must refresh measured status exactly once after releasing the guard');
+		assert.equal(failures.length, result.ok ? 0 : 1);
+		assert.equal(state.view.credentialsUncertain === true, result.indeterminate === true);
+	}
+}
+
 function managementContainer(state) {
 	return state.elements.find(node => node.tag === 'span' &&
 		node.attrs?.class === 'adguardhome-management');
@@ -601,6 +632,7 @@ async function main() {
 	await testManagementURLValidation();
 	await testDnsAndWritebackAvailability();
 	await testWritebackClickUncertainty();
+	await testCredentialPolling();
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

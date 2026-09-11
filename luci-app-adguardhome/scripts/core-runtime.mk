@@ -63,8 +63,8 @@ remember_core_runtime() {
 	root_private_directory "$$NORMALIZER_RUNTIME_DIR" || return 1
 	[ ! -e "$$record" ] && [ ! -L "$$record" ] || root_private_file "$$record" || return 1
 	identity="$$(core_runtime_identity)" && fingerprint="$$(core_runtime_fingerprint)" || return 1
-	# A core migration or an external edit during startup cannot become an
-	# unproven baseline. The next Apply conservatively runs the full lifecycle.
+	# Only publish the startup inputs or the canonical YAML already validated by
+	# the caller. A mismatch leaves the next Apply on the full lifecycle.
 	[ "$$fingerprint" = "$$expected" ] && [ "$$(core_runtime_identity)" = "$$identity" ] || return 1
 	temporary="$$(mktemp "$${NORMALIZER_RUNTIME_DIR}/.applied-runtime.XXXXXX")" || return 1
 	if ! printf '%s %s\n' "$$identity" "$$fingerprint" >"$$temporary" ||
@@ -73,5 +73,13 @@ remember_core_runtime() {
 		rm -f "$$temporary"
 		return 1
 	fi
+}
+
+# Call after successful readiness/configuration checks. Recording is optional:
+# a failure keeps the working core and makes the next Apply recheck it fully.
+record_ready_core_runtime() {
+	remember_core_runtime "$$1" ||
+		log_error "Runtime baseline unavailable; the next settings Apply will recheck and restart the core"
+	return 0
 }
 endef
