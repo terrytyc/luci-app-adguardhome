@@ -752,20 +752,20 @@ function parse_yaml_job_state(content) {
 	return null;
 }
 
-function read_yaml_job(token) {
-	let path = yaml_job_path(token);
-	if (!path || !root_private_directory(lstat(YAML_JOB_DIRECTORY)))
-		return null;
-
-	return read_yaml_job_file(path);
-}
-
 function read_yaml_job_file(path) {
 	let metadata = lstat(path);
 	if (!root_private_file(metadata))
 		return null;
 
 	return parse_yaml_job_state(readfile(path, YAML_JOB_STATE_LIMIT + 1));
+}
+
+function read_yaml_job(token) {
+	let path = yaml_job_path(token);
+	if (!path || !root_private_directory(lstat(YAML_JOB_DIRECTORY)))
+		return null;
+
+	return read_yaml_job_file(path);
 }
 
 function write_yaml_job(token, content, create_only) {
