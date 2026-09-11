@@ -35,8 +35,35 @@ check_selection v3.0.0-r9 $'v3.0.0-r9\nv3.0.0-r10' ''
 grep -Fq "if: needs.build.outputs.current != ''" "$workflow" || die 'deploy must skip old releases'
 ! grep -Fq 'inputs.tag' "$workflow" || die 'manual publication must use the latest release'
 ! grep -qi previous "$workflow" || die 'publication must not retain an unindexed previous release'
-grep -Fq 'ref: ${{ steps.releases.outputs.current }}' "$workflow" || die 'publication must check out the selected tag'
+grep -Fq 'ref: ${{ steps.tests.outputs.head_sha }}' "$workflow" ||
+	die 'publication checkout is not bound to the tested commit'
+! grep -Fq 'ref: ${{ steps.releases.outputs.current }}' "$workflow" ||
+	die 'publication must not resolve a movable tag after the test gate'
 grep -Fq 'persist-credentials: false' "$workflow" || die 'release checkout must not retain write credentials'
+! grep -Fq 'gh release download' "$workflow" || die 'signed feed must not trust independently uploaded release APKs'
+grep -Fq 'TEST_RUN_ID: ${{ steps.tests.outputs.run_id }}' "$workflow" ||
+	die 'feed download is not bound to the passing test run'
+grep -Fq 'TEST_ARTIFACT_ATTEMPT: ${{ steps.tests.outputs.artifact_attempt }}' "$workflow" ||
+	die 'feed download is not bound to the full-job artifact attempt'
+grep -Fq 'gh run download "$TEST_RUN_ID" --repo "$GITHUB_REPOSITORY"' "$workflow" ||
+	die 'feed does not download the passing run artifact'
+grep -Fq -- '--name "release-apks-$TEST_ARTIFACT_ATTEMPT" --dir release/current' "$workflow" ||
+	die 'feed does not select the passing attempt artifact'
+download=$(awk '
+ /name: Download verified CI APKs/ { selected=1 }
+ selected && /run: \|/ { active=1; next }
+ active && /      - name:/ { exit }
+ active { sub(/^          /, ""); print }
+' "$workflow")
+mkdir "$temporary/download"
+(cd "$temporary/download" && TEST_RUN_ID=123 TEST_ARTIFACT_ATTEMPT=7 \
+	GITHUB_REPOSITORY=test/project CALLS="$temporary/download-call" DOWNLOAD="$download" bash -c '
+	gh() { printf "%s\n" "$*" >"$CALLS"; }
+	eval "$DOWNLOAD"
+')
+[[ $(<"$temporary/download-call") == \
+	'run download 123 --repo test/project --name release-apks-7 --dir release/current' ]] ||
+	die 'feed artifact download escaped the passing run identity'
 ! grep -Eq 'uses: [^ ]+@v[0-9]' "$workflow" || die 'publication actions must use immutable commits'
 [[ $(grep -Ec 'uses: [^ ]+@[0-9a-f]{40}( |$)' "$workflow") == 4 ]] ||
 	die 'publication action pins are missing'
@@ -56,6 +83,18 @@ grep -Fq 'bash scripts/prepare-test-sdk.sh "$RUNNER_TEMP/openwrt-sdk" "$GITHUB_W
 	"$repo/.github/workflows/test.yml" || die 'CI does not prepare a real OpenWrt SDK'
 grep -Fq 'NO_DEPS=1 JOBS=2 bash scripts/build-apk.sh' "$repo/.github/workflows/test.yml" ||
 	die 'CI does not build and verify real APKs'
+grep -Fq 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1' \
+	"$repo/.github/workflows/test.yml" || die 'CI artifact upload is not pinned'
+grep -Fq "if: github.event_name == 'push'" "$repo/.github/workflows/test.yml" ||
+	die 'release artifacts must come from main push tests'
+grep -Fq 'name: release-apks-${{ github.run_attempt }}' "$repo/.github/workflows/test.yml" ||
+	die 'release artifact name does not distinguish rerun attempts'
+grep -Fq 'path: ${{ runner.temp }}/real-apks/*.apk' "$repo/.github/workflows/test.yml" ||
+	die 'CI does not upload its verified APKs'
+grep -Eq '^PKG_RELEASE:=4$' "$repo/luci-app-adguardhome/Makefile" ||
+	die 'package release was not advanced to r4'
+grep -Eq '^LUCI_DEPENDS:=.*\+dnsmasq .*\+firewall4 ' "$repo/luci-app-adguardhome/Makefile" ||
+	die 'runtime DNS dependencies are incomplete'
 grep -Fq 'openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' \
 	"$repo/scripts/prepare-test-sdk.sh" || die 'test SDK URL is not pinned'
 grep -Fq '9f371906ce6d2f95418f69fac06df58bf9df0ffc4abed6206c30f1b547fcfc12' \
@@ -69,20 +108,25 @@ gate=$(awk '
 ' "$workflow")
 [[ -n $gate ]] || die 'release commit test gate is missing'
 for outcome in success failure pending empty commit-error runs-error invalid-commit empty-commit \
-	invalid-run full-missing full-skipped full-failure jobs-error; do
+	invalid-run invalid-attempt invalid-run-sha mismatched-run-sha extra-run \
+	full-missing full-skipped full-failure invalid-full-attempt extra-full jobs-error \
+	partial-rerun; do
 	gate_rc=0
+	: >"$temporary/gate-output"
 	OUTCOME=$outcome GATE="$gate" CURRENT_TAG=v3.0.0-r2 \
-		GITHUB_REPOSITORY=test/project bash -c '
+		GITHUB_REPOSITORY=test/project GITHUB_OUTPUT="$temporary/gate-output" bash -c '
 		gh() {
 			[[ $1 == api ]] || return 9
-			if [[ $2 == --paginate ]]; then
-				[[ $3 == repos/test/project/actions/runs/123/jobs ]] || return 9
+			if [[ $2 == "repos/test/project/actions/runs/123/jobs?filter=all&per_page=100" ]]; then
 				case "$OUTCOME" in
 					jobs-error) return 7 ;;
 					full-missing) return 0 ;;
-					full-skipped) printf "skipped\n" ;;
-					full-failure) printf "failure\n" ;;
-					*) printf "success\n" ;;
+					full-skipped) printf "skipped 1\n" ;;
+					full-failure) printf "failure 1\n" ;;
+					invalid-full-attempt) printf "success invalid\n" ;;
+					extra-full) printf "success 1 extra\n" ;;
+					partial-rerun) printf "success 1\n" ;;
+					*) printf "success 1\n" ;;
 				esac
 				return
 			fi
@@ -96,18 +140,30 @@ for outcome in success failure pending empty commit-error runs-error invalid-com
 					[[ $OUTCOME != runs-error ]] || return 7
 					case "$OUTCOME" in
 						failure|pending|empty) return 0 ;;
-						invalid-run) printf "not-a-run-id\n" ;;
-						*) printf "123\n" ;;
+						invalid-run) printf "not-a-run-id 1 %040d\n" 1 ;;
+						invalid-attempt) printf "123 not-an-attempt %040d\n" 1 ;;
+						invalid-run-sha) printf "123 1 not-a-sha\n" ;;
+						mismatched-run-sha) printf "123 1 %040d\n" 2 ;;
+						extra-run) printf "123 1 %040d extra\n" 1 ;;
+						partial-rerun) printf "123 2 %040d\n" 1 ;;
+						*) printf "123 1 %040d\n" 1 ;;
 					esac ;;
 				*) return 9 ;;
 			esac
 		}
 		eval "$GATE"
 	' >"$temporary/gate.log" 2>&1 || gate_rc=$?
-	if [[ $outcome == success ]]; then
+	if [[ $outcome == success || $outcome == partial-rerun ]]; then
 		[[ $gate_rc == 0 ]] || die 'passing release commit tests were rejected'
+		expected_run_attempt=1
+		[[ $outcome != partial-rerun ]] || expected_run_attempt=2
+		[[ $(<"$temporary/gate-output") == \
+			$(printf 'run_id=123\nrun_attempt=%s\nartifact_attempt=1\nhead_sha=%040d' \
+				"$expected_run_attempt" 1) ]] ||
+			die 'passing test run provenance was not exported'
 	else
 		[[ $gate_rc != 0 ]] || die "release commit gate accepted $outcome"
+		[[ ! -s $temporary/gate-output ]] || die "failed gate exported $outcome"
 	fi
 done
 
@@ -156,7 +212,7 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 	{
 		printf 'info:\n  name: %s\n  version: %s\n  arch: noarch\n  origin: %s\n  depends:\n' "$name" "$version" "$origin"
 		if [[ $name == luci-app-adguardhome ]]; then
-			printf '    - adguardhome>=0.107.76-r1\n'
+			printf '    - adguardhome>=0.107.76-r1\n    - dnsmasq\n    - firewall4\n'
 			hooks='pre-install post-install pre-deinstall post-deinstall pre-upgrade post-upgrade'
 			uci_configs='adguardhome dhcp firewall'
 		else
@@ -175,7 +231,22 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 					[[ $name != luci-app-adguardhome ]] || printf '    run_bounded 180 5 /etc/init.d/AdGuardHome stop\n' ;;
 				post-install|post-upgrade)
 					printf '    default_postinst\n    # AdGuard Home initialization failed; package installation aborted.\n    /etc/init.d/rpcd reload\n' ;;
-				pre-deinstall) printf '    default_prerm\n    /etc/init.d/AdGuardHome memory_cleanup\n' ;;
+				pre-deinstall)
+					printf '%s\n' \
+						'    default_prerm' \
+						'    recover_failed_removal() {' \
+						'      rollback_yaml_maintenance >/dev/null 2>&1 || true' \
+						'      /etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true' \
+						'      for recovery_config in adguardhome dhcp firewall; do' \
+						'        recovery_changes="$(uci -q changes "$recovery_config" 2>/dev/null)" || return 0' \
+						'        [ -z "$recovery_changes" ] || return 0' \
+						'      done' \
+						'      run_bounded 180 5 /etc/init.d/AdGuardHome start >/dev/null 2>&1 || true' \
+						'    }' \
+						"    trap 'recover_failed_removal' 0" \
+						'    run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || exit 1' \
+						'    trap - 0 HUP INT TERM'
+					;;
 				post-deinstall) printf '    # verified AdGuard Home removal state\n' ;;
 			esac
 		done
@@ -229,7 +300,8 @@ for artifact in "$temporary/first/"*; do
 done
 archive=$temporary/first/luci-app-adguardhome-3.0.0-r2.tar.gz
 [[ $(tar -xOf "$archive" luci-app-adguardhome/root/marker) == committed ]] || die 'dirty file shipped'
-! tar -tzf "$archive" | grep -q untracked || die 'untracked file shipped'
+tar -tzf "$archive" >"$temporary/archive.list"
+! grep -q untracked "$temporary/archive.list" || die 'untracked file shipped'
 SOURCE_REF=v3.0.0-r1 OUTPUT_DIR=$temporary/tag bash "$script"
 [[ -f $temporary/tag/luci-app-adguardhome-3.0.0-r1.apk ]] || die 'tag build used working-tree version'
 assert_build_tmp_clean
@@ -272,6 +344,8 @@ check_apk_failure i18n 'APK version mismatch' 's/^  version: .*/  version: 3.0.0
 check_apk_failure main 'APK is not noarch' 's/^  arch: .*/  arch: x86_64/'
 check_apk_failure main 'versioned adguardhome dependency' 's/adguardhome>=0.107.76-r1/adguardhome/'
 check_apk_failure main 'versioned adguardhome dependency' 's/adguardhome>=0.107.76-r1/adguardhome>=0.107.0-r1/'
+check_apk_failure main 'dnsmasq dependency' '/^    - dnsmasq$/d'
+check_apk_failure main 'firewall4 dependency' '/^    - firewall4$/d'
 check_apk_failure i18n 'luci-app-adguardhome dependency' '/^    - luci-app-adguardhome$/d'
 check_apk_failure main 'conffile manifest is missing' '/^# payload-conffile:/d'
 check_apk_failure main 'does not preserve its active YAML' '\|^# payload-conffile: /etc/AdGuardHome/AdGuardHome.yaml$|d'
@@ -295,7 +369,15 @@ for hook in post-install post-upgrade; do
 	check_apk_failure main "$hook lost RPC reload" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /rpcd reload/d; }"
 done
 check_apk_failure main 'platform removal hook' '/default_prerm/d'
-check_apk_failure main 'safe memory cleanup' '\|/etc/init.d/AdGuardHome memory_cleanup|d'
+check_apk_failure main 'safe coordinator stop' \
+	'\|run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded|d'
+check_apk_failure main 'failed-removal recovery' "/trap 'recover_failed_removal' 0/d"
+check_apk_failure main 'does not guard every owned UCI config' \
+	'/for recovery_config in adguardhome dhcp firewall/d'
+check_apk_failure main 'may start through pending UCI changes' \
+	'/\[ -z "\$recovery_changes" \] || return 0/d'
+check_apk_failure main 'does not recover around its verified stop' \
+	'/^    default_prerm$/d; /^    trap - 0 HUP INT TERM$/i\    default_prerm'
 check_apk_failure main 'verified cleanup state' '/verified AdGuard Home removal state/d'
 expect_failure 'versioned adguardhome dependency' env BAD_CORE_DEPENDENCY=1 \
 	OUTPUT_DIR="$temporary/rejected-build" bash "$script"

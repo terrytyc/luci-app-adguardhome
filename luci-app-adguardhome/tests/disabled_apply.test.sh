@@ -72,7 +72,7 @@ for RAM_REQUESTED in 0 1; do
 	: >"$events"
 	settings_update_locked 0 /etc/AdGuardHome 0 none "$RAM_REQUESTED" 60 "$revision"
 	[ "$STORED_ENABLED:$CORE_RUNNING:$RAM_ACTIVE" = 0:0:0 ]
-	! grep -q '^unexpected-' "$events"
+	! grep -q '^unexpected-' "$events" || exit 1
 	grep -qx jail-sync "$events"
 	grep -qx monitor-sync "$events"
 	[ "$(grep -c '^writeback$' "$events" || true)" = "$RAM_REQUESTED" ]
@@ -85,7 +85,7 @@ for FAILURE in cleanup stop wait writeback; do
 	: >"$events"
 	if orchestrate_core_locked; then exit 1; fi
 	[ "$RAM_ACTIVE" = 1 ]
-	! grep -Eq '^(unexpected-|jail-sync|monitor-sync)' "$events"
+	! grep -Eq '^(unexpected-|jail-sync|monitor-sync)' "$events" || exit 1
 done
 
 # Exercise the real RAM deactivation and checked pattern migration during a
@@ -135,12 +135,12 @@ done
 		settings_update_locked 0 "$new_work" 0 none 1 60 "$revision"
 		[ "$STORED_ENABLED:$CORE_RUNNING:$MEMORY_ACTIVE" = 0:0:0 ]
 		[ "$STORED_WORK_DIR" = "$new_work" ] && [ ! -e "$MEMORY_RUNTIME_DIR" ]
-		! grep -q '^unexpected-' "$events"
+		! grep -q '^unexpected-' "$events" || exit 1
 		case "$yaml_kind" in
 			valid)
 				grep -Fqx "    - $new_work/data/userfilters/*" "$new_work/AdGuardHome.yaml"
 				grep -Fqx '    - /custom/filters/*' "$new_work/AdGuardHome.yaml"
-				! grep -Fq "$old_work/data/userfilters/*" "$new_work/AdGuardHome.yaml"
+				! grep -Fq "$old_work/data/userfilters/*" "$new_work/AdGuardHome.yaml" || exit 1
 				;;
 			broken)
 				grep -Fqx "    - $old_work/data/userfilters/*" "$new_work/AdGuardHome.yaml"
@@ -154,13 +154,13 @@ done
 	result=0
 	prepare_wrapper_locked || result=$?
 	[ "$result" = 2 ] && [ ! -e "$new_work/AdGuardHome.yaml" ]
-	! grep -q '^unexpected-' "$events"
+	! grep -q '^unexpected-' "$events" || exit 1
 	for boundary in writeback unmount restore-paths remove-tree state-identity directory-identity jail-sync; do
 		prepare_ram_case
 		STORED_ENABLED=0 STORED_WORK_DIR="$new_work" FAILURE="$boundary"
 		if orchestrate_core_locked; then exit 1; fi
 		grep -qx "$boundary" "$events"
-		! grep -q '^monitor-sync$' "$events"
+		! grep -q '^monitor-sync$' "$events" || exit 1
 	done
 )
 printf 'ok - disabling broken activation config stays saved and preserves stop/writeback failures\n'

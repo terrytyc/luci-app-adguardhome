@@ -173,7 +173,7 @@ for scenario in bad-lock pending candidate stale hash-failure inactive stopped \
 			esac
 			;;
 	esac
-	! grep -q '^unexpected-service:' "$events"
+	! grep -q '^unexpected-service:' "$events" || exit 1
 ); done
 
 printf 'ok - settings/YAML share authenticated inherited-FD cleanup and retain task locks\n'

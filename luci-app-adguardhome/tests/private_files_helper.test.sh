@@ -39,8 +39,8 @@ sed '/^$/d' "$temporary/init.helper" >"$temporary/init.compact"
 cmp "$temporary/helper.compact" "$temporary/init.compact"
 [ "$(grep -Fc '$(AdGuardHome/PrivateFiles)' "$makefile")" = 4 ]
 ! grep -Eq '^entry_metadata\(\)|^root_private_(directory|file)\(\)|^bounded_private_file\(\)' \
-	"$makefile" "$defaults"
-! grep -Fq '# @include ' "$temporary/defaults.sh"
+	"$makefile" "$defaults" || exit 1
+! grep -Fq '# @include ' "$temporary/defaults.sh" || exit 1
 
 # Missing, unknown or duplicated source markers must fail the build.
 for marker in '# @include missing' '# @include private-files'; do
@@ -67,17 +67,17 @@ chmod 0600 "$temporary/private/file"
 if [ "$(id -u)" = 0 ] && [ "$(id -g)" = 0 ]; then
 	root_private_directory "$temporary/private"
 	root_private_file "$temporary/private/file"
-	! bounded_private_file "$temporary/private/file"
+	! bounded_private_file "$temporary/private/file" || exit 1
 	printf 'x\n' >"$temporary/private/file"
 	bounded_private_file "$temporary/private/file"
 fi
 ln -s "$temporary/private/file" "$temporary/link"
-! root_private_file "$temporary/link"
+! root_private_file "$temporary/link" || exit 1
 ln "$temporary/private/file" "$temporary/hardlink"
-! root_private_file "$temporary/private/file"
+! root_private_file "$temporary/private/file" || exit 1
 chmod 0755 "$temporary/private"
-! root_private_directory "$temporary/private"
-! root_private_file "$temporary/missing"
+! root_private_directory "$temporary/private" || exit 1
+! root_private_file "$temporary/missing" || exit 1
 
 # Runtime wrappers reuse the same policy but retain their path/size limits.
 log_error() { :; }
@@ -97,12 +97,12 @@ if [ "$(id -u):$(id -g)" = 0:0 ]; then
 	: >"$YAML_JOB_RUNTIME_DIR/update.lock"
 	chmod 0600 "$YAML_JOB_RUNTIME_DIR/update.lock"
 	yaml_job_lock_file_is_private
-	! yaml_job_file_is_private "$YAML_JOB_RUNTIME_DIR/update.lock"
+	! yaml_job_file_is_private "$YAML_JOB_RUNTIME_DIR/update.lock" || exit 1
 	printf 'pending\n' >"$YAML_JOB_RUNTIME_DIR/update.lock"
-	! yaml_job_lock_file_is_private
+	! yaml_job_lock_file_is_private || exit 1
 	yaml_job_file_is_private "$YAML_JOB_RUNTIME_DIR/update.lock"
 	ln -s "$YAML_JOB_RUNTIME_DIR" "$temporary/jobs-link"
 	NORMALIZER_LOCK="$temporary/jobs-link/normalizer.lock"
-	! normalizer_lock_is_private
+	! normalizer_lock_is_private || exit 1
 fi
 printf 'ok - single-source private-file checks and helper expansion\n'

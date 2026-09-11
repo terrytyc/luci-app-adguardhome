@@ -133,11 +133,22 @@ postrm="$(hook_body "$makefile" postrm)"
 before "$preinst" begin_yaml_maintenance '/etc/init.d/AdGuardHome stop'
 before "$postinst" begin_yaml_maintenance '/etc/init.d/rpcd reload'
 before "$postinst" '/etc/init.d/rpcd reload' finish_yaml_maintenance
-before "$prerm" begin_yaml_maintenance 'uci -q changes adguardhome'
-before "$prerm" begin_yaml_maintenance '/etc/init.d/AdGuardHome do_redirect 0'
+before "$prerm" begin_yaml_maintenance '/etc/init.d/AdGuardHome stop'
 before "$postrm" begin_yaml_maintenance '/etc/init.d/rpcd reload'
 before "$postrm" '/etc/init.d/rpcd reload' finish_yaml_maintenance
-printf '%s\n' "$preinst$prerm" | grep -Fq "trap 'rollback_yaml_maintenance' 0"
+printf '%s\n' "$preinst" | grep -Fq "trap 'rollback_yaml_maintenance' 0"
+printf '%s\n' "$prerm" | grep -Fq "trap 'recover_failed_removal' 0"
+printf '%s\n' "$prerm" | grep -Fq 'for recovery_config in adguardhome dhcp firewall; do'
+if printf '%s\n' "$prerm" |
+	grep -Fq 'Commit or revert pending adguardhome changes before uninstalling.'; then
+	printf 'pre-deinstall retained its ineffective late UCI guard\n' >&2
+	exit 1
+fi
+before "$prerm" 'rollback_yaml_maintenance >/dev/null' '/etc/init.d/AdGuardHome enable'
+before "$prerm" '/etc/init.d/AdGuardHome enable' 'for recovery_config in adguardhome dhcp firewall'
+before "$prerm" 'for recovery_config in adguardhome dhcp firewall' '/etc/init.d/AdGuardHome start'
+before "$prerm" "trap 'recover_failed_removal' 0" begin_yaml_maintenance
+before "$prerm" '/etc/init.d/AdGuardHome stop' 'trap - 0 HUP INT TERM'
 printf '%s\n' "$postinst$postrm" |
 	grep -Fq '[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1'
 

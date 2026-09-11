@@ -367,16 +367,19 @@ return view.extend({
 		const cursor = Number.isInteger(this.yamlEditor.selectionStart)
 			? this.yamlEditor.selectionStart
 			: 0;
-		const lines = content.split('\n');
-		const activeLine = yamlActiveLine(content, cursor);
+		const lines = content.length > MAX_HIGHLIGHT_LENGTH ? null : content.split('\n');
+		const plainText = lines == null || lines.length > MAX_HIGHLIGHT_LINES;
+		const activeLine = plainText ? 0 : yamlActiveLine(content, cursor);
 
-		if (lines.length !== this.yamlLineCount) {
-			this.yamlLineNumbers.textContent = Array.from({ length: lines.length }, (_, index) => index + 1).join('\n');
+		if (plainText !== this.yamlPlainText || (!plainText && lines.length !== this.yamlLineCount)) {
+			this.yamlLineNumbers.textContent = plainText
+				? ''
+				: Array.from({ length: lines.length }, (_, index) => index + 1).join('\n');
 			this.yamlEditorFrame.style.setProperty('--adguardhome-yaml-gutter',
-				`max(3rem, calc(${String(lines.length).length}ch + 1rem))`);
-			this.yamlLineCount = lines.length;
+				plainText ? '0px' : `max(3rem, calc(${String(lines.length).length}ch + 1rem))`);
+			this.yamlLineCount = plainText ? null : lines.length;
 		}
-		this.yamlPlainText = content.length > MAX_HIGHLIGHT_LENGTH || lines.length > MAX_HIGHLIGHT_LINES;
+		this.yamlPlainText = plainText;
 		this.yamlEditorFrame.classList.toggle('adguardhome-yaml-plain', this.yamlPlainText);
 		this.highlightNotice.hidden = !this.yamlPlainText;
 		this.yamlHighlight.innerHTML = this.yamlPlainText ? '' : highlightYaml(lines, activeLine);
@@ -386,7 +389,7 @@ return view.extend({
 	},
 
 	updateActiveYamlLine() {
-		if (this.yamlRefreshFrame != null)
+		if (this.yamlRefreshFrame != null || this.yamlPlainText)
 			return;
 
 		const content = String(this.yamlEditor.value ?? '');

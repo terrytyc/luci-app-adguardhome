@@ -1772,15 +1772,15 @@ memory_quarantine_stopped_conflicts_locked() (
 memory_copy_stopped_data_locked() {
 	local copy_rc=0 quarantine_rc=0
 	memory_copy_live_data_locked 0 || copy_rc=$?
-	if [ "$copy_rc" = 0 ]; then
-		memory_prune_stopped_data_locked
-		return
+	if [ "$copy_rc" != 0 ]; then
+		[ "$copy_rc" = 1 ] || return "$copy_rc"
+		memory_quarantine_stopped_conflicts_locked || quarantine_rc=$?
+		[ "$quarantine_rc" = 0 ] || return 1
+		memory_copy_live_data_locked 0 || return 1
 	fi
-	[ "$copy_rc" = 1 ] || return "$copy_rc"
-	memory_quarantine_stopped_conflicts_locked || quarantine_rc=$?
-	[ "$quarantine_rc" = 0 ] || return 1
-	memory_copy_live_data_locked 0 || return 1
-	memory_prune_stopped_data_locked
+	memory_prune_stopped_data_locked || return 1
+	# Successful callers may immediately unmount and remove the RAM tree.
+	memory_durability_barrier
 }
 
 # Once the stopped copy has succeeded, remove only persistent entries that no
@@ -3378,6 +3378,18 @@ reload_service_if_present() {
 	"$service" "$action" >/dev/null 2>&1
 }
 
+dnsmasq_server_foreach() {
+	local section="$1" callback="$2" value length
+	config_get length "$section" server_LENGTH 0
+	case "$length" in ''|*[!0-9]*) return 1 ;; esac
+	if [ "$length" -gt 0 ]; then
+		config_list_foreach "$section" server "$callback"
+	else
+		config_get value "$section" server
+		[ -z "$value" ] || "$callback" "$value"
+	fi
+}
+
 mark_managed_dnsmasq_upstream() {
 	[ "$1" != "$DNSMASQ_CLEANUP_UPSTREAM" ] || DNSMASQ_CLEANUP_FOUND=1
 }
@@ -3387,7 +3399,7 @@ remember_first_dnsmasq() {
 	[ -n "$DNSMASQ_SECTION" ] || DNSMASQ_SECTION="$1"
 	[ -n "$DNSMASQ_CLEANUP_UPSTREAM" ] || return 0
 	DNSMASQ_CLEANUP_FOUND=0
-	config_list_foreach "$1" server mark_managed_dnsmasq_upstream
+	dnsmasq_server_foreach "$1" mark_managed_dnsmasq_upstream || return 1
 	[ "$DNSMASQ_CLEANUP_FOUND" = 1 ] || return 0
 	DNSMASQ_CLEANUP_COUNT=$((DNSMASQ_CLEANUP_COUNT + 1))
 	DNSMASQ_CLEANUP_SECTION="$1"
@@ -3446,15 +3458,72 @@ mark_generic_server() {
 dnsmasq_takeover_is_safe() {
 	config_load dhcp || return 1
 	GENERIC_SERVER_FOUND=0
-	config_list_foreach "$DNSMASQ_SECTION" server mark_generic_server
+	dnsmasq_server_foreach "$DNSMASQ_SECTION" mark_generic_server || return 1
 	if [ "$GENERIC_SERVER_FOUND" != 0 ]; then
 		log_error "dnsmasq already has a generic upstream; refusing AdGuard Home takeover"
 		return 1
 	fi
 }
 
+remove_managed_dnsmasq_upstream() {
+	local upstream="$1" length value
+	DNSMASQ_CLEANUP_UPSTREAM="$upstream"
+	DNSMASQ_CLEANUP_FOUND=0
+	dnsmasq_server_foreach "$DNSMASQ_SECTION" mark_managed_dnsmasq_upstream || return 1
+	[ "$DNSMASQ_CLEANUP_FOUND" = 1 ] || return 0
+	config_get length "$DNSMASQ_SECTION" server_LENGTH 0
+	if [ "$length" -gt 0 ]; then
+		uci -q del_list "${DNSMASQ_UCI}.server=${upstream}"
+	else
+		config_get value "$DNSMASQ_SECTION" server
+		[ "$value" = "$upstream" ] && uci -q delete "${DNSMASQ_UCI}.server"
+	fi
+}
+
+dnsmasq_restored_state_matches() {
+	local upstream="$1" previous_present="$2" previous_value="$3" section_type current
+	config_load dhcp || return 1
+	config_get section_type "$DNSMASQ_SECTION" TYPE
+	[ "$section_type" = dnsmasq ] || return 1
+	DNSMASQ_CLEANUP_UPSTREAM="$upstream"
+	DNSMASQ_CLEANUP_FOUND=0
+	dnsmasq_server_foreach "$DNSMASQ_SECTION" mark_managed_dnsmasq_upstream || return 1
+	[ "$DNSMASQ_CLEANUP_FOUND" = 0 ] || return 1
+	if [ "$previous_present" = 1 ]; then
+		current="$(uci -q get "${DNSMASQ_UCI}.noresolv")" || return 1
+		[ "$current" = "$previous_value" ]
+	else
+		! uci -q get "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1
+	fi
+}
+
+clear_dnsmasq_recovery_marker() {
+	local option
+	if ! uci -q delete \
+	   "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}"; then
+		uci -q revert "$PLUGIN_CONFIG" >/dev/null 2>&1 || true
+		return 1
+	fi
+	for option in "$MANAGED_DNSMASQ_NORESOLV_PRESENT" \
+		"$MANAGED_DNSMASQ_NORESOLV_VALUE"; do
+		if uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${option}" \
+		   >/dev/null 2>&1; then
+			uci -q delete "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${option}" || {
+				uci -q revert "$PLUGIN_CONFIG" >/dev/null 2>&1 || true
+				return 1
+			}
+		fi
+	done
+	if ! uci -q commit "$PLUGIN_CONFIG"; then
+		uci -q revert "$PLUGIN_CONFIG" >/dev/null 2>&1 || true
+		return 1
+	fi
+	refresh_managed_config_snapshot
+}
+
 clear_managed_dnsmasq_upstream() {
 	local managed_port upstream previous_present previous_value=""
+	uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
 	managed_port="$(uci -q get \
 		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}")"
 	[ -n "$managed_port" ] || return 0
@@ -3484,49 +3553,48 @@ clear_managed_dnsmasq_upstream() {
 			return 1
 			;;
 	esac
-	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
-	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
+	uci_guard_no_delta dhcp || return 1
+	remove_managed_dnsmasq_upstream "$upstream" || return 1
 	if [ "$previous_present" = 1 ]; then
-		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" || return 1
+		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" || {
+			uci -q revert dhcp >/dev/null 2>&1 || true
+			return 1
+		}
 	else
 		uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
 	fi
-	uci -q commit dhcp || return 1
+	uci -q commit dhcp || {
+		uci -q revert dhcp >/dev/null 2>&1 || true
+		return 1
+	}
+	memory_durability_barrier || return 1
+	dnsmasq_restored_state_matches "$upstream" "$previous_present" \
+		"$previous_value" || return 1
 	reload_service_if_present /etc/init.d/dnsmasq restart || return 1
-	uci -q delete \
-		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}" || return 1
-	uci -q delete \
-		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}" \
-		>/dev/null 2>&1 || true
-	uci -q delete \
-		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}" \
-		>/dev/null 2>&1 || true
-	uci -q commit "$PLUGIN_CONFIG" || return 1
-	refresh_managed_config_snapshot
+	clear_dnsmasq_recovery_marker
 }
 
 rollback_new_dnsmasq_upstream() {
 	local previous_present="$1" previous_value="$2"
 	local upstream="127.0.0.1#${dns_port}"
-	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
+	remove_managed_dnsmasq_upstream "$upstream" || return 1
 	if [ "$previous_present" = 1 ]; then
-		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" >/dev/null 2>&1 || true
+		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" >/dev/null 2>&1 || {
+			uci -q revert dhcp >/dev/null 2>&1 || true
+			return 1
+		}
 	else
 		uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
 	fi
-	uci -q commit dhcp >/dev/null 2>&1 || true
-	uci -q delete \
-		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}" \
-		>/dev/null 2>&1 || true
-	uci -q delete \
-		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}" \
-		>/dev/null 2>&1 || true
-	uci -q delete \
-		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}" \
-		>/dev/null 2>&1 || true
-	uci -q commit "$PLUGIN_CONFIG" >/dev/null 2>&1 || true
-	refresh_managed_config_snapshot >/dev/null 2>&1 || true
-	reload_service_if_present /etc/init.d/dnsmasq restart >/dev/null 2>&1 || true
+	if ! uci -q commit dhcp >/dev/null 2>&1; then
+		uci -q revert dhcp >/dev/null 2>&1 || true
+		return 1
+	fi
+	memory_durability_barrier || return 1
+	dnsmasq_restored_state_matches "$upstream" "$previous_present" \
+		"$previous_value" || return 1
+	reload_service_if_present /etc/init.d/dnsmasq restart >/dev/null 2>&1 || return 1
+	clear_dnsmasq_recovery_marker
 }
 
 set_dnsmasq_upstream() {
@@ -3538,15 +3606,7 @@ set_dnsmasq_upstream() {
 	if previous_value="$(uci -q get "${DNSMASQ_UCI}.noresolv")"; then
 		previous_present=1
 	fi
-	uci -q add_list "${DNSMASQ_UCI}.server=${upstream}" || return 1
-	uci -q set "${DNSMASQ_UCI}.noresolv=1" || {
-		uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
-		return 1
-	}
-	uci -q commit dhcp || {
-		uci -q revert dhcp >/dev/null 2>&1 || true
-		return 1
-	}
+	# Make the rollback marker durable before DHCP can publish the takeover.
 	if ! uci -q set \
 	   "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}=${dns_port}" ||
 	   ! uci -q set \
@@ -3567,6 +3627,13 @@ set_dnsmasq_upstream() {
 	fi
 	if ! uci -q commit "$PLUGIN_CONFIG" ||
 	   ! refresh_managed_config_snapshot ||
+	   ! memory_durability_barrier; then
+		rollback_new_dnsmasq_upstream "$previous_present" "$previous_value"
+		return 1
+	fi
+	if ! uci -q add_list "${DNSMASQ_UCI}.server=${upstream}" ||
+	   ! uci -q set "${DNSMASQ_UCI}.noresolv=1" ||
+	   ! uci -q commit dhcp ||
 	   ! reload_service_if_present /etc/init.d/dnsmasq restart; then
 		rollback_new_dnsmasq_upstream "$previous_present" "$previous_value"
 		return 1
@@ -3593,7 +3660,7 @@ dnsmasq_integration_matches() (
 	load_dnsmasq_section || return 1
 	config_get noresolv "$DNSMASQ_SECTION" noresolv
 	[ "$noresolv" = 1 ] || return 1
-	config_list_foreach "$DNSMASQ_SECTION" server inspect_active_server
+	dnsmasq_server_foreach "$DNSMASQ_SECTION" inspect_active_server || return 1
 	[ "$EXPECTED_UPSTREAM_COUNT" = 1 ] && [ "$UNEXPECTED_GENERIC_SERVER" = 0 ]
 )
 
@@ -4632,7 +4699,7 @@ tls_prepare() {
 
 fail_safe_locked() {
 	local rc=0
-	clear_recorded_integration_locked || rc=1
+	clear_recorded_integration_locked || return 1
 	if [ -x "$OFFICIAL_SERVICE" ]; then
 		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || rc=1
 		wait_for_core_stopped >/dev/null 2>&1 || rc=1
@@ -5068,7 +5135,11 @@ orchestrate_core_locked() {
 	if [ "$MEMORY_ACTIVE" = 1 ] && [ "$service_enabled" = 1 ] &&
 	   [ "$memory_requested" = 1 ] &&
 	   [ "$MEMORY_BACKING_WORK_DIR" = "$persistent_work_dir" ]; then
-		memory_copy_stopped_data_locked || return 1
+		if ! memory_copy_stopped_data_locked; then
+			resume_yaml_runtime 1 >/dev/null 2>&1 ||
+				log_error "Unable to restore AdGuard Home after RAM write-back failure"
+			return 1
+		fi
 	fi
 	if [ "$service_enabled" != 1 ] && [ "$MEMORY_ACTIVE" = 1 ]; then
 		memory_deactivate_locked || return 1
@@ -5465,7 +5536,15 @@ service_started() {
 }
 
 stop_wrapper_locked() {
-	local shutdown_mode="$1" settings_rc=0
+	local shutdown_mode="$1" settings_rc=0 package
+	if [ "${APK_SCRIPT:-}" = pre-deinstall ]; then
+		for package in "$PLUGIN_CONFIG" dhcp firewall; do
+			uci_guard_no_delta "$package" || return 1
+		done
+		# default_prerm runs before the package hook.  It may only preflight;
+		# the hook performs the real stop after installing its recovery trap.
+		[ "${LUCI_ADGUARDHOME_PRERM_PHASE:-}" = bounded ] || return 0
+	fi
 	[ "$shutdown_mode" = 1 ] && RELOAD_SERVICES=0
 	load_settings || settings_rc=$?
 	clear_recorded_integration_locked || return 1

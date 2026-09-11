@@ -237,6 +237,9 @@ msgstr "此字段为必填项。"
 msgid "Path must be absolute."
 msgstr "必须使用绝对路径。"
 
+msgid "Path must not exceed 4040 characters."
+msgstr "路径长度不能超过 4040 个字符。"
+
 msgid "The working directory must not be the filesystem root."
 msgstr "工作目录不能是文件系统根目录。"
 
@@ -251,6 +254,9 @@ msgstr "路径包含当前服务脚本不接受的字符。"
 
 msgid "Path must not contain \".\" or \"..\" components."
 msgstr "路径不能包含“.”或“..”路径段。"
+
+msgid "Each path component must not exceed 255 characters."
+msgstr "每个路径段不能超过 255 个字符。"
 
 msgid "Runtime Log"
 msgstr "运行日志"

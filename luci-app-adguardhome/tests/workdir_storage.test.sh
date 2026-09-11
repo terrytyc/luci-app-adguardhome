@@ -22,7 +22,7 @@ repeat_a() {
 component255="$(repeat_a 255)"
 component256="${component255}a"
 validate_work_dir "/opt/${component255}"
-! validate_work_dir "/opt/${component256}"
+! validate_work_dir "/opt/${component256}" || exit 1
 
 max_work_dir=""
 count=0
@@ -33,17 +33,17 @@ done
 max_work_dir="${max_work_dir}/$(repeat_a 199)"
 [ "${#max_work_dir}" = 4040 ]
 validate_work_dir "$max_work_dir"
-! validate_work_dir "${max_work_dir}a"
+! validate_work_dir "${max_work_dir}a" || exit 1
 
 # These existing host mount points exercise the real /proc/mounts parser.
 validate_managed_work_dir_namespace /etc/dns-custom
 validate_managed_work_dir_namespace /opt/dns-custom
 validate_managed_work_dir_namespace /dns-custom
-! validate_managed_work_dir_namespace /dev/shm/dns-custom
-! validate_managed_work_dir_namespace /proc/dns-custom
-! validate_managed_work_dir_namespace /etc
-! validate_managed_work_dir_namespace /
-! validate_managed_work_dir_namespace /etc/../dns-custom
-! validate_managed_work_dir_namespace /etc/passwd/dns-custom
+! validate_managed_work_dir_namespace /dev/shm/dns-custom || exit 1
+! validate_managed_work_dir_namespace /proc/dns-custom || exit 1
+! validate_managed_work_dir_namespace /etc || exit 1
+! validate_managed_work_dir_namespace / || exit 1
+! validate_managed_work_dir_namespace /etc/../dns-custom || exit 1
+! validate_managed_work_dir_namespace /etc/passwd/dns-custom || exit 1
 
 printf 'ok - custom persistent work directories and memory filesystem rejection\n'

@@ -16,6 +16,8 @@ const LUCI_SECTION_NAME = 'luci';
 const DEFAULT_WORK_DIR = '/etc/AdGuardHome';
 const DEFAULT_MEMORY_WRITEBACK_INTERVAL = 60;
 const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
+const MAX_WORK_DIR_LENGTH = 4040;
+const MAX_WORK_DIR_COMPONENT_LENGTH = 255;
 
 const POLL_INTERVAL = 10;
 const SAFE_PATH_RE = /^\/[A-Za-z0-9_./+@%:,=-]+$/;
@@ -294,6 +296,8 @@ function validateWorkDir(_sectionId, value) {
 		return _('This field is required.');
 
 	value = String(value);
+	if (value.length > MAX_WORK_DIR_LENGTH)
+		return _('Path must not exceed 4040 characters.');
 
 	if (!value.startsWith('/'))
 		return _('Path must be absolute.');
@@ -311,6 +315,8 @@ function validateWorkDir(_sectionId, value) {
 		return _('Path contains characters that are unsafe for the current service script.');
 
 	const segments = value.split('/');
+	if (segments.some(segment => segment.length > MAX_WORK_DIR_COMPONENT_LENGTH))
+		return _('Each path component must not exceed 255 characters.');
 	if (segments.includes('.') || segments.includes('..'))
 		return _('Path must not contain "." or ".." components.');
 

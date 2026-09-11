@@ -191,7 +191,7 @@ SNAPSHOT_CONFIG_HASH=stale
 snapshot_config_file "$yaml" "$target" '' '' '' skip-hash
 [ -z "$SNAPSHOT_CONFIG_HASH" ]
 cmp -s "$yaml" "$target"
-! grep -q '^hash$' "$calls"
+! grep -q '^hash$' "$calls" || exit 1
 snapshot_config_file "$yaml" "$target" '' '' ''
 [ "$(grep -c '^hash$' "$calls")" = 1 ]
 expected_hash="$SNAPSHOT_CONFIG_HASH"
@@ -248,7 +248,7 @@ printf 'dns:\n  port: 53335\nhttp:\n  address: 0.0.0.0:3000\n' >"$yaml"
 load_runtime_dns_port
 [ "$dns_port" = 53335 ]
 [ "$(grep -c '^awk$' "$calls")" = 1 ]
-! grep -q '^hash$' "$calls"
+! grep -q '^hash$' "$calls" || exit 1
 
 # Reproduce the core's atomic startup rewrite during an actual held-FD read.
 (

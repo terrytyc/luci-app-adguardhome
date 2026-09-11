@@ -67,11 +67,11 @@ fi
 
 mv "$config_file" "$temporary/real.yaml"
 ln -s "$temporary/real.yaml" "$config_file"
-! secure_active_paths
+! secure_active_paths || exit 1
 rm "$config_file"
 mv "$temporary/real.yaml" "$config_file"
 ln -s "$temporary" "$work_dir/data"
-! secure_active_paths
+! secure_active_paths || exit 1
 
 eval "$(function_body "$defaults_file" secure_target_work_dir)"
 valid_managed_work_dir() { :; }

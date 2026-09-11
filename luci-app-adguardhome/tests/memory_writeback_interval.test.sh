@@ -247,8 +247,12 @@ if grep -Fq -- 'memory_begin_live_checkpoint' "$init_file"; then
 fi
 # A normal wrapper restart directly copies to the persistent alias without
 # tearing down the RAM generation; an orderly stop performs full deactivation.
-printf '%s\n' "$orchestrate_body" | grep -Fq -- 'memory_copy_stopped_data_locked || return 1' || {
+printf '%s\n' "$orchestrate_body" | grep -Fq -- 'if ! memory_copy_stopped_data_locked; then' || {
 	printf 'normal restart no longer writes stopped RAM data directly\n' >&2
+	exit 1
+}
+printf '%s\n' "$orchestrate_body" | grep -Fq -- 'resume_yaml_runtime 1' || {
+	printf 'normal restart does not recover after a stopped RAM write-back failure\n' >&2
 	exit 1
 }
 printf '%s\n' "$stop_body" | grep -Fq -- 'memory_deactivate_locked || return 1' || {

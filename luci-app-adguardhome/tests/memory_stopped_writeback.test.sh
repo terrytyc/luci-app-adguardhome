@@ -79,6 +79,7 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 	memory_copy_live_data_locked() { printf 'copy\n' >>"$events"; return 1; }
 	memory_quarantine_stopped_conflicts_locked() { printf 'quarantine\n' >>"$events"; return 2; }
 	memory_prune_stopped_data_locked() { printf 'prune\n' >>"$events"; }
+	memory_durability_barrier() { :; }
 	if memory_copy_stopped_data_locked; then
 		printf 'failed stopped copy unexpectedly pruned data\n' >&2
 		exit 1
@@ -143,6 +144,7 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 	memory_copy_live_data_locked() {
 		busybox cp -pR "$MEMORY_WORK_DIR/data/." "$MEMORY_BACKING_DATA_MOUNT/" 2>/dev/null
 	}
+	memory_durability_barrier() { :; }
 
 	memory_copy_stopped_data_locked
 	[ -f "$MEMORY_BACKING_DATA_MOUNT/to-file" ]

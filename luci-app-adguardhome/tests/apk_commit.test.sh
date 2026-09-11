@@ -134,7 +134,7 @@ for TEST_ENABLED in 0 1; do
 	assert_events "$(printf 'locked:apk_reconcile_locked 0\nofficial:disable')"
 	root_private_file "$snapshot"
 	grep -qx 'Unable to reconcile AdGuard Home after the APK transaction' "$logs"
-	! grep -q '^Reconciled ' "$logs"
+	! grep -q '^Reconciled ' "$logs" || exit 1
 done
 
 # Each failed reconciliation stays visibly failed and preserves the snapshot
@@ -152,7 +152,7 @@ for failure in guard config sections disable orchestrate stop monitor lock; do
 	fi
 	root_private_file "$snapshot"
 	grep -qx 'Unable to reconcile AdGuard Home after the APK transaction' "$logs"
-	! grep -q '^Reconciled ' "$logs"
+	! grep -q '^Reconciled ' "$logs" || exit 1
 done
 
 # A stale unsafe snapshot must never be followed or overwritten.
@@ -260,8 +260,8 @@ assert_events ''
 	[ "$START_PREPARED:$START_DISABLED" = 0:0 ]
 	assert_events 'official:disable'
 	if service_started; then exit 1; fi
-	! grep -qx orchestrate "$events"
-	! grep -qx 'AdGuard Home coordinator started' "$logs"
+	! grep -qx orchestrate "$events" || exit 1
+	! grep -qx 'AdGuard Home coordinator started' "$logs" || exit 1
 
 	load_settings() { MEMORY_ACTIVE="$TEST_RAM"; }
 	clear_recorded_integration_locked() { record cleanup; }
@@ -283,7 +283,7 @@ assert_events ''
 		reset_events
 		TEST_RUNNING=1 TEST_RAM=1 APK_TEST_FAILURE="$failure"
 		if stop_wrapper_locked 1; then exit 1; fi
-		! grep -qx deactivate "$events"
+		! grep -qx deactivate "$events" || exit 1
 	done
 )
 

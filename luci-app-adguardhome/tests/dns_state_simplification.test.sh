@@ -65,6 +65,12 @@ config_get() {
 	local actual
 	case "$config_context:$2:$3" in
 		dhcp:cfg01411c:noresolv) actual="${TEST_NORESOLV:-}" ;;
+		dhcp:cfg01411c:server_LENGTH)
+			if [ -n "${TEST_SCALAR_SERVER:-}" ] || [ -z "${TEST_SERVERS:-}" ]; then actual=0; else actual=1; fi ;;
+		dhcp:cfgsecond:server_LENGTH)
+			if [ -n "${TEST_SECOND_SCALAR_SERVER:-}" ] || [ -z "${TEST_SECOND_SERVERS:-}" ]; then actual=0; else actual=1; fi ;;
+		dhcp:cfg01411c:server) actual="${TEST_SCALAR_SERVER:-}" ;;
+		dhcp:cfgsecond:server) actual="${TEST_SECOND_SCALAR_SERVER:-}" ;;
 		"firewall:${FIREWALL_SECTION}:TYPE") actual="${TEST_FW_TYPE:-redirect}" ;;
 		"firewall:${FIREWALL_SECTION}:${FIREWALL_OWNER_OPTION}") actual="${TEST_FW_OWNER:-$FIREWALL_OWNER_VALUE}" ;;
 		"firewall:${FIREWALL_SECTION}:src") actual="${TEST_FW_SRC:-lan}" ;;
@@ -107,7 +113,9 @@ config_list_foreach() {
 }
 log_error() { printf 'log:%s\n' "$*" >>"$uci_log"; }
 refresh_managed_config_snapshot() { printf 'snapshot\n' >>"$uci_log"; }
+memory_durability_barrier() { printf 'barrier\n' >>"$uci_log"; }
 reload_service_if_present() { printf 'reload:%s:%s\n' "$1" "$2" >>"$uci_log"; }
+dnsmasq_restored_state_matches() { :; }
 
 uci() {
 	[ "${1:-}" != -q ] || shift
@@ -151,8 +159,25 @@ uci() {
 		"set:dhcp.cfg01411c.noresolv="*)
 			TEST_NORESOLV="${1#*=}"
 			;;
+		"add_list:dhcp.cfg01411c.server="*)
+			TEST_SERVERS="${TEST_SERVERS:-}${TEST_SERVERS:+
+}${1#*=}"
+			;;
+		"del_list:dhcp.cfg01411c.server="*)
+			TEST_SERVERS="$(printf '%s\n' "${TEST_SERVERS:-}" |
+				awk -v removed="${1#*=}" '$0 != removed')"
+			;;
+		"del_list:dhcp.cfgsecond.server="*)
+			TEST_SECOND_SERVERS="$(printf '%s\n' "${TEST_SECOND_SERVERS:-}" |
+				awk -v removed="${1#*=}" '$0 != removed')"
+			;;
+		"delete:dhcp.cfg01411c.server") unset TEST_SCALAR_SERVER ;;
+		"delete:dhcp.cfgsecond.server") unset TEST_SECOND_SCALAR_SERVER ;;
 		"delete:dhcp.cfg01411c.noresolv")
 			unset TEST_NORESOLV
+			;;
+		"set:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}="*)
+			TEST_MANAGED_PORT="${1#*=}"
 			;;
 		"set:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}="*)
 			TEST_MANAGED_NORESOLV_PRESENT="${1#*=}"
@@ -167,6 +192,9 @@ uci() {
 		"delete:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}")
 			TEST_MANAGED_NORESOLV_VALUE_SET=0
 			unset TEST_MANAGED_NORESOLV_VALUE
+			;;
+		"delete:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}")
+			TEST_MANAGED_PORT=""
 			;;
 	esac
 	printf '%s:%s\n' "$command" "$*" >>"$uci_log"
@@ -200,6 +228,13 @@ ${generic}"
 		exit 1
 	fi
 done
+TEST_SERVERS=''
+TEST_SCALAR_SERVER=9.9.9.9
+if dnsmasq_takeover_is_safe; then
+	printf 'scalar generic dnsmasq upstream was accepted\n' >&2
+	exit 1
+fi
+unset TEST_SCALAR_SERVER
 
 : >"$uci_log"
 dns_port=53335
@@ -288,6 +323,7 @@ TEST_DNSMASQ_SECTIONS='cfg01411c cfgsecond'
 TEST_SERVERS='/example.test/192.0.2.53'
 TEST_SECOND_SERVERS="/second.test/192.0.2.54
 127.0.0.1#53335"
+TEST_MANAGED_PORT=53335
 : >"$uci_log"
 clear_managed_dnsmasq_upstream
 grep -Fqx -- 'del_list:dhcp.cfgsecond.server=127.0.0.1#53335' "$uci_log"
@@ -308,6 +344,8 @@ fi
 # More than one section containing the recorded upstream is ambiguous and
 # must fail before any UCI mutation.
 TEST_SERVERS='127.0.0.1#53335'
+TEST_SECOND_SERVERS='127.0.0.1#53335'
+TEST_MANAGED_PORT=53335
 : >"$uci_log"
 if clear_managed_dnsmasq_upstream; then
 	printf 'ambiguous managed dnsmasq upstream was cleaned\n' >&2
@@ -393,7 +431,7 @@ expect_status() {
 : >"$uci_log"
 TEST_MODE=none TEST_MANAGED_PORT=''
 expect_status 0 53335 none
-! grep -q '^probe$' "$uci_log"
+! grep -q '^probe$' "$uci_log" || exit 1
 TEST_FIREWALL_RECORDED=1 expect_status 1 53335 none
 TEST_MANAGED_PORT=53335
 expect_status 1 53335 none

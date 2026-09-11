@@ -178,7 +178,7 @@ memory_reconcile_requested_storage_locked
 # without rewriting restored metadata.
 [ "$(stat -c '%a:%u:%g' "$persistent_config_file")" = '600:853:853' ]
 [ "$(cat "$old_work_dir/data/saved")" = 'RAM update' ]
-! path_is_exact_mountpoint "$old_work_dir/data"
+! path_is_exact_mountpoint "$old_work_dir/data" || exit 1
 memory_prepare_runtime_locked
 assert_prepared 0 0
 [ ! -e "$MEMORY_DATA_DIR/saved" ]

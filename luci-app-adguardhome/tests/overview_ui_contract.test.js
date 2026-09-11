@@ -28,6 +28,8 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(
+	[ 'MAX_WORK_DIR_LENGTH', 'MAX_WORK_DIR_COMPONENT_LENGTH' ]
+		.map(name => source.match(new RegExp(`^const ${name} = .+;$`, 'm'))[0]).join('\n') + '\n' +
 	`${source.match(/^const SAFE_PATH_RE = .+;$/m)[0]}\n` +
 	`${extractFunction('validateWorkDir')}\n` +
 	`${credentialFieldSource}\nthis.credentialField = credentialField; this.validateWorkDir = validateWorkDir;`,
@@ -40,6 +42,19 @@ for (const directory of [ '/dns', '/opt/mydns', '/srv/nested/dns', '/tmp/disk/dn
 		'the browser must leave filesystem validation to the router');
 for (const directory of [ '/', '/etc', '/etc/../dns', 'dns', '/dns/' ])
 	assert.notEqual(sandbox.validateWorkDir(null, directory), true);
+
+const component255 = 'a'.repeat(255);
+const component256 = `${component255}a`;
+const maxWorkDir = `${Array(15).fill(`/${component255}`).join('')}/${'b'.repeat(199)}`;
+assert.equal(maxWorkDir.length, 4040);
+assert.equal(sandbox.validateWorkDir(null, `/opt/${component255}`), true,
+	'a 255-character component must remain valid');
+assert.notEqual(sandbox.validateWorkDir(null, `/opt/${component256}`), true,
+	'a 256-character component must be rejected in the browser');
+assert.equal(sandbox.validateWorkDir(null, maxWorkDir), true,
+	'a 4040-character work directory must remain valid');
+assert.notEqual(sandbox.validateWorkDir(null, `${maxWorkDir}b`), true,
+	'a 4041-character work directory must be rejected in the browser');
 
 const input = { tag: 'input' };
 const field = sandbox.credentialField('New username', input);

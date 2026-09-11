@@ -55,7 +55,15 @@ YAML_ORIGINAL_ABSENT=0
 DATA_ORIGINAL_ABSENT=0
 RUNTIME_DIR="$temporary/runtime"
 events="$temporary/events"
-uci() { [ "$2" = changes ] || [ "$2" = revert ]; }
+uci() {
+	case "$2" in
+		changes)
+			[ "${TEST_PENDING_CONFIG:-}" != "$3" ] || printf 'pending=value\n'
+			;;
+		revert) ;;
+		*) return 1 ;;
+	esac
+}
 bounded_private_file() { bounded_regular_file "$1"; }
 chown() { :; }
 run_bounded() {
@@ -170,16 +178,24 @@ restore_install_files
 discard_install_transaction
 
 # Neither install preflight nor uninstall may depend on a historic snapshot.
-! grep -Eq 'OriginalSnapshot|validate_original_snapshot|official-adguardhome.config' "$package_dir/Makefile"
-! grep -Fq '# @include original-snapshot' "$defaults"
+! grep -Eq 'OriginalSnapshot|validate_original_snapshot|official-adguardhome.config' "$package_dir/Makefile" || exit 1
+! grep -Fq '# @include original-snapshot' "$defaults" || exit 1
 
 # Run the actual removal body against isolated service scripts. There is no
 # original snapshot; current UCI/YAML/data must survive enabled and disabled cases.
 fixture_root="$temporary/router"
 mkdir -p "$fixture_root/etc/init.d" "$fixture_root/etc/config" \
 	"$fixture_root/etc/AdGuardHome/data" "$fixture_root/var/run"
-export events
-printf '#!/bin/sh\nprintf "coordinator:%%s\\n" "$*" >>"$events"\nexit "${fixture_fail:-0}"\n' \
+stop_count="$temporary/stop-count"
+export events stop_count
+printf '%s\n' '#!/bin/sh' \
+	'printf "coordinator:%s\n" "$*" >>"$events"' \
+	'if [ "$1" = stop ]; then' \
+	'  count=0; [ ! -f "$stop_count" ] || read -r count <"$stop_count"' \
+	'  count=$((count + 1)); printf "%s\n" "$count" >"$stop_count"' \
+	'  [ "${fixture_stop_fail:-0}" != 1 ] || exit 1' \
+	'  [ "$count" != 1 ] || printf "ram:writeback\n" >>"$events"' \
+	'fi' \
 	>"$fixture_root/etc/init.d/AdGuardHome"
 printf '#!/bin/sh\nprintf "core:%%s\\n" "$1" >>"$events"\n' \
 	>"$fixture_root/etc/init.d/adguardhome"
@@ -191,24 +207,44 @@ awk '
 ' "$package_dir/Makefile" | sed "s|/etc/|$fixture_root/etc/|g;s|/var/run/|$fixture_root/var/run/|g" \
 	>"$temporary/prerm"
 root_private_directory() { [ -d "$1" ] && [ ! -L "$1" ]; }
-begin_yaml_maintenance() { :; }
-rollback_yaml_maintenance() { :; }
+begin_yaml_maintenance() { printf 'maintenance:begin\n' >>"$events"; }
+rollback_yaml_maintenance() { printf 'maintenance:rollback\n' >>"$events"; }
+default_prerm() {
+	# OpenWrt's generated APK hook ignores both service return values here.
+	"$fixture_root/etc/init.d/AdGuardHome" disable >/dev/null 2>&1 || true
+	"$fixture_root/etc/init.d/AdGuardHome" stop >/dev/null 2>&1 || true
+}
 for enabled in 0 1; do
 	printf 'enabled=%s\n' "$enabled" >"$fixture_root/etc/config/adguardhome"
 	printf 'current YAML\n' >"$fixture_root/etc/AdGuardHome/AdGuardHome.yaml"
 	printf 'current data\n' >"$fixture_root/etc/AdGuardHome/data/querylog.json"
 	before="$(cksum "$fixture_root/etc/config/adguardhome" "$fixture_root/etc/AdGuardHome/AdGuardHome.yaml" \
 		"$fixture_root/etc/AdGuardHome/data/querylog.json")"
-	: >"$events"
-	(IPKG_INSTROOT=; PKG_UPGRADE=0; set -- remove; . "$temporary/prerm")
-	[ "$(cat "$events")" = "$(printf 'coordinator:do_redirect 0\ncoordinator:memory_cleanup\ncore:stop\ncore:disable')" ]
+	: >"$events"; rm -f "$stop_count"
+	(default_prerm; IPKG_INSTROOT=; PKG_UPGRADE=0; set -- remove; . "$temporary/prerm")
+	[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nram:writeback\nmaintenance:begin\ncoordinator:stop\ncore:disable')" ]
 	[ "$(cat "$fixture_root/var/run/luci-app-adguardhome/remove-ok")" = 1 ]
 	[ "$(cksum "$fixture_root/etc/config/adguardhome" "$fixture_root/etc/AdGuardHome/AdGuardHome.yaml" \
 		"$fixture_root/etc/AdGuardHome/data/querylog.json")" = "$before" ]
 done
 rm "$fixture_root/var/run/luci-app-adguardhome/remove-ok"
-if (export fixture_fail=1; IPKG_INSTROOT=; PKG_UPGRADE=0; set -- remove; . "$temporary/prerm"); then
+: >"$events"; rm -f "$stop_count"
+if (export fixture_stop_fail=1; default_prerm; IPKG_INSTROOT=; PKG_UPGRADE=0;
+	set -- remove; . "$temporary/prerm"); then
 	exit 1
 fi
+[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nmaintenance:begin\ncoordinator:stop\nmaintenance:rollback\ncoordinator:enable\ncoordinator:start')" ]
 [ ! -e "$fixture_root/var/run/luci-app-adguardhome/remove-ok" ]
+
+# Recovery re-enables the coordinator but never starts it through any pending
+# UCI view; the package-manager stop guard keeps the pre-existing core serving.
+for pending_config in adguardhome dhcp firewall; do
+	: >"$events"; rm -f "$stop_count"
+	if (export fixture_stop_fail=1 TEST_PENDING_CONFIG="$pending_config";
+		default_prerm; IPKG_INSTROOT=; PKG_UPGRADE=0; set -- remove;
+		. "$temporary/prerm"); then
+		exit 1
+	fi
+	[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nmaintenance:begin\ncoordinator:stop\nmaintenance:rollback\ncoordinator:enable')" ]
+done
 printf 'ok - first-install rollback and history-free uninstall preserve current UCI/YAML/data\n'

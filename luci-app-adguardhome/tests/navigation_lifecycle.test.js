@@ -665,7 +665,8 @@ async function testYamlEditing() {
 	assert.equal(lineNumberWrites, 1, 'changing the line count must rebuild line numbers once');
 	assert.equal(view.draftStatus.hidden, false);
 	for (const content of [ '# ' + 'x'.repeat(128 * 1024),
-		Array.from({ length: 18001 }, (_, i) => `  - ||ads${i}.example^`).join('\n') ]) {
+		'\n'.repeat(5000),
+		'\n'.repeat(512 * 1024) ]) {
 		view.yamlEditor.value = content;
 		view.yamlEditor.selectionStart = content.length;
 		view.yamlEditor.scrollTop = 210;
@@ -685,10 +686,10 @@ async function testYamlEditing() {
 		assert.equal(view.saveButton.disabled, false, 'plain presentation must retain save and validation');
 		assert.equal(view.hasDraft(), true);
 		assert.equal(view.beforeUnloadListenerCount(), 1);
-		const lineCount = content.split('\n').length;
-		assert.equal(view.yamlLineNumbers.textContent.split('\n').at(-1), String(lineCount));
-		assert.equal(view.yamlEditorFrame.style['--adguardhome-yaml-gutter'],
-			`max(3rem, calc(${String(lineCount).length}ch + 1rem))`, 'all line number digits must fit the gutter');
+		assert.equal(view.yamlLineNumbers.textContent, '',
+			'plain mode must not build a line-number string');
+		assert.equal(view.yamlEditorFrame.style['--adguardhome-yaml-gutter'], '0px',
+			'plain mode must not reserve an empty line-number gutter');
 		view.yamlEditor.selectionStart = 0;
 		view.updateActiveYamlLine();
 		assert.equal(view.activeYamlLine, 0, 'plain mode must not access nonexistent highlight children');
@@ -698,6 +699,8 @@ async function testYamlEditing() {
 	assert.equal(view.yamlPlainText, false, 'shrinking a draft restores syntax highlighting');
 	assert.equal(view.yamlEditorFrame.classList.contains('adguardhome-yaml-plain'), false);
 	assert.equal(view.highlightNotice.hidden, true);
+	assert.equal(view.yamlLineNumbers.textContent, '1\n2',
+		'shrinking a draft must restore line numbers');
 	assert.match(view.yamlHighlight.innerHTML, /adguardhome-yaml-comment/);
 	await view.handleReload();
 	assert.equal(modals.at(-1).title, 'Discard unsaved changes?');

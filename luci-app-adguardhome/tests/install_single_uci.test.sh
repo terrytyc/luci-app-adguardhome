@@ -24,10 +24,11 @@ grep -Eq '^PKG_VERSION:=3\.[0-9]+\.[0-9]+$' "$makefile"
 grep -Eq '^PKG_RELEASE:=[1-9][0-9]*$' "$makefile"
 reject_text "$makefile" '/usr/lib/opkg/'
 require_text "$makefile" 'run_bounded 180 5 /etc/init.d/AdGuardHome stop'
-require_text "$makefile" 'managed_dnsmasq_upstream'
+reject_text "$makefile" 'managed_dnsmasq_upstream'
 reject_text "$makefile" 'official-adguardhome.config'
 require_text "$makefile" 'managed-adguardhome.config'
-require_text "$makefile" '/etc/init.d/AdGuardHome memory_cleanup'
+reject_text "$makefile" '/etc/init.d/AdGuardHome memory_cleanup'
+reject_text "$makefile" '/etc/init.d/AdGuardHome do_redirect 0'
 reject_text "$makefile" '$(AdGuardHome/OriginalSnapshot)'
 require_text "$defaults" 'capture_install_config'
 require_text "$defaults" 'INSTALL_BACKUP'
@@ -69,7 +70,7 @@ require_text "$defaults" 'SOURCE_WORK_DIR="$(resolve_source_work_dir "$configure
 
 managed_block="$(sed -n '/^if \[ "$(uci -q get "$UCI_CONFIG.$LUCI_SECTION")" = luci \]; then$/,/^fi$/p' "$defaults")"
 printf '%s\n' "$managed_block" | grep -Fq 'managed_config_is_valid'
-! printf '%s\n' "$managed_block" | grep -Fq 'validate_original_snapshot'
+! printf '%s\n' "$managed_block" | grep -Fq 'validate_original_snapshot' || exit 1
 printf '%s\n' "$managed_block" | grep -Fq 'refresh_managed_config_snapshot'
 if printf '%s\n' "$managed_block" | grep -Fq 'ensure_original_snapshot'; then
 	printf 'the overwrite path recreates a missing original snapshot\n' >&2

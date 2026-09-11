@@ -8,12 +8,12 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.1.0
-PKG_RELEASE:=3
+PKG_RELEASE:=4
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
 LUCI_PKGARCH:=all
-LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +ucode-mod-uloop +flock +procd-ujail +adguardhome
+LUCI_DEPENDS:=+luci-base +rpcd-mod-ucode +ucode-mod-digest +ucode-mod-uloop +flock +procd-ujail +dnsmasq +firewall4 +adguardhome
 LUCI_EXTRA_DEPENDS:=adguardhome (>=0.107.76-r1)
 LUCI_DESCRIPTION:=LuCI integration for the packaged AdGuard Home service
 LUCI_MAINTAINER:=terrytyc
@@ -200,7 +200,18 @@ $(AdGuardHome/PrivateFiles)
 
 $(AdGuardHome/YamlMaintenance)
 
-trap 'rollback_yaml_maintenance' 0
+recover_failed_removal() {
+	rollback_yaml_maintenance >/dev/null 2>&1 || true
+	[ -x /etc/init.d/AdGuardHome ] || return 0
+	/etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true
+	for recovery_config in adguardhome dhcp firewall; do
+		recovery_changes="$$(uci -q changes "$$recovery_config" 2>/dev/null)" || return 0
+		[ -z "$$recovery_changes" ] || return 0
+	done
+	run_bounded 180 5 /etc/init.d/AdGuardHome start >/dev/null 2>&1 || true
+}
+
+trap 'recover_failed_removal' 0
 trap 'exit 1' HUP INT TERM
 begin_yaml_maintenance || {
 	echo "Unable to quiesce LuCI YAML updates; uninstall aborted." >&2
@@ -210,29 +221,10 @@ begin_yaml_maintenance || {
 runtime_dir=/var/run/luci-app-adguardhome
 remove_state="$$runtime_dir/remove-ok"
 
-changes="$$(uci -q changes adguardhome 2>/dev/null)" || exit 1
-[ -z "$$changes" ] || {
-	echo "Commit or revert pending adguardhome changes before uninstalling." >&2
-	exit 1
-}
-
 if [ -x /etc/init.d/AdGuardHome ]; then
-	run_bounded 30 2 /etc/init.d/AdGuardHome do_redirect 0 \
-		>/dev/null 2>&1 || exit 1
-	if uci -q get adguardhome.luci.managed_dnsmasq_upstream >/dev/null 2>&1; then
-		echo "The managed dnsmasq upstream is still active." >&2
-		exit 1
-	fi
-	if [ "$$(uci -q get firewall.adguardhome_redirect.name)" = \
-		'AdGuard Home (luci-app-adguardhome)' ]; then
-		echo "The managed firewall redirect is still active." >&2
-		exit 1
-	fi
-	run_bounded 180 5 /etc/init.d/AdGuardHome memory_cleanup \
-		>/dev/null 2>&1 || exit 1
+	run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || exit 1
 fi
 if [ -x /etc/init.d/adguardhome ]; then
-	run_bounded 20 2 /etc/init.d/adguardhome stop >/dev/null 2>&1 || exit 1
 	/etc/init.d/adguardhome disable >/dev/null 2>&1 || exit 1
 fi
 
