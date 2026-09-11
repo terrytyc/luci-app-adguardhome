@@ -18,7 +18,7 @@ trap 'rm -rf "$test_tmp"' EXIT
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 
-for name in uci_guard_configs_unchanged uci_guard_file_signature \
+for name in uci_guard_configs_unchanged uci_guard_config_file_valid uci_guard_file_signature \
 	memory_run_with_official_path_guard; do
 	eval "$(function_body "$init_file" "$name")"
 done
@@ -29,11 +29,16 @@ mkdir "$UCI_CONFIG_DIRECTORY"
 config_target="${UCI_CONFIG_DIRECTORY}/${OFFICIAL_CONFIG}"
 events="${test_tmp}/events"
 DELTA_PENDING=0
+MAX_UCI_CONFIG_SIZE=1048576
+metadata_events="${test_tmp}/metadata"
 
 # File lifecycle is real; only ownership preconditions (so tests run without
 # root), UCI delta lookup and the global sync are stubbed.
 uci_guard_snapshot_dir_valid() { [ -d "$1" ] && [ ! -L "$1" ]; }
-uci_guard_config_file_valid() { [ -f "$1" ] && [ ! -L "$1" ]; }
+entry_metadata() {
+	printf 'read\n' >>"$metadata_events"
+	LC_ALL=C ls -ldn "$1" | awk '{ $3=0; $4=0; print }'
+}
 uci_guard_no_delta() { [ "$DELTA_PENDING" = 0 ]; }
 uci_guard_snapshot_configs() {
 	local directory
@@ -70,6 +75,28 @@ sync_tls_access_persistent() { "$ACTION"; }
 
 printf 'old\n' >"$config_target"
 chmod 0644 "$config_target"
+# Validation and the returned signature must describe the same metadata read.
+: >"$metadata_events"
+[ "$(uci_guard_file_signature "$config_target")" = '0:0:-rw-r--r--:4' ]
+[ "$(cat "$metadata_events")" = read ]
+: >"$metadata_events"
+[ -z "$(uci_guard_config_file_valid "$config_target")" ]
+[ "$(cat "$metadata_events")" = read ]
+(
+	entry_metadata() { printf '%s\n' "$fixture_metadata"; }
+	fixture_metadata='-rw------- 1 0 0 1048576'
+	[ "$(uci_guard_file_signature "$config_target")" = '0:0:-rw-------:1048576' ]
+	for fixture_metadata in \
+		'-rw-rw-r-- 1 0 0 4' '-rw------- 2 0 0 4' \
+		'-rw------- 1 853 0 4' '-rw------- 1 0 853 4' \
+		'-rw------- 1 0 0 0' '-rw------- 1 0 0 1048577' \
+		'-rw------- 1 0 0 invalid'; do
+		if uci_guard_file_signature "$config_target"; then exit 1; fi
+	done
+	fixture_metadata='-rw------- 1 0 0 4'
+	ln -s "$config_target" "$test_tmp/config-link"
+	if uci_guard_file_signature "$test_tmp/config-link"; then exit 1; fi
+)
 : >"$events"
 ACTION=no_change
 memory_run_with_official_path_guard settings_commit_persistent

@@ -2780,16 +2780,7 @@ write_mount_list() {
 }
 
 uci_guard_config_file_valid() {
-	local target="$1" metadata mode links owner group size remainder
-	[ -f "$target" ] && [ ! -L "$target" ] || return 1
-	metadata="$(LC_ALL=C ls -ldn "$target" 2>/dev/null)" || return 1
-	read -r mode links owner group size remainder <<-EOF
-	$metadata
-	EOF
-	case "$mode" in -rw-------|-rw-r-----|-rw-r--r--) ;; *) return 1 ;; esac
-	[ "$links:$owner:$group" = "1:0:0" ] || return 1
-	case "$size" in ""|*[!0-9]*) return 1 ;; esac
-	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_UCI_CONFIG_SIZE" ]
+	uci_guard_file_signature "$1" >/dev/null
 }
 
 uci_guard_snapshot_dir_valid() {
@@ -2804,11 +2795,15 @@ uci_guard_snapshot_dir_valid() {
 
 uci_guard_file_signature() {
 	local metadata mode links owner group size remainder
-	uci_guard_config_file_valid "$1" || return 1
-	metadata="$(LC_ALL=C ls -ldn "$1" 2>/dev/null)" || return 1
+	[ -f "$1" ] && [ ! -L "$1" ] || return 1
+	metadata="$(entry_metadata "$1")" || return 1
 	read -r mode links owner group size remainder <<-EOF
 	$metadata
 	EOF
+	case "$mode" in -rw-------|-rw-r-----|-rw-r--r--) ;; *) return 1 ;; esac
+	[ "$links:$owner:$group" = "1:0:0" ] || return 1
+	case "$size" in ""|*[!0-9]*) return 1 ;; esac
+	[ "$size" -gt 0 ] && [ "$size" -le "$MAX_UCI_CONFIG_SIZE" ] || return 1
 	printf '%s:%s:%s:%s\n' "$owner" "$group" "$mode" "$size"
 }
 
@@ -3199,13 +3194,16 @@ memory_data_jail_count() {
 # sole persistent record; actual RAM state continues to require the authenticated
 # state file and mount identities.
 sync_memory_data_jail_access_persistent() {
-	local desired="" backing candidate changed=0
+	local desired="" backing candidate checked="" changed=0
 	[ "$MEMORY_ACTIVE" != 1 ] || desired="${MEMORY_BACKING_WORK_DIR%/}/data"
 	for backing in "$previous_work_dir" "$persistent_work_dir" \
 		"$MEMORY_BACKING_WORK_DIR"; do
 		[ -n "$backing" ] || continue
 		candidate="${backing%/}/data"
 		[ "$candidate" = "$desired" ] && continue
+		line_list_contains "$candidate" "$checked" && continue
+		checked="${checked}
+${candidate}"
 		memory_data_jail_count "$candidate" || return 1
 		[ "$MEMORY_DATA_JAIL_COUNT" -gt 0 ] || continue
 		uci -q del_list \
@@ -3225,7 +3223,8 @@ sync_memory_data_jail_access_persistent() {
 			*) return 1 ;;
 		esac
 	fi
-	[ "$changed" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
+	[ "$changed" != 0 ] || return 0
+	uci -q commit "$OFFICIAL_CONFIG" || return 1
 	[ -z "$desired" ] && return 0
 	memory_data_jail_count "$desired" || return 1
 	[ "$MEMORY_DATA_JAIL_COUNT" = 1 ]
@@ -3271,6 +3270,22 @@ sync_official_uci() {
 	refresh_managed_config_snapshot
 }
 
+settings_persistent_matches() {
+	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
+	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
+	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = "$requested_enabled" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = \
+			"${requested_work_dir}/AdGuardHome.yaml" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$requested_work_dir" ] &&
+		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")" = "$requested_verbose" ] &&
+		[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.redirect")" = "$requested_redirect" ] &&
+		[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.run_from_memory")" = "$requested_memory" ] &&
+		[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.memory_writeback_interval")" = \
+			"$requested_interval" ] || return 1
+	uci_guard_no_delta "$OFFICIAL_CONFIG"
+}
+
 settings_commit_persistent() {
 	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
 	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
@@ -3304,16 +3319,8 @@ settings_commit_persistent() {
 	uci_set_if_changed "$PLUGIN_CONFIG" "$PLUGIN_SECTION" memory_writeback_interval \
 		"$requested_interval" || return 1
 	[ "$UCI_CHANGED" = 0 ] || uci -q commit "$OFFICIAL_CONFIG" || return 1
-	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
-	[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.enabled")" = "$requested_enabled" ] &&
-		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")" = \
-			"${requested_work_dir}/AdGuardHome.yaml" ] &&
-		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$requested_work_dir" ] &&
-		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.verbose")" = "$requested_verbose" ] &&
-		[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.redirect")" = "$requested_redirect" ] &&
-		[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.run_from_memory")" = "$requested_memory" ] &&
-		[ "$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.memory_writeback_interval")" = \
-			"$requested_interval" ]
+	settings_persistent_matches "$requested_enabled" "$requested_work_dir" "$requested_verbose" \
+		"$requested_redirect" "$requested_memory" "$requested_interval"
 }
 
 # Hash the same seven-line canonical settings record as the ucode RPC.
@@ -4964,6 +4971,7 @@ settings_update_locked() {
 	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
 	local expected_revision="$7" current_revision
 	local old_enabled old_work_dir old_verbose old_redirect old_memory old_interval fast_apply=0
+	local settings_unchanged=0
 	SETTINGS_CORE_RESTARTED=1
 	case "$expected_revision" in
 		*[!0-9a-f]*) return 1 ;;
@@ -4971,8 +4979,10 @@ settings_update_locked() {
 	[ "${#expected_revision}" = 64 ] || return 1
 	# run_locked() has acquired the integration lock.  Keep every recovery path
 	# that can commit UCI disabled until this second, authoritative CAS succeeds.
+	# Settings need state/mount identities; data lifecycle boundaries retain
+	# full tree validation when orchestration or write-back actually runs.
 	SETTINGS_CAS_GUARD=1
-	if ! load_settings; then
+	if ! load_settings light; then
 		SETTINGS_CAS_GUARD=0
 		return 1
 	fi
@@ -5000,13 +5010,25 @@ settings_update_locked() {
 	   { [ "$old_memory:$MEMORY_ACTIVE" = 0:0 ] ||
 	     { [ "$old_memory:$MEMORY_ACTIVE" = 1:1 ] &&
 	       [ "$MEMORY_BACKING_WORK_DIR" = "$requested_work_dir" ]; }; } &&
-	   validate_work_dir_mount_dependency "$persistent_work_dir" &&
-	   core_runtime_matches; then
+	   validate_work_dir_mount_dependency "$persistent_work_dir"; then
 		fast_apply=1
 	fi
-	if ! memory_run_with_official_path_guard settings_commit_persistent \
+	# Canonical values alone can conceal missing fields or aliases such as
+	# enabled=yes. Only exact persisted values may skip the write transaction.
+	if [ "$old_enabled" = "$requested_enabled" ] &&
+	   [ "$old_work_dir" = "$requested_work_dir" ] &&
+	   [ "$old_verbose" = "$requested_verbose" ] &&
+	   [ "$old_redirect" = "$requested_redirect" ] &&
+	   [ "$old_memory" = "$requested_memory" ] &&
+	   [ "$old_interval" = "$requested_interval" ] &&
+	   settings_persistent_matches "$requested_enabled" "$requested_work_dir" "$requested_verbose" \
+		"$requested_redirect" "$requested_memory" "$requested_interval"; then
+		settings_unchanged=1
+	fi
+	if ! { [ "$settings_unchanged" = 1 ] ||
+	   memory_run_with_official_path_guard settings_commit_persistent \
 		"$requested_enabled" "$requested_work_dir" "$requested_verbose" \
-		"$requested_redirect" "$requested_memory" "$requested_interval" ||
+		"$requested_redirect" "$requested_memory" "$requested_interval"; } ||
 	   ! refresh_managed_config_snapshot; then
 		if memory_run_with_official_path_guard settings_commit_persistent \
 			"$old_enabled" "$old_work_dir" "$old_verbose" \
@@ -5018,7 +5040,7 @@ settings_update_locked() {
 		log_error "Unable to prove that the previous AdGuard Home settings were restored"
 		return 2
 	fi
-	if [ "$fast_apply" = 1 ] && load_settings &&
+	if [ "$fast_apply" = 1 ] && load_settings light &&
 	   load_runtime_dns_port && core_runtime_matches && dns_port_listening &&
 	   { integration_status_locked "$dns_port" "$redirect_mode" ||
 	     { wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" &&
@@ -5083,7 +5105,7 @@ settings_update_job_locked() {
 	settings_rc=$?
 	case "$settings_rc" in
 		0)
-			if load_settings &&
+			if load_settings light &&
 			   current_revision="$(settings_current_revision)" &&
 			   [ "$current_revision" = "$candidate_revision" ]; then
 				if [ "$SETTINGS_CORE_RESTARTED" = 1 ] && official_running; then restarted=1; fi

@@ -17,8 +17,13 @@ eval "$(init_source "$init_file")"
 
 TEST_RW=""
 TEST_COMMITS=0
+TEST_LOADS=0
+TEST_DROP_ON_COMMIT=0
 
-config_load() { return 0; }
+config_load() {
+	TEST_LOADS=$((TEST_LOADS + 1))
+	TEST_LOADED_RW="$TEST_RW"
+}
 config_list_foreach() {
 	local section="$1" option="$2" callback="$3" value
 	[ "$section:$option" = "${OFFICIAL_SECTION}:jail_mount_rw" ] || return 1
@@ -26,7 +31,7 @@ config_list_foreach() {
 		[ -n "$value" ] || continue
 		"$callback" "$value"
 	done <<-EOF
-	${TEST_RW}
+	${TEST_LOADED_RW}
 	EOF
 }
 validate_managed_work_dir_namespace() {
@@ -74,6 +79,7 @@ ${value}"
 			;;
 		commit:${OFFICIAL_CONFIG})
 			TEST_COMMITS=$((TEST_COMMITS + 1))
+			[ "$TEST_DROP_ON_COMMIT" = 0 ] || TEST_RW="$other"
 			;;
 		*) return 1 ;;
 	esac
@@ -106,10 +112,15 @@ assert_rw "$other"
 # A second disk-mode synchronization must not infer a change merely because
 # libuci del_list would return success while the unrelated RW list still exists.
 TEST_COMMITS=0
+TEST_LOADS=0
 sync_memory_data_jail_access_persistent
 assert_rw "$other"
 [ "$TEST_COMMITS" = 0 ] || {
 	printf 'an unchanged disk-mode RW mount list was committed again\n' >&2
+	exit 1
+}
+[ "$TEST_LOADS" = 1 ] || {
+	printf 'unchanged disk mode reloaded the same candidate more than once\n' >&2
 	exit 1
 }
 
@@ -120,15 +131,22 @@ previous_work_dir=/etc/AdGuardHome
 persistent_work_dir=/etc/AdGuardHome
 TEST_RW="$other"
 TEST_COMMITS=0
+TEST_LOADS=0
 sync_memory_data_jail_access_persistent
 assert_rw "${other}
 ${path_a}"
 [ "$TEST_COMMITS" = 1 ]
+[ "$TEST_LOADS" = 2 ]
+TEST_LOADS=0
 sync_memory_data_jail_access_persistent
 assert_rw "${other}
 ${path_a}"
 [ "$TEST_COMMITS" = 1 ] || {
 	printf 'an unchanged RAM jail mount was committed again\n' >&2
+	exit 1
+}
+[ "$TEST_LOADS" = 1 ] || {
+	printf 'unchanged RAM mode reloaded an already validated mount count\n' >&2
 	exit 1
 }
 
@@ -159,5 +177,46 @@ sync_memory_data_jail_access_persistent
 assert_rw "${path_old}
 ${other}"
 [ "$TEST_COMMITS" = 1 ]
+
+# Repeated nonadjacent candidates, including a trailing slash, are checked once.
+MEMORY_ACTIVE=0
+MEMORY_BACKING_WORK_DIR=/etc/AdGuardHome/
+previous_work_dir=/etc/AdGuardHome
+persistent_work_dir=/mnt/storage/AdGuardHome
+TEST_RW="$other"
+TEST_COMMITS=0
+TEST_LOADS=0
+sync_memory_data_jail_access_persistent
+assert_rw "$other"
+[ "$TEST_COMMITS" = 0 ]
+[ "$TEST_LOADS" = 2 ]
+
+# An existing duplicate desired mount still fails before committing any change.
+MEMORY_ACTIVE=1
+MEMORY_BACKING_WORK_DIR=/etc/AdGuardHome
+previous_work_dir=/etc/AdGuardHome
+persistent_work_dir=/etc/AdGuardHome
+TEST_RW="${other}
+${path_a}
+${path_a}"
+TEST_COMMITS=0
+if sync_memory_data_jail_access_persistent; then
+	printf 'a duplicated desired RAM jail mount was accepted\n' >&2
+	exit 1
+fi
+[ "$TEST_COMMITS" = 0 ]
+
+# A changed mount list must be reloaded after commit; its pre-commit snapshot
+# cannot hide a missing desired mount in the committed configuration.
+TEST_RW="$other"
+TEST_DROP_ON_COMMIT=1
+TEST_LOADS=0
+if sync_memory_data_jail_access_persistent; then
+	printf 'a missing committed RAM jail mount was accepted\n' >&2
+	exit 1
+fi
+[ "$TEST_COMMITS" = 1 ]
+[ "$TEST_LOADS" = 2 ]
+TEST_DROP_ON_COMMIT=0
 
 printf 'ok - RAM ujail uses one derived jail_mount_rw state without a duplicate marker\n'

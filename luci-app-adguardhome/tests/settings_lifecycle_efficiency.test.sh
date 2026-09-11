@@ -65,24 +65,76 @@ if core_runtime_matches; then exit 1; fi
 # changes in startup inputs, readiness or baseline availability take the full path.
 events="$test_tmp/events"
 record() { printf '%s\n' "$*" >>"$events"; }
-revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-STORED_ENABLED=1 STORED_WORK=/persistent STORED_VERBOSE=0 STORED_RAM=1
-STORED_MODE=dnsmasq-upstream STORED_INTERVAL=60
-BASELINE_OK=1 SOCKET_OK=1 INTEGRATION_OK=1 RAM_ACTIVE=1
+counts="$test_tmp/counts"
+states="$test_tmp/states"
+count() { printf '%s\n' "$1" >>"$counts"; }
+call_count() { awk -v name="$1" '$0 == name { count++ } END { print count+0 }' "$counts"; }
+assert_count() { [ "$(call_count "$2")" = "$1" ] || {
+	printf '%s: expected %s %s calls, got %s\n' "$change" "$1" "$2" "$(call_count "$2")" >&2
+	exit 1
+}; }
+reset_settings_fixture() {
+	STORED_ENABLED=1 STORED_WORK=/persistent STORED_VERBOSE=0 STORED_RAM=1
+	STORED_MODE=dnsmasq-upstream STORED_INTERVAL=60
+	RAW_ENABLED=1 RAW_CONFIG=/persistent/AdGuardHome.yaml RAW_MEMORY=1 RAW_INTERVAL=60
+	BASELINE_OK=1 SOCKET_OK=1 INTEGRATION_OK=1 RAM_ACTIVE=1 MOUNT_OK=1
+	DRIFT_AFTER_COMMIT=0 DRIFT_AFTER_REFRESH=0 DRIFT_AT_MATCH=0 PENDING_AT_CHECK=0
+	: >"$events"
+	: >"$counts"
+	: >"$states"
+}
+uci() {
+	case "$1:$2" in
+		-q:export) return 0 ;;
+		-q:changes)
+			count delta
+			if [ "$PENDING_AT_CHECK" -gt 0 ] &&
+			   [ "$(call_count delta)" -ge "$PENDING_AT_CHECK" ]; then
+				printf "adguardhome.config.enabled='1'\n"
+			fi
+			return 0 ;;
+		-q:get) count raw-get ;;
+		*) return 1 ;;
+	esac
+	case "$3" in
+		adguardhome.config.enabled) printf '%s\n' "$RAW_ENABLED" ;;
+		adguardhome.config.config_file) printf '%s\n' "$RAW_CONFIG" ;;
+		adguardhome.config.work_dir) printf '%s\n' "$STORED_WORK" ;;
+		adguardhome.config.verbose) printf '%s\n' "$STORED_VERBOSE" ;;
+		adguardhome.luci.redirect) printf '%s\n' "$STORED_MODE" ;;
+		adguardhome.luci.run_from_memory) printf '%s\n' "$RAW_MEMORY" ;;
+		adguardhome.luci.memory_writeback_interval) printf '%s\n' "$RAW_INTERVAL" ;;
+		*) return 1 ;;
+	esac
+}
 load_settings() {
+	count "load:${1:-full}"
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return $?
 	service_enabled="$STORED_ENABLED" persistent_work_dir="$STORED_WORK"
 	work_dir="$STORED_WORK" verbose="$STORED_VERBOSE" memory_requested="$STORED_RAM"
 	redirect_mode="$STORED_MODE" memory_writeback_interval="$STORED_INTERVAL"
 	MEMORY_ACTIVE="$RAM_ACTIVE" MEMORY_BACKING_WORK_DIR=/persistent
 }
-settings_current_revision() { printf '%s\n' "$revision"; }
 settings_commit_persistent() {
+	count commit
 	STORED_ENABLED="$1" STORED_WORK="$2" STORED_VERBOSE="$3"
 	STORED_MODE="$4" STORED_RAM="$5" STORED_INTERVAL="$6"
+	RAW_ENABLED="$1" RAW_CONFIG="$2/AdGuardHome.yaml" RAW_MEMORY="$5" RAW_INTERVAL="$6"
+	[ "$DRIFT_AFTER_COMMIT" = 0 ] || BASELINE_OK=0
 }
-memory_run_with_official_path_guard() { "$@"; }
-refresh_managed_config_snapshot() { :; }
-core_runtime_matches() { [ "$BASELINE_OK" = 1 ]; }
+memory_run_with_official_path_guard() {
+	count write-guard
+	uci_guard_no_delta "$OFFICIAL_CONFIG" || return $?
+	"$@"
+}
+refresh_managed_config_snapshot() {
+	count snapshot
+	[ "$DRIFT_AFTER_REFRESH" = 0 ] || BASELINE_OK=0
+}
+core_runtime_matches() {
+	count fingerprint
+	[ "$BASELINE_OK" = 1 ] && [ "$(call_count fingerprint)" != "$DRIFT_AT_MATCH" ]
+}
 validate_work_dir_mount_dependency() { [ "$MOUNT_OK" = 1 ]; }
 load_runtime_dns_port() { dns_port=53335; }
 dns_port_listening() { [ "$SOCKET_OK" = 1 ]; }
@@ -91,16 +143,20 @@ integration_status_locked() { integration_matches_desired; }
 wait_for_core_ready() { record ready; }
 apply_integration_locked() { record dns; }
 sync_monitor_instance() { record monitor; }
-orchestrate_core_locked() { record restart; }
+orchestrate_core_locked() { load_settings; record restart; }
+official_running() { return 0; }
+yaml_job_runtime_is_private() { return 0; }
+yaml_job_pending_matches() { [ "$1:$2:$3" = "$token:$revision:$candidate" ]; }
+write_yaml_job_state() { printf '%s\n' "$2" >>"$states"; }
 log_error() { :; }
-for change in unchanged disk interval dns core work ram missing-baseline dead-core fallback unmounted; do
-	STORED_ENABLED=1 STORED_WORK=/persistent STORED_VERBOSE=0 STORED_RAM=1
-	STORED_MODE=dnsmasq-upstream STORED_INTERVAL=60
-	BASELINE_OK=1 SOCKET_OK=1 INTEGRATION_OK=1 RAM_ACTIVE=1 MOUNT_OK=1
+token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+for change in unchanged disk interval dns core work ram missing-baseline dead-core fallback unmounted \
+             normalized-enabled normalized-interval missing-field drift-after-commit drift-after-refresh final-drift; do
+	reset_settings_fixture
 	requested_work=/persistent requested_verbose=0 requested_ram=1
 	requested_mode=dnsmasq-upstream requested_interval=60
 	case "$change" in
-		disk) STORED_RAM=0 RAM_ACTIVE=0 requested_ram=0 ;;
+		disk) STORED_RAM=0 RAW_MEMORY=0 RAM_ACTIVE=0 requested_ram=0 ;;
 		interval) requested_interval=120 ;;
 		dns) requested_mode=redirect; INTEGRATION_OK=0 ;;
 		core) requested_verbose=1 ;;
@@ -110,31 +166,67 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 		dead-core) SOCKET_OK=0 ;;
 		fallback) RAM_ACTIVE=0 ;;
 		unmounted) MOUNT_OK=0 ;;
+		normalized-enabled) RAW_ENABLED=yes ;;
+		normalized-interval) RAW_INTERVAL=060 ;;
+		missing-field) STORED_RAM=0 RAW_MEMORY='' RAM_ACTIVE=0 requested_ram=0 ;;
+		drift-after-commit) requested_interval=120 DRIFT_AFTER_COMMIT=1 ;;
+		drift-after-refresh) DRIFT_AFTER_REFRESH=1 ;;
+		final-drift) DRIFT_AT_MATCH=2 ;;
 	esac
-	: >"$events"
-	settings_update_locked 1 "$requested_work" "$requested_verbose" \
-		"$requested_mode" "$requested_ram" "$requested_interval" "$revision"
+	revision="$(settings_values_revision "$STORED_ENABLED" "$STORED_WORK" "$STORED_VERBOSE" \
+		"$STORED_MODE" "$STORED_RAM" "$STORED_INTERVAL")"
+	candidate="$(settings_values_revision 1 "$requested_work" "$requested_verbose" \
+		"$requested_mode" "$requested_ram" "$requested_interval")"
+	settings_update_job_locked 1 "$requested_work" "$requested_verbose" \
+		"$requested_mode" "$requested_ram" "$requested_interval" "$revision" "$token" "$candidate"
 	case "$change" in
-		unchanged|disk|interval) [ "$(cat "$events")" = monitor ] && [ "$SETTINGS_CORE_RESTARTED" = 0 ] ;;
-		dns) [ "$(cat "$events")" = "$(printf 'ready\ndns\nmonitor')" ] && [ "$SETTINGS_CORE_RESTARTED" = 0 ] ;;
-		*) [ "$(cat "$events")" = restart ] && [ "$SETTINGS_CORE_RESTARTED" = 1 ] ;;
+		unchanged|disk|interval|normalized-*|missing-field)
+			[ "$(cat "$events")" = monitor ]; restarted=0 ;;
+		dns) [ "$(cat "$events")" = "$(printf 'ready\ndns\nmonitor')" ]; restarted=0 ;;
+		*) [ "$(cat "$events")" = restart ]; restarted=1 ;;
 	esac
+	[ "$(tail -n 1 "$states")" = "success:${candidate}:${restarted}:${revision}:${candidate}" ]
+	assert_count 1 snapshot
+	assert_count "$restarted" load:full
+	case "$change" in
+		core|work|ram|fallback|unmounted) assert_count 2 load:light; assert_count 0 fingerprint ;;
+		missing-baseline|dead-core|drift-after-commit|drift-after-refresh)
+			assert_count 3 load:light; assert_count 1 fingerprint ;;
+		*) assert_count 3 load:light; assert_count 2 fingerprint ;;
+	esac
+	case "$change" in
+		interval|dns|core|work|ram|normalized-*|missing-field|drift-after-commit)
+			assert_count 1 write-guard; assert_count 1 commit ;;
+		*) assert_count 0 write-guard; assert_count 0 commit ;;
+	esac
+done
+
+# A stale revision or pending edit still fails before runtime repair. A pending
+# edit appearing after the raw field reads also cannot authorize the no-op.
+for change in stale pending-before-load pending-after-raw; do
+	reset_settings_fixture
+	revision="$(settings_values_revision 1 /persistent 0 dnsmasq-upstream 1 60)"
+	case "$change" in
+		stale) revision=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+		pending-before-load) PENDING_AT_CHECK=1 ;;
+		pending-after-raw) PENDING_AT_CHECK=3 ;;
+	esac
+	if settings_update_locked 1 /persistent 0 dnsmasq-upstream 1 60 "$revision"; then
+		printf '%s unexpectedly applied settings\n' "$change" >&2
+		exit 1
+	fi
+	[ ! -s "$events" ]
+	assert_count 0 commit
+	assert_count 0 fingerprint
+	assert_count 0 snapshot
 done
 
 # The merged UCI view can look correct while an external DNS edit is still
 # pending. Such a view cannot authorize the unchanged-settings shortcut.
 (
 	eval "$(function_body "$init_file" integration_status_locked)"
-	STORED_ENABLED=1 STORED_WORK=/persistent STORED_VERBOSE=0 STORED_RAM=1
-	STORED_MODE=dnsmasq-upstream STORED_INTERVAL=60
-	BASELINE_OK=1 SOCKET_OK=1 INTEGRATION_OK=1 RAM_ACTIVE=1 MOUNT_OK=1
-	uci() {
-		case "$1:$2" in
-			-q:export) return 0 ;;
-			-q:get) printf '%s\n' "$STORED_MODE" ;;
-			*) return 1 ;;
-		esac
-	}
+	reset_settings_fixture
+	revision="$(settings_values_revision 1 /persistent 0 dnsmasq-upstream 1 60)"
 	uci_guard_no_delta() { [ "$1" != "$pending_package" ]; }
 	apply_integration_locked() { return 1; }
 	for pending_package in dhcp firewall; do
@@ -154,6 +246,7 @@ STORED_ENABLED=1 STORED_WORK=/persistent STORED_RAM=1 RAM_ACTIVE=0
 START_PREPARED=1 START_DISABLED=0 WRAPPER_BOOT=0
 CORE_RUNNING=0
 load_settings() {
+	count "startup-load:${1:-full}"
 	service_enabled=1 persistent_work_dir=/persistent work_dir=/persistent
 	persistent_config_file=/persistent/AdGuardHome.yaml config_file="$persistent_config_file"
 	previous_work_dir=/persistent memory_requested=1 MEMORY_ACTIVE="$RAM_ACTIVE"
@@ -176,13 +269,16 @@ remember_core_runtime() { record baseline; }
 wait_for_core_ready() { CORE_RUNNING=1; record ready; }
 start_official_core() { "$OFFICIAL_SERVICE" start; }
 : >"$events"
+: >"$counts"
 prepare_wrapper_locked
 [ ! -s "$events" ]
+: >"$counts"
 service_started
 [ "$(grep -c '^copy-in$' "$events")" = 1 ]
 ! grep -q '^copy-back$' "$events"
 [ "$(grep -c '^uci-sync$' "$events")" = 1 ]
 [ "$(grep -c '^check-config$' "$events")" = 1 ]
+assert_count 1 startup-load:full
 grep -qx baseline "$events"
 
 # Failure to retain this optimization record never turns a ready core into
