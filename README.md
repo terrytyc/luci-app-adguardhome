@@ -66,6 +66,8 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 
 选择“无”且关闭内存运行时，不启动插件监控进程，核心仍由官方服务管理。通过 SSH 修改 UCI 后，请执行 `/etc/init.d/AdGuardHome reload` 应用设置。
 
+防火墙接管撤销失败时会保留可重试状态，确认重载成功后才完成清理。无法确认撤销成功时不会继续停止核心。
+
 ## 💾 内存运行
 
 开启后，插件把持久目录中的 data 载入 RAM，再挂载到原来的 `<工作目录>/data`。**主程序、YAML 和 UCI 工作目录路径都不变。** 不需要额外安装 rsync、cron 或 timeout 软件包。
@@ -81,6 +83,10 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 日常操作都在“设置、运行日志、YAML 配置”三个页签中，入口为 `/admin/services/adguardhome`。
 
 工作目录默认是 `/etc/AdGuardHome`，YAML 固定为目录下的 `AdGuardHome.yaml`，修改工作目录时自动同步配置路径。可选择其他持久目录，但须使用可写、核心用户可访问的专用绝对路径；不能用 tmpfs / ramfs、符号链接或 `/`、`/etc` 等系统目录，也不会自动放宽共享父目录权限。
+
+使用外部磁盘时，请在 `/etc/config/fstab` 声明挂载目标及设备、UUID 或 LABEL。启动和配置写入前会检查对应目标已可写挂载，并在启动端核对设备身份；缺盘时不会改用挂载点下面的闪存目录。禁用的 fstab 挂载条目仍保留这项依赖。没有 fstab 条目的路径按普通持久目录处理，插件无法推测它原来属于哪块外盘。缺盘时仍可在设置页停用服务或选择其他目录。
+
+保存应用会先核对核心进程、官方参数、YAML、证书及核心文件是否与已应用状态一致。确认一致时，仅调整回写间隔或 DNS 接管，不重启核心；设置无变化也会检查运行状态。状态记录缺失或发现变化时执行完整启动协调，保留“再次应用以修复运行状态”的用途。
 
 更换工作目录不会搬移旧数据：新目录有 YAML 就使用现有文件，没有则写入模板，旧目录保留。需要沿用配置与 data 时，请先自行复制。
 
@@ -124,6 +130,8 @@ config luci 'luci'
 
 直接调用官方小写 `/etc/init.d/adguardhome` 会绕过插件的启动前权限准备，请使用 LuCI 或 `/etc/init.d/AdGuardHome`。
 
+目录所属组和读写权限决定能否访问文件；沙箱挂载决定文件是否可见，内存挂载决定 data 的实际存储位置。调整组权限不能替代这些挂载。
+
 ### 📦 更新前知道这些
 
 - 支持 APK 覆盖更新，保留当前格式的 UCI、YAML 和 data。安装前停止服务，完成后按现有启用状态恢复；不会重启共享的 rpcd 进程。
@@ -137,3 +145,9 @@ config luci 'luci'
 - 固件升级保留清单随工作目录同步，包含当前 YAML 和插件 UCI 快照，**不包含整个 data**。
 
 历史改动见 [Releases](https://github.com/terrytyc/luci-app-adguardhome/releases)。
+
+## 开发与验证
+
+配置读取、运行身份核对、DNS 接管、存储准备和启停编排分别由专用方法负责。`scripts/` 下共享 Shell 模块在构建期展开为独立可执行的安装脚本，不增加运行时子服务。状态查询使用只读加载和非阻塞共享锁；配置修复、写入和启停使用协调锁。所有核心启动入口共用挂载依赖检查。
+
+`scripts/test.sh --light` 执行主机回归；`--full` 另使用 OpenWrt UCI/ucode 和隔离 APK 事务环境。测试读取构建期展开后的核心协调脚本，覆盖挂载缺失、失败重试、只读状态、按变更应用及启动复制次数。

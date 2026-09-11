@@ -12,7 +12,8 @@ if grep -Fq 'MANAGED_DATA_JAIL_OPTION=' "$init_file" ||
 fi
 
 # shellcheck disable=SC1090
-. "$init_file"
+. "$script_dir/lib/function-body.sh"
+eval "$(init_source "$init_file")"
 
 TEST_RW=""
 TEST_COMMITS=0

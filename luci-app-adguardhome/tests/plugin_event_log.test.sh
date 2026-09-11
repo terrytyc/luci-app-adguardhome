@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 for name in service_started stop_service wait_for_core_stopped settings_update_locked \
-	tls_refresh_locked; do
+	tls_refresh_locked start_official_core; do
 	eval "$(function_body "$init_file" "$name")"
 done
 
@@ -202,6 +202,7 @@ uci() {
 	[ "$1" = get ] && printf '%s\n' "$UCI_FINGERPRINT"
 }
 load_settings() { service_enabled=1; work_dir=/etc/AdGuardHome; redirect_mode=none; }
+validate_work_dir_mount_dependency() { return 0; }
 load_active_tls_access() { TLS_USES_ACME=1; TLS_FINGERPRINT=loaded; }
 check_core_config() { TLS_FINGERPRINT=; }
 sync_tls_access() { UCI_FINGERPRINT="$SYNC_FINGERPRINT"; }

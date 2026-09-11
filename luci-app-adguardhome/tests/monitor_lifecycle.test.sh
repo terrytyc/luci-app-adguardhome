@@ -61,6 +61,11 @@ memory_copy_stopped_data_locked() { return 0; }
 memory_deactivate_locked() { TEST_RAM=0; MEMORY_ACTIVE=0; }
 memory_reconcile_requested_storage_locked() { TEST_BACKING="$persistent_work_dir"; }
 ensure_config_file() { return 0; }
+start_official_core() { "$OFFICIAL_SERVICE" start; }
+validate_work_dir_mount_dependency() { return 0; }
+check_core_config() { return 0; }
+core_runtime_fingerprint() { printf 'fixture\n'; }
+remember_core_runtime() { return 0; }
 sync_yaml_managed_fields_checked() { return 0; }
 memory_prepare_or_fallback_locked() { MEMORY_BACKING_WORK_DIR="$persistent_work_dir"; }
 load_runtime_dns_port() { dns_port=53335; }

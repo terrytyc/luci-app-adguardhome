@@ -12,14 +12,14 @@ trap 'rm -rf "$test_tmp"' EXIT
 
 for name in official_socket_snapshot official_owns_socket \
 	official_owns_ipv4_reachable_socket official_memory_data_mount_visible \
-	dns_port_listening dns_ipv6_listening web_listening runtime_settings_match; do
+	dns_port_listening dns_ipv6_listening web_listening read_settings runtime_settings_match; do
 	eval "$(function_body "$init_file" "$name")"
 done
 
 # Readiness still loads fresh settings/YAML each time, but requests the light
 # mount-identity check instead of traversing the active data tree every second.
 load_settings() {
-	[ "$*" = light ]
+	[ "$*" = 'light 1' ]
 	service_enabled=1
 	work_dir=/etc/AdGuardHome
 	redirect_mode=none

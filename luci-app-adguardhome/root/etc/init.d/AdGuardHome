@@ -7,7 +7,7 @@
 
 USE_PROCD=1
 # rc.common sources procd.sh (and takes its service lock) before dispatch.
-case "${action:-}" in integration_status|web_listening|overview_status) USE_PROCD="" ;; esac
+case "${action:-}" in integration_status|web_listening|overview_status|memory_status) USE_PROCD="" ;; esac
 START=18
 STOP=90
 
@@ -398,8 +398,54 @@ validate_managed_work_dir_namespace() {
 	esac
 }
 
+check_work_dir_fstab_mount() {
+	local section="$1" target device uuid label mounted source options info actual
+	config_get target "$section" target ""
+	target="${target%/}"
+	# Root/extroot selection is handled by boot; only explicit child mounts
+	# describe a dependency of this workdir. Disabled entries still reserve it.
+	case "$target" in /*) ;; *) return 0 ;; esac
+	case "${WORK_DIR_MOUNT_CHECK_PATH}/" in "$target/"*) ;; *) return 0 ;; esac
+	mounted="$(awk -v target="$target" '$2 == target { entry=$1 " " $4 } END { print entry }' /proc/mounts)"
+	read -r source options <<-EOF
+	$mounted
+	EOF
+	case ",$options," in *,rw,*) ;; *) WORK_DIR_MOUNT_CHECK_RC=1; return 0 ;; esac
+	config_get device "$section" device ""
+	config_get uuid "$section" uuid ""
+	config_get label "$section" label ""
+	if [ -n "$uuid" ] || [ -n "$label" ]; then
+		info="$(/sbin/block info "$source" 2>/dev/null)" || {
+			WORK_DIR_MOUNT_CHECK_RC=1
+			return 0
+		}
+		if [ -n "$uuid" ]; then
+			actual="$(printf '%s\n' "$info" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p' | tr 'A-Z' 'a-z')"
+			[ "$actual" = "$(printf '%s' "$uuid" | tr 'A-Z' 'a-z')" ] || WORK_DIR_MOUNT_CHECK_RC=1
+		else
+			case "$info" in *" LABEL=\"$label\""*) ;; *) WORK_DIR_MOUNT_CHECK_RC=1 ;; esac
+		fi
+	elif [ -n "$device" ]; then
+		actual="$(readlink -f "$device")"
+		[ -n "$actual" ] && [ "$actual" = "$(readlink -f "$source")" ] || WORK_DIR_MOUNT_CHECK_RC=1
+	fi
+}
+
+validate_work_dir_mount_dependency() (
+	# Keep the fstab snapshot out of the caller's loaded adguardhome settings.
+	local WORK_DIR_MOUNT_CHECK_PATH="${1%/}" WORK_DIR_MOUNT_CHECK_RC=0
+	[ -e /etc/config/fstab ] || [ -L /etc/config/fstab ] || return 0
+	config_load fstab || return 1
+	config_foreach check_work_dir_fstab_mount mount
+	[ "$WORK_DIR_MOUNT_CHECK_RC" = 0 ] || {
+		log_error "Required workdir mount is absent, read-only or has the wrong device: $1"
+		return 1
+	}
+)
+
 check_work_dir() {
-	[ "$#" = 1 ] && validate_managed_work_dir_namespace "$1"
+	[ "$#" = 1 ] && validate_managed_work_dir_namespace "$1" &&
+		validate_work_dir_mount_dependency "$1"
 }
 
 normalize_managed_config_file_persistent() {
@@ -623,84 +669,7 @@ memory_state_binds_persistent() {
 		[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$requested" ]
 }
 
-load_settings() {
-	local configured_work_dir official_work official_config state_rc=0
-	local MEMORY_STATE_CHECK="${1:-full}"
-	MONITOR_SETTINGS_READY=0
-	ensure_managed_config_present || return $?
-	config_load "$PLUGIN_CONFIG" || return 1
-	validate_loaded_merged_sections || {
-		log_error "Merged AdGuard Home UCI must contain exactly the named config and luci sections"
-		return 1
-	}
-	config_get_bool service_enabled "$OFFICIAL_SECTION" enabled 0
-	config_get configured_work_dir "$OFFICIAL_SECTION" work_dir "$DEFAULT_WORK_DIR"
-	config_get redirect_mode "$PLUGIN_SECTION" redirect "dnsmasq-upstream"
-	config_get_bool verbose "$OFFICIAL_SECTION" verbose 0
-	config_get_bool memory_requested "$PLUGIN_SECTION" run_from_memory 0
-	config_get memory_writeback_interval "$PLUGIN_SECTION" memory_writeback_interval \
-		"$MEMORY_WRITEBACK_DEFAULT_MINUTES"
-	memory_writeback_interval="$(normalize_memory_writeback_interval \
-		"$memory_writeback_interval")" || return 1
-	# Reuse the package already loaded above instead of spawning two more UCI
-	# readers within the same settings snapshot.
-	config_get official_work "$OFFICIAL_SECTION" work_dir ""
-	config_get official_config "$OFFICIAL_SECTION" config_file ""
-	uci_guard_no_delta "$OFFICIAL_CONFIG" || return $?
-	previous_work_dir="$official_work"
-	# config_file is never an independent YAML selector.  Validate the
-	# authoritative workdir first, then repair its derived field before any
-	# normal runtime code can read a YAML pathname.
-	validate_managed_work_dir_namespace "$configured_work_dir" || return 1
-	normalize_managed_config_file "$configured_work_dir" "$official_config" || return 1
-	official_config="${configured_work_dir%/}/AdGuardHome.yaml"
-	# A preparation interrupted before the volatile state was published has no
-	# authoritative data.  Remove only the validated plugin-owned /tmp tree and
-	# rebuild it from persistent data on demand.
-	memory_discard_incomplete_runtime_locked "$configured_work_dir" || return 1
-
-	MEMORY_ACTIVE=0
-	MEMORY_BACKING_WORK_DIR=""
-	memory_state_load "$MEMORY_STATE_CHECK" || state_rc=$?
-	case "$state_rc" in
-		0)
-			;;
-		1) ;;
-		2)
-			log_error "Unsafe or incomplete AdGuard Home memory namespace"
-			return 1
-			;;
-		*) return 1 ;;
-	esac
-
-	persistent_work_dir="${configured_work_dir%/}"
-	persistent_config_file="${persistent_work_dir}/AdGuardHome.yaml"
-	work_dir="$persistent_work_dir"
-	config_file="$persistent_config_file"
-	if [ "$state_rc" = 0 ]; then
-		MEMORY_ACTIVE=1
-		MEMORY_BACKING_WORK_DIR="$MEMORY_STATE_PERSISTENT_WORK_DIR"
-		previous_work_dir="$MEMORY_BACKING_WORK_DIR"
-		work_dir="$persistent_work_dir"
-		# A new authoritative workdir request is reconciled only after the current
-		# generation has stopped and been written back.  Until then its YAML remains
-		# the persistent file bound by the v4 state record, never the newly
-		# requested directory and never a RAM copy.
-		config_file="${MEMORY_BACKING_WORK_DIR}/AdGuardHome.yaml"
-		# The official work_dir and YAML remain persistent.  The state record
-		# authenticates only the RAM data overlay and its persistent backing.
-		memory_apply_official_path_delta || return 1
-	fi
-
-	case "$redirect_mode" in
-		none|redirect|dnsmasq-upstream) ;;
-		*)
-			log_error "Invalid redirect mode '${redirect_mode}', using none"
-			redirect_mode="none"
-			;;
-	esac
-	MONITOR_SETTINGS_READY=1
-}
+# @include runtime-settings
 
 # The official YAML is the sole runtime authority for the DNS listener.  The
 # packaged value 53335 is only present in the clean-install template; an
@@ -958,6 +927,7 @@ secure_config_inode() {
 
 ensure_config_file() {
 	local source directory candidate candidate_hash
+	validate_work_dir_mount_dependency "$work_dir" || return 1
 	if [ -L "$config_file" ]; then
 		log_error "The AdGuard Home configuration file must not be a symlink: ${config_file}"
 		return 1
@@ -1523,6 +1493,7 @@ memory_prepare_runtime_locked() {
 	[ "$memory_requested" = 1 ] || return 0
 	official_running && return 1
 	adguard_uid_process_exists && return 1
+	validate_work_dir_mount_dependency "$persistent_work_dir" || return 1
 	memory_capacity_available || return 1
 	memory_discard_incomplete_runtime_locked "$persistent_work_dir" || return 1
 	data_source="${persistent_work_dir}/data"
@@ -2304,6 +2275,7 @@ install_config_candidate_attempt() (
 install_config_candidate() {
 	local source="$1" expected_active="$2" desired_hash="$3"
 	local replacement_marker="$4" source_hash attempt=0 stage
+	validate_work_dir_mount_dependency "${config_file%/*}" || return 1
 	[ -f "$source" ] && [ ! -L "$source" ] || return 1
 	root_private_config_source "$source" || return 1
 	source_hash="$(yaml_file_hash "$source")" || return 1
@@ -2335,6 +2307,7 @@ sync_yaml_managed_fields_checked() {
 	# Since v2.4 only a real persistent workdir move can change this field.
 	[ -n "$previous_work_dir" ] &&
 		[ "${previous_work_dir%/}" != "$work_dir" ] || return 0
+	validate_work_dir_mount_dependency "${config_file%/*}" || return 1
 	directory="$(mktemp -d /tmp/AdGuardHome-managed.XXXXXX)" || return 1
 	backup="${directory}/original.yaml"
 	candidate="${directory}/AdGuardHome.yaml"
@@ -3701,19 +3674,27 @@ set_firewall_redirect() {
 }
 
 clear_firewall_redirect() {
-	local existed=0 section="firewall.${FIREWALL_SECTION}" owner
-	if uci -q get "$section" >/dev/null 2>&1; then
-		owner="$(uci -q get "${section}.${FIREWALL_OWNER_OPTION}")"
-		if [ "$owner" != "$FIREWALL_OWNER_VALUE" ]; then
-			return 0
-		fi
-		uci_guard_no_delta firewall || return 1
-		existed=1
-		uci -q delete "$section" || return 1
-		uci -q commit firewall || return 1
+	local section="firewall.${FIREWALL_SECTION}" owner
+	# An absolute UCI package path reads committed state without CLI deltas.
+	# Pending deletion/renaming must not hide ownership and authorize core stop.
+	owner="$(uci -q get "${UCI_CONFIG_DIRECTORY}/${section}.${FIREWALL_OWNER_OPTION}")" || {
+		# Only a readable, valid package can prove that ownership is absent.
+		uci -q export "${UCI_CONFIG_DIRECTORY}/firewall" >/dev/null 2>&1 || return 1
+		return 0
+	}
+	[ "$owner" = "$FIREWALL_OWNER_VALUE" ] || return 0
+	uci_guard_no_delta firewall || return 1
+	# Keep the disabled owned stanza until the live rules have been reloaded.
+	# A failed reload or interruption can then retry without a separate marker.
+	if ! uci -q set "${section}.enabled=0" || ! uci -q commit firewall; then
+		uci -q revert firewall >/dev/null 2>&1 || true
+		return 1
 	fi
-	[ "$existed" = 1 ] || return 0
-	reload_service_if_present /etc/init.d/firewall reload
+	reload_service_if_present /etc/init.d/firewall reload || return 1
+	if ! uci -q delete "$section" || ! uci -q commit firewall; then
+		uci -q revert firewall >/dev/null 2>&1 || true
+		return 1
+	fi
 }
 
 firewall_integration_matches() (
@@ -3759,7 +3740,7 @@ runtime_settings_match() {
 	local expected_port="$1" expected_mode="$2" expected_work_dir="$3"
 	# Readiness polling validates mount/state identities, not every data file.
 	# Copy/start/switch/removal entry points keep their full tree checks.
-	load_settings light || return 1
+	read_settings || return 1
 	[ "$service_enabled" = 1 ] || return 1
 	load_runtime_dns_port || return 1
 	[ "$dns_port" = "$expected_port" ] &&
@@ -3888,6 +3869,11 @@ overview_status() (
 	[ "$http_port" = 0 ] || ! web_listening "$http_port" || http=1
 	printf 'integration=%s\nhttps=%s\nhttp=%s\n' "$integration" "$https" "$http"
 )
+
+start_official_core() {
+	validate_work_dir_mount_dependency "$work_dir" || return 1
+	"$OFFICIAL_SERVICE" start >/dev/null 2>&1
+}
 
 official_running() {
 	[ -x "$OFFICIAL_SERVICE" ] && "$OFFICIAL_SERVICE" running >/dev/null 2>&1
@@ -4174,7 +4160,7 @@ resume_yaml_runtime() {
 	load_runtime_dns_port || return 1
 	sync_official_uci || return 1
 	if ! official_running; then
-		"$OFFICIAL_SERVICE" start >/dev/null 2>&1 || return 1
+		start_official_core || return 1
 	fi
 	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || return 1
 	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
@@ -4275,6 +4261,7 @@ yaml_update_locked() {
 	local committed_port committed_mode committed_work_dir committed_tls_mounts
 	local was_running=0 backup="" backup_directory=""
 	load_settings || return 1
+	validate_work_dir_mount_dependency "${config_file%/*}" || return 2
 	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
 		"$inherited_fd" || return 2
 	YAML_STAGE_CLEANUP="$stage"
@@ -4367,7 +4354,7 @@ yaml_update_locked() {
 	committed_work_dir="$work_dir"
 	committed_tls_mounts="$TLS_DESIRED_MOUNTS"
 	if [ "$service_enabled" = 1 ]; then
-		if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1 ||
+		if ! start_official_core ||
 		   ! wait_for_core_ready "$committed_port" "$committed_mode" "$committed_work_dir" ||
 		   ! apply_integration_locked "$committed_port" "$committed_mode" "$committed_work_dir"; then
 			log_error "The edited YAML failed at runtime; restoring the previous file"
@@ -4641,6 +4628,7 @@ restore_tls_fingerprint() {
 tls_refresh_locked() {
 	local old_fingerprint new_fingerprint was_running=0
 	load_settings || return 1
+	validate_work_dir_mount_dependency "${config_file%/*}" || return 1
 	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 0
 	old_fingerprint="$(uci -q get "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_TLS_FINGERPRINT}")"
 	load_active_tls_access || return 1
@@ -4669,7 +4657,7 @@ tls_refresh_locked() {
 			return 1
 		fi
 	fi
-	if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1 ||
+	if ! start_official_core ||
 	   ! load_runtime_dns_port ||
 	   ! wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" ||
 	   ! apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; then
@@ -4781,9 +4769,18 @@ memory_prepare_or_fallback_locked() {
 	[ "$memory_requested" = 1 ] || return 0
 	[ "$MEMORY_ACTIVE" != 1 ] || return 0
 	memory_prepare_runtime_locked && return 0
-	# Preparation has not changed authoritative UCI and has cleaned only objects created
-	# by this attempt.  Preserve availability by using the validated persistent
-	# tree for this start, while leaving the requested checkbox set for retry.
+	# Never start a disk core through an unpublished leftover overlay, or
+	# discard a generation whose state was published before preparation failed.
+	[ ! -e "$MEMORY_STATE_FILE" ] && [ ! -L "$MEMORY_STATE_FILE" ] &&
+		memory_discard_incomplete_runtime_locked "$persistent_work_dir" &&
+		[ ! -e "$MEMORY_RUNTIME_DIR" ] && [ ! -L "$MEMORY_RUNTIME_DIR" ] &&
+		tree_is_mount_free "$MEMORY_RUNTIME_DIR" &&
+		tree_is_mount_free "${persistent_work_dir}/data" &&
+		validate_work_dir_mount_dependency "$persistent_work_dir" || {
+		log_error "Memory preparation left unsafe state; refusing persistent fallback"
+		return 1
+	}
+	# The failed attempt is fully removed. Keep the requested checkbox for retry.
 	MEMORY_ACTIVE=0
 	MEMORY_BACKING_WORK_DIR=""
 	work_dir="$persistent_work_dir"
@@ -4892,12 +4889,16 @@ memory_prepare() {
 	run_locked memory_prepare_locked_command
 }
 
-memory_status() {
+memory_status() (
 	local load_rc=0
-	load_settings light || load_rc=$?
+	open_integration_read_lock || {
+		printf 'requested=unknown\nactive=busy\n'
+		exit 2
+	}
+	read_settings || load_rc=$?
 	if [ "$load_rc" != 0 ]; then
 		printf 'requested=unknown\nactive=invalid\n'
-		return 1
+		exit 1
 	fi
 	printf 'requested=%s\nactive=%s\npersistent_work_dir=%s\n' \
 		"$memory_requested" "$MEMORY_ACTIVE" "$persistent_work_dir"
@@ -4909,7 +4910,7 @@ memory_status() {
 		printf 'active_work_dir=%s\nactive_config_file=%s\n' \
 			"$persistent_work_dir" "$persistent_config_file"
 	fi
-}
+)
 
 prepare_wrapper_locked() {
 	[ "${WRAPPER_BOOT:-0}" = 1 ] && RELOAD_SERVICES=0
@@ -4937,55 +4938,16 @@ prepare_wrapper_locked() {
 		# monitor for a deliberately disabled installation.
 		return 2
 	fi
-	# A power loss can leave persisted takeover pointing at a not-yet-started
-	# core. Restore the resolver before waiting for the first interface event.
-	[ "${WRAPPER_BOOT:-0}" != 1 ] || clear_recorded_integration_locked || return 1
-	memory_reconcile_requested_storage_locked || return 1
-	if [ "$MEMORY_ACTIVE" = 1 ]; then
-		# A coordinator restart in the same boot adopts its validated RAM
-		# generation.  Recopying the persistent backing here would discard
-		# changes made by the official Web UI since the last write-back.
-		if official_running; then
-			check_core_config || return 1
-		else
-			sync_yaml_managed_fields_checked || return 1
-		fi
-		load_runtime_dns_port || return 1
-		sync_official_uci
-		return
-	fi
-	work_dir="$persistent_work_dir"
-	config_file="$persistent_config_file"
-	# A work-directory change selects an independent YAML/data tree.  Stop the
-	# old writer before switching the official service paths, but never
-	# copy files from the previous directory into the new one.
-	if { [ ! -f "$config_file" ] || [ "${previous_work_dir%/}" != "$work_dir" ]; } &&
-	   official_running; then
+	# Boot must withdraw persisted takeover before netifd's first event.  Keep
+	# its YAML preflight, but prepare RAM and synchronize the official service
+	# only in the stopped-core orchestrator that will actually start the writer.
+	if [ "${WRAPPER_BOOT:-0}" = 1 ]; then
 		clear_recorded_integration_locked || return 1
-		"$OFFICIAL_SERVICE" stop >/dev/null 2>&1 || return 1
-		wait_for_core_stopped || return 1
+		if [ "$MEMORY_ACTIVE" != 1 ] && ! official_running; then
+			ensure_config_file || return 1
+		fi
+		check_core_config && load_runtime_dns_port || return 1
 	fi
-	ensure_config_file || {
-		fail_safe_locked >/dev/null 2>&1 || true
-		return 1
-	}
-	# Preserve the existing no-live-writer boundary in persistent mode.  Boot,
-	# fresh workdir initialization, and the later orchestrator reach this block
-	# with the core stopped.  An already-running disk core is validated here and
-	# transitioned by service_started(), which first stops it under the same lock.
-	if ! official_running; then
-		sync_yaml_managed_fields_checked || return 1
-		memory_prepare_or_fallback_locked || return 1
-	fi
-	load_runtime_dns_port || {
-		fail_safe_locked >/dev/null 2>&1 || true
-		return 1
-	}
-
-	# Any fresh workdir initialization and RAM copy-in completed while the core was
-	# stopped.  A pre-existing disk core reaches only this non-writing check.
-	check_core_config || return 1
-	sync_official_uci || return 1
 	# Carry the idle-monitor decision across run_locked's subshell without
 	# suppressing service_started(), which still starts the official core.
 	if [ "$redirect_mode" = none ] && [ "$memory_requested" = 0 ]; then
@@ -4995,11 +4957,14 @@ prepare_wrapper_locked() {
 	return 0
 }
 
+# @include core-runtime
+
 settings_update_locked() {
 	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
 	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
 	local expected_revision="$7" current_revision
-	local old_enabled old_work_dir old_verbose old_redirect old_memory old_interval
+	local old_enabled old_work_dir old_verbose old_redirect old_memory old_interval fast_apply=0
+	SETTINGS_CORE_RESTARTED=1
 	case "$expected_revision" in
 		*[!0-9a-f]*) return 1 ;;
 	esac
@@ -5026,6 +4991,19 @@ settings_update_locked() {
 	old_redirect="$redirect_mode"
 	old_memory="$memory_requested"
 	old_interval="$memory_writeback_interval"
+	# Every Apply reaches the coordinator, including unchanged settings. Reuse
+	# a running core only when its process and all startup inputs still match.
+	if [ "$old_enabled:$requested_enabled" = 1:1 ] &&
+	   [ "$old_work_dir" = "$requested_work_dir" ] &&
+	   [ "$old_verbose" = "$requested_verbose" ] &&
+	   [ "$old_memory" = "$requested_memory" ] &&
+	   { [ "$old_memory:$MEMORY_ACTIVE" = 0:0 ] ||
+	     { [ "$old_memory:$MEMORY_ACTIVE" = 1:1 ] &&
+	       [ "$MEMORY_BACKING_WORK_DIR" = "$requested_work_dir" ]; }; } &&
+	   validate_work_dir_mount_dependency "$persistent_work_dir" &&
+	   core_runtime_matches; then
+		fast_apply=1
+	fi
 	if ! memory_run_with_official_path_guard settings_commit_persistent \
 		"$requested_enabled" "$requested_work_dir" "$requested_verbose" \
 		"$requested_redirect" "$requested_memory" "$requested_interval" ||
@@ -5039,6 +5017,18 @@ settings_update_locked() {
 		fi
 		log_error "Unable to prove that the previous AdGuard Home settings were restored"
 		return 2
+	fi
+	if [ "$fast_apply" = 1 ] && load_settings &&
+	   load_runtime_dns_port && core_runtime_matches && dns_port_listening &&
+	   { integration_status_locked "$dns_port" "$redirect_mode" ||
+	     { wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" &&
+	       apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; }; } &&
+	   core_runtime_matches && dns_port_listening &&
+	   "$OFFICIAL_SERVICE" disable >/dev/null 2>&1 &&
+	   sync_monitor_instance; then
+		SETTINGS_CORE_RESTARTED=0
+		log_error "Applied AdGuard Home settings without restarting the unchanged core"
+		return 0
 	fi
 	if orchestrate_core_locked; then
 		log_error "Applied AdGuard Home settings (enabled ${old_enabled}->${requested_enabled}, DNS ${old_redirect}->${requested_redirect}, memory ${old_memory}->${requested_memory})"
@@ -5062,6 +5052,7 @@ settings_update_job_locked() {
 	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
 	local expected_revision="$7" token="$8" candidate_revision="$9"
 	local calculated_revision current_revision restarted=0 settings_rc terminal
+	local SETTINGS_CORE_RESTARTED=1
 	yaml_job_hash_valid "$expected_revision" || return 1
 	yaml_job_token_valid "$token" || return 1
 	yaml_job_hash_valid "$candidate_revision" || return 1
@@ -5095,7 +5086,7 @@ settings_update_job_locked() {
 			if load_settings &&
 			   current_revision="$(settings_current_revision)" &&
 			   [ "$current_revision" = "$candidate_revision" ]; then
-				official_running && restarted=1
+				if [ "$SETTINGS_CORE_RESTARTED" = 1 ] && official_running; then restarted=1; fi
 				if write_yaml_job_state "$token" \
 				   "success:${candidate_revision}:${restarted}:${expected_revision}:${candidate_revision}"; then
 					return 0
@@ -5118,6 +5109,7 @@ settings_update() {
 }
 
 orchestrate_core_locked() {
+	local runtime_fingerprint=""
 	if ! load_settings; then
 		fail_safe_locked >/dev/null 2>&1 || true
 		return 1
@@ -5165,12 +5157,15 @@ orchestrate_core_locked() {
 
 	# The core is stopped here, so the managed workdir rewrite cannot race its
 	# own configuration writer.  DNS and Web endpoints remain YAML-owned.
+	validate_work_dir_mount_dependency "$persistent_work_dir" || return 1
 	sync_yaml_managed_fields_checked || return 1
 	memory_prepare_or_fallback_locked || return 1
 	load_runtime_dns_port || return 1
+	check_core_config || return 1
 	sync_official_uci || return 1
 	[ -x "$OFFICIAL_SERVICE" ] || return 1
-	if ! "$OFFICIAL_SERVICE" start >/dev/null 2>&1; then
+	runtime_fingerprint="$(core_runtime_fingerprint)" || runtime_fingerprint=""
+	if ! start_official_core; then
 		log_error "Official AdGuard Home service start command failed"
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
@@ -5183,7 +5178,10 @@ orchestrate_core_locked() {
 		clear_recorded_integration_locked >/dev/null 2>&1 || true
 		return 1
 	fi
-	sync_monitor_instance
+	sync_monitor_instance || return 1
+	remember_core_runtime "$runtime_fingerprint" ||
+		log_error "Runtime baseline unavailable; the next settings Apply will recheck and restart the core"
+	return 0
 }
 
 reconcile_core_locked() {

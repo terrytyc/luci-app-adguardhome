@@ -36,7 +36,7 @@ const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
 const MAX_WORK_DIR_LENGTH = 4040;
 const MAX_WORK_DIR_COMPONENT_LENGTH = 255;
 
-function valid_work_dir(value) {
+function valid_work_dir(value, require_mount) {
 	if (type(value) != 'string' ||
 	    length(value) > MAX_WORK_DIR_LENGTH ||
 	    !match(value, /^\/[A-Za-z0-9_./+@%:,=-]+$/) ||
@@ -75,6 +75,42 @@ function valid_work_dir(value) {
 	}
 	if (!filesystem || match(filesystem, /^(tmpfs|ramfs|rootfs|devtmpfs|proc|sysfs|cgroup|cgroup2)$/))
 		return null;
+	// Keep saved settings editable while their external disk is unavailable.
+	// File readers and enabled candidates require its explicit fstab target;
+	// the locked shell start also checks the configured device/UUID identity.
+	if (require_mount !== false && lstat('/etc/config/fstab')) {
+		let fstab = null, ready = true;
+		try {
+			fstab = cursor();
+			if (!fstab.load('fstab'))
+				ready = false;
+			else fstab.foreach('fstab', 'mount', (entry) => {
+				let target = entry.target;
+				if (type(target) != 'string')
+					return;
+				while (length(target) && substr(target, length(target) - 1, 1) == '/')
+					target = substr(target, 0, length(target) - 1);
+				if (!length(target) || substr(target, 0, 1) != '/' ||
+				    substr(`${value}/`, 0, length(target) + 1) != `${target}/`)
+					return;
+				let options = null;
+				for (let i = 0; i < length(mounts); i++) {
+					let fields = split(mounts[i], /\s+/);
+					if (fields[1] == target)
+						options = fields[3];
+				}
+				if (!options || !match(options, /(^|,)rw(,|$)/))
+					ready = false;
+			});
+		}
+		catch (error) { ready = false; }
+		if (fstab) {
+			try { fstab.unload('fstab'); }
+			catch (error) { }
+		}
+		if (!ready)
+			return null;
+	}
 	return value;
 }
 
@@ -135,7 +171,7 @@ function settings_snapshot() {
 		let interval = configured_interval(
 			uci.get(CONFIG_NAME, LUCI_SECTION, 'memory_writeback_interval'));
 
-		if (enabled != null && valid_work_dir(work_dir) &&
+		if (enabled != null && valid_work_dir(work_dir, false) &&
 		    configured_file == `${work_dir}/${CONFIG_FILENAME}` && verbose != null &&
 		    (redirect == 'none' || redirect == 'dnsmasq-upstream' ||
 		     redirect == 'redirect') && run_from_memory != null && interval != null) {
@@ -165,7 +201,7 @@ function settings_snapshot() {
 function settings_candidate(enabled, work_dir, verbose, redirect,
 						run_from_memory, interval) {
 	if (type(enabled) != 'bool' || type(verbose) != 'bool' ||
-	    type(run_from_memory) != 'bool' || !valid_work_dir(work_dir) ||
+	    type(run_from_memory) != 'bool' || !valid_work_dir(work_dir, enabled) ||
 	    (redirect != 'none' && redirect != 'dnsmasq-upstream' &&
 	     redirect != 'redirect') || type(interval) != 'int' || interval < 0 ||
 	    interval > MAX_MEMORY_WRITEBACK_INTERVAL)

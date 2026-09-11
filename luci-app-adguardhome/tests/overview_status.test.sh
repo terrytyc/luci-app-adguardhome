@@ -2,7 +2,8 @@
 set -eu
 
 script_dir="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
-. "$script_dir/../root/etc/init.d/AdGuardHome"
+. "$script_dir/lib/function-body.sh"
+eval "$(init_source "$script_dir/../root/etc/init.d/AdGuardHome")"
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 INTEGRATION_LOCK="$test_tmp/integration.lock"

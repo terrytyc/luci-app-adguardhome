@@ -139,6 +139,8 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 	token=22222222222222222222222222222222
 	states="${protocol_tmp}/yaml-states"
 	load_settings() { [ "$scenario" != settings ]; }
+	config_file=/etc/AdGuardHome/AdGuardHome.yaml
+	validate_work_dir_mount_dependency() { [ "$scenario" != mount ]; }
 	validate_yaml_stage() { [ "$scenario" != stage ]; }
 	active_config_hash() {
 		[ "$scenario" != hash-read ] || return 1
@@ -160,7 +162,7 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 		[ "$1" = "$token" ] || return 1
 		printf '%s\n' "$2" >>"$states"
 	}
-	for scenario in validation settings stage hash-read hash-conflict cleanup; do
+	for scenario in validation settings mount stage hash-read hash-conflict cleanup; do
 		: >"$states"
 		touched=0
 		# Values from an earlier call must not affect this job's classification.
@@ -256,7 +258,8 @@ for obsolete in \
 	reject "$init_file" "$obsolete"
 done
 require "$init_file" 'memory_discard_incomplete_runtime_locked() {'
-require "$init_file" 'memory_discard_incomplete_runtime_locked "$configured_work_dir" || return 1'
+function_body "$init_file" load_settings |
+	grep -Fq 'memory_discard_incomplete_runtime_locked "$configured_work_dir" || return 1'
 
 require "$init_file" 'refresh_managed_config_snapshot || return 1'
 require "$init_file" 'official_memory_data_mount_visible'

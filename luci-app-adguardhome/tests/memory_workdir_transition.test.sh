@@ -353,6 +353,11 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	}
 	load_runtime_dns_port() { dns_port=53335; }
 	sync_official_uci() { return 0; }
+	start_official_core() { "$OFFICIAL_SERVICE" start; }
+	validate_work_dir_mount_dependency() { return 0; }
+	check_core_config() { return 0; }
+	core_runtime_fingerprint() { printf 'fixture\n'; }
+	remember_core_runtime() { return 0; }
 	sync_monitor_instance() { printf 'monitor:%s:%s\n' "$COMMITTED_WORK" "$COMMITTED_ENABLED" >>"$events"; }
 	wait_for_core_ready() {
 		printf 'ready:%s:%s\n' "$3" "$config_file" >>"$events"

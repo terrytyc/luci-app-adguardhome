@@ -10,13 +10,15 @@ if [ -z "$real_uci" ] && [ -z "$uci_root" ]; then
 	exit 0
 fi
 # shellcheck disable=SC1090
-. "$script_dir/../root/etc/init.d/AdGuardHome"
-test_tmp="$(mktemp -d)"
+. "$script_dir/lib/function-body.sh"
+eval "$(init_source "$script_dir/../root/etc/init.d/AdGuardHome")"
+# Absolute UCI package tuples cannot contain dots before the section name.
+test_tmp="$(mktemp -d /tmp/adguardhome-dns-uci-XXXXXX)"
 trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 mkdir "$test_tmp/config" "$test_tmp/delta"
 UCI_CONFIG_DIRECTORY="$test_tmp/config"
 UCI_DELTA_DIRECTORY="$test_tmp/delta"
-uci() {
+uci_actual() {
 	if [ -n "$uci_root" ]; then
 		"$uci_root/lib/ld-musl-x86_64.so.1" --library-path "$uci_root/lib:$uci_root/usr/lib" \
 			"$uci_root/sbin/uci" -c "$test_tmp/config" -t "$test_tmp/delta" "$@"
@@ -24,6 +26,7 @@ uci() {
 		"$real_uci" -c "$test_tmp/config" -t "$test_tmp/delta" "$@"
 	fi
 }
+uci() { uci_actual "$@"; }
 # Keep every UCI operation real; only service/snapshot effects and section
 # discovery are isolated from the host. Existing DNS tests cover discovery.
 config_context=dhcp
@@ -98,6 +101,33 @@ for operation in set_dnsmasq_upstream clear_managed_dnsmasq_upstream; do
 done
 uci revert adguardhome
 
+# Pending edits must not hide a committed owned firewall rule from cleanup.
+for pending_change in delete-section delete-owner rename-section change-owner; do
+	seed_config
+	case "$pending_change" in
+		delete-section) uci delete "firewall.$FIREWALL_SECTION" ;;
+		delete-owner) uci delete "firewall.$FIREWALL_SECTION.$FIREWALL_OWNER_OPTION" ;;
+		rename-section) uci rename "firewall.$FIREWALL_SECTION=renamed_redirect" ;;
+		change-owner) uci set "firewall.$FIREWALL_SECTION.$FIREWALL_OWNER_OPTION=User-owned rule" ;;
+	esac
+	before="$(uci changes firewall)"
+	committed="$(cksum <"$test_tmp/config/firewall")"
+	if clear_firewall_redirect; then
+		printf 'firewall cleanup accepted a pending ownership change: %s\n' "$pending_change" >&2
+		exit 1
+	fi
+	[ "$(uci changes firewall)" = "$before" ]
+	[ "$(cksum <"$test_tmp/config/firewall")" = "$committed" ]
+	uci revert firewall
+done
+printf "config 'unterminated\n" >"$test_tmp/config/firewall"
+committed="$(cksum <"$test_tmp/config/firewall")"
+if clear_firewall_redirect; then
+	printf 'firewall cleanup treated malformed committed UCI as absent ownership\n' >&2
+	exit 1
+fi
+[ "$(cksum <"$test_tmp/config/firewall")" = "$committed" ]
+
 # A pending deletion can hide the marker from ordinary `uci get`; cleanup must
 # reject it before treating the managed takeover as absent. Malformed plugin
 # UCI is likewise an error, never a successful no-op.
@@ -167,6 +197,64 @@ uci set firewall.defaults.forward=ACCEPT
 before="$(uci changes firewall)"
 clear_firewall_redirect || exit 1
 [ "$(uci changes firewall)" = "$before" ]
+uci revert firewall
+
+# Real commits plus injected mutation/reload failures must retain ownership
+# until the live rule is disabled. Every failure remains retryable, with no
+# transaction delta that could hide the stanza from the next cleanup.
+(
+	uci() {
+		case "$*" in
+			"-q set firewall.$FIREWALL_SECTION.enabled=0")
+				[ "$TEST_FW_FAILURE" != set ] || return 1 ;;
+			'-q commit firewall')
+				TEST_FW_COMMITS=$((TEST_FW_COMMITS + 1))
+				[ "$TEST_FW_FAILURE:$TEST_FW_COMMITS" != disable-commit:1 ] &&
+					[ "$TEST_FW_FAILURE:$TEST_FW_COMMITS" != delete-commit:2 ] || return 1 ;;
+			"-q delete firewall.$FIREWALL_SECTION")
+				[ "$TEST_FW_FAILURE" != delete ] || return 1 ;;
+		esac
+		uci_actual "$@"
+	}
+	reload_service_if_present() {
+		[ "$*" = '/etc/init.d/firewall reload' ] || return 1
+		TEST_FW_RELOADS=$((TEST_FW_RELOADS + 1))
+		[ "$(uci_actual get "$test_tmp/config/firewall.$FIREWALL_SECTION.enabled")" = 0 ] || return 1
+		[ "$TEST_FW_FAILURE" != reload ] || return 1
+		TEST_FW_LIVE=0
+	}
+	for failure in set disable-commit reload delete delete-commit; do
+		TEST_FW_FAILURE=""
+		seed_config
+		TEST_FW_FAILURE="$failure"
+		TEST_FW_COMMITS=0 TEST_FW_RELOADS=0 TEST_FW_LIVE=1
+		if clear_firewall_redirect; then
+			printf 'firewall cleanup ignored %s failure\n' "$failure" >&2
+			exit 1
+		fi
+		[ -z "$(uci_actual changes firewall)" ]
+		[ "$(uci_actual get "$test_tmp/config/firewall.$FIREWALL_SECTION.$FIREWALL_OWNER_OPTION")" = "$FIREWALL_OWNER_VALUE" ]
+		case "$failure" in
+			set|disable-commit)
+				[ "$TEST_FW_RELOADS:$TEST_FW_LIVE" = 0:1 ]
+				if uci_actual -q get "firewall.$FIREWALL_SECTION.enabled"; then exit 1; fi ;;
+			reload)
+				[ "$TEST_FW_RELOADS:$TEST_FW_LIVE" = 1:1 ]
+				[ "$(uci_actual get "firewall.$FIREWALL_SECTION.enabled")" = 0 ] ;;
+			delete|delete-commit)
+				[ "$TEST_FW_RELOADS:$TEST_FW_LIVE" = 1:0 ]
+				[ "$(uci_actual get "firewall.$FIREWALL_SECTION.enabled")" = 0 ] ;;
+		esac
+		TEST_FW_FAILURE=""
+		clear_firewall_redirect || exit 1
+		[ "$TEST_FW_LIVE" = 0 ]
+		[ -z "$(uci_actual changes firewall)" ]
+		if uci_actual -q get "firewall.$FIREWALL_SECTION"; then exit 1; fi
+		previous_reloads="$TEST_FW_RELOADS"
+		clear_firewall_redirect || exit 1
+		[ "$TEST_FW_RELOADS" = "$previous_reloads" ]
+	done
+)
 
 # UCI accepts both scalar `option server` and list form. A scalar public
 # resolver must block takeover, while an exact scalar managed value can be

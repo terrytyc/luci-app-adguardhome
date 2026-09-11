@@ -51,12 +51,17 @@ const fixture = {
 	interval: '60',
 	lstatCalls: 0,
 	mountReads: 0,
+	fstab: null,
 	mounts: '/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n' +
 		'tmpfs /opt/ram tmpfs rw 0 0\n/dev/sda1 /tmp/disk ext4 rw 0 0\n',
 };
 
 function cursor() {
 	return {
+		load() { return true; },
+		foreach(config, section, callback) {
+			for (const entry of fixture.fstab ?? []) callback(entry);
+		},
 		get(config, section, option) {
 			return {
 				'adguardhome.config.enabled': fixture.enabled,
@@ -94,6 +99,8 @@ const sandbox = {
 	},
 	lstat(pathname) {
 		fixture.lstatCalls++;
+		if (pathname === '/etc/config/fstab')
+			return fixture.fstab ? { type: 'file' } : null;
 		if (pathname === '/etc')
 			return { type: 'directory', uid: 0, gid: 0, mode: 0o755 };
 		if (pathname === '/etc/AdGuardHome')
@@ -105,6 +112,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(`${constants}\n${functions}\nthis.api = {
+	valid_work_dir,
 	configured_boolean,
 	settings_snapshot,
 	settings_candidate,
@@ -194,6 +202,26 @@ assert.equal(fixture.lstatCalls, lstatCalls, 'total bounds must run before lstat
 assert.equal(fixture.mountReads, mountReads, 'total bounds must run before mount parsing');
 
 const mountedFilesystems = fixture.mounts;
+
+// Missing external mounts block reads/starts, while saved settings retain a
+// revision so the user can disable the service or select another directory.
+fixture.fstab = [ { target: '/mnt/disk/', enabled: '0' } ];
+fixture.workDir = '/mnt/disk/AdGuardHome';
+fixture.configFile = `${fixture.workDir}/AdGuardHome.yaml`;
+assert.equal(sandbox.api.valid_work_dir(fixture.workDir), null);
+assert.ok(sandbox.api.settings_snapshot()?.revision);
+assert.equal(sandbox.api.settings_candidate(true, fixture.workDir, false, 'none', false, 60), null);
+assert.ok(sandbox.api.settings_candidate(false, fixture.workDir, false, 'none', false, 60));
+assert.ok(sandbox.api.valid_work_dir('/mnt/disk-other/AdGuardHome'));
+fixture.mounts += '/dev/sda1 /mnt/disk ext4 ro 0 0\n';
+assert.equal(sandbox.api.valid_work_dir(fixture.workDir), null);
+fixture.mounts += '/dev/sda1 /mnt/disk ext4 rw 0 0\n';
+assert.equal(sandbox.api.valid_work_dir(fixture.workDir), fixture.workDir);
+fixture.mounts += '/dev/sda1 /mnt/disk ext4 ro 0 0\n';
+assert.equal(sandbox.api.valid_work_dir(fixture.workDir), null, 'the topmost mount controls access');
+fixture.fstab = null;
+fixture.workDir = '/etc/AdGuardHome';
+fixture.configFile = `${fixture.workDir}/AdGuardHome.yaml`;
 fixture.mounts = '';
 assert.equal(sandbox.api.settings_snapshot(), null, 'unknown storage must not be accepted');
 fixture.mounts = mountedFilesystems;

@@ -32,8 +32,10 @@ managed_body="$(function_body "$init_file" sync_yaml_managed_fields_checked)"
 (
 	eval "$managed_body"
 	mktemp() { return 1; }
+	validate_work_dir_mount_dependency() { return 0; }
 	previous_work_dir=""
 	work_dir=/etc/AdGuardHome
+	config_file="$work_dir/AdGuardHome.yaml"
 	sync_yaml_managed_fields_checked
 	previous_work_dir=/etc/AdGuardHome
 	sync_yaml_managed_fields_checked

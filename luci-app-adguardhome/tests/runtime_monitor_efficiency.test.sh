@@ -134,10 +134,11 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 # path must freshly reject YAML/core changes after the wait, and must remove
 # takeover again if either changes while the resolver reload is in progress.
 (
+	eval "$(function_body "$init_file" read_settings)"
 	eval "$(function_body "$init_file" runtime_settings_match)"
 	eval "$(function_body "$init_file" apply_integration_locked)"
 	load_settings() {
-		[ "$*" = light ] || return 1
+		[ "$*" = 'light 1' ] || return 1
 		record runtime-settings
 		service_enabled=1
 		redirect_mode=dnsmasq-upstream

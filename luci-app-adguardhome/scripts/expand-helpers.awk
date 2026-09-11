@@ -21,6 +21,10 @@ function read_helper(path, name, line, copying, complete, body) {
 		printf "%s", read_helper(helper_dir "/private-files.mk", "PrivateFiles")
 	else if (name == "keep-active-config")
 		printf "%s", read_helper(helper_dir "/keep-active-config.mk", "KeepActiveConfig")
+	else if (name == "runtime-settings")
+		printf "%s", read_helper(helper_dir "/runtime-settings.mk", "RuntimeSettings")
+	else if (name == "core-runtime")
+		printf "%s", read_helper(helper_dir "/core-runtime.mk", "CoreRuntime")
 	else { failed = 1; exit 1 }
 	next
 }

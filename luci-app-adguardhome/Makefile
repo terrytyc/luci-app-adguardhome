@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.1.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -272,6 +272,11 @@ if [ -e "$$managed_snapshot" ] || [ -L "$$managed_snapshot" ]; then
 	rm -f "$$managed_snapshot" || exit 1
 fi
 rmdir "$$snapshot_dir" 2>/dev/null || true
+for applied_state in "$$runtime_dir/applied-runtime" "$$runtime_dir"/.applied-runtime.??????; do
+	[ -e "$$applied_state" ] || [ -L "$$applied_state" ] || continue
+	root_private_file "$$applied_state" || exit 1
+	rm -f "$$applied_state" || exit 1
+done
 rm -f "$$remove_state" || exit 1
 rmdir "$$runtime_dir" 2>/dev/null || true
 

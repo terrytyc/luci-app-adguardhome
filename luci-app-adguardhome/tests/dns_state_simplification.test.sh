@@ -49,7 +49,8 @@ fi
 # Source the coordinator under plain ash, then replace its OpenWrt interfaces
 # with a small deterministic UCI/config model for behavioral coverage.
 # shellcheck disable=SC1090
-. "$init_file"
+. "$script_dir/lib/function-body.sh"
+eval "$(init_source "$init_file")"
 
 test_tmp="$(mktemp -d "${TMPDIR:-/tmp}/luci-agh-dns-state.XXXXXX")"
 trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
