@@ -363,6 +363,15 @@ const DNS = 'dns:\n  port: 53335\n';
 const TLS_PATHS = '  certificate_path: /etc/ssl/cert.pem\n  private_key_path: /etc/ssl/key.pem\n';
 const TLS = 'tls:\n  enabled: true\n  server_name: router.example.com\n  port_https: 1029\n';
 
+for (let newline in [ '\n', '\r\n', '\r' ]) {
+	expect_config('line endings: DNS/HTTP', replace(HTTP + DNS, /\n/g, newline),
+		[ 3000 ], 53335, 'http', null, 3000);
+	expect_config('line endings: duplicate key', replace(HTTP + DNS + '  port: 53\n', /\n/g, newline),
+		[ 3000 ], null, 'http', null, 3000);
+	expect_config('line endings: TLS', replace(HTTP + DNS + TLS + TLS_PATHS, /\n/g, newline),
+		[ 1029 ], 53335, 'https', 'router.example.com', 1029);
+}
+
 expect_config('one-pass HTTP and dynamic DNS port', HTTP + 'dns:\n  port: 5353\n',
 	[ 3000 ], 5353, 'http', null, 3000);
 expect_config('DNS port 53 remains supported', HTTP + 'dns:\n  port: 53\n',

@@ -232,6 +232,7 @@ done
 # Every failure branch must restore the retry marker after that attempt.
 (
 	TEST_COORDINATOR_PRESENT=1
+	eval "$(function_body "$init_file" resume_core_and_dns)"
 	eval "$(function_body "$init_file" resume_yaml_runtime)"
 	eval "$(function_body "$init_file" restore_tls_fingerprint)"
 	uci() {

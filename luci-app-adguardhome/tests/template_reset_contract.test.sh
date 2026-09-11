@@ -119,7 +119,7 @@ for fragment in (
     if fragment not in directory_guard:
         raise SystemExit(f"template directory guard omits: {fragment}")
 
-reader = between("function read_template()", "function read_config(configuration)")
+reader = between("function read_template()", "function requested_log_lines(value)")
 for fragment in (
     "for (let directory in [ '/usr', '/usr/share' ])",
     "safe_template_directory(directory, true)",

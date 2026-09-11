@@ -14,7 +14,7 @@ const extractFunction = require('./lib/source').extractFunction.bind(null, sourc
 
 const functions = [
 	'configured_boolean', 'configuration_state', 'service_running', 'service_status',
-	'same_inode', 'read_yaml', 'read_config', 'credentials_info', 'update_credentials', 'reset_yaml',
+	'same_inode', 'read_yaml', 'credentials_info', 'update_credentials', 'reset_yaml',
 	'yaml_scalar', 'yaml_config_values', 'yaml_section_value',
 	'valid_port', 'yaml_bool', 'valid_dns_name', 'http_port', 'yaml_material_value',
 	'tls_material_complete', 'config_info', 'probe_overview', 'overview_info',
@@ -229,6 +229,15 @@ assert.equal(fixture.jobChecks, 1);
 assert.deepEqual(fixture.probes, [ 3000 ]);
 assert.equal(fixture.probeCalls.length, 1, 'Web and DNS status must use one init process');
 assert.deepEqual(Array.from(fixture.integrationProbes[0]), [ '53335', 'dnsmasq-upstream' ]);
+for (const newline of [ '\n', '\r\n', '\r' ]) {
+	reset();
+	fixture.yaml = fixture.yaml.replace(/\n/g, newline);
+	const overview = sandbox.overview();
+	assert.equal(overview.config.dns_port, 53335);
+	assert.equal(overview.config.web.port, 3000);
+	assert.equal(fixture.reads, 1);
+	assert.equal(fixture.hashes, 0);
+}
 fixture.integration = 1;
 assert.equal(sandbox.overview().status.dns_integration, 'pending');
 fixture.integration = 2;
@@ -457,8 +466,6 @@ assert.equal(fixture.hashes, 0);
 assert.equal(sandbox.rpc.get_yaml.call().error, 'YAML configuration is unavailable',
 	'an editor read must still fail closed if its required digest is unavailable');
 
-const readConfigSource = extractFunction('read_config');
-assert.match(readConfigSource, /read_yaml\(configuration, false\)/);
 assert.equal((source.match(/read_yaml\([^)]*, false\)/g) ?? []).length, 1,
 	'only the status-only reader may suppress hashing; editor/CAS paths keep the default');
 

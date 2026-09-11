@@ -64,6 +64,30 @@ fi
 test_tmp="$(mktemp -d)"
 trap 'rm -rf "$test_tmp"' EXIT
 (
+	eval "$(function_body "$init_file" memory_source_size_kib)"
+	persistent_work_dir="$test_tmp/size"
+	mkdir -p "$persistent_work_dir/data"
+	root_held_tree_is_plain() { return 0; }
+	run_bounded() {
+		printf '%s\n' "$DU_OUTPUT"
+		return "$DU_STATUS"
+	}
+	DU_STATUS=0
+	DU_OUTPUT="$(printf '4096\t/proc/self/fd/8/.')"
+	[ "$(memory_source_size_kib)" = 4096 ]
+	DU_STATUS=7
+	if memory_source_size_kib >/dev/null; then
+		printf 'RAM capacity accepted a partial summary from a failed du\n' >&2
+		exit 1
+	fi
+	DU_STATUS=0
+	for DU_OUTPUT in '' 'invalid size'; do
+		if memory_source_size_kib >/dev/null; then exit 1; fi
+	done
+	DU_OUTPUT="$(printf '0\t/proc/self/fd/8/.')"
+	[ "$(memory_source_size_kib)" = 0 ]
+)
+(
 	eval "$state_body"
 	MEMORY_RUNTIME_DIR="$test_tmp"
 	MEMORY_STATE_FILE="${test_tmp}/state"

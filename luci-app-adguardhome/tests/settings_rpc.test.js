@@ -318,6 +318,7 @@ assert.deepEqual(launchedArguments, [
 ], 'the worker must receive ten arguments with the numeric lock descriptor last');
 
 launchSandbox.sha256 = sandbox.sha256;
+launchSandbox.valid_work_dir = sandbox.api.valid_work_dir;
 launchSandbox.memory_state_active = () => true;
 launchSandbox.service_running = () => true;
 launchSandbox.settings_snapshot = () => ({ ...snapshot, run_from_memory: true });
@@ -332,6 +333,17 @@ assert.deepEqual(writebackJob, [ token, snapshot.revision, writebackHash ]);
 assert.deepEqual(launchedArguments, [
 	'memory_writeback_job', snapshot.revision, writebackHash, token, '193',
 ], 'write-back accepts only a committed revision, never draft settings');
+fixture.fstab = [ { target: fixture.workDir } ];
+assert.ok(sandbox.api.settings_snapshot()?.revision,
+	'saved settings stay readable while their required mount is unavailable');
+launchedArguments = null;
+assert.ok(launchSandbox.writeback(snapshot.revision).error,
+	'write-back must check the required mount even when the RAM state is present');
+assert.equal(launchedArguments, null);
+fixture.mounts += `/dev/sda1 ${fixture.workDir} ext4 rw 0 0\n`;
+assert.equal(launchSandbox.writeback(snapshot.revision).accepted, true);
+fixture.fstab = null;
+fixture.mounts = mountedFilesystems;
 launchSandbox.prepare_yaml_job = () => ({ token, reused: true });
 launchedArguments = null;
 assert.equal(launchSandbox.writeback(snapshot.revision).reused, true);

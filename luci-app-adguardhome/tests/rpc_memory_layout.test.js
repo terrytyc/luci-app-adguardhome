@@ -260,10 +260,12 @@ assert.doesNotMatch(configPathSource,
 assert.doesNotMatch(configPathSource, /memory_namespace/,
 	'a stale data-only RAM namespace must not independently hide persistent YAML');
 
-assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), true,
+assert.equal(api.service_status().memory_active, true,
 	'a valid version=4 data-only RAM generation and both bind aliases should be active');
 assert.deepEqual(fixture.readfilePaths, [ '/proc/mounts' ],
-	'an existing runtime must validate persistent storage');
+	'one status request must validate persistent storage only once');
+assert.equal(fixture.lstatPaths.length, 11,
+	'RAM status must reuse the validated workdir instead of repeating its three metadata reads');
 assert.equal(api.config_path(), PERSISTENT_CONFIG,
 	'valid RAM mode must keep YAML in the persistent work directory');
 assert.equal(api.service_status().memory_active, true,
@@ -292,8 +294,13 @@ assert.deepEqual(fixture.readfilePaths, [],
 assert.deepEqual(fixture.lsdirPaths, [], 'persistent mode must not enumerate an absent RAM work directory');
 assert.deepEqual(fixture.openPaths, [], 'persistent mode must not try opening an absent RAM state record');
 fixture.requested = '1';
+fixture.readfilePaths.length = 0;
+fixture.lstatPaths.length = 0;
 assert.equal(api.service_status().memory_active, false,
 	'a checked memory request must not bypass the absent-runtime fast path');
+assert.deepEqual(fixture.readfilePaths, [ '/proc/mounts' ]);
+assert.equal(fixture.lstatPaths.length, 4,
+	'without RAM, status needs only the validated workdir and absent runtime lookup');
 fixture.runtimePresent = true;
 fixture.requested = '0';
 for (const invalid of [ 'symlinkPath', 'writablePath' ]) {
@@ -301,7 +308,7 @@ for (const invalid of [ 'symlinkPath', 'writablePath' ]) {
 	fixture.lstatPaths.length = 0;
 	fixture.lsdirPaths.length = 0;
 	fixture.readfilePaths.length = 0;
-	assert.equal(api.memory_state_active(PERSISTENT_WORK_DIR), false,
+	assert.equal(api.service_status().memory_active, false,
 		`${invalid}: an existing abnormal runtime object must retain validation`);
 	assert.deepEqual(fixture.readfilePaths, [ '/proc/mounts' ],
 		'an existing abnormal runtime must still validate persistent storage');

@@ -28,22 +28,38 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 awk -v helper_dir="$script_dir/../scripts" \
 	-f "$script_dir/../scripts/expand-helpers.awk" \
-	"$script_dir/../root/etc/init.d/AdGuardHome" >"$test_tmp/init"
+	"$script_dir/../root/etc/init.d/AdGuardHome" |
+	sed 's@/bin/mount -o bind@test_mount -o bind@g' >"$test_tmp/init"
 # shellcheck disable=SC1090
 . "$test_tmp/init"
 chmod 0755 "$test_tmp"
+
+# Only the bind syscall boundary is intercepted for failure injection; normal
+# calls still create real mounts inside this test's private namespace.
+test_mount() {
+	printf '%s\n' "$4" >>"$test_tmp/mounts"
+	[ "${TEST_FAIL_MOUNT:-}" != "$4" ] || return 1
+	/bin/mount "$@"
+}
 
 # The host may not have an adguardhome passwd entry or ash as /bin/sh. Preserve
 # the production command and numeric credentials while adapting just that
 # launcher; all scans, copies, chmods and mounts below execute for real.
 run_bounded() {
-	local executable
+	local executable operation=""
 	shift 2
 	if [ "$1" = /sbin/start-stop-daemon ]; then
 		shift
-		while [ "$1" != -x ]; do shift; done
+		while [ "$1" != -x ]; do
+			[ "$1" != -n ] || operation="$2"
+			shift
+		done
 		executable="$2"
 		shift 3
+		if [ "$operation" = AGHDataScan ]; then
+			printf '%s\n' "$4" >>"$test_tmp/scans"
+			[ "${TEST_FAIL_SCAN:-0}" != 1 ] || [ "$4" != "$MEMORY_DATA_DIR" ] || return 1
+		fi
 		[ "$executable" != /bin/cp ] || [ "${TEST_FAIL_COPY:-0}" != 1 ] || return 1
 		if [ "$executable" = /bin/sh ]; then
 			set -- busybox ash "$@"
@@ -90,6 +106,10 @@ set_fixture() {
 	MEMORY_MOUNTS_SUSPENDED=0
 	memory_requested=1
 	TEST_FAIL_COPY=0
+	TEST_FAIL_SCAN=0
+	TEST_FAIL_MOUNT=""
+	: >"$test_tmp/scans"
+	: >"$test_tmp/mounts"
 }
 assert_private_owner() {
 	local metadata mode links owner group remainder
@@ -132,6 +152,10 @@ for scenario in empty existing service-owned; do
 	fi
 	memory_prepare_runtime_locked
 	assert_prepared "$owner" "$group"
+	expected_scans=3
+	[ "$scenario" != empty ] || expected_scans=2
+	[ "$(wc -l <"$test_tmp/scans")" -eq "$expected_scans" ]
+	[ "$(grep -Fxc "$MEMORY_DATA_DIR" "$test_tmp/scans")" = 1 ]
 	[ "$scenario" = empty ] || [ "$(cat "$MEMORY_DATA_DIR/saved")" = 'saved data' ]
 	remove_prepared
 done
@@ -148,6 +172,27 @@ fi
 assert_private_owner "$persistent_work_dir" 0 0
 [ "$MEMORY_ACTIVE" = 0 ] && [ ! -e "$MEMORY_RUNTIME_DIR" ]
 [ "$(cat "$persistent_work_dir/data/saved")" = 'saved data' ]
+
+# The final activation scan remains mandatory. Copy/scan/mount failures must
+# leave the source intact, restore its parent permissions and remove partial RAM.
+for failure in scan backing-mount overlay-mount; do
+	set_fixture "$failure-failure"
+	seed_data
+	case "$failure" in
+		scan) TEST_FAIL_SCAN=1 ;;
+		backing-mount) TEST_FAIL_MOUNT="$MEMORY_BACKING_DATA_MOUNT" ;;
+		overlay-mount) TEST_FAIL_MOUNT="$persistent_work_dir/data" ;;
+	esac
+	if memory_prepare_runtime_locked; then
+		printf 'RAM preparation accepted a failed %s\n' "$failure" >&2
+		exit 1
+	fi
+	assert_private_owner "$persistent_work_dir" 0 0
+	[ "$MEMORY_ACTIVE" = 0 ] && [ ! -e "$MEMORY_RUNTIME_DIR" ]
+	[ "$(cat "$persistent_work_dir/data/saved")" = 'saved data' ]
+	! path_is_exact_mountpoint "$persistent_work_dir/data" || exit 1
+	[ "$failure" != scan ] || [ ! -s "$test_tmp/mounts" ]
+done
 
 # A foreign runtime parent must not become cleanup-eligible just because the
 # permission handoff now covers the complete preparation.

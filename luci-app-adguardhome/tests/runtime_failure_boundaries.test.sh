@@ -106,6 +106,90 @@ done
 	}
 )
 
+# YAML rollback prepares the restored file once, then restores only a runtime
+# that was previously running and remains enabled. Ordinary resume keeps its
+# earlier no-op cases, including a core that is already running.
+(
+	for name in resume_core_and_dns resume_yaml_runtime rollback_yaml_update attempt_yaml_rollback; do
+		eval "$(function_body "$init_file" "$name")"
+	done
+	events="$test_tmp/yaml-recovery.events"
+	backup="$test_tmp/yaml-recovery.backup"
+	config_file="$test_tmp/yaml-recovery.yaml"
+	OFFICIAL_SERVICE=recovery_service
+	FAIL_STEP=''
+	step() { printf '%s\n' "$1" >>"$events"; [ "$FAIL_STEP" != "$1" ]; }
+	load_settings() {
+		step load || return 1
+		service_enabled="$TEST_ENABLED" redirect_mode=dnsmasq-upstream work_dir=/persistent
+	}
+	load_runtime_dns_port() { step port || return 1; dns_port=53335; }
+	sync_official_uci() { step sync; }
+	official_running() { [ "$CORE_RUNNING" = 1 ]; }
+	recovery_service() { step "$1" || return 1; CORE_RUNNING=0; }
+	start_official_core() { step start || return 1; CORE_RUNNING=1; }
+	wait_for_core_stopped() { step stopped; }
+	wait_for_core_ready() {
+		[ "$*" = '53335 dnsmasq-upstream /persistent' ] && step ready
+	}
+	apply_integration_locked() {
+		[ "$*" = '53335 dnsmasq-upstream /persistent' ] && step dns
+	}
+	clear_recorded_integration_locked() { step cleanup; }
+	restore_yaml_backup() { step restore && cp "$1" "$config_file"; }
+	secure_active_config() { step secure; }
+	remove_yaml_backup() { step remove && rm -f "$1"; }
+	log_error() { :; }
+	for was_running in 0 1; do
+		for TEST_ENABLED in 0 1; do
+			printf 'previous YAML\n' >"$backup"
+			printf 'candidate YAML\n' >"$config_file"
+			YAML_BACKUP_CLEANUP="$backup" CORE_RUNNING=1
+			: >"$events"
+			attempt_yaml_rollback "$backup" "$was_running"
+			expected="$(printf 'cleanup\nstop\nstopped\nrestore\nsecure\nload\nport\nsync')"
+			if [ "$was_running:$TEST_ENABLED" = 1:1 ]; then
+				expected="$(printf '%s\nstart\nready\ndns' "$expected")"
+				[ "$CORE_RUNNING" = 1 ]
+			else
+				[ "$CORE_RUNNING" = 0 ]
+			fi
+			expected="$(printf '%s\nremove' "$expected")"
+			[ "$(cat "$events")" = "$expected" ] || {
+				printf 'unexpected YAML rollback sequence (%s:%s):\n%s\n' \
+					"$was_running" "$TEST_ENABLED" "$(cat "$events")" >&2
+				exit 1
+			}
+			[ "$(cat "$config_file")" = 'previous YAML' ] && [ ! -e "$backup" ]
+			for running_now in 0 1; do
+				CORE_RUNNING="$running_now"
+				: >"$events"
+				resume_yaml_runtime "$was_running"
+				expected=''
+				if [ "$was_running" = 1 ]; then
+					expected=load
+					if [ "$TEST_ENABLED" = 1 ]; then
+						expected="$(printf '%s\nport\nsync' "$expected")"
+						[ "$running_now" = 1 ] || expected="$(printf '%s\nstart' "$expected")"
+						expected="$(printf '%s\nready\ndns' "$expected")"
+					fi
+				fi
+				[ "$(cat "$events")" = "$expected" ]
+			done
+		done
+	done
+	TEST_ENABLED=1
+	for FAIL_STEP in load port sync start ready dns; do
+		printf 'previous YAML\n' >"$backup"
+		YAML_BACKUP_CLEANUP="$backup" CORE_RUNNING=1
+		: >"$events"
+		if attempt_yaml_rollback "$backup" 1; then exit 1; fi
+		[ "$(tail -n 1 "$events")" = "$FAIL_STEP" ]
+		[ "$(cat "$backup")" = 'previous YAML' ] && [ -z "$YAML_BACKUP_CLEANUP" ]
+		! grep -qx remove "$events"
+	done
+)
+
 # A stopped-core RAM write-back failure keeps the RAM generation intact, so
 # the orchestrator must restore that same runtime before reporting failure.
 (

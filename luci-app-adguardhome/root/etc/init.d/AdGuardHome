@@ -1365,11 +1365,9 @@ memory_source_size_kib() (
 		exec 8<"$data_dir" || return 1
 		data_fd=/proc/self/fd/8
 		root_held_tree_is_plain "$data_fd" "$data_dir" || return 1
-		data_size="$(
-			run_bounded 30 2 \
-				/usr/bin/du -sk "${data_fd}/." 2>/dev/null |
-				awk 'NR == 1 && $1 ~ /^[0-9]+$/ { print $1; exit }'
-		)" || return 1
+		data_size="$(run_bounded 30 2 \
+			/usr/bin/du -sk "${data_fd}/." 2>/dev/null)" || return 1
+		data_size="${data_size%%[[:space:]]*}"
 		case "$data_size" in ""|*[!0-9]*) return 1 ;; esac
 		root_held_tree_is_plain "$data_fd" "$data_dir" || return 1
 	fi
@@ -1387,7 +1385,6 @@ memory_copy_data_to_runtime() {
 		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
 		-n AGHMemoryCopy -x /bin/cp -- -pR "${source}/." "$target/" || return 1
 	chown "${ADGUARD_UID}:${ADGUARD_GID}" "$target" && chmod 0700 "$target" || return 1
-	uid853_tree_is_plain "$target"
 }
 
 memory_capacity_available() {
@@ -1526,13 +1523,11 @@ memory_prepare_runtime_locked() {
 			mkdir -m 0700 "$data_source" &&
 				chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_source" &&
 				mkdir -m 0700 "$data_target" &&
-				chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_target" &&
-				uid853_tree_is_plain "$data_source" &&
-				uid853_tree_is_plain "$data_target" || exit 1
+				chown "${ADGUARD_UID}:${ADGUARD_GID}" "$data_target" || exit 1
 		fi
 		MEMORY_MOUNTS_SUSPENDED=1
 		chmod 0700 "$MEMORY_WORK_DIR" &&
-			memory_active_tree_valid "$persistent_work_dir" &&
+			memory_active_layout_valid "$persistent_work_dir" &&
 			memory_activate_data_bindings "$persistent_work_dir" || exit 1
 		if [ "$restore_access" = 1 ]; then
 			restore_workdir_access "$persistent_work_dir" \
@@ -2226,13 +2221,8 @@ open_fd_hash() {
 	[ -f "$fd_path" ] || return 1
 	digest="$(/usr/bin/sha256sum "$fd_path" 2>/dev/null)" || return 1
 	digest="${digest%% *}"
-	case "$digest" in
-		????????????????????????????????????????????????????????????????)
-			case "$digest" in *[!0-9a-f]*) return 1 ;; esac
-			printf '%s\n' "$digest"
-			;;
-		*) return 1 ;;
-	esac
+	yaml_job_hash_valid "$digest" || return 1
+	printf '%s\n' "$digest"
 }
 
 install_config_candidate_attempt() (
@@ -2673,8 +2663,7 @@ load_tls_access() {
 		TLS_FINGERPRINT="$(printf '%s\n%s\n' "$certificate_hash" "$key_hash" |
 			sha256sum 2>/dev/null)" || return 1
 		TLS_FINGERPRINT="${TLS_FINGERPRINT%% *}"
-		[ "${#TLS_FINGERPRINT}" -eq 64 ] || return 1
-		case "$TLS_FINGERPRINT" in *[!0-9a-f]*) return 1 ;; esac
+		yaml_job_hash_valid "$TLS_FINGERPRINT" || return 1
 	fi
 }
 
@@ -3294,10 +3283,7 @@ settings_values_revision() {
 	read -r revision marker extra <<-EOF
 	$output
 	EOF
-	case "$revision" in
-		*[!0-9a-f]*) return 1 ;;
-	esac
-	[ "${#revision}" = 64 ] && [ "$marker" = - ] && [ -z "$extra" ] || return 1
+	yaml_job_hash_valid "$revision" && [ "$marker" = - ] && [ -z "$extra" ] || return 1
 	printf '%s\n' "$revision"
 }
 
@@ -4058,37 +4044,20 @@ yaml_file_hash() {
 	[ -f "$1" ] && [ ! -L "$1" ] || return 1
 	digest="$(sha256sum "$1" 2>/dev/null)" || return 1
 	digest="${digest%% *}"
-	case "$digest" in
-		????????????????????????????????????????????????????????????????)
-			case "$digest" in *[!0-9a-f]*) return 1 ;; esac
-			printf '%s\n' "$digest"
-			;;
-		*) return 1 ;;
-	esac
+	yaml_job_hash_valid "$digest" || return 1
+	printf '%s\n' "$digest"
 }
 
 validate_yaml_stage() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local name token fd_path config_dir
-	case "$expected_hash" in
-		????????????????????????????????????????????????????????????????)
-			case "$expected_hash" in *[!0-9a-f]*) return 1 ;; esac
-			;;
-		*) return 1 ;;
-	esac
-	case "$candidate_hash" in
-		????????????????????????????????????????????????????????????????)
-			case "$candidate_hash" in *[!0-9a-f]*) return 1 ;; esac
-			;;
-		*) return 1 ;;
-	esac
+	yaml_job_hash_valid "$expected_hash" && yaml_job_hash_valid "$candidate_hash" || return 1
 	config_dir="${config_file%/*}"
 	[ -n "$config_dir" ] || return 1
 	name="${stage##*/}"
 	case "$name" in AdGuardHome.yaml.luci-*) ;; *) return 1 ;; esac
 	token="${name#AdGuardHome.yaml.luci-}"
-	[ "${#token}" -eq 32 ] || return 1
-	case "$token" in *[!0-9a-f]*) return 1 ;; esac
+	yaml_job_token_valid "$token" || return 1
 	[ "$stage" = "${config_file}.luci-${token}" ] || return 1
 	[ -f "$stage" ] && [ ! -L "$stage" ] || return 1
 	[ -f "$config_file" ] && [ ! -L "$config_file" ] || return 1
@@ -4119,6 +4088,14 @@ held_config_hash() (
 	printf '%s\n' "$SNAPSHOT_CONFIG_HASH"
 )
 
+resume_core_and_dns() {
+	if ! official_running; then
+		start_official_core || return 1
+	fi
+	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || return 1
+	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
+}
+
 resume_yaml_runtime() {
 	local was_running="$1"
 	[ "$was_running" = 1 ] || return 0
@@ -4126,11 +4103,7 @@ resume_yaml_runtime() {
 	[ "$service_enabled" = 1 ] || return 0
 	load_runtime_dns_port || return 1
 	sync_official_uci || return 1
-	if ! official_running; then
-		start_official_core || return 1
-	fi
-	wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" || return 1
-	apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"
+	resume_core_and_dns
 }
 
 rollback_yaml_update() {
@@ -4147,7 +4120,9 @@ rollback_yaml_update() {
 	load_settings || return 1
 	load_runtime_dns_port || return 1
 	sync_official_uci || return 1
-	resume_yaml_runtime "$was_running" || return 1
+	if [ "$was_running:$service_enabled" = 1:1 ]; then
+		resume_core_and_dns || return 1
+	fi
 	remove_yaml_backup "$backup"
 }
 
@@ -4933,10 +4908,6 @@ settings_update_locked() {
 	local old_enabled old_work_dir old_verbose old_redirect old_memory old_interval fast_apply=0
 	local settings_unchanged=0
 	SETTINGS_CORE_RESTARTED=1
-	case "$expected_revision" in
-		*[!0-9a-f]*) return 1 ;;
-	esac
-	[ "${#expected_revision}" = 64 ] || return 1
 	# run_locked() has acquired the integration lock.  Keep every recovery path
 	# that can commit UCI disabled until this second, authoritative CAS succeeds.
 	# Settings need state/mount identities; data lifecycle boundaries retain
@@ -5477,17 +5448,15 @@ start_service() {
 		log_error "Unable to disable independent AdGuard Home autostart"
 		return 1
 	fi
-	if [ "$START_PREPARED" != 1 ]; then
-		run_locked prepare_wrapper_locked || prepare_rc=$?
-		case "$prepare_rc" in
-			0) START_PREPARED=1 ;;
-			2|3)
-				START_PREPARED=1
-				[ "$prepare_rc" != 2 ] || START_DISABLED=1
-				return 0
-				;;
-		esac
-	fi
+	run_locked prepare_wrapper_locked || prepare_rc=$?
+	case "$prepare_rc" in
+		0) START_PREPARED=1 ;;
+		2|3)
+			START_PREPARED=1
+			[ "$prepare_rc" != 2 ] || START_DISABLED=1
+			return 0
+			;;
+	esac
 	if [ "$START_PREPARED" != 1 ]; then
 		log_error "AdGuard Home coordinator preparation failed"
 		return 1

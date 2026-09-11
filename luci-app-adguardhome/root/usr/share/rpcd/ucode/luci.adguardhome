@@ -247,7 +247,7 @@ function same_directory_inode(left, right) {
 
 function memory_state_active(persistent_work_dir) {
 	let runtime = lstat(MEMORY_RUNTIME_DIRECTORY);
-	if (runtime == null || !valid_work_dir(persistent_work_dir))
+	if (runtime == null)
 		return false;
 
 	let active = lstat(MEMORY_WORK_DIRECTORY);
@@ -533,11 +533,6 @@ function read_template() {
 	}
 
 	return valid ? content : null;
-}
-
-function read_config(configuration) {
-	let result = read_yaml(configuration, false);
-	return result ? replace(result.content, /\r\n?/g, '\n') : null;
 }
 
 function requested_log_lines(value) {
@@ -1117,6 +1112,7 @@ function memory_writeback(expected_revision) {
 	if (!current || current.revision != expected_revision)
 		return { error: 'Settings changed since the page was loaded' };
 	if (!current.enabled || !current.run_from_memory ||
+	    !valid_work_dir(current.work_dir) ||
 	    !memory_state_active(current.work_dir) || !service_running())
 		return { error: 'RAM data is not currently running' };
 	let token = random_token();
@@ -1667,7 +1663,7 @@ function yaml_config_values(content) {
 
 	// Scan only the three mappings needed by the status link.  This is not a
 	// general YAML parser: the core still validates the complete configuration.
-	for (let line in split(content, '\n')) {
+	for (let line in split(content, /\r\n?|\n/)) {
 		if (match(line, /^[ \t]*($|#)/))
 			continue;
 		if (match(line, /^[^ \t#][^:]*:/)) {
@@ -1895,7 +1891,7 @@ function overview_info() {
 				can_probe = mark_yaml_job_indeterminate(item) && can_probe;
 		can_probe = can_probe &&
 			(result.status.running === true || configuration.redirect == 'none');
-		let config = config_info(read_config(configuration));
+		let config = config_info(read_yaml(configuration, false)?.content);
 		result.config.dns_port = config.dns_port;
 		result.status.dns_integration = 'unknown';
 		if (can_probe && (config.dns_port || config.https || config.http)) {

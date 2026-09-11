@@ -63,6 +63,8 @@ protocol_tmp="$(mktemp -d)"
 trap 'rm -rf "$protocol_tmp"' EXIT
 settings_values_body="$(function_body "$init_file" settings_values_revision)"
 (
+	eval "$(function_body "$init_file" yaml_job_hash_valid)"
+	eval "$(function_body "$init_file" yaml_job_token_valid)"
 	eval "$settings_values_body"
 	eval "$settings_job_body"
 	expected_hash=1111111111111111111111111111111111111111111111111111111111111111
@@ -71,12 +73,6 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 	candidate_hash="$(settings_values_revision 1 "$work_dir" 0 dnsmasq-upstream 1 60)"
 	states="${protocol_tmp}/states"
 
-	yaml_job_hash_valid() {
-		[ "${#1}" = 64 ] && ! printf '%s' "$1" | grep -q '[^0-9a-f]'
-	}
-	yaml_job_token_valid() {
-		[ "${#1}" = 32 ] && ! printf '%s' "$1" | grep -q '[^0-9a-f]'
-	}
 	yaml_job_runtime_is_private() { return 0; }
 	yaml_job_pending_matches() {
 		[ "$1:$2:$3" = "$token:$expected_hash:$candidate_hash" ]
