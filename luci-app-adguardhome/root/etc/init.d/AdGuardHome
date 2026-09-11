@@ -2395,54 +2395,34 @@ line_list_contains() {
 append_tls_desired_mount() {
 	local value="$1"
 	line_list_contains "$value" "$TLS_DESIRED_MOUNTS" && return 0
-	if [ -n "$TLS_DESIRED_MOUNTS" ]; then
-		TLS_DESIRED_MOUNTS="${TLS_DESIRED_MOUNTS}
-${value}"
-	else
-		TLS_DESIRED_MOUNTS="$value"
-	fi
+	TLS_DESIRED_MOUNTS="${TLS_DESIRED_MOUNTS:+${TLS_DESIRED_MOUNTS}
+}${value}"
 }
 
 append_tls_old_mount() {
 	local value="$1"
 	line_list_contains "$value" "$TLS_OLD_MOUNTS" && return 0
-	if [ -n "$TLS_OLD_MOUNTS" ]; then
-		TLS_OLD_MOUNTS="${TLS_OLD_MOUNTS}
-${value}"
-	else
-		TLS_OLD_MOUNTS="$value"
-	fi
+	TLS_OLD_MOUNTS="${TLS_OLD_MOUNTS:+${TLS_OLD_MOUNTS}
+}${value}"
 }
 
 append_tls_new_managed_mount() {
 	local value="$1"
 	line_list_contains "$value" "$TLS_NEW_MANAGED_MOUNTS" && return 0
-	if [ -n "$TLS_NEW_MANAGED_MOUNTS" ]; then
-		TLS_NEW_MANAGED_MOUNTS="${TLS_NEW_MANAGED_MOUNTS}
-${value}"
-	else
-		TLS_NEW_MANAGED_MOUNTS="$value"
-	fi
+	TLS_NEW_MANAGED_MOUNTS="${TLS_NEW_MANAGED_MOUNTS:+${TLS_NEW_MANAGED_MOUNTS}
+}${value}"
 }
 
 append_tls_original_mount() {
 	local value="$1"
-	if [ -n "$TLS_ORIGINAL_MOUNTS" ]; then
-		TLS_ORIGINAL_MOUNTS="${TLS_ORIGINAL_MOUNTS}
-${value}"
-	else
-		TLS_ORIGINAL_MOUNTS="$value"
-	fi
+	TLS_ORIGINAL_MOUNTS="${TLS_ORIGINAL_MOUNTS:+${TLS_ORIGINAL_MOUNTS}
+}${value}"
 	if line_list_contains "$value" "$TLS_OLD_MOUNTS" ||
 	   line_list_contains "$value" "$TLS_PRESERVED_MOUNTS"; then
 		return 0
 	fi
-	if [ -n "$TLS_PRESERVED_MOUNTS" ]; then
-		TLS_PRESERVED_MOUNTS="${TLS_PRESERVED_MOUNTS}
-${value}"
-	else
-		TLS_PRESERVED_MOUNTS="$value"
-	fi
+	TLS_PRESERVED_MOUNTS="${TLS_PRESERVED_MOUNTS:+${TLS_PRESERVED_MOUNTS}
+}${value}"
 }
 
 derive_tls_new_managed_mounts() {
@@ -2992,27 +2972,6 @@ memory_commit_official_persistent_paths() {
 		[ "$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")" = "$backing" ] &&
 		uci_guard_no_delta "$OFFICIAL_CONFIG" &&
 		refresh_managed_config_snapshot
-}
-
-memory_apply_official_path_delta() {
-	local backing effective_config effective_work
-	[ "$MEMORY_ACTIVE" = 1 ] || return 0
-	backing="${MEMORY_BACKING_WORK_DIR%/}"
-	[ -n "$backing" ] && memory_state_binds_persistent "$backing" || return 1
-	uci_guard_no_delta "$OFFICIAL_CONFIG" || return 1
-	effective_config="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.config_file")"
-	effective_work="$(uci -q get "${OFFICIAL_CONFIG}.${OFFICIAL_SECTION}.work_dir")"
-	# While RAM data is active, the authoritative package may still describe
-	# the state-authenticated old backing or may already contain a validated new
-	# workdir request.  In the latter case load_settings() deliberately
-	# keeps config_file on the old state's persistent YAML until the orchestrator
-	# stops the writer, directly copies data, removes the old binds, and switches.
-	if [ "$effective_config" = "${backing}/AdGuardHome.yaml" ] &&
-	   [ "${effective_work%/}" = "$backing" ]; then
-		return 0
-	fi
-	[ "$effective_config" = "$persistent_config_file" ] &&
-		[ "${effective_work%/}" = "$persistent_work_dir" ]
 }
 
 memory_restore_official_persistent_paths() {
@@ -3953,6 +3912,7 @@ official_socket_snapshot() {
 		[ -d "/proc/${pid}/fd" ] || continue
 		OFFICIAL_SOCKET_PIDS="${OFFICIAL_SOCKET_PIDS} ${pid}"
 		for fd in "/proc/${pid}/fd/"*; do
+			[ -S "$fd" ] || continue
 			link="$(readlink "$fd" 2>/dev/null)" || continue
 			case "$link" in socket:\[*\]) ;; *) continue ;; esac
 			inode="${link#socket:\[}"
@@ -4797,14 +4757,14 @@ memory_prepare_or_fallback_locked() {
 }
 
 memory_checkpoint_locked_command() {
-	load_settings || return 1
+	load_settings light || return 1
 	[ "$MEMORY_ACTIVE" = 1 ] || return 0
 	official_running && return 1
 	memory_copy_stopped_data_locked
 }
 
 memory_cleanup_locked_command() {
-	load_settings || return 1
+	load_settings light || return 1
 	[ "$MEMORY_ACTIVE" = 1 ] || {
 		memory_discard_incomplete_runtime_locked "$persistent_work_dir" || return 1
 		uci_guard_no_delta "$OFFICIAL_CONFIG"

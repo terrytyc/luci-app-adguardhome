@@ -166,6 +166,11 @@ readlink() {
 		*) return 1 ;;
 	esac
 }
+# These synthetic links stand in for socket FDs; the separate real-procfs test
+# exercises the actual -S prefilter with files, pipes and O_PATH socket nodes.
+# shellcheck disable=SC2016
+eval "$(function_body "$init_file" official_socket_snapshot |
+	sed 's/\[ -S "$fd" \]/[ -n "$fd" ]/')"
 # Run the production awk expression unchanged over deterministic kernel-table
 # fixtures, while the PID/FD collection uses this real shell's /proc directory.
 awk() {

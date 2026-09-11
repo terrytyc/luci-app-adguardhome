@@ -173,6 +173,8 @@ return view.extend({
 		this.loadedYaml = result.content;
 		if (this.yamlBeforeUnload)
 			window.removeEventListener('beforeunload', this.yamlBeforeUnload);
+		if (this.yamlPageHide)
+			window.removeEventListener('pagehide', this.yamlPageHide);
 		const beforeUnload = event => {
 			if (!operation.isPageActive(pageScope) || !this.hasDraft())
 				return;
@@ -180,9 +182,8 @@ return view.extend({
 			event.returnValue = '';
 		};
 		this.yamlBeforeUnload = beforeUnload;
-		window.addEventListener('pagehide', () => {
-			window.removeEventListener('beforeunload', beforeUnload);
-		}, { once: true });
+		this.yamlPageHide = () => window.removeEventListener('beforeunload', beforeUnload);
+		window.addEventListener('pagehide', this.yamlPageHide, { once: true });
 		this.editorNotice = E('p', { class: 'alert-message error', role: 'status', hidden: true });
 		this.draftStatus = E('span', { class: 'adguardhome-yaml-draft', role: 'status', hidden: true }, _('Unsaved changes'));
 		this.highlightNotice = E('span', { hidden: true }, [

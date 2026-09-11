@@ -8,7 +8,6 @@ init_file="${script_dir}/../root/etc/init.d/AdGuardHome"
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
 
-apply_body="$(function_body "$init_file" memory_apply_official_path_delta)"
 normalize_persistent_body="$(function_body "$init_file" normalize_managed_config_file_persistent)"
 normalize_body="$(function_body "$init_file" normalize_managed_config_file)"
 load_body="$(function_body "$init_file" load_settings)"
@@ -21,7 +20,7 @@ values_revision_body="$(function_body "$init_file" settings_values_revision)"
 revision_body="$(function_body "$init_file" settings_current_revision)"
 orchestrate_body="$(function_body "$init_file" orchestrate_core_locked)"
 
-for body in "$apply_body" "$normalize_persistent_body" "$normalize_body" \
+for body in "$normalize_persistent_body" "$normalize_body" \
 	"$load_body" "$suspend_body" "$restore_body" \
 	"$deactivate_body" "$reconcile_body" "$settings_body" \
 	"$values_revision_body" "$revision_body" \
@@ -49,16 +48,8 @@ derived_line="$(printf '%s\n' "$load_body" |
 old_yaml_line="$(printf '%s\n' "$load_body" |
 	grep -n 'config_file="${MEMORY_BACKING_WORK_DIR}/AdGuardHome.yaml"' |
 	cut -d: -f1)"
-path_guard_line="$(printf '%s\n' "$load_body" |
-	grep -n 'memory_apply_official_path_delta || return 1' | cut -d: -f1)"
-[ -n "$old_yaml_line" ] && [ -n "$path_guard_line" ] &&
-	[ "$old_yaml_line" -lt "$path_guard_line" ] || {
+[ -n "$old_yaml_line" ] || {
 	printf 'active RAM load does not retain the old state-bound YAML\n' >&2
-	exit 1
-}
-printf '%s\n' "$apply_body" |
-	grep -Fq '[ "$effective_config" = "$persistent_config_file" ]' || {
-	printf 'active RAM path guard does not accept a validated next workdir pair\n' >&2
 	exit 1
 }
 printf '%s\n' "$reconcile_body" |
@@ -98,50 +89,6 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	printf 'bind-suspend compensation does not restore alias before overlay\n' >&2
 	exit 1
 }
-
-# Dynamic path-pair test: both the old state backing and the newly committed,
-# already-validated authoritative pair are accepted, but mixed pairs are not.
-(
-	eval "$apply_body"
-	OFFICIAL_CONFIG=adguardhome
-	OFFICIAL_SECTION=config
-	MEMORY_ACTIVE=1
-	MEMORY_BACKING_WORK_DIR=/etc/AdGuardHome-old
-	persistent_work_dir=/etc/AdGuardHome-new
-	persistent_config_file=/etc/AdGuardHome-new/AdGuardHome.yaml
-	UCI_WORK=""
-	UCI_CONFIG=""
-	UCI_DELTA=0
-	memory_state_binds_persistent() {
-		[ "$1" = /etc/AdGuardHome-old ]
-	}
-	uci_guard_no_delta() { [ "$UCI_DELTA" = 0 ]; }
-	uci() {
-		case "$3" in
-			adguardhome.config.work_dir) printf '%s\n' "$UCI_WORK" ;;
-			adguardhome.config.config_file) printf '%s\n' "$UCI_CONFIG" ;;
-			*) return 1 ;;
-		esac
-	}
-
-	UCI_WORK=/etc/AdGuardHome-old
-	UCI_CONFIG=/etc/AdGuardHome-old/AdGuardHome.yaml
-	memory_apply_official_path_delta || exit 1
-	UCI_WORK=/etc/AdGuardHome-new
-	UCI_CONFIG=/etc/AdGuardHome-new/AdGuardHome.yaml
-	memory_apply_official_path_delta || exit 1
-	UCI_CONFIG=/etc/AdGuardHome-old/AdGuardHome.yaml
-	if memory_apply_official_path_delta; then
-		printf 'mixed old/new workdir pair was accepted\n' >&2
-		exit 1
-	fi
-	UCI_CONFIG=/etc/AdGuardHome-new/AdGuardHome.yaml
-	UCI_DELTA=1
-	if memory_apply_official_path_delta; then
-		printf 'pending official UCI delta was accepted\n' >&2
-		exit 1
-	fi
-)
 
 # Dynamic derived-field test: a hand-edited config_file is normalized for both
 # the default and a custom authoritative workdir.  A pending UCI delta blocks
@@ -248,7 +195,6 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 	chmod 0700 "$service"
 	export TEST_EVENTS="$events" TEST_SERVICE_STATE="$service_state"
 
-	eval "$apply_body"
 	eval "$reconcile_body"
 	eval "$orchestrate_body"
 	eval "$values_revision_body"
@@ -277,7 +223,6 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		esac
 	}
 	uci_guard_no_delta() { return 0; }
-	memory_state_binds_persistent() { [ "$1" = "$RUNTIME_BACKING" ]; }
 	load_settings() {
 		service_enabled="$COMMITTED_ENABLED"
 		persistent_work_dir="$COMMITTED_WORK"
@@ -293,7 +238,6 @@ overlay_bind_line="$(printf '%s\n' "$restore_body" |
 		config_file="$persistent_config_file"
 		if [ "$MEMORY_ACTIVE" = 1 ]; then
 			config_file="${MEMORY_BACKING_WORK_DIR}/AdGuardHome.yaml"
-			memory_apply_official_path_delta || return 1
 		fi
 	}
 	settings_commit_persistent() {

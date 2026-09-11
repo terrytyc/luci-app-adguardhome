@@ -1,6 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
+const { getEventListeners } = require('node:events');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -56,6 +57,7 @@ function loadOperation() {
 	};
 	const fakeWindow = {
 		addEventListener: fakeDocument.addEventListener.bind(fakeDocument),
+		removeEventListener: fakeDocument.removeEventListener.bind(fakeDocument),
 		setTimeout(callback, delay) { timerDelays.push(delay); return setTimeout(callback, 0); },
 		clearTimeout(id) { clearTimeout(id); },
 		location: {
@@ -110,7 +112,6 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 	const source = fs.readFileSync(viewPath, 'utf8');
 	const animationFrames = new Map();
 	const windowEvents = new EventTarget();
-	const beforeUnloadListeners = new Set();
 	let nextAnimationFrame = 1;
 	const rpc = {
 		declare: specification => async (...args) => {
@@ -137,14 +138,8 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		console,
 		window: {
 			location: { href: 'https://router.example/cgi-bin/luci/admin/services/adguardhome' },
-			addEventListener(type, callback, options) {
-				if (type === 'beforeunload') beforeUnloadListeners.add(callback);
-				windowEvents.addEventListener(type, callback, options);
-			},
-			removeEventListener(type, callback) {
-				if (type === 'beforeunload') beforeUnloadListeners.delete(callback);
-				windowEvents.removeEventListener(type, callback);
-			},
+			addEventListener: windowEvents.addEventListener.bind(windowEvents),
+			removeEventListener: windowEvents.removeEventListener.bind(windowEvents),
 			setTimeout(callback) { return setTimeout(callback, 0); },
 			requestAnimationFrame(callback) {
 				const id = nextAnimationFrame++;
@@ -162,7 +157,8 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		Object.assign(sandbox, { operation, rpc, ui, view }),
 		{ filename: viewPath },
 	);
-	loadedView.beforeUnloadListenerCount = () => beforeUnloadListeners.size;
+	loadedView.beforeUnloadListenerCount = () => getEventListeners(windowEvents, 'beforeunload').length;
+	loadedView.pageHideListenerCount = () => getEventListeners(windowEvents, 'pagehide').length;
 	loadedView.dispatchWindowEvent = event => windowEvents.dispatchEvent(event);
 	loadedView.pendingAnimationFrames = () => animationFrames.size;
 	loadedView.flushAnimationFrames = () => {
@@ -775,20 +771,54 @@ async function testYamlEditing() {
 	view.flushAnimationFrames();
 	assert.equal(view.yamlHighlight.innerHTML, obsoleteHighlight,
 		'a queued editor redraw must not update an inactive page');
+
+	failRead = false;
+	for (let i = 0; i < 32; i++) {
+		state.operation.createPageScope();
+		const leaveOldView = new Event('beforeunload', { cancelable: true });
+		view.dispatchWindowEvent(leaveOldView);
+		assert.equal(leaveOldView.defaultPrevented, false,
+			'a previous YAML draft must not warn after switching to another view');
+		view.render(await view.load());
+		assert.equal(view.pageHideListenerCount(), 1,
+			're-entering YAML must replace its previous pagehide listener');
+		assert.equal(view.beforeUnloadListenerCount(), 0,
+			'a freshly loaded YAML view must have no old draft listener');
+		view.yamlEditor.value += '# draft\n';
+		view.updateDraftStatus();
+		assert.equal(view.beforeUnloadListenerCount(), 1);
+		const leaveDraft = new Event('beforeunload', { cancelable: true });
+		view.dispatchWindowEvent(leaveDraft);
+		assert.equal(leaveDraft.defaultPrevented, true,
+			'the current YAML draft must retain its leave warning');
+	}
+	state.dispatch('pagehide');
+	view.dispatchWindowEvent(new Event('pagehide'));
+	assert.equal(view.pageHideListenerCount(), 0);
+	assert.equal(view.beforeUnloadListenerCount(), 0,
+		'leaving YAML must remove its current draft warning');
 }
 
 async function main() {
 	const bfcacheState = loadOperation();
-	bfcacheState.operation.createPageScope();
-	const bfcacheRoot = { isConnected: true };
-	const bfcacheScope = bfcacheState.operation.createPageScope();
-	bfcacheScope.attach(bfcacheRoot);
+	const scopes = Array.from({ length: 32 }, () => {
+		const scope = bfcacheState.operation.createPageScope();
+		scope.attach({ isConnected: true });
+		return scope;
+	});
+	const bfcacheScope = scopes.pop();
+	assert.equal(scopes.every(scope => !scope.active()), true,
+		'replacing a pagehide listener must not reactivate earlier view scopes');
+	assert.equal((bfcacheState.listeners.get('pagehide') ?? []).length, 1,
+		'same-document navigation must not retain pagehide listeners for old view roots');
 	assert.equal((bfcacheState.listeners.get('pageshow') ?? []).length, 1,
 		'multiple view scopes must share one BFCache restoration guard');
 	bfcacheState.dispatch('pageshow', { persisted: false });
 	assert.equal(bfcacheState.reloads(), 0,
 		'an ordinary initial pageshow must not reload the view');
 	bfcacheState.dispatch('pagehide', { persisted: true });
+	assert.equal((bfcacheState.listeners.get('pagehide') ?? []).length, 0,
+		'pagehide must remove the remaining one-shot listener');
 	assert.equal(bfcacheScope.active(), false,
 		'pagehide must permanently invalidate the old page scope');
 	bfcacheState.dispatch('pageshow', { persisted: true });

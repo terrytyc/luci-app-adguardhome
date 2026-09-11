@@ -15,6 +15,7 @@ return baseclass.extend({
 	_generation: 0,
 	_scopeGeneration: 0,
 	_activeScope: null,
+	_pageHideGuard: null,
 	_pageShowGuard: null,
 	_bfcacheReloading: false,
 
@@ -72,13 +73,17 @@ return baseclass.extend({
 			},
 		};
 
-		window.addEventListener('pagehide', () => {
+		// Same-document navigation does not fire pagehide for the previous view.
+		if (this._pageHideGuard != null)
+			window.removeEventListener('pagehide', this._pageHideGuard);
+		this._pageHideGuard = () => {
 			hidden = true;
 			if (this._activeScope === scope) {
 				this._clearTimer();
 				this._generation++;
 			}
-		}, { once: true });
+		};
+		window.addEventListener('pagehide', this._pageHideGuard, { once: true });
 
 		this._activeScope = scope;
 		return scope;

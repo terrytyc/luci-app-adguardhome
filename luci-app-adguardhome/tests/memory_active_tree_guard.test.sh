@@ -39,7 +39,8 @@ fi
 
 # Monitor/status and live-copy setup are lightweight.  The actual copy retains
 # a full default state load, then scans the persistent destination once.
-for name in reconcile_core_locked memory_writeback_locked_command; do
+for name in reconcile_core_locked memory_writeback_locked_command \
+	memory_checkpoint_locked_command memory_cleanup_locked_command; do
 	function_body "$init_file" "$name" | grep -Fq 'load_settings light' || exit 1
 done
 function_body "$init_file" memory_status | grep -Fq 'read_settings' || exit 1

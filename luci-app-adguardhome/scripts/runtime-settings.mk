@@ -16,7 +16,8 @@ load_settings() {
 		return 1
 	}
 	config_get_bool service_enabled "$$OFFICIAL_SECTION" enabled 0
-	config_get configured_work_dir "$$OFFICIAL_SECTION" work_dir "$$DEFAULT_WORK_DIR"
+	config_get official_work "$$OFFICIAL_SECTION" work_dir ""
+	configured_work_dir="$${official_work:-$$DEFAULT_WORK_DIR}"
 	config_get redirect_mode "$$PLUGIN_SECTION" redirect "dnsmasq-upstream"
 	config_get_bool verbose "$$OFFICIAL_SECTION" verbose 0
 	config_get_bool memory_requested "$$PLUGIN_SECTION" run_from_memory 0
@@ -24,9 +25,7 @@ load_settings() {
 		"$$MEMORY_WRITEBACK_DEFAULT_MINUTES"
 	memory_writeback_interval="$$(normalize_memory_writeback_interval \
 		"$$memory_writeback_interval")" || return 1
-	# Reuse the package already loaded above instead of spawning two more UCI
-	# readers within the same settings snapshot.
-	config_get official_work "$$OFFICIAL_SECTION" work_dir ""
+	# Keep work_dir and config_file in the same loaded settings snapshot.
 	config_get official_config "$$OFFICIAL_SECTION" config_file ""
 	uci_guard_no_delta "$$OFFICIAL_CONFIG" || return $$?
 	previous_work_dir="$$official_work"
@@ -39,7 +38,6 @@ load_settings() {
 	else
 		normalize_managed_config_file "$$configured_work_dir" "$$official_config" || return 1
 	fi
-	official_config="$${configured_work_dir%/}/AdGuardHome.yaml"
 	# A preparation interrupted before the volatile state was published has no
 	# authoritative data.  Remove only the validated plugin-owned /tmp tree and
 	# rebuild it from persistent data on demand.
@@ -68,15 +66,15 @@ load_settings() {
 		MEMORY_ACTIVE=1
 		MEMORY_BACKING_WORK_DIR="$$MEMORY_STATE_PERSISTENT_WORK_DIR"
 		previous_work_dir="$$MEMORY_BACKING_WORK_DIR"
-		work_dir="$$persistent_work_dir"
 		# A new authoritative workdir request is reconciled only after the current
 		# generation has stopped and been written back.  Until then its YAML remains
 		# the persistent file bound by the v4 state record, never the newly
 		# requested directory and never a RAM copy.
 		config_file="$${MEMORY_BACKING_WORK_DIR}/AdGuardHome.yaml"
-		# The official work_dir and YAML remain persistent.  The state record
-		# authenticates only the RAM data overlay and its persistent backing.
-		memory_apply_official_path_delta || return 1
+		# State loading authenticated this generation; the paths above come from
+		# one UCI snapshot. Active RAM still requires an explicit work_dir.
+		[ -n "$$official_work" ] || return 1
+		uci_guard_no_delta "$$OFFICIAL_CONFIG" || return 1
 	fi
 
 	case "$$redirect_mode" in

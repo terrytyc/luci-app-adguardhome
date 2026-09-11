@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.1.0
-PKG_RELEASE:=6
+PKG_RELEASE:=7
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
