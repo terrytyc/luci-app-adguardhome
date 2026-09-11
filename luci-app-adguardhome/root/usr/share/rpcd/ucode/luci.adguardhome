@@ -979,12 +979,11 @@ function prepare_yaml_job(token, expected_hash, candidate_hash) {
 		return { error: 'A previous YAML update was interrupted; reload the YAML before editing it again' };
 	}
 
-	// Keep terminal results readable by every observer of a reused token.
-	// Clean stages left by read-only overview recovery before a workdir change,
-	// and bound retained records when a later transaction starts.
+	// Keep the latest result until the next submission. Clean accessible stages
+	// left by overview recovery before a workdir change.
 	for (let item in jobs.terminal)
 		if ((item.record.state == 'indeterminate' && !remove_yaml_stage(item.token, null)) ||
-		    (length(jobs.terminal) >= 16 && !discard_yaml_job(item.token))) {
+		    !discard_yaml_job(item.token)) {
 			close_yaml_job_lock(lock);
 			return { error: 'Unable to clean completed YAML update state' };
 		}
@@ -1084,21 +1083,6 @@ function update_settings(enabled, work_dir, verbose, redirect,
 		return job;
 	if (job.reused)
 		return { accepted: true, token: job.token, reused: true };
-
-	// The optimistic revision check above happens before the shared job lock is
-	// acquired.  Re-read while holding that lock so another completed settings
-	// transaction cannot turn this request into a stale overwrite.  The init
-	// coordinator performs the same check again under its integration lock.
-	let locked_current = settings_snapshot();
-	if (!locked_current || locked_current.revision != expected_revision) {
-		let discarded = discard_yaml_job(token);
-		let released = close_yaml_job_lock({ file: job.lock });
-		if (!discarded || !released)
-			return { error: 'Unable to abandon stale settings update state' };
-		return { error: locked_current
-			? 'Settings changed since the page was loaded'
-			: 'Current settings are unavailable or invalid' };
-	}
 
 	return start_settings_process(job, expected_revision, candidate.revision, [
 			'settings_update',
@@ -1318,14 +1302,7 @@ function update_job_status(token, settings) {
 	if (!lock.file) {
 		if (lock.error)
 			return { error: lock.error };
-		// A distinct worker can publish its pending record only after this
-		// terminal job released the shared lock. Its historical result is then
-		// stable even while that later transaction is still running.
-		let jobs = record.state != 'pending' && record.state != 'running'
-			? scan_yaml_jobs(false) : null;
-		if (!jobs || jobs.error || jobs.maintenance || length(jobs.active) != 1 ||
-		    jobs.active[0].token == token)
-			return { state: record.state == 'pending' ? 'pending' : 'running' };
+		return { state: record.state == 'pending' ? 'pending' : 'running' };
 	}
 
 	record = read_yaml_job(token);
@@ -1651,12 +1628,6 @@ function reset_yaml(expected_hash) {
 	if (type(expected_hash) != 'string' ||
 	    !match(expected_hash, /^[0-9a-f]{64}$/))
 		return { error: 'Invalid or missing YAML revision' };
-
-	let yaml = read_yaml();
-	if (!yaml)
-		return { error: 'YAML configuration is unavailable' };
-	if (yaml.sha256 != expected_hash)
-		return { error: 'YAML changed since the page was loaded' };
 
 	let content = read_template();
 	if (!content)

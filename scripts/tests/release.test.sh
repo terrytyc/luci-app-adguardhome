@@ -91,9 +91,6 @@ grep -Fq 'name: release-apks-${{ github.run_attempt }}' "$repo/.github/workflows
 	die 'release artifact name does not distinguish rerun attempts'
 grep -Fq 'path: ${{ runner.temp }}/real-apks/*.apk' "$repo/.github/workflows/test.yml" ||
 	die 'CI does not upload its verified APKs'
-grep -Eq '^PKG_VERSION:=3\.2\.0$' "$repo/luci-app-adguardhome/Makefile" &&
-	grep -Eq '^PKG_RELEASE:=1$' "$repo/luci-app-adguardhome/Makefile" ||
-	die 'package version was not advanced to 3.2.0-r1'
 grep -Eq '^LUCI_DEPENDS:=.*\+dnsmasq .*\+firewall4 ' "$repo/luci-app-adguardhome/Makefile" ||
 	die 'runtime DNS dependencies are incomplete'
 grep -Fq 'openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' \
@@ -227,20 +224,11 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 					printf '    pending_uci_changes="$(uci -q changes 2>/dev/null)"\n'
 					[[ $name != luci-app-adguardhome ]] || printf '    run_bounded 180 5 /etc/init.d/AdGuardHome stop\n' ;;
 				post-install|post-upgrade)
-					printf '    default_postinst\n    # AdGuard Home initialization failed; package installation aborted.\n    /etc/init.d/rpcd reload\n' ;;
+					printf '    default_postinst\n    # AdGuard Home initialization failed; installed files were kept for repair.\n    /etc/init.d/rpcd reload\n' ;;
 				pre-deinstall)
 					printf '%s\n' \
 						'    default_prerm' \
-						'    recover_failed_removal() {' \
-						'      rollback_yaml_maintenance >/dev/null 2>&1 || true' \
-						'      /etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true' \
-						'      for recovery_config in adguardhome dhcp firewall; do' \
-						'        recovery_changes="$(uci -q changes "$recovery_config" 2>/dev/null)" || return 0' \
-						'        [ -z "$recovery_changes" ] || return 0' \
-						'      done' \
-						'      run_bounded 180 5 /etc/init.d/AdGuardHome start >/dev/null 2>&1 || true' \
-						'    }' \
-						"    trap 'recover_failed_removal' 0" \
+						"    trap 'rollback_yaml_maintenance' 0" \
 						'    run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || exit 1' \
 						'    trap - 0 HUP INT TERM'
 					;;
@@ -368,12 +356,10 @@ done
 check_apk_failure main 'platform removal hook' '/default_prerm/d'
 check_apk_failure main 'safe coordinator stop' \
 	'\|run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded|d'
-check_apk_failure main 'failed-removal recovery' "/trap 'recover_failed_removal' 0/d"
-check_apk_failure main 'does not guard every owned UCI config' \
-	'/for recovery_config in adguardhome dhcp firewall/d'
-check_apk_failure main 'may start through pending UCI changes' \
-	'/\[ -z "\$recovery_changes" \] || return 0/d'
-check_apk_failure main 'does not recover around its verified stop' \
+check_apk_failure main 'cleanup ordering is incomplete' "/trap 'rollback_yaml_maintenance' 0/d"
+check_apk_failure main 'may restart a service' \
+	'/^    default_prerm$/a\    /etc/init.d/AdGuardHome start'
+check_apk_failure main 'does not clean up around its verified stop' \
 	'/^    default_prerm$/d; /^    trap - 0 HUP INT TERM$/i\    default_prerm'
 check_apk_failure main 'verified cleanup state' '/verified AdGuard Home removal state/d'
 expect_failure 'versioned adguardhome dependency' env BAD_CORE_DEPENDENCY=1 \

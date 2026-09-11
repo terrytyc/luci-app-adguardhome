@@ -148,7 +148,7 @@ done
 for hook in post-install post-upgrade; do
 	grep -Fq default_postinst "$temporary/main-$hook" ||
 		die "main APK $hook lost the platform installation hook"
-	grep -Fq 'AdGuard Home initialization failed; package installation aborted.' \
+	grep -Fq 'AdGuard Home initialization failed; installed files were kept for repair.' \
 		"$temporary/main-$hook" || die "main APK $hook lost initialization validation"
 	grep -Fq '/etc/init.d/rpcd reload' "$temporary/main-$hook" ||
 		die "main APK $hook lost RPC reload"
@@ -158,46 +158,25 @@ grep -Fq default_prerm "$temporary/main-pre-deinstall" ||
 grep -Fq 'run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded' \
 	"$temporary/main-pre-deinstall" ||
 	die 'main APK pre-deinstall lost safe coordinator stop'
-grep -Fq "trap 'recover_failed_removal' 0" "$temporary/main-pre-deinstall" ||
-	die 'main APK pre-deinstall lost failed-removal recovery'
-grep -Fq 'for recovery_config in adguardhome dhcp firewall; do' \
-	"$temporary/main-pre-deinstall" ||
-	die 'main APK pre-deinstall recovery does not guard every owned UCI config'
-grep -Fq '[ -z "$recovery_changes" ] || return 0' \
-	"$temporary/main-pre-deinstall" ||
-	die 'main APK pre-deinstall recovery may start through pending UCI changes'
-if grep -Fq 'Commit or revert pending adguardhome changes before uninstalling.' \
+if grep -Eq '/etc/init.d/AdGuardHome (enable|start)|recover_failed_removal' \
 	"$temporary/main-pre-deinstall"; then
-	die 'main APK pre-deinstall retained its ineffective late UCI guard'
+	die 'main APK pre-deinstall may restart a service whose files APK will remove'
 fi
 default_line=$(script_line "$temporary/main-pre-deinstall" default_prerm)
-rollback_line=$(script_line "$temporary/main-pre-deinstall" \
-	'rollback_yaml_maintenance >/dev/null 2>&1 || true')
-enable_line=$(script_line "$temporary/main-pre-deinstall" \
-	'/etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true')
-recovery_guard_line=$(script_line "$temporary/main-pre-deinstall" \
-	'for recovery_config in adguardhome dhcp firewall; do')
-start_line=$(script_line "$temporary/main-pre-deinstall" \
-	'run_bounded 180 5 /etc/init.d/AdGuardHome start >/dev/null 2>&1 || true')
-recovery_trap_line=$(script_line "$temporary/main-pre-deinstall" \
-	"trap 'recover_failed_removal' 0")
+cleanup_trap_line=$(script_line "$temporary/main-pre-deinstall" \
+	"trap 'rollback_yaml_maintenance' 0")
 stop_line=$(script_line "$temporary/main-pre-deinstall" \
 	'run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || exit 1')
 clear_trap_line=$(script_line "$temporary/main-pre-deinstall" 'trap - 0 HUP INT TERM')
-for line in "$default_line" "$rollback_line" "$enable_line" "$recovery_guard_line" \
-	"$start_line" "$recovery_trap_line" "$stop_line" "$clear_trap_line"; do
+for line in "$default_line" "$cleanup_trap_line" "$stop_line" "$clear_trap_line"; do
 	case "$line" in
-		''|*[!0-9]*) die 'main APK pre-deinstall recovery ordering is incomplete' ;;
+		''|*[!0-9]*) die 'main APK pre-deinstall cleanup ordering is incomplete' ;;
 	esac
 done
-if ! { [ "$default_line" -lt "$rollback_line" ] &&
-	[ "$rollback_line" -lt "$enable_line" ] &&
-	[ "$enable_line" -lt "$recovery_guard_line" ] &&
-	[ "$recovery_guard_line" -lt "$start_line" ] &&
-	[ "$start_line" -lt "$recovery_trap_line" ] &&
-	[ "$recovery_trap_line" -lt "$stop_line" ] &&
+if ! { [ "$default_line" -lt "$cleanup_trap_line" ] &&
+	[ "$cleanup_trap_line" -lt "$stop_line" ] &&
 	[ "$stop_line" -lt "$clear_trap_line" ]; }; then
-	die 'main APK pre-deinstall does not recover around its verified stop'
+	die 'main APK pre-deinstall does not clean up around its verified stop'
 fi
 grep -Fq 'verified AdGuard Home removal state' "$temporary/main-post-deinstall" ||
 	die 'main APK post-deinstall lost verified cleanup state'

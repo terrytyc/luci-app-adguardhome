@@ -444,15 +444,19 @@ const credentials = sandbox.rpc.get_credentials.call();
 assert.equal(credentials.sha256, originalHash, 'credentials must retain a fresh CAS revision');
 assert.equal(credentials.username, 'admin');
 assert.equal(fixture.hashes, 2);
+const readsBeforeTemplate = fixture.reads;
 const restored = sandbox.rpc.reset_yaml.call({ args: { sha256: originalHash } });
 assert.equal(restored.content, template);
 assert.equal(restored.sha256, undefined, 'reset must not return an unused template revision');
-assert.equal(fixture.hashes, 3, 'reset verifies only the active revision; it does not hash the template');
+assert.equal(fixture.reads, readsBeforeTemplate, 'loading the template does not reread the active YAML');
+assert.equal(fixture.hashes, 2, 'loading the template does not calculate an unused active or template hash');
 assert.equal(fixture.yaml, editor.content, 'reset must remain an editor-only operation');
 
 fixture.yaml += '# external edit\n';
-assert.equal(sandbox.rpc.reset_yaml.call({ args: { sha256: originalHash } }).error,
-	'YAML changed since the page was loaded', 'reset must reject an outdated editor revision');
+assert.equal(sandbox.rpc.reset_yaml.call({ args: { sha256: originalHash } }).content,
+	template, 'loading the template does not depend on the active revision; the eventual save checks it');
+assert.ok(sandbox.rpc.reset_yaml.call({ args: { sha256: 'invalid' } }).error,
+	'the existing public revision parameter must still be validated');
 assert.equal(sandbox.rpc.set_credentials.call({ args: {
 	username: 'operator', password_hash: '', sha256: originalHash,
 } }).error, 'YAML changed since the credential dialog was opened',

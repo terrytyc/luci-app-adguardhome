@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.2.0
-PKG_RELEASE:=1
+PKG_RELEASE:=2
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -20,13 +20,15 @@ LUCI_MAINTAINER:=terrytyc
 LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
 define AdGuardHome/UciPendingGuard
-# The platform default_postinst commits all default UCI deltas.
+# This reports first-install preflight failure; only an already-installed
+# pre-commit hook can abort APK before extraction and default_postinst.
 pending_uci_changes="$$(uci -q changes 2>/dev/null)" || {
-	echo "Unable to inspect pending UCI changes; package installation aborted." >&2
+	echo "Unable to inspect pending UCI changes; APK may still install files." >&2
 	exit 1
 }
 [ -z "$$pending_uci_changes" ] || {
 	echo "Commit or revert pending UCI changes before installing this package." >&2
+	echo "APK may still install files after this package script fails." >&2
 	exit 1
 }
 endef
@@ -132,7 +134,7 @@ $(AdGuardHome/YamlMaintenance)
 trap 'rollback_yaml_maintenance' 0
 trap 'exit 1' HUP INT TERM
 begin_yaml_maintenance || {
-	echo "Unable to quiesce LuCI YAML updates; installation aborted." >&2
+	echo "Unable to quiesce LuCI YAML updates; APK may still install files." >&2
 	exit 1
 }
 
@@ -170,7 +172,7 @@ begin_yaml_maintenance || {
 
 if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
    [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
-	echo "AdGuard Home initialization failed; package installation aborted." >&2
+	echo "AdGuard Home initialization failed; installed files were kept for repair." >&2
 	exit 1
 fi
 
@@ -197,28 +199,30 @@ $(AdGuardHome/RunBounded)
 
 $(AdGuardHome/PrivateFiles)
 
-$(AdGuardHome/YamlMaintenance)
-
-recover_failed_removal() {
-	rollback_yaml_maintenance >/dev/null 2>&1 || true
-	[ -x /etc/init.d/AdGuardHome ] || return 0
-	/etc/init.d/AdGuardHome enable >/dev/null 2>&1 || true
-	for recovery_config in adguardhome dhcp firewall; do
-		recovery_changes="$$(uci -q changes "$$recovery_config" 2>/dev/null)" || return 0
-		[ -z "$$recovery_changes" ] || return 0
-	done
-	run_bounded 180 5 /etc/init.d/AdGuardHome start >/dev/null 2>&1 || true
-}
-
-trap 'recover_failed_removal' 0
-trap 'exit 1' HUP INT TERM
-begin_yaml_maintenance || {
-	echo "Unable to quiesce LuCI YAML updates; uninstall aborted." >&2
-	exit 1
-}
-
 runtime_dir=/var/run/luci-app-adguardhome
 remove_state="$$runtime_dir/remove-ok"
+if [ -e "$$runtime_dir" ] || [ -L "$$runtime_dir" ]; then
+	root_private_directory "$$runtime_dir" || exit 1
+else
+	mkdir -m 0700 "$$runtime_dir" || exit 1
+	chown 0:0 "$$runtime_dir" && chmod 0700 "$$runtime_dir" || exit 1
+fi
+# A previous failed post-deinstall may have left a success marker. Invalidate
+# it before this removal can fail, including maintenance or service preflight.
+if [ -e "$$remove_state" ] || [ -L "$$remove_state" ]; then
+	root_private_file "$$remove_state" && rm -f "$$remove_state" || exit 1
+fi
+
+$(AdGuardHome/YamlMaintenance)
+
+# APK continues removal even if pre-deinstall fails. Never restart a service
+# whose coordinator files are about to be removed; retain failed-stop state.
+trap 'rollback_yaml_maintenance' 0
+trap 'exit 1' HUP INT TERM
+begin_yaml_maintenance || {
+	echo "Unable to quiesce LuCI YAML updates; APK may still remove files." >&2
+	exit 1
+}
 
 if [ -x /etc/init.d/AdGuardHome ]; then
 	run_bounded 180 5 env LUCI_ADGUARDHOME_PRERM_PHASE=bounded /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || exit 1
@@ -228,12 +232,6 @@ if [ -x /etc/init.d/adguardhome ]; then
 fi
 
 # Leave the current UCI, YAML and data in place for an explicit reinstall.
-if [ -e "$$runtime_dir" ] || [ -L "$$runtime_dir" ]; then
-	root_private_directory "$$runtime_dir" || exit 1
-else
-	mkdir -m 0700 "$$runtime_dir" || exit 1
-	chown 0:0 "$$runtime_dir" && chmod 0700 "$$runtime_dir" || exit 1
-fi
 (umask 077; printf '1\n' >"$$remove_state") || exit 1
 chown 0:0 "$$remove_state" && chmod 0600 "$$remove_state" || exit 1
 trap - 0 HUP INT TERM

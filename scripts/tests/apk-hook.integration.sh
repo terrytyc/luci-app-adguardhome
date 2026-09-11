@@ -9,6 +9,7 @@ apk=${APK_BIN:-${SDK:-/root/sdk-x86-64}/staging_dir/host/bin/apk}
 hook=${APK_HOOK_FILE:-$repo/luci-app-adguardhome/root/lib/apk/commit_hooks.d/90-luci-app-adguardhome}
 init=${APK_INIT_FILE:-$repo/luci-app-adguardhome/root/etc/init.d/AdGuardHome}
 busybox=${STATIC_BUSYBOX:-$(command -v busybox || true)}
+uci_root=${ADGUARDHOME_TEST_UCI_ROOT:-${TARGET_ROOT:-${SDK:-/root/sdk-x86-64}/staging_dir/target-x86_64_musl/root-x86}}
 die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 [[ $# == 0 ]] || die 'usage: APK_BIN=... STATIC_BUSYBOX=... APK_HOOK_FILE=... APK_INIT_FILE=... APK_HOOK_TEST_TMPDIR=... bash scripts/tests/apk-hook.integration.sh'
 [[ $(id -u) == 0 ]] || die 'this isolated chroot integration test requires root'
@@ -16,6 +17,7 @@ die() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 [[ -f $hook ]] || die "production commit hook is unavailable: $hook"
 [[ -f $init ]] || die "production coordinator is unavailable: $init"
 [[ -n $busybox && -x $busybox ]] || die 'a static BusyBox is required; set STATIC_BUSYBOX'
+[[ -x $uci_root/sbin/uci ]] || die 'native UCI is required; set ADGUARDHOME_TEST_UCI_ROOT'
 version=$("$apk" --version)
 [[ $version == 'apk-tools 3.'* ]] || die "APK v3 is required: $version"
 
@@ -33,7 +35,12 @@ cleanup() {
 trap cleanup EXIT
 root=$temporary/root
 mkdir -p "$root/bin" "$root/dev" "$root/etc/init.d" "$root/etc/config" "$root/etc/rc.d" \
-	"$root/lib/apk/commit_hooks.d" "$root/var/run"
+	"$root/lib/apk/commit_hooks.d" "$root/var/run" "$root/sbin" "$root/tmp/.uci"
+cp "$uci_root/sbin/uci" "$root/sbin/uci"
+cp -P "$uci_root/lib"/ld-musl-*.so.1 "$uci_root/lib/libc.so" \
+	"$uci_root/lib/libgcc_s.so.1" "$uci_root/lib"/libuci.so* \
+	"$uci_root/lib"/libubox.so* "$root/lib/"
+printf "config probe 'test'\n option value 'committed'\n" >"$root/etc/config/network"
 cp "$busybox" "$root/bin/busybox"
 chmod 0755 "$root/bin/busybox"
 ln -s busybox "$root/bin/sh"
@@ -59,7 +66,7 @@ NORMALIZER_RUNTIME_DIR=/var/run/luci-app-adguardhome
 uci_guard_no_delta() { return 0; }
 config_load() { return 0; }
 validate_loaded_merged_sections() { return 0; }
-config_get_bool() { [ "$1" = service_enabled ] && read -r service_enabled </etc/config/adguardhome; }
+config_get_bool() { [ "$1" = service_enabled ] && read -r service_enabled </fixture-enabled; }
 official_running() { [ -f /core-running ]; }
 run_locked() { printf 'decision:%s:changed=%s\n' "$1" "$2" >>/events; "$@"; }
 orchestrate_core_locked() { printf 'orchestrate\n' >>/events; "$OFFICIAL_SERVICE" start; }
@@ -73,7 +80,7 @@ for name in entry_metadata root_private_directory root_private_file bounded_priv
 done
 cat >>"$root/etc/init.d/AdGuardHome" <<'SH'
 [ "$#" = 2 ] && [ "$1" = apk_commit ] || exit 90
-read -r enabled </etc/config/adguardhome
+read -r enabled </fixture-enabled
 printf 'hook:%s:enabled=%s\n' "$2" "$enabled" >>/events
 apk_commit "$2"
 SH
@@ -127,7 +134,7 @@ chmod 0755 "$root/lib/apk/commit_hooks.d/90-luci-app-adguardhome"
 
 for enabled in 0 1; do
 	revision=$((enabled + 2))
-	printf '%s\n' "$enabled" >"$root/etc/config/adguardhome"
+	printf '%s\n' "$enabled" >"$root/fixture-enabled"
 	chroot "$root" /etc/init.d/adguardhome enable
 	: >"$root/events"
 	apk_transaction add "adguardhome-hook-test=$revision.0-r0"
@@ -178,7 +185,7 @@ for enabled in 0 1; do
 		>"$temporary/unrelated.log" 2>&1 || {
 		cat "$temporary/unrelated.log" >&2; die 'could not build unrelated package';
 	}
-	printf '%s\n' "$enabled" >"$root/etc/config/adguardhome"
+	printf '%s\n' "$enabled" >"$root/fixture-enabled"
 	if [[ $enabled == 0 ]]; then rm -f "$root/core-running"; else : >"$root/core-running"; fi
 	chroot "$root" /etc/init.d/adguardhome enable
 	[[ -L $root/etc/rc.d/S99adguardhome ]] || die 'fixture did not enable official autostart'
@@ -198,4 +205,95 @@ for enabled in 0 1; do
 	fi
 	printf 'ok - native unrelated package repairs autostart without changing runtime (enabled=%s)\n' "$enabled"
 done
+
+# A native pre-commit failure must prevent even unrelated payload replacement.
+# The production hook uses real UCI; package-script failures cannot substitute
+# for this boundary because APK still unpacks and runs later scripts.
+payload=$temporary/guard-payload
+mkdir -p "$payload/usr/share"
+printf 'must-not-install\n' >"$payload/usr/share/guard-payload"
+"$apk" mkpkg --info name:uci-guard-hook-test --info version:1-r0 --info arch:noarch \
+	--files "$payload" --output "$temporary/uci-guard.apk"
+printf "config probe 'test'\n option value 'committed'\n" >"$root/etc/config/network"
+chroot "$root" /sbin/uci set network.test.value=pending
+pending=$(chroot "$root" /sbin/uci changes)
+committed=$(cksum <"$root/etc/config/network")
+: >"$root/events"
+guard_rc=0
+"$apk" --root "$root" --arch x86_64 --allow-untrusted --network=no \
+	--repositories-file /dev/null --sync=no add "$temporary/uci-guard.apk" \
+	>"$temporary/guard.log" 2>&1 || guard_rc=$?
+[[ $guard_rc != 0 ]] || die 'native pre-commit did not fail the APK transaction'
+grep -Fq 'Commit or revert pending UCI changes' "$temporary/guard.log" || die 'UCI guard was not reached'
+[[ ! -e $root/usr/share/guard-payload ]] || die 'blocked transaction installed its payload'
+[[ ! -s $root/events ]] || die 'blocked transaction touched the core'
+[[ $(chroot "$root" /sbin/uci changes) == "$pending" ]] || die 'blocked transaction changed UCI delta'
+[[ $(cksum <"$root/etc/config/network") == "$committed" ]] || die 'blocked transaction committed UCI'
+chroot "$root" /sbin/uci revert network
+apk_transaction add "$temporary/uci-guard.apk"
+[[ -f $root/usr/share/guard-payload ]] || die 'clean retry did not install payload'
+printf 'ok - native pre-commit blocks payload and preserves real UCI pending changes\n'
+
+# APK still removes a package after pre-deinstall fails. Exercise the current
+# Makefile bodies under the real platform default_prerm and native APK, with
+# only service execution/maintenance locks isolated. Recovery data must stay,
+# and no recovery start may run immediately before the coordinator is deleted.
+platform_functions=$uci_root/lib/functions.sh
+[[ -f $platform_functions ]] || platform_functions=${SDK:-/root/sdk-x86-64}/feeds/base_root/package/base-files/files/lib/functions.sh
+[[ -f $platform_functions ]] || die 'OpenWrt platform functions are missing'
+cp "$platform_functions" "$root/lib/functions.sh"
+for name in entry_metadata root_private_directory root_private_file; do
+	function_body "$temporary/init.expanded" "$name" >>"$root/removal-helpers"
+done
+cat >>"$root/removal-helpers" <<'SH'
+run_bounded() { shift 2; "$@"; }
+begin_yaml_maintenance() { :; }
+rollback_yaml_maintenance() { :; }
+finish_yaml_maintenance() { :; }
+SH
+for phase in prerm postrm; do
+	{
+		printf '#!/bin/sh\n. /lib/functions.sh\n. /removal-helpers\npkgname=removal-failure-test\n'
+		[[ $phase != prerm ]] || printf 'default_prerm\n'
+		awk -v phase="$phase" '
+			$0 == "define Package/$(PKG_NAME)/" phase { copying=1; next }
+			copying && /^endef$/ { exit }
+			copying && !/^\$\(AdGuardHome\// { gsub(/\$\$/, "$"); print }
+		' "$repo/luci-app-adguardhome/Makefile"
+	} >"$temporary/$phase"
+done
+payload=$temporary/removal-payload
+mkdir -p "$payload/etc/init.d" "$payload/lib/apk/packages"
+{
+	printf '#!/bin/sh\ncase "$1" in\n stop) echo stop >>/removal-events; exit 1;;\n enable|disable|start) echo "$1" >>/removal-events; exit 0;;\nesac\n'
+	cat "$root/etc/init.d/AdGuardHome"
+} >"$payload/etc/init.d/AdGuardHome"
+chmod 0755 "$payload/etc/init.d/AdGuardHome"
+printf '/etc/init.d/AdGuardHome\n' >"$payload/lib/apk/packages/removal-failure-test.list"
+"$apk" mkpkg --info name:removal-failure-test --info version:1-r0 --info arch:noarch \
+	--files "$payload" --script "pre-deinstall:$temporary/prerm" \
+	--script "post-deinstall:$temporary/postrm" --output "$temporary/removal.apk"
+# Replace the earlier unowned service fixture so this APK owns the pathname.
+rm "$root/etc/init.d/AdGuardHome"
+apk_transaction add "$temporary/removal.apk"
+mkdir -p "$root/tmp/luci-app-adguardhome-memory" "$root/root/.luci-app-adguardhome"
+chmod 0700 "$root/var/run/luci-app-adguardhome" "$root/root/.luci-app-adguardhome"
+printf 'ram-data\n' >"$root/tmp/luci-app-adguardhome-memory/state"
+printf 'dns-ownership\n' >"$root/root/.luci-app-adguardhome/managed-adguardhome.config"
+printf 'applied-state\n' >"$root/var/run/luci-app-adguardhome/applied-runtime"
+chmod 0600 "$root/root/.luci-app-adguardhome/managed-adguardhome.config" \
+	"$root/var/run/luci-app-adguardhome/applied-runtime"
+# A previous successful stop followed by failed post-deinstall must not
+# authorize cleanup after this new stop fails.
+printf '1\n' >"$root/var/run/luci-app-adguardhome/remove-ok"
+chmod 0600 "$root/var/run/luci-app-adguardhome/remove-ok"
+apk_transaction del removal-failure-test
+grep -Fq 'exited with error 1' "$temporary/apk.log" || die 'fixture did not fail its package script'
+[[ ! -e $root/etc/init.d/AdGuardHome ]] || die 'native APK no longer removes after pre-deinstall failure'
+[[ $(<"$root/removal-events") == $'disable\nstop\nstop' ]] || die 'failed removal restarted the deleted coordinator'
+[[ $(<"$root/tmp/luci-app-adguardhome-memory/state") == ram-data ]] || die 'failed removal lost RAM state'
+[[ $(<"$root/root/.luci-app-adguardhome/managed-adguardhome.config") == dns-ownership ]] || die 'failed removal lost recovery snapshot'
+[[ $(<"$root/var/run/luci-app-adguardhome/applied-runtime") == applied-state ]] || die 'failed removal lost runtime state'
+[[ ! -e $root/var/run/luci-app-adguardhome/remove-ok ]] || die 'failed removal retained an old success marker'
+printf 'ok - native failed removal deletes package without restarting it or discarding recovery state\n'
 printf 'APK_HOOK_INTEGRATION_OK (%s; isolated dummy services)\n' "$version"

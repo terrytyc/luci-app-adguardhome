@@ -33,20 +33,35 @@ wget -O /etc/apk/keys/terrytyc-adguardhome.pem \
 feed='@terrytyc https://terrytyc.github.io/luci-app-adguardhome/packages/packages.adb'
 grep -qxF "$feed" /etc/apk/repositories.d/customfeeds.list 2>/dev/null || \
   printf '%s\n' "$feed" >> /etc/apk/repositories.d/customfeeds.list
-apk update
+apk update &&
+agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
 apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 ```
 
 打开 LuCI → **服务 → AdGuard Home**，勾选启用并保存应用。全新安装默认关闭，不会立即接管 DNS。
+
+安装命令要求默认 UCI 工作区没有待提交设置；若未开始安装，先运行 `uci changes` 查看并提交或撤销自己的修改。首次安装尚无插件事务钩子，必须先完成这项检查，不能依赖包内脚本失败来阻止 APK 写入文件。
 
 默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号或密码。
 
 后续更新只需：
 
 ```sh
-apk update
+apk update &&
+agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
+/etc/init.d/AdGuardHome stop &&
 apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 ```
+
+卸载也先确认停止成功，再交给 APK 删除插件；当前 UCI、YAML 和 data 保留：
+
+```sh
+agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
+/etc/init.d/AdGuardHome stop &&
+apk del luci-i18n-adguardhome-zh-cn luci-app-adguardhome
+```
+
+停止失败时先处理服务日志中的原因，不继续升级或卸载。APK 的包级安装、升级、卸载脚本即使报错，也可能继续替换或删除文件；卸载前脚本的失败甚至不一定反映在 APK 退出码中。
 
 `@terrytyc` 指定使用本项目软件源，避免同名包被其他源替换。正常校验签名，无需 `--allow-untrusted`。保留配置升级固件时，请将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，一并保留公钥。
 
@@ -64,7 +79,7 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 
 概览中的 DNS“就绪”表示接管配置与核心监听匹配，不等同于外网解析测试或实时防火墙检查。
 
-选择“无”且关闭内存运行时，不启动插件监控进程，核心仍由官方服务管理。通过 SSH 修改 UCI 后，请执行 `/etc/init.d/AdGuardHome reload` 应用设置。
+选择“无”，并且关闭内存运行或将定时回写设为 `0` 时，不启动插件监控进程，核心仍由官方服务管理。关闭定时回写不影响手动回写和停止时回写。通过 SSH 修改 UCI 后，请执行 `/etc/init.d/AdGuardHome reload` 应用设置。
 
 防火墙接管撤销失败时会保留可重试状态，确认重载成功后才完成清理。无法确认撤销成功时不会继续停止核心。
 
@@ -143,7 +158,7 @@ config luci 'luci'
 - 官方核心通过 APK 更新后，插件会检查运行状态：启用时按需重启到新核心，关闭时停止被安装脚本拉起的核心。检查由 APK 触发，插件关闭时也有效；无关软件更新不会重启状态正常的核心。
 - 此检查在整个 APK 事务结束后执行，不阻止官方安装脚本在升级期间启动核心。事务中断、跳过安装脚本或钩子失败时，不保证自动恢复，应检查服务状态和系统日志。
 - 升级前无法安全记录核心状态时，会报错并中止本次 APK 事务，包括无关软件安装；不会忽略损坏的插件运行目录继续更新。核心文件缺失本身不会阻止修复安装。
-- 安装、更新前，请先提交或撤销默认 UCI 工作区中的待提交设置。固件的安装脚本会执行全局 `uci commit`，因此主包和中文包均在安装前一次性检查全部默认 UCI 改动，存在改动即中止，避免替你提交尚未确认的配置。
+- 安装、更新前，请先提交或撤销默认 UCI 工作区中的待提交设置。固件的安装脚本会执行全局 `uci commit`。本版本已安装后，插件在 APK 的 `pre-commit` 阶段检查全部默认 UCI 改动，存在改动或检查失败时阻止本次事务，包括无关软件安装。首次安装和旧版本升级请使用上面的检查命令；包级检查本身不能阻止 APK 后续文件操作或固件钩子。
 - 不迁移旧插件格式或清理历史遗留文件。配置格式不同的旧安装，请手动整理，或卸载 LuCI 插件后重装，无需卸载官方核心。
 - 导入已有官方实例时保留启用状态，以 `none` 模式开始，不接管原 DNS 流程；易失目录中的 YAML 和 data 会导入 `/etc/AdGuardHome`，原目录保留。
 - 固件升级保留清单随工作目录同步，包含当前 YAML 和插件 UCI 快照，**不包含整个 data**。

@@ -7,10 +7,11 @@ package_dir="${script_dir}/.."
 source_template="${package_dir}/root/usr/share/luci-app-adguardhome/default.yaml"
 makefile="${package_dir}/Makefile"
 rpc_source="${package_dir}/root/usr/share/rpcd/ucode/luci.adguardhome"
+init_source="${package_dir}/root/etc/init.d/AdGuardHome"
 yaml_view="${package_dir}/htdocs/luci-static/resources/view/adguardhome/yaml.js"
 expected_sha256=b4444ea895489e86928ea696aa415a7679ad9ecf74cd01067749ad1a93e00425
 
-for file in "$source_template" "$makefile" "$rpc_source" "$yaml_view"; do
+for file in "$source_template" "$makefile" "$rpc_source" "$yaml_view" "$init_source"; do
 	if [ ! -f "$file" ] || [ -L "$file" ]; then
 		printf 'required template-reset source is missing or unsafe: %s\n' "$file" >&2
 		exit 1
@@ -58,7 +59,7 @@ for file in "$active_template" "$reset_template"; do
 	}
 done
 
-python3 - "$active_template" "$rpc_source" "$yaml_view" <<'PY'
+python3 - "$active_template" "$rpc_source" "$yaml_view" "$init_source" <<'PY'
 import pathlib
 import sys
 
@@ -148,9 +149,9 @@ if "return { content };" not in reset_backend:
     raise SystemExit("reset_yaml does not return the packaged template to the editor")
 if "sha256(content)" in reset_backend:
     raise SystemExit("reset_yaml still computes an unused template revision")
-if "yaml.sha256 != expected_hash" not in reset_backend:
-    raise SystemExit("reset_yaml no longer checks the active YAML revision")
-for forbidden in ("update_yaml(", "write(", "yaml_update_job"):
+if "match(expected_hash, /^[0-9a-f]{64}$/)" not in reset_backend:
+    raise SystemExit("reset_yaml no longer validates its public revision parameter")
+for forbidden in ("read_yaml(", "update_yaml(", "write(", "yaml_update_job"):
     if forbidden in reset_backend:
         raise SystemExit(f"reset_yaml still applies the template directly: {forbidden}")
 
@@ -171,11 +172,24 @@ for forbidden in (
     "operation.start()",
     "reloadYaml()",
     "invalidateYamlEditor()",
+    "this.yamlHash =",
 ):
     if forbidden in reset_view:
         raise SystemExit(f"template button still applies or discards editor state: {forbidden}")
 if "_('Load Template')" not in view or "handleTemplateResetClick" in view:
     raise SystemExit("template loading must remain an ordinary editor action")
+
+# Loading the template preserves the editor's original revision. Actual saving
+# passes that revision to the worker, which checks it before replacing the file.
+if "callSetYaml(content, this.yamlHash)" not in view:
+    raise SystemExit("YAML saving no longer sends the editor's active revision")
+save_backend = between("function update_yaml(", "function update_job_status(")
+if "'yaml_update_job', expected_hash, candidate_hash, stage," not in save_backend:
+    raise SystemExit("YAML saving no longer forwards its revision to the worker")
+init = pathlib.Path(sys.argv[4]).read_text(encoding="utf-8")
+save_worker = init.split("yaml_update_locked() {", 1)[1].split("\n}", 1)[0]
+if '[ "$before_hash" = "$expected_hash" ] || return 2' not in save_worker:
+    raise SystemExit("YAML saving no longer rejects a changed active revision")
 PY
 
 printf 'ok - single-source YAML build, installed permissions and reset safety contract\n'

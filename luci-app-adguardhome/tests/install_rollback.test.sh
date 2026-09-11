@@ -111,6 +111,7 @@ fi
 # a target that was originally absent returns to absent.  Partial staged data
 # is private and never becomes authoritative.
 root_private_directory() { [ -d "$1" ] && [ ! -L "$1" ]; }
+root_private_file() { [ -f "$1" ] && [ ! -L "$1" ]; }
 
 # mountinfo escapes whitespace and backslashes.  Migration paths use the same
 # restricted alphabet as managed paths so nested-mount comparisons stay exact.
@@ -207,7 +208,10 @@ awk '
 ' "$package_dir/Makefile" | sed "s|/etc/|$fixture_root/etc/|g;s|/var/run/|$fixture_root/var/run/|g" \
 	>"$temporary/prerm"
 root_private_directory() { [ -d "$1" ] && [ ! -L "$1" ]; }
-begin_yaml_maintenance() { printf 'maintenance:begin\n' >>"$events"; }
+begin_yaml_maintenance() {
+	printf 'maintenance:begin\n' >>"$events"
+	[ "${fixture_maintenance_fail:-0}" != 1 ]
+}
 rollback_yaml_maintenance() { printf 'maintenance:rollback\n' >>"$events"; }
 default_prerm() {
 	# OpenWrt's generated APK hook ignores both service return values here.
@@ -233,11 +237,21 @@ if (export fixture_stop_fail=1; default_prerm; IPKG_INSTROOT=; PKG_UPGRADE=0;
 	set -- remove; . "$temporary/prerm"); then
 	exit 1
 fi
-[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nmaintenance:begin\ncoordinator:stop\nmaintenance:rollback\ncoordinator:enable\ncoordinator:start')" ]
+[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nmaintenance:begin\ncoordinator:stop\nmaintenance:rollback')" ]
 [ ! -e "$fixture_root/var/run/luci-app-adguardhome/remove-ok" ]
 
-# Recovery re-enables the coordinator but never starts it through any pending
-# UCI view; the package-manager stop guard keeps the pre-existing core serving.
+# An earlier successful stop may leave its marker when post-deinstall fails.
+# Even a failure before this stop starts must revoke that old authorization.
+printf '1\n' >"$fixture_root/var/run/luci-app-adguardhome/remove-ok"
+chmod 0600 "$fixture_root/var/run/luci-app-adguardhome/remove-ok"
+if (export fixture_maintenance_fail=1; IPKG_INSTROOT=; PKG_UPGRADE=0;
+	set -- remove; . "$temporary/prerm"); then
+	exit 1
+fi
+[ ! -e "$fixture_root/var/run/luci-app-adguardhome/remove-ok" ]
+
+# A failed package script cannot stop APK removal. It must not re-enable or
+# restart the coordinator, including when pending UCI prevented cleanup.
 for pending_config in adguardhome dhcp firewall; do
 	: >"$events"; rm -f "$stop_count"
 	if (export fixture_stop_fail=1 TEST_PENDING_CONFIG="$pending_config";
@@ -245,6 +259,6 @@ for pending_config in adguardhome dhcp firewall; do
 		. "$temporary/prerm"); then
 		exit 1
 	fi
-	[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nmaintenance:begin\ncoordinator:stop\nmaintenance:rollback\ncoordinator:enable')" ]
+	[ "$(cat "$events")" = "$(printf 'coordinator:disable\ncoordinator:stop\nmaintenance:begin\ncoordinator:stop\nmaintenance:rollback')" ]
 done
 printf 'ok - first-install rollback and history-free uninstall preserve current UCI/YAML/data\n'

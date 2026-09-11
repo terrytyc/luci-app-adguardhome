@@ -77,7 +77,7 @@ reset_settings_fixture() {
 	STORED_ENABLED=1 STORED_WORK=/persistent STORED_VERBOSE=0 STORED_RAM=1
 	STORED_MODE=dnsmasq-upstream STORED_INTERVAL=60
 	RAW_ENABLED=1 RAW_CONFIG=/persistent/AdGuardHome.yaml RAW_MEMORY=1 RAW_INTERVAL=60
-	BASELINE_OK=1 SOCKET_OK=1 INTEGRATION_OK=1 RAM_ACTIVE=1 MOUNT_OK=1
+	BASELINE_OK=1 SOCKET_OK=1 INTEGRATION_OK=1 DNS_APPLY_OK=1 RAM_ACTIVE=1 MOUNT_OK=1
 	DRIFT_AFTER_COMMIT=0 DRIFT_AFTER_REFRESH=0 DRIFT_AT_MATCH=0 PENDING_AT_CHECK=0
 	: >"$events"
 	: >"$counts"
@@ -141,7 +141,7 @@ dns_port_listening() { [ "$SOCKET_OK" = 1 ]; }
 integration_matches_desired() { [ "$INTEGRATION_OK" = 1 ]; }
 integration_status_locked() { integration_matches_desired; }
 wait_for_core_ready() { record ready; }
-apply_integration_locked() { record dns; }
+apply_integration_locked() { record dns; [ "$DNS_APPLY_OK" = 1 ]; }
 sync_monitor_instance() { record monitor; }
 orchestrate_core_locked() { load_settings; record restart; }
 official_running() { return 0; }
@@ -151,7 +151,8 @@ write_yaml_job_state() { printf '%s\n' "$2" >>"$states"; }
 log_error() { :; }
 token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 for change in unchanged disk interval dns core work ram missing-baseline dead-core fallback unmounted \
-             normalized-enabled normalized-interval missing-field drift-after-commit drift-after-refresh final-drift; do
+             normalized-enabled normalized-interval missing-field drift-after-commit drift-after-refresh \
+             dns-final-drift dns-repair-failure; do
 	reset_settings_fixture
 	requested_work=/persistent requested_verbose=0 requested_ram=1
 	requested_mode=dnsmasq-upstream requested_interval=60
@@ -171,7 +172,8 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 		missing-field) STORED_RAM=0 RAW_MEMORY='' RAM_ACTIVE=0 requested_ram=0 ;;
 		drift-after-commit) requested_interval=120 DRIFT_AFTER_COMMIT=1 ;;
 		drift-after-refresh) DRIFT_AFTER_REFRESH=1 ;;
-		final-drift) DRIFT_AT_MATCH=2 ;;
+		dns-final-drift) requested_mode=redirect INTEGRATION_OK=0 DRIFT_AT_MATCH=2 ;;
+		dns-repair-failure) requested_mode=redirect INTEGRATION_OK=0 DNS_APPLY_OK=0 ;;
 	esac
 	revision="$(settings_values_revision "$STORED_ENABLED" "$STORED_WORK" "$STORED_VERBOSE" \
 		"$STORED_MODE" "$STORED_RAM" "$STORED_INTERVAL")"
@@ -183,6 +185,8 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 		unchanged|disk|interval|normalized-*|missing-field)
 			[ "$(cat "$events")" = monitor ]; restarted=0 ;;
 		dns) [ "$(cat "$events")" = "$(printf 'ready\ndns\nmonitor')" ]; restarted=0 ;;
+		dns-final-drift|dns-repair-failure)
+			[ "$(cat "$events")" = "$(printf 'ready\ndns\nrestart')" ]; restarted=1 ;;
 		*) [ "$(cat "$events")" = restart ]; restarted=1 ;;
 	esac
 	[ "$(tail -n 1 "$states")" = "success:${candidate}:${restarted}:${revision}:${candidate}" ]
@@ -192,10 +196,11 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 		core|work|ram|fallback|unmounted) assert_count 2 load:light; assert_count 0 fingerprint ;;
 		missing-baseline|dead-core|drift-after-commit|drift-after-refresh)
 			assert_count 3 load:light; assert_count 1 fingerprint ;;
-		*) assert_count 3 load:light; assert_count 2 fingerprint ;;
+		dns|dns-final-drift) assert_count 3 load:light; assert_count 2 fingerprint ;;
+		*) assert_count 3 load:light; assert_count 1 fingerprint ;;
 	esac
 	case "$change" in
-		interval|dns|core|work|ram|normalized-*|missing-field|drift-after-commit)
+		interval|dns|dns-final-drift|dns-repair-failure|core|work|ram|normalized-*|missing-field|drift-after-commit)
 			assert_count 1 write-guard; assert_count 1 commit ;;
 		*) assert_count 0 write-guard; assert_count 0 commit ;;
 	esac

@@ -5,6 +5,19 @@
 [ -x /etc/init.d/AdGuardHome ] || exit 0
 case "$1" in pre-commit|post-commit) ;; *) exit 0 ;; esac
 
+# Package pre-install/pre-upgrade failures do not stop APK extraction or its
+# generated post-install hook, which may commit every default UCI delta.
+if [ "$1" = pre-commit ]; then
+	pending_uci_changes="$(uci -q changes 2>/dev/null)" || {
+		echo "Unable to inspect pending UCI changes; APK transaction aborted." >&2
+		exit 1
+	}
+	[ -z "$pending_uci_changes" ] || {
+		echo "Commit or revert pending UCI changes before running APK." >&2
+		exit 1
+	}
+fi
+
 if ! /etc/init.d/AdGuardHome apk_commit "$1"; then
 	logger -t AdGuardHome "APK $1 service check failed; inspect the AdGuard Home service"
 	echo "AdGuard Home APK $1 check failed; inspect the service and system log." >&2

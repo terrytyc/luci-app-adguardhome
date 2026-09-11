@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 # Execute the real lifecycle entry points without launching a core or monitor.
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-for name in record_ready_core_runtime declare_monitor_instance sync_monitor_instance start_service service_triggers \
+for name in record_ready_core_runtime monitor_needed declare_monitor_instance sync_monitor_instance start_service service_triggers \
 	orchestrate_core_locked reconcile_core_locked monitor_interval_locked; do
 	eval "$(function_body "$init_file" "$name")"
 done
@@ -20,6 +20,7 @@ OFFICIAL_SERVICE=/bin/true
 TEST_ENABLED=0
 TEST_RUNNING=0
 TEST_RAM=0
+TEST_INTERVAL=60
 TEST_MODE=dnsmasq-upstream
 TEST_BACKING=/etc/AdGuardHome
 TEST_COMMIT_FAIL=0
@@ -42,7 +43,7 @@ load_settings() {
 	MEMORY_ACTIVE="$TEST_RAM"
 	MEMORY_BACKING_WORK_DIR="$TEST_BACKING"
 	memory_requested="$TEST_RAM"
-	memory_writeback_interval=60
+	memory_writeback_interval="$TEST_INTERVAL"
 	redirect_mode="$TEST_MODE"
 	MONITOR_SETTINGS_READY=1
 }
@@ -191,7 +192,7 @@ done
 # Exercise the real preparation result across a subshell, as run_locked does.
 # No parent settings variables may be needed to select the monitor definition.
 (
-	for name in prepare_wrapper_locked service_started stop_wrapper_locked; do
+	for name in prepare_wrapper_locked service_started stop_wrapper_locked memory_writeback_locked_command; do
 		eval "$(function_body "$init_file" "$name")"
 	done
 	run_locked() ( "$@"; )
@@ -205,37 +206,76 @@ done
 	TEST_ENABLED=1
 	TEST_RUNNING=0
 	TEST_BACKING=/etc/AdGuardHome
-	for TEST_MODE in dnsmasq-upstream redirect none; do
-		for TEST_RAM in 0 1; do
-			unset service_enabled redirect_mode memory_requested
-			: >"$events"
-			procd_open_service AdGuardHome "$initscript"
-			start_service
-			[ "$START_PREPARED:$START_DISABLED" = 1:0 ]
-			if [ "$TEST_MODE:$TEST_RAM" = none:0 ]; then
-				[ -z "$TX_DEFINITION" ]
-				# Withdraw old DNS takeover before removing its monitor.
+	for TEST_INTERVAL in 0 60; do
+		for TEST_MODE in dnsmasq-upstream redirect none; do
+			for TEST_RAM in 0 1; do
+				idle=0
+				case "$TEST_MODE:$TEST_RAM:$TEST_INTERVAL" in none:0:*|none:1:0) idle=1 ;; esac
+				unset service_enabled redirect_mode memory_requested
+				: >"$events"
+				procd_open_service AdGuardHome "$initscript"
+				start_service
+				[ "$START_PREPARED:$START_DISABLED" = 1:0 ]
+				if [ "$idle" = 1 ]; then
+					[ -z "$TX_DEFINITION" ]
+					# Withdraw old DNS takeover before removing its monitor.
+					grep -qx cleanup "$events"
+				else
+					[ "$TX_DEFINITION" = "$expected" ]
+				fi
+				procd_close_service
+				service_started
+				read_monitor_state
+				grep -qx start "$events"
 				grep -qx cleanup "$events"
-			else
-				[ "$TX_DEFINITION" = "$expected" ]
-			fi
-			procd_close_service
-			service_started
-			read_monitor_state
-			grep -qx start "$events"
-			grep -qx cleanup "$events"
-			if [ "$TEST_MODE:$TEST_RAM" = none:0 ]; then
-				[ -z "$LIVE_DEFINITION" ] && [ "$MONITOR_PID" = 0 ]
-			else
-				[ "$LIVE_DEFINITION" = "$expected" ] && [ "$MONITOR_PID" -gt 0 ]
-			fi
+				if [ "$idle" = 1 ]; then
+					[ -z "$LIVE_DEFINITION" ] && [ "$MONITOR_PID" = 0 ]
+				else
+					[ "$LIVE_DEFINITION" = "$expected" ] && [ "$MONITOR_PID" -gt 0 ]
+				fi
+			done
 		done
 	done
+	# Interval-only changes add and remove the monitor without starting/stopping
+	# the core. Exercise both directions with RAM active and DNS unmanaged.
+	TEST_MODE=none TEST_RAM=1
+	: >"$events"
+	for TEST_INTERVAL in 0 60 0; do
+		load_settings
+		sync_monitor_instance
+		read_monitor_state
+		if [ "$TEST_INTERVAL" = 0 ]; then
+			[ -z "$LIVE_DEFINITION" ] && [ "$MONITOR_PID" = 0 ]
+		else
+			[ "$LIVE_DEFINITION" = "$expected" ] && [ "$MONITOR_PID" -gt 0 ]
+		fi
+	done
+	[ ! -s "$events" ]
+	for TEST_MODE in redirect none dnsmasq-upstream none; do
+		load_settings
+		sync_monitor_instance
+		read_monitor_state
+		if [ "$TEST_MODE" = none ]; then
+			[ -z "$LIVE_DEFINITION" ] && [ "$MONITOR_PID" = 0 ]
+		else
+			[ "$LIVE_DEFINITION" = "$expected" ] && [ "$MONITOR_PID" -gt 0 ]
+		fi
+	done
+	[ ! -s "$events" ]
 	# A service without a monitor still runs its normal core-stop/cleanup hook.
 	TEST_MODE=none TEST_RAM=0 TEST_RUNNING=1
 	: >"$events"
 	run_locked stop_wrapper_locked 0
 	[ "$(cat "$events")" = "$(printf 'cleanup\nstop')" ]
+	# Disabling only the schedule must keep manual write-back and the RAM-stop
+	# boundary available even when there is no monitor instance.
+	TEST_RAM=1 TEST_INTERVAL=0 TEST_RUNNING=1
+	memory_copy_live_data_locked() { printf 'writeback\n' >>"$events"; }
+	memory_deactivate_locked() { printf 'deactivate\n' >>"$events"; }
+	: >"$events"
+	memory_writeback_locked_command
+	run_locked stop_wrapper_locked 0
+	[ "$(cat "$events")" = "$(printf 'writeback\ncleanup\nstop\ndeactivate')" ]
 )
 
 # Apply/reload also repairs independent official autostart. Failure must leave

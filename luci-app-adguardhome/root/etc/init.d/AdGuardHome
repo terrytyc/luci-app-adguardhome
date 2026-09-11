@@ -4900,7 +4900,7 @@ prepare_wrapper_locked() {
 	fi
 	# Carry the idle-monitor decision across run_locked's subshell without
 	# suppressing service_started(), which still starts the official core.
-	if [ "$redirect_mode" = none ] && [ "$memory_requested" = 0 ]; then
+	if ! monitor_needed; then
 		clear_recorded_integration_locked || return 1
 		return 3
 	fi
@@ -4983,8 +4983,8 @@ settings_update_locked() {
 	   load_runtime_dns_port && core_runtime_matches && dns_port_listening &&
 	   { integration_status_locked "$dns_port" "$redirect_mode" ||
 	     { wait_for_core_ready "$dns_port" "$redirect_mode" "$work_dir" &&
-	       apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir"; }; } &&
-	   core_runtime_matches && dns_port_listening &&
+	       apply_integration_locked "$dns_port" "$redirect_mode" "$work_dir" &&
+	       core_runtime_matches && dns_port_listening; }; } &&
 	   "$OFFICIAL_SERVICE" disable >/dev/null 2>&1 &&
 	   sync_monitor_instance; then
 		SETTINGS_CORE_RESTARTED=0
@@ -5404,6 +5404,12 @@ isrunning() {
 	return 1
 }
 
+monitor_needed() {
+	[ "$service_enabled" = 1 ] &&
+		{ [ "$redirect_mode" != none ] ||
+		  { [ "$memory_requested" = 1 ] && [ "$memory_writeback_interval" != 0 ]; }; }
+}
+
 declare_monitor_instance() {
 	procd_open_instance monitor
 	procd_set_param command "$initscript" monitor
@@ -5419,8 +5425,7 @@ sync_monitor_instance() (
 	# Submit only the instance definition, never recurse through start/restart
 	# while holding the integration lock.  An unchanged instance keeps its PID.
 	procd_open_service AdGuardHome "$initscript"
-	if [ "$service_enabled" = 1 ] &&
-	   { [ "$redirect_mode" != none ] || [ "$memory_requested" != 0 ]; }; then
+	if monitor_needed; then
 		declare_monitor_instance
 	fi
 	# The procd_close_service wrapper loses the ubus exit status.
@@ -5498,7 +5503,7 @@ stop_wrapper_locked() {
 			uci_guard_no_delta "$package" || return 1
 		done
 		# default_prerm runs before the package hook.  It may only preflight;
-		# the hook performs the real stop after installing its recovery trap.
+		# the real stop runs inside the bounded package hook.
 		[ "${LUCI_ADGUARDHOME_PRERM_PHASE:-}" = bounded ] || return 0
 	fi
 	[ "$shutdown_mode" = 1 ] && RELOAD_SERVICES=0
@@ -5524,7 +5529,7 @@ stop_service() {
 	else
 		log_error "AdGuard Home coordinator stop failed"
 		# rc.common ignores this hook's return value and would delete the monitor.
-		# Abort its action so a failed stop also blocks package replacement.
+		# Abort its action so a failed stop keeps the monitor instance registered.
 		exit "$rc"
 	fi
 	return "$rc"

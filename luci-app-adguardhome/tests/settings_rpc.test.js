@@ -244,9 +244,6 @@ assert.match(updateSource,
 assert.doesNotMatch(updateSource, /candidate\.revision == current\.revision|unchanged/,
 	'every Save & Apply must reach the coordinator even when values are unchanged');
 assert.match(updateSource,
-	/let locked_current = settings_snapshot\(\);[\s\S]*?locked_current\.revision != expected_revision[\s\S]*?discard_yaml_job\(token\)[\s\S]*?close_yaml_job_lock\(\{ file: job\.lock \}\)/,
-	'the settings revision must be rechecked and stale job state removed while holding the shared lock');
-assert.match(updateSource,
 	/start_settings_process\(job, expected_revision, candidate\.revision, \[\s*'settings_update'/,
 	'settings must be applied asynchronously through the coordinator command');
 assert.match(updateSource,
@@ -290,11 +287,12 @@ const expectedHash = '1'.repeat(64);
 const candidateHash = '2'.repeat(64);
 const token = '3'.repeat(32);
 let launchedArguments = null;
+let settingsSnapshots = 0;
 const launchSandbox = {
 	type: sandbox.type,
 	match: sandbox.match,
 	settings_candidate: () => candidate,
-	settings_snapshot: () => snapshot,
+	settings_snapshot: () => { settingsSnapshots++; return snapshot; },
 	random_token: () => token,
 	prepare_yaml_job: () => ({ token, lock: {}, lock_descriptor: 193 }),
 	YAML_UPDATE_COMMAND: '/etc/init.d/AdGuardHome',
@@ -312,10 +310,17 @@ vm.createContext(launchSandbox);
 vm.runInContext(`${startSource}\n${updateSource}\n${extractFunction('memory_writeback')}\nthis.update = update_settings; this.writeback = memory_writeback;`, launchSandbox);
 assert.equal(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
 	true, 120, snapshot.revision).accepted, true);
+assert.equal(settingsSnapshots, 1, 'a settings submission reads its current snapshot once');
 assert.deepEqual(launchedArguments, [
 	'settings_update', '1', fixture.workDir, '0', fixture.redirect, '1', '120',
 	snapshot.revision, token, candidate.revision, '193',
 ], 'the worker must receive ten arguments with the numeric lock descriptor last');
+settingsSnapshots = 0;
+launchedArguments = null;
+assert.ok(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
+	true, 120, expectedHash).error, 'a stale page revision is rejected before launching a worker');
+assert.equal(settingsSnapshots, 1);
+assert.equal(launchedArguments, null);
 
 launchSandbox.sha256 = sandbox.sha256;
 launchSandbox.valid_work_dir = sandbox.api.valid_work_dir;
@@ -448,7 +453,6 @@ const jobFixture = {
 	closes: 0,
 	stageRemovals: 0,
 	recoveries: 0,
-	jobs: { active: [] },
 };
 const jobSandbox = {
 	length: value => value.length,
@@ -462,9 +466,8 @@ const jobSandbox = {
 			error: jobFixture.lockError,
 		};
 	},
-	scan_yaml_jobs(cleanTemporary) {
-		assert.equal(cleanTemporary, false, 'observing a later worker must not clean its files');
-		return jobFixture.jobs;
+	scan_yaml_jobs() {
+		assert.fail('observing the current task must not scan historical job records');
 	},
 	close_yaml_job_lock() {
 		jobFixture.closes++;
@@ -501,7 +504,6 @@ function resetJob(state) {
 		lockAvailable: true, lockError: null, recoverySucceeds: true,
 		stageRemovalSucceeds: true, closeSucceeds: true,
 		reads: 0, closes: 0, stageRemovals: 0, recoveries: 0,
-		jobs: { active: [] },
 	});
 }
 
@@ -513,7 +515,7 @@ for (const settings of [ false, true ]) {
 	assert.equal(query(token).error, `${title} update job is unavailable`);
 	assert.equal(jobFixture.closes, 0, 'an unavailable job must not acquire or close a lock');
 
-	for (const state of [ 'pending', 'running', 'success' ]) {
+	for (const state of [ 'pending', 'running', 'success', 'failure', 'indeterminate' ]) {
 		resetJob(state);
 		jobFixture.lockAvailable = false;
 		assert.equal(query(token).state, state === 'pending' ? 'pending' : 'running',
@@ -570,19 +572,6 @@ for (const settings of [ false, true ]) {
 	resetJob('success');
 	jobFixture.closeSucceeds = false;
 	assert.equal(query(token).error, `Unable to release ${label} update lock`);
-}
-
-for (const jobs of [ { active: [] }, { active: [ { token } ] },
-	{ active: [ { token: 'other' }, { token: 'third' } ] },
-	{ active: [ { token: 'other' } ], error: 'unsafe state' },
-	{ active: [ { token: 'other' } ], maintenance: true } ]) {
-	resetJob('success');
-	jobFixture.lockAvailable = false;
-	jobFixture.jobs = jobs;
-	assert.equal(jobSandbox.query(token, true).state, 'running',
-		'without one distinct active worker, terminal bytes must remain hidden during lock handoff');
-	assert.equal(jobFixture.stageRemovals, 0);
-	assert.equal(jobFixture.recoveries, 0);
 }
 
 resetJob('running');
@@ -802,15 +791,17 @@ for (const settings of [ false, true, 'writeback' ]) {
 		resetWrites();
 		writeFixture.entries.set(jobPath, terminalState);
 		const completed = writeSandbox.api.update_job_status(token, settings);
+		assert.deepEqual(writeSandbox.api.update_job_status(token, settings), completed,
+			'the current result remains readable until the next submission');
 		const nextToken = '5'.repeat(32);
 		assert.equal(writeSandbox.api.prepare_yaml_job(
 			nextToken, candidateHash, '6'.repeat(64)).reused, false);
 		writeFixture.busy = true;
-		assert.deepEqual(writeSandbox.api.update_job_status(token, settings), completed,
-			'a later transaction must not turn a completed task back into running');
-		assert.equal(writeFixture.entries.get(jobPath), terminalState);
+		assert.match(writeSandbox.api.update_job_status(token, settings).error, /job is unavailable/,
+			'a new submission retires the previous completed task');
+		assert.equal(writeFixture.entries.has(jobPath), false);
 		assert.match(writeFixture.entries.get(`${jobDirectory}/${nextToken}`), /^pending:/,
-			'observing the completed task must preserve the later worker');
+			'querying an old token must preserve the current worker');
 	}
 }
 
@@ -824,10 +815,7 @@ assert.equal(writeSandbox.api.prepare_yaml_job('5'.repeat(32), expectedHash, can
 	'an interrupted task must not block settings recovery while its disk is offline');
 assert.equal(writeFixture.entries.has(offlineStage), true,
 	'offline cleanup must not remove a same-named file in the underlying filesystem');
-writeFixture.pathUnavailable = false;
-writeFixture.entries.delete(`${jobDirectory}/${'5'.repeat(32)}`);
-assert.equal(writeSandbox.api.prepare_yaml_job('6'.repeat(32), expectedHash, candidateHash).reused, false);
-assert.equal(writeFixture.entries.has(offlineStage), false, 'an accessible stage is cleaned on the next submission');
+assert.equal(writeFixture.entries.has(jobPath), false, 'only the new task result is retained');
 for (const retained of [ 1, 15, 16 ]) {
 	resetWrites();
 	writeFixture.entries.set(activeYaml, 'active YAML must survive');
@@ -841,8 +829,8 @@ for (const retained of [ 1, 15, 16 ]) {
 		'orphaned YAML stages must be cleaned by the next write, before its workdir can change');
 	assert.equal(writeFixture.entries.get(activeYaml), 'active YAML must survive');
 	for (const oldToken of oldTokens)
-		assert.equal(writeFixture.entries.has(`${jobDirectory}/${oldToken}`), retained < 16,
-			'terminal records stay readable below the existing retention bound');
+		assert.equal(writeFixture.entries.has(`${jobDirectory}/${oldToken}`), false,
+			'the next submission removes completed records, including results retained by older versions');
 }
 
 resetWrites();
@@ -853,7 +841,7 @@ assert.ok(writeSandbox.api.prepare_yaml_job('5'.repeat(32), expectedHash, candid
 assert.equal(writeFixture.entries.has(oversizedStage), true, 'unsafe stage files must never be removed');
 assert.equal(writeFixture.entries.get(jobPath), terminal, 'failed cleanup must retain the recovery record');
 assert.equal(writeFixture.lockCloses, 1);
-console.log('reused-token observations and bounded terminal/stage retention tests passed');
+console.log('current-task observations and terminal/stage cleanup tests passed');
 
 let randomBytes;
 const randomSandbox = {
