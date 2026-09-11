@@ -16,7 +16,7 @@ run_bounded() (
 		exit 125
 	}
 	bounded_signal_session() {
-		/bin/kill "-$$1" -- "-$$child" 2>/dev/null ||
+		kill "-$$1" "-$$child" 2>/dev/null ||
 			/bin/kill "-$$1" "$$child" 2>/dev/null || true
 	}
 	bounded_abort() {
@@ -59,7 +59,7 @@ run_bounded() (
 		}
 		trap bounded_watchdog_abort HUP INT QUIT TERM
 		bounded_watchdog_sleep "$$limit" || exit 1
-		/bin/kill -0 -- "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
+		kill -0 "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
 		printf '1\n' >"$$marker" || exit 1
 		bounded_signal_session TERM
 		bounded_watchdog_sleep "$$grace" || exit 0

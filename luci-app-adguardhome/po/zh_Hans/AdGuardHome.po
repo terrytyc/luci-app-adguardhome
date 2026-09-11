@@ -435,8 +435,11 @@ msgstr "内存回写结果未知。请重新加载此页面后再试。"
 msgid "Choose a dedicated working directory, not a system directory."
 msgstr "请选择独立的工作目录，不要使用系统目录本身。"
 
-msgid "The username or password update outcome is unknown. The request may have reached the router, but its response could not be read: %s. Reopen this dialog to review the current account before making another change."
-msgstr "用户名或密码的修改结果未知。请求可能已到达路由器，但无法读取响应：%s。请重新打开账号窗口，确认当前状态后再修改。"
+msgid "The username or password update outcome is unknown. The request may have reached the router, but its response could not be read: %s. Reload this page before making any other change."
+msgstr "用户名或密码的修改结果未知。请求可能已到达路由器，但无法读取响应：%s。请重新加载此页面后再进行其他修改。"
 
-msgid "The username or password update outcome is unknown. The server accepted the update job but did not return a valid status token. Reopen this dialog to review the current account before making another change."
-msgstr "用户名或密码的修改结果未知。服务器已接受任务，但未返回有效的状态令牌。请重新打开账号窗口，确认当前状态后再修改。"
+msgid "The username or password update outcome is unknown. The server accepted the update job but did not return a valid status token. Reload this page before making any other change."
+msgstr "用户名或密码的修改结果未知。服务器已接受任务，但未返回有效的状态令牌。请重新加载此页面后再进行其他修改。"
+
+msgid "The username or password update outcome is unknown. Reload this page before making any other change."
+msgstr "用户名或密码的修改结果未知。请重新加载此页面后再进行其他修改。"

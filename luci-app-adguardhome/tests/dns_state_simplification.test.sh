@@ -74,6 +74,10 @@ config_get() {
 		"firewall:${FIREWALL_SECTION}:target") actual="${TEST_FW_TARGET:-DNAT}" ;;
 		"firewall:${FIREWALL_SECTION}:family") actual="${TEST_FW_FAMILY:-ipv4}" ;;
 		"firewall:${FIREWALL_SECTION}:reflection") actual="${TEST_FW_REFLECTION:-0}" ;;
+		"firewall:${FIREWALL_SECTION}:enabled") actual="${TEST_FW_ENABLED:-}" ;;
+		"firewall:${FIREWALL_SECTION}:dest_ip") actual="${TEST_FW_DEST_IP:-}" ;;
+		"firewall:${FIREWALL_SECTION}:src_ip") actual="${TEST_FW_SRC_IP:-}" ;;
+		"firewall:${FIREWALL_SECTION}:"*) actual="" ;;
 		*) printf 'unexpected config_get: %s:%s:%s\n' "$config_context" "$2" "$3" >&2; return 1 ;;
 	esac
 	eval "$1=\$actual"
@@ -87,10 +91,11 @@ config_foreach() {
 }
 config_list_foreach() {
 	local callback="$3" value values
-	[ "$2" = server ] || return 1
-	case "$1" in
-		cfg01411c) values="${TEST_SERVERS:-}" ;;
-		cfgsecond) values="${TEST_SECOND_SERVERS:-}" ;;
+	case "$config_context:$1:$2" in
+		dhcp:cfg01411c:server) values="${TEST_SERVERS:-}" ;;
+		dhcp:cfgsecond:server) values="${TEST_SECOND_SERVERS:-}" ;;
+		"firewall:${FIREWALL_SECTION}:dest_ip") values="${TEST_FW_DEST_IP_LIST:-}" ;;
+		"firewall:${FIREWALL_SECTION}:"*) values="" ;;
 		*) return 1 ;;
 	esac
 	while IFS= read -r value; do
@@ -128,10 +133,40 @@ uci() {
 			printf '%s\n' "$TEST_MANAGED_PORT"
 			return 0
 			;;
+		"get:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}")
+			[ -n "${TEST_MANAGED_NORESOLV_PRESENT:-}" ] || return 1
+			printf '%s\n' "$TEST_MANAGED_NORESOLV_PRESENT"
+			return 0
+			;;
+		"get:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}")
+			[ "${TEST_MANAGED_NORESOLV_VALUE_SET:-0}" = 1 ] || return 1
+			printf '%s\n' "${TEST_MANAGED_NORESOLV_VALUE:-}"
+			return 0
+			;;
 		"get:dhcp.cfg01411c.noresolv")
 			[ -n "${TEST_NORESOLV:-}" ] || return 1
 			printf '%s\n' "$TEST_NORESOLV"
 			return 0
+			;;
+		"set:dhcp.cfg01411c.noresolv="*)
+			TEST_NORESOLV="${1#*=}"
+			;;
+		"delete:dhcp.cfg01411c.noresolv")
+			unset TEST_NORESOLV
+			;;
+		"set:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}="*)
+			TEST_MANAGED_NORESOLV_PRESENT="${1#*=}"
+			;;
+		"set:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}="*)
+			TEST_MANAGED_NORESOLV_VALUE="${1#*=}"
+			TEST_MANAGED_NORESOLV_VALUE_SET=1
+			;;
+		"delete:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}")
+			unset TEST_MANAGED_NORESOLV_PRESENT
+			;;
+		"delete:${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}")
+			TEST_MANAGED_NORESOLV_VALUE_SET=0
+			unset TEST_MANAGED_NORESOLV_VALUE
 			;;
 	esac
 	printf '%s:%s\n' "$command" "$*" >>"$uci_log"
@@ -185,9 +220,11 @@ TEST_MANAGED_PORT=''
 set_dnsmasq_upstream
 for expected in \
 	'add_list:dhcp.cfg01411c.server=127.0.0.1#53335' \
-	'set:dhcp.cfg01411c.noresolv=1' \
-	'set:adguardhome.luci.managed_dnsmasq_upstream=53335' \
-	'commit:dhcp' \
+		'set:dhcp.cfg01411c.noresolv=1' \
+		'set:adguardhome.luci.managed_dnsmasq_upstream=53335' \
+		'set:adguardhome.luci.managed_dnsmasq_noresolv_present=1' \
+		'set:adguardhome.luci.managed_dnsmasq_noresolv_value=1' \
+		'commit:dhcp' \
 	'commit:adguardhome' \
 	'reload:/etc/init.d/dnsmasq:restart'; do
 	grep -Fqx -- "$expected" "$uci_log" || {
@@ -205,13 +242,45 @@ TEST_MANAGED_PORT=53335
 clear_managed_dnsmasq_upstream
 for expected in \
 	'del_list:dhcp.cfg01411c.server=127.0.0.1#53335' \
-	'delete:dhcp.cfg01411c.noresolv' \
+	'set:dhcp.cfg01411c.noresolv=1' \
+	'delete:adguardhome.luci.managed_dnsmasq_noresolv_present' \
+	'delete:adguardhome.luci.managed_dnsmasq_noresolv_value' \
 	'delete:adguardhome.luci.managed_dnsmasq_upstream'; do
 	grep -Fqx -- "$expected" "$uci_log" || {
 		printf 'DNS cleanup omitted operation: %s\n' "$expected" >&2
 		exit 1
 	}
 done
+
+# Exact noresolv ownership includes both absence and a false pre-existing value.
+for previous_noresolv in absent 0; do
+	: >"$uci_log"
+	TEST_SERVERS='/example.test/192.0.2.53'
+	TEST_MANAGED_PORT=''
+	unset TEST_MANAGED_NORESOLV_PRESENT TEST_MANAGED_NORESOLV_VALUE
+	TEST_MANAGED_NORESOLV_VALUE_SET=0
+	if [ "$previous_noresolv" = absent ]; then
+		unset TEST_NORESOLV
+	else
+		TEST_NORESOLV="$previous_noresolv"
+	fi
+	set_dnsmasq_upstream
+	grep -Fqx -- "set:adguardhome.luci.managed_dnsmasq_noresolv_present=$([ "$previous_noresolv" = absent ] && printf 0 || printf 1)" "$uci_log"
+	if [ "$previous_noresolv" != absent ]; then
+		grep -Fqx -- "set:adguardhome.luci.managed_dnsmasq_noresolv_value=${previous_noresolv}" "$uci_log"
+	fi
+	: >"$uci_log"
+	TEST_MANAGED_PORT=53335
+	clear_managed_dnsmasq_upstream
+	if [ "$previous_noresolv" = absent ]; then
+		grep -Fqx -- 'delete:dhcp.cfg01411c.noresolv' "$uci_log"
+	else
+		grep -Fqx -- "set:dhcp.cfg01411c.noresolv=${previous_noresolv}" "$uci_log"
+	fi
+done
+TEST_NORESOLV=1
+unset TEST_MANAGED_NORESOLV_PRESENT TEST_MANAGED_NORESOLV_VALUE
+TEST_MANAGED_NORESOLV_VALUE_SET=0
 
 # Cleanup may locate its unique recorded upstream after another dnsmasq
 # instance is added, but takeover remains single-instance only.
@@ -281,7 +350,8 @@ if grep -q '^get:firewall[.]' "$uci_log"; then
 	exit 1
 fi
 for changed in TEST_FW_TYPE TEST_FW_OWNER TEST_FW_SRC TEST_FW_PROTO \
-	TEST_FW_SRC_PORT TEST_FW_DEST_PORT TEST_FW_TARGET TEST_FW_FAMILY TEST_FW_REFLECTION; do
+	TEST_FW_SRC_PORT TEST_FW_DEST_PORT TEST_FW_TARGET TEST_FW_FAMILY TEST_FW_REFLECTION \
+	TEST_FW_ENABLED TEST_FW_DEST_IP TEST_FW_DEST_IP_LIST TEST_FW_SRC_IP; do
 	eval "$changed=unexpected"
 	if firewall_integration_matches; then
 		printf 'firewall mismatch accepted: %s\n' "$changed" >&2

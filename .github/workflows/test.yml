@@ -13,7 +13,7 @@ jobs:
   light:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install host test tools
         run: |
@@ -28,15 +28,14 @@ jobs:
           sudo env "PATH=$RUNNER_TEMP/luci-test-bin:$PATH" bash scripts/test.sh --light
 
   full:
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install host test tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y busybox-static python3-yaml
+          sudo apt-get install --no-install-recommends -y busybox-static python3-yaml zstd
 
       - name: Prepare pinned OpenWrt and APK test tools
         run: bash scripts/prepare-test-runtime.sh "$RUNNER_TEMP/luci-full-runtime"
@@ -50,3 +49,11 @@ jobs:
             "TARGET_ROOT=$RUNNER_TEMP/luci-full-runtime/root" \
             "APK_BIN=$RUNNER_TEMP/luci-full-runtime/apk/sbin/apk.static" \
             "STATIC_BUSYBOX=$(command -v busybox)" bash scripts/test.sh --full
+
+      - name: Build and verify real APKs with the pinned OpenWrt SDK
+        run: |
+          bash scripts/prepare-test-sdk.sh "$RUNNER_TEMP/openwrt-sdk" "$GITHUB_WORKSPACE"
+          env "SDK=$RUNNER_TEMP/openwrt-sdk" \
+            "TMPDIR=$RUNNER_TEMP" \
+            "OUTPUT_DIR=$RUNNER_TEMP/real-apks" \
+            NO_DEPS=1 JOBS=2 bash scripts/build-apk.sh

@@ -8,7 +8,7 @@ source_template="${package_dir}/root/usr/share/luci-app-adguardhome/default.yaml
 makefile="${package_dir}/Makefile"
 rpc_source="${package_dir}/root/usr/share/rpcd/ucode/luci.adguardhome"
 yaml_view="${package_dir}/htdocs/luci-static/resources/view/adguardhome/yaml.js"
-expected_sha256=5cfed909100879796de2b9c6d5d75c855ffb2d271a814789a6db263867a9d6db
+expected_sha256=b4444ea895489e86928ea696aa415a7679ad9ecf74cd01067749ad1a93e00425
 
 for file in "$source_template" "$makefile" "$rpc_source" "$yaml_view"; do
 	if [ ! -f "$file" ] || [ -L "$file" ]; then
@@ -74,10 +74,18 @@ if template["schema_version"] != 34:
     raise SystemExit("template schema version is not 34")
 if template["dns"]["port"] != 53335:
     raise SystemExit("template DNS port is not 53335")
+if template["dns"]["ratelimit"] != 20:
+    raise SystemExit("template DNS rate limit is not 20 queries per second")
+if template["dns"]["cache_size"] != 4194304:
+    raise SystemExit("template DNS cache is not 4 MiB")
 if template["http"]["address"] != "0.0.0.0:3000":
     raise SystemExit("template HTTP listener is not 0.0.0.0:3000")
 if template["tls"]["enabled"] is not False:
     raise SystemExit("template TLS is not disabled")
+if template["querylog"]["interval"] != "7d":
+    raise SystemExit("template query log retention is not 7 days")
+if template["statistics"]["interval"] != "1d":
+    raise SystemExit("template statistics retention is not 1 day")
 if template["filtering"]["safe_fs_patterns"] != [
     "/tmp/lib/adguardhome/userfilters/*"
 ]:

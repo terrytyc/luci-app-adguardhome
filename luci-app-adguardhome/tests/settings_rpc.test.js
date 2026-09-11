@@ -27,6 +27,8 @@ const constants = [
 	'LUCI_SECTION',
 	'CONFIG_FILENAME',
 	'MAX_MEMORY_WRITEBACK_INTERVAL',
+	'MAX_WORK_DIR_LENGTH',
+	'MAX_WORK_DIR_COMPONENT_LENGTH',
 ].map(extractConstant).join('\n');
 const functions = [
 	'valid_work_dir',
@@ -36,7 +38,7 @@ const functions = [
 	'settings_snapshot',
 	'settings_candidate',
 ].map(extractFunction).join('\n')
-	.replace('for (let component in components)',
+	.replace(/for \(let component in components\)/g,
 		'for (let component of components)');
 
 const fixture = {
@@ -47,6 +49,8 @@ const fixture = {
 	redirect: 'dnsmasq-upstream',
 	runFromMemory: '0',
 	interval: '60',
+	lstatCalls: 0,
+	mountReads: 0,
 	mounts: '/dev/root / ext4 rw 0 0\ntmpfs /tmp tmpfs rw 0 0\n' +
 		'tmpfs /opt/ram tmpfs rw 0 0\n/dev/sda1 /tmp/disk ext4 rw 0 0\n',
 };
@@ -84,8 +88,12 @@ const sandbox = {
 	length: value => value.length,
 	split: (value, separator) => value.split(separator),
 	substr: (value, start, count) => value.substr(start, count),
-	readfile: () => fixture.mounts,
+	readfile() {
+		fixture.mountReads++;
+		return fixture.mounts;
+	},
 	lstat(pathname) {
+		fixture.lstatCalls++;
 		if (pathname === '/etc')
 			return { type: 'directory', uid: 0, gid: 0, mode: 0o755 };
 		if (pathname === '/etc/AdGuardHome')
@@ -97,9 +105,16 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(`${constants}\n${functions}\nthis.api = {
+	configured_boolean,
 	settings_snapshot,
 	settings_candidate,
 };`, sandbox, { filename: rpcPath });
+
+for (const value of [ '1', 'on', 'true', 'yes', 'enabled' ])
+	assert.equal(sandbox.api.configured_boolean(value), true, `${value}: native true value`);
+for (const value of [ '0', 'off', 'false', 'no', 'disabled', 'ON', 'Yes', 'TRUE',
+	'ENABLED', 'invalid', '', undefined, null ])
+	assert.equal(sandbox.api.configured_boolean(value), false, `${value}: native default false`);
 
 const snapshot = sandbox.api.settings_snapshot();
 assert.equal(snapshot.enabled, true);
@@ -154,6 +169,30 @@ for (const workDir of [ '/', '/etc', '/opt/ram/dns', '/tmp/dns', '/srv/../dns' ]
 	assert.equal(sandbox.api.settings_candidate(true, workDir, false, 'none', false, 60), null,
 		`${workDir}: unsafe or memory-backed directories must be rejected`);
 }
+
+const component255 = 'a'.repeat(255);
+const component256 = `${component255}a`;
+const maxWorkDir = `${Array(15).fill(`/${component255}`).join('')}/${'b'.repeat(199)}`;
+assert.equal(maxWorkDir.length, 4040);
+assert.ok(sandbox.api.settings_candidate(true, `/opt/${component255}`, false, 'none', false, 60),
+	'a 255-byte component must remain valid');
+let lstatCalls = fixture.lstatCalls;
+let mountReads = fixture.mountReads;
+assert.equal(sandbox.api.settings_candidate(
+	true, `/opt/${component256}`, false, 'none', false, 60), null,
+	'a 256-byte component must be rejected');
+assert.equal(fixture.lstatCalls, lstatCalls, 'component bounds must run before lstat');
+assert.equal(fixture.mountReads, mountReads, 'component bounds must run before mount parsing');
+assert.ok(sandbox.api.settings_candidate(true, maxWorkDir, false, 'none', false, 60),
+	'a 4040-byte work directory must remain valid');
+lstatCalls = fixture.lstatCalls;
+mountReads = fixture.mountReads;
+assert.equal(sandbox.api.settings_candidate(
+	true, `${maxWorkDir}b`, false, 'none', false, 60), null,
+	'a 4041-byte work directory must be rejected');
+assert.equal(fixture.lstatCalls, lstatCalls, 'total bounds must run before lstat');
+assert.equal(fixture.mountReads, mountReads, 'total bounds must run before mount parsing');
+
 const mountedFilesystems = fixture.mounts;
 fixture.mounts = '';
 assert.equal(sandbox.api.settings_snapshot(), null, 'unknown storage must not be accepted');
@@ -556,6 +595,7 @@ function jobMetadata(name) {
 }
 const writeSandbox = {
 	YAML_JOB_DIRECTORY: jobDirectory,
+	YAML_MAINTENANCE_MARKER: `${jobDirectory}/removing`,
 	YAML_JOB_STATE_LIMIT: 256,
 	MAX_CONFIG_LENGTH: 512 * 1024,
 	type: value => Array.isArray(value) ? 'array' : typeof value,
@@ -687,6 +727,14 @@ assert.equal(firstObserver.ok, true);
 assert.deepEqual(writeSandbox.api.update_job_status(reused.token, false), firstObserver,
 	'two callers sharing a real stored token must both read its terminal result');
 assert.equal(writeFixture.entries.has(jobPath), true);
+
+resetWrites();
+writeFixture.entries.set(`${jobDirectory}/removing`, '');
+const maintenance = writeSandbox.api.prepare_yaml_job(
+	'5'.repeat(32), expectedHash, candidateHash);
+assert.match(maintenance.error, /package maintenance/);
+assert.equal(writeFixture.entries.size, 1, 'maintenance must not create a pending job');
+assert.equal(writeFixture.lockCloses, 1);
 
 for (const settings of [ false, true, 'writeback' ]) {
 	for (const terminalState of [

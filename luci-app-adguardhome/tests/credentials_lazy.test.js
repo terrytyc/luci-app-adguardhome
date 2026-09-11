@@ -47,9 +47,22 @@ function loadOverview() {
 		},
 		success(_message, ticket) { assert.equal(ticket, scope); events.push('operation-success'); },
 		failure(message) { failures.push(String(message)); },
-		async waitForJob(statusFn, token, currentScope) {
+		async waitForJob(statusFn, token, currentScope, messages, makeError) {
 			assert.equal(currentScope, scope);
-			return statusFn(token);
+			assert.equal(typeof makeError, 'function', 'credential polling must mark uncertain results');
+			let result = null;
+			try {
+				result = await statusFn(token);
+			} catch (error) {
+				throw makeError(messages.unavailable.format(String(error.message ?? error)));
+			}
+			if (result?.state === 'done')
+				return result;
+			if (typeof result?.error === 'string' && result.error)
+				throw makeError(result.error);
+			if (result?.state !== 'pending' && result?.state !== 'running')
+				throw makeError(messages.unknown);
+			return result;
 		},
 	};
 	class BcryptInstance {
@@ -135,12 +148,13 @@ async function readyDialog() {
 	assert.deepEqual(state.preparations, [ 'Preparing account change…' ]);
 	assert.equal(state.view.credentialsPreparing, true);
 	Object.assign(state.view, {
-		memoryWritebackAvailable: true, memoryWritebackButton: {},
+		memoryWritebackAvailable: true, memoryWritebackButton: {}, credentialsButton: {},
 		committedSettings: { revision: 'a'.repeat(64) },
 		submitSettings() { assert.fail('Apply must not replace the pending credential preparation'); },
 	});
 	state.view.updateMemoryWritebackButton();
 	assert.equal(state.view.memoryWritebackButton.disabled, true);
+	assert.equal(state.view.credentialsButton.disabled, true);
 	await state.view.openCredentialsDialog();
 	await state.view.handleSaveApply();
 	await state.view.handleMemoryWriteback();
@@ -157,11 +171,12 @@ async function readyDialog() {
 	assert.equal(state.failures.length, 0);
 	assert.equal(state.view.credentialsPreparing, false);
 	assert.equal(state.view.memoryWritebackButton.disabled, false);
+	assert.equal(state.view.credentialsButton.disabled, false);
 	return state;
 }
 
 async function main() {
-	for (const busy of [ 'credentialsPreparing', 'settingsSubmission', 'memoryWritebackBusy', 'memoryWritebackUncertain' ]) {
+	for (const busy of [ 'credentialsPreparing', 'credentialsUncertain', 'settingsSubmission', 'memoryWritebackBusy', 'memoryWritebackUncertain' ]) {
 		const state = loadOverview();
 		state.view[busy] = true;
 		await state.view.openCredentialsDialog();
@@ -204,13 +219,13 @@ async function main() {
 		{
 			name: 'lost response',
 			reply: () => { throw new Error('accepted response was lost'); },
-			expected: /outcome is unknown.*may have reached.*accepted response was lost.*Reopen this dialog/,
+			expected: /outcome is unknown.*may have reached.*accepted response was lost.*Reload this page/,
 			uncertain: true,
 		},
 		{
 			name: 'accepted without token',
 			reply: () => ({ accepted: true, token: 'invalid' }),
-			expected: /outcome is unknown.*accepted the update job.*valid status token.*Reopen this dialog/,
+			expected: /outcome is unknown.*accepted the update job.*valid status token.*Reload this page/,
 			uncertain: true,
 		},
 		{
@@ -219,23 +234,61 @@ async function main() {
 			expected: /Unable to change.*did not accept/,
 			uncertain: false,
 		},
+		{
+			name: 'status unavailable',
+			reply: () => ({ accepted: true, token: 'b'.repeat(32) }),
+			statusReply: () => { throw new Error('status transport failed'); },
+			expected: /status is temporarily unavailable.*status transport failed.*reload this page/,
+			uncertain: true,
+		},
+		{
+			name: 'unknown job state',
+			reply: () => ({ accepted: true, token: 'b'.repeat(32) }),
+			statusReply: () => ({ state: 'expired', ok: false }),
+			expected: /credential update returned an unknown job state/,
+			uncertain: true,
+		},
+		{
+			name: 'indeterminate completion',
+			reply: () => ({ accepted: true, token: 'b'.repeat(32) }),
+			statusReply: () => ({ state: 'done', ok: false, indeterminate: true }),
+			expected: /outcome is unknown.*Reload this page/,
+			uncertain: true,
+		},
 	]) {
 		const state = await readyDialog();
 		state.handlers.set_credentials = (...args) => {
 			state.events.push([ 'set_credentials', ...args ]);
 			return scenario.reply();
 		};
+		if (scenario.statusReply)
+			state.handlers.get_yaml_update = token => {
+				state.events.push([ 'get_yaml_update', token ]);
+				return scenario.statusReply();
+			};
 		state.inputs()[0].value = 'operator';
 		await state.submit();
 		assert.equal(state.failures.length, 1, `${scenario.name}: report one result`);
 		assert.match(state.failures[0], scenario.expected);
-		assert.equal(state.failures[0].includes('outcome is unknown'), scenario.uncertain,
-			`${scenario.name}: distinguish an uncertain outcome from a confirmed rejection`);
-		assert.deepEqual(state.events.filter(Array.isArray), [
-			[ 'set_credentials', 'operator', '', info.sha256 ],
-		], `${scenario.name}: submit the CAS-protected mutation only once`);
-		assert.equal(state.events.some(event => Array.isArray(event) && event[0] === 'get_yaml_update'), false,
-			`${scenario.name}: do not poll without a valid token`);
+		assert.equal(state.view.credentialsUncertain === true, scenario.uncertain,
+			`${scenario.name}: retain an uncertain outcome until reload`);
+		const mutations = state.events.filter(event => Array.isArray(event));
+		assert.deepEqual(mutations[0], [ 'set_credentials', 'operator', '', info.sha256 ],
+			`${scenario.name}: submit the CAS-protected mutation only once`);
+		assert.equal(mutations.filter(event => event[0] === 'set_credentials').length, 1);
+		assert.equal(mutations.some(event => event[0] === 'get_yaml_update'), !!scenario.statusReply,
+			`${scenario.name}: poll only after receiving a valid token`);
+		if (scenario.uncertain) {
+			assert.equal(state.view.memoryWritebackButton.disabled, true);
+			assert.equal(state.view.credentialsButton.disabled, true);
+			const before = state.events.slice();
+			await state.view.openCredentialsDialog();
+			await state.view.handleMemoryWriteback();
+			await state.view.handleSaveApply();
+			assert.deepEqual(state.events, before,
+				`${scenario.name}: no write may start before the page is reloaded`);
+			assert.match(state.failures.at(-1), /outcome is unknown.*Reload this page/);
+		}
 	}
 
 	for (const failedDependency of [ 'moduleReply', 'credentialReply' ]) {

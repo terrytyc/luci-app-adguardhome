@@ -27,6 +27,10 @@ INSTALL_STARTED=0
 INSTALL_BACKUP=""
 INSTALL_WAS_RUNNING=0
 YAML_STAGE=""
+INSTALL_TRANSACTION_DIR=""
+TARGET_WORK_DIR_CREATED=0
+YAML_ORIGINAL_ABSENT=0
+DATA_ORIGINAL_ABSENT=0
 
 # @include run-bounded
 
@@ -90,8 +94,14 @@ resolve_source_file() {
 resolve_source_work_dir() {
 	local value resolved
 	value="$(trim_trailing_slashes "$1")" || return 1
+	case "$value" in
+		""|/|//*|*//*|*[!A-Za-z0-9_./+@%:,=-]*) return 1 ;;
+	esac
 	case "$value" in /var/*|/tmp/*) ;; *) return 1 ;; esac
 	resolved="$(readlink -f "$value" 2>/dev/null)" || return 1
+	case "$resolved" in
+		""|/|//*|*//*|*/|*[!A-Za-z0-9_./+@%:,=-]*) return 1 ;;
+	esac
 	case "$resolved" in /tmp/*) ;; *) return 1 ;; esac
 	[ -d "$resolved" ] && [ ! -L "$resolved" ] || return 1
 	printf '%s\n' "$resolved"
@@ -197,12 +207,34 @@ secure_target_work_dir() {
 	if [ ! -e "$TARGET_WORK_DIR" ] && [ ! -L "$TARGET_WORK_DIR" ]; then
 		mkdir -p -m 0700 "$TARGET_WORK_DIR" &&
 			chown 0:0 "$TARGET_WORK_DIR" && chmod 0700 "$TARGET_WORK_DIR" || return 1
+		TARGET_WORK_DIR_CREATED=1
 	fi
 	[ -d "$TARGET_WORK_DIR" ] && [ ! -L "$TARGET_WORK_DIR" ]
 }
 
+install_transaction_dir_valid() {
+	[ -n "$INSTALL_TRANSACTION_DIR" ] || return 1
+	case "$INSTALL_TRANSACTION_DIR" in
+		"$TARGET_WORK_DIR"/.luci-install.??????) ;;
+		*) return 1 ;;
+	esac
+	root_private_directory "$INSTALL_TRANSACTION_DIR"
+}
+
+ensure_install_transaction_dir() {
+	[ -z "$INSTALL_TRANSACTION_DIR" ] || {
+		install_transaction_dir_valid
+		return
+	}
+	INSTALL_TRANSACTION_DIR="$(mktemp -d "$TARGET_WORK_DIR/.luci-install.XXXXXX")" ||
+		return 1
+	chown 0:0 "$INSTALL_TRANSACTION_DIR" &&
+		chmod 0700 "$INSTALL_TRANSACTION_DIR" &&
+		install_transaction_dir_valid
+}
+
 install_selected_yaml() {
-	local source="$SOURCE_CONFIG_FILE"
+	local source="$SOURCE_CONFIG_FILE" target_stage old_yaml old_yaml_stage
 	bounded_regular_file "$source" || return 1
 	if [ -e "$RUNTIME_DIR" ] || [ -L "$RUNTIME_DIR" ]; then
 		root_private_directory "$RUNTIME_DIR" || return 1
@@ -218,15 +250,43 @@ install_selected_yaml() {
 	run_bounded 120 5 /etc/init.d/AdGuardHome normalize_config \
 		"$YAML_STAGE" "$TARGET_WORK_DIR" >/dev/null 2>&1 || return 1
 	chown 0:0 "$YAML_STAGE" && chmod 0600 "$YAML_STAGE" || return 1
-	mv -f "$YAML_STAGE" "$TARGET_CONFIG_FILE" || return 1
-	YAML_STAGE=""
-	rmdir "$RUNTIME_DIR" 2>/dev/null || true
-	bounded_regular_file "$TARGET_CONFIG_FILE"
+	ensure_install_transaction_dir || return 1
+	target_stage="$INSTALL_TRANSACTION_DIR/AdGuardHome.yaml.new"
+	old_yaml="$INSTALL_TRANSACTION_DIR/AdGuardHome.yaml.old"
+	old_yaml_stage="$INSTALL_TRANSACTION_DIR/AdGuardHome.yaml.old.new"
+	[ ! -e "$target_stage" ] && [ ! -L "$target_stage" ] || return 1
+	(umask 077; : >"$target_stage") || return 1
+	run_bounded 5 1 /bin/dd if="$YAML_STAGE" of="$target_stage" \
+		bs=4096 count=129 2>/dev/null || return 1
+	chown 0:0 "$target_stage" && chmod 0600 "$target_stage" || return 1
+	bounded_regular_file "$target_stage" && cmp -s "$YAML_STAGE" "$target_stage" ||
+		return 1
+	if [ -e "$TARGET_CONFIG_FILE" ] || [ -L "$TARGET_CONFIG_FILE" ]; then
+		bounded_regular_file "$TARGET_CONFIG_FILE" || return 1
+		[ ! -e "$old_yaml_stage" ] && [ ! -L "$old_yaml_stage" ] || return 1
+		if ! run_bounded 5 1 /bin/cp -p "$TARGET_CONFIG_FILE" "$old_yaml_stage" ||
+		   ! bounded_regular_file "$old_yaml_stage" ||
+		   ! cmp -s "$TARGET_CONFIG_FILE" "$old_yaml_stage" ||
+		   ! mv "$old_yaml_stage" "$old_yaml"; then
+			rm -f "$old_yaml_stage"
+			return 1
+		fi
+	else
+		YAML_ORIGINAL_ABSENT=1
+	fi
+	mv -f "$target_stage" "$TARGET_CONFIG_FILE" || return 1
+	bounded_regular_file "$TARGET_CONFIG_FILE" &&
+		cmp -s "$YAML_STAGE" "$TARGET_CONFIG_FILE"
 }
 
 plain_data_tree() {
 	local unsafe
 	[ -d "$1" ] && [ ! -L "$1" ] || return 1
+	[ -r /proc/self/mountinfo ] || return 1
+	awk -v base="${1%/}" '
+		$5 == base || index($5, base "/") == 1 { found = 1 }
+		END { exit found ? 1 : 0 }
+	' /proc/self/mountinfo || return 1
 	unsafe="$(find "$1" -xdev \
 		\( -type l -o -type b -o -type c -o -type p -o -type s \) \
 		-print 2>/dev/null)" || return 1
@@ -234,7 +294,7 @@ plain_data_tree() {
 }
 
 copy_official_data_if_needed() {
-	local source_data target_data existing
+	local source_data target_data existing data_stage old_data
 	[ -n "$SOURCE_WORK_DIR" ] || return 0
 	source_data="$SOURCE_WORK_DIR/data"
 	target_data="$TARGET_WORK_DIR/data"
@@ -248,12 +308,23 @@ copy_official_data_if_needed() {
 			echo "Existing managed data was kept; official data was not merged."
 			return 0
 		}
-	else
-		mkdir -m 0700 "$target_data" || return 1
 	fi
-	cp -a "$source_data/." "$target_data/" || return 1
-	chown "$ADGUARD_UID:$ADGUARD_GID" "$target_data" &&
-		chmod 0700 "$target_data"
+	ensure_install_transaction_dir || return 1
+	data_stage="$INSTALL_TRANSACTION_DIR/data.new"
+	old_data="$INSTALL_TRANSACTION_DIR/data.old"
+	[ ! -e "$data_stage" ] && [ ! -L "$data_stage" ] || return 1
+	mkdir -m 0700 "$data_stage" || return 1
+	cp -a "$source_data/." "$data_stage/" || return 1
+	plain_data_tree "$data_stage" || return 1
+	chown "$ADGUARD_UID:$ADGUARD_GID" "$data_stage" &&
+		chmod 0700 "$data_stage" || return 1
+	if [ -e "$target_data" ]; then
+		mv "$target_data" "$old_data" || return 1
+	else
+		DATA_ORIGINAL_ABSENT=1
+	fi
+	mv "$data_stage" "$target_data" || return 1
+	plain_data_tree "$target_data"
 }
 
 managed_config_is_valid() {
@@ -333,19 +404,79 @@ restore_install_config() {
 		return 1
 	fi
 	cmp -s "$INSTALL_BACKUP" /etc/config/adguardhome || return 1
-	if [ "$INSTALL_WAS_RUNNING" = 1 ]; then
-		run_bounded 20 2 /etc/init.d/adguardhome start >/dev/null 2>&1 || return 1
+}
+
+restore_install_files() {
+	local old_yaml old_data target_data
+	[ -n "$INSTALL_TRANSACTION_DIR" ] || return 0
+	install_transaction_dir_valid || return 1
+	old_yaml="$INSTALL_TRANSACTION_DIR/AdGuardHome.yaml.old"
+	old_data="$INSTALL_TRANSACTION_DIR/data.old"
+	target_data="$TARGET_WORK_DIR/data"
+
+	if [ -e "$old_yaml" ] || [ -L "$old_yaml" ]; then
+		bounded_regular_file "$old_yaml" || return 1
+		if [ -e "$TARGET_CONFIG_FILE" ] || [ -L "$TARGET_CONFIG_FILE" ]; then
+			bounded_regular_file "$TARGET_CONFIG_FILE" &&
+				bounded_regular_file "$YAML_STAGE" &&
+				cmp -s "$YAML_STAGE" "$TARGET_CONFIG_FILE" || return 1
+		fi
+		mv -f "$old_yaml" "$TARGET_CONFIG_FILE" || return 1
+	elif [ "$YAML_ORIGINAL_ABSENT" = 1 ] &&
+	     { [ -e "$TARGET_CONFIG_FILE" ] || [ -L "$TARGET_CONFIG_FILE" ]; }; then
+		bounded_regular_file "$TARGET_CONFIG_FILE" &&
+			bounded_regular_file "$YAML_STAGE" &&
+			cmp -s "$YAML_STAGE" "$TARGET_CONFIG_FILE" || return 1
+		rm -f "$TARGET_CONFIG_FILE" || return 1
+	fi
+
+	if [ -e "$old_data" ] || [ -L "$old_data" ]; then
+		[ -d "$old_data" ] && [ ! -L "$old_data" ] &&
+			plain_data_tree "$old_data" || return 1
+		if [ -e "$target_data" ] || [ -L "$target_data" ]; then
+			[ -d "$target_data" ] && [ ! -L "$target_data" ] &&
+				plain_data_tree "$target_data" || return 1
+			rm -rf "$target_data" || return 1
+		fi
+		mv "$old_data" "$target_data" || return 1
+	elif [ "$DATA_ORIGINAL_ABSENT" = 1 ] &&
+	     { [ -e "$target_data" ] || [ -L "$target_data" ]; }; then
+		[ -d "$target_data" ] && [ ! -L "$target_data" ] &&
+			plain_data_tree "$target_data" || return 1
+		rm -rf "$target_data" || return 1
 	fi
 }
 
+discard_install_transaction() {
+	[ -n "$INSTALL_TRANSACTION_DIR" ] || return 0
+	install_transaction_dir_valid || return 1
+	plain_data_tree "$INSTALL_TRANSACTION_DIR" || return 1
+	rm -rf "$INSTALL_TRANSACTION_DIR" || return 1
+	[ ! -e "$INSTALL_TRANSACTION_DIR" ] && [ ! -L "$INSTALL_TRANSACTION_DIR" ] ||
+		return 1
+	INSTALL_TRANSACTION_DIR=""
+}
+
 cleanup_install() {
-	local rc=$?
-	[ -z "$YAML_STAGE" ] || rm -f "$YAML_STAGE" 2>/dev/null || true
+	local rc=$? restored=1
 	if [ "$INSTALL_STARTED" = 1 ] && [ "$INSTALL_COMMITTED" != 1 ]; then
-		if ! restore_install_config; then
-			echo "Unable to restore installation settings; previous UCI kept at $INSTALL_BACKUP" >&2
+		restore_install_files || restored=0
+		restore_install_config || restored=0
+		if [ "$restored" = 1 ] && [ "$INSTALL_WAS_RUNNING" = 1 ]; then
+			run_bounded 20 2 /etc/init.d/adguardhome start \
+				>/dev/null 2>&1 || restored=0
+		fi
+		[ "$restored" = 1 ] && discard_install_transaction || restored=0
+		if [ "$restored" != 1 ]; then
+			echo "Unable to restore installation settings; recovery files were kept." >&2
 			exit 1
 		fi
+	fi
+	[ -z "$YAML_STAGE" ] || rm -f "$YAML_STAGE" 2>/dev/null || true
+	rmdir "$RUNTIME_DIR" 2>/dev/null || true
+	if [ "$INSTALL_STARTED" = 1 ] && [ "$INSTALL_COMMITTED" != 1 ] &&
+	   [ "$TARGET_WORK_DIR_CREATED" = 1 ]; then
+		rmdir "$TARGET_WORK_DIR" 2>/dev/null || true
 	fi
 	[ -z "$INSTALL_BACKUP" ] || rm -f "$INSTALL_BACKUP"
 	exit "$rc"
@@ -403,6 +534,7 @@ managed_config_is_valid && keep_active_config "$TARGET_CONFIG_FILE" "$SNAPSHOT_D
 	echo "Unable to validate the initialized AdGuard Home configuration." >&2
 	exit 1
 }
-
 INSTALL_COMMITTED=1
+discard_install_transaction ||
+	echo "Unable to remove completed installation recovery files." >&2
 exit 0

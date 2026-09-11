@@ -24,8 +24,8 @@ fetch rootfs.tar.gz 11c2f26b9d48c02cbdb3b63d499e1f6413ed62bcdbbea78937b12279b95a
 	https://downloads.openwrt.org/releases/25.12.0/targets/x86/64/openwrt-25.12.0-x86-64-rootfs.tar.gz
 fetch apk-tools-static.apk 2edccd3267ce540f8d2371a0f394e84b40d8348ecc28425309e6d07079ed1259 \
 	https://dl-cdn.alpinelinux.org/alpine/v3.23/main/x86_64/apk-tools-static-3.0.8-r0.apk
-fetch digest.apk 3fe11155a01a4e2cff9d871fa7f80e9a173867ca623ccea7972e3c6c91421f4f \
-	https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/base/ucode-mod-digest-2026.01.16~85922056-r1.apk
+fetch digest.apk 1bb1a001ab2dcb7fed204ecf2c7ac27485dd1771d52a8564581f3725b4e38c74 \
+	https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/base/ucode-mod-digest-2026.01.16~85922056-r2.apk
 
 tar -xzf "$runtime/rootfs.tar.gz" -C "$runtime/root" \
 	./lib ./usr/lib ./usr/bin/ucode ./sbin/uci

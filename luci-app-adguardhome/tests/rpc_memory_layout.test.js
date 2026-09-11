@@ -33,6 +33,8 @@ const constants = [
 	'MEMORY_STATE_PATH',
 	'ADGUARD_UID',
 	'ADGUARD_GID',
+	'MAX_WORK_DIR_LENGTH',
+	'MAX_WORK_DIR_COMPONENT_LENGTH',
 ].map(extractConstant).join('\n');
 
 const functionNames = [
@@ -50,7 +52,7 @@ const functionNames = [
 const functions = functionNames.map(extractFunction).join('\n')
 	// ucode iterates array values with `for (value in array)`; JavaScript uses
 	// `of` for the same dependency-free host-test operation.
-	.replace('for (let component in components)',
+	.replace(/for \(let component in components\)/g,
 		'for (let component of components)');
 
 const PERSISTENT_WORK_DIR = '/etc/AdGuardHome';
@@ -411,12 +413,13 @@ assert.equal(api.service_status().memory_active, false,
 
 fixture.workDir = PERSISTENT_WORK_DIR;
 fixture.configFile = PERSISTENT_CONFIG;
-for (const value of [ '1', 'ON', 'true', 'Yes', 'enabled' ]) {
+for (const value of [ '1', 'on', 'true', 'yes', 'enabled' ]) {
 	fixture.requested = value;
 	assert.equal(api.service_status().memory_requested, true,
 		`status must reuse the settings boolean parser for ${value}`);
 }
-for (const value of [ '0', 'OFF', 'false', 'No', 'disabled', '', undefined ]) {
+for (const value of [ '0', 'off', 'false', 'no', 'disabled', 'ON', 'Yes',
+	'TRUE', 'ENABLED', '', undefined ]) {
 	fixture.requested = value;
 	assert.equal(api.service_status().memory_requested, false,
 		`status must reject a disabled or invalid memory request: ${value}`);

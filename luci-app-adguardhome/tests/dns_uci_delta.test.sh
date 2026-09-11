@@ -27,14 +27,14 @@ uci() {
 load_dnsmasq_section() { DNSMASQ_UCI=dhcp.main; }
 dnsmasq_takeover_is_safe() { return 0; }
 reload_service_if_present() { :; }
-refresh_managed_config_snapshot() { :; }
+refresh_managed_config_snapshot() { [ "${TEST_SNAPSHOT_FAIL:-0}" != 1 ]; }
 dns_ipv6_listening() { return 1; }
 log_error() { :; }
 dns_port=53335
 
 seed_config() {
 	printf "config dnsmasq 'main'\n option noresolv '1'\n list server '127.0.0.1#53335'\nconfig dhcp 'lan'\n option start '100'\n" | uci import dhcp
-	printf "config luci 'luci'\n option managed_dnsmasq_upstream '53335'\n" | uci import adguardhome
+	printf "config luci 'luci'\n option managed_dnsmasq_upstream '53335'\n option managed_dnsmasq_noresolv_present '1'\n option managed_dnsmasq_noresolv_value '1'\n" | uci import adguardhome
 	printf "config redirect '%s'\n option name '%s'\nconfig defaults 'defaults'\n option forward 'REJECT'\n" \
 		"$FIREWALL_SECTION" "$FIREWALL_OWNER_VALUE" | uci import firewall
 }
@@ -91,12 +91,30 @@ seed_config
 clear_managed_dnsmasq_upstream || exit 1
 [ -z "$(uci changes dhcp)" ]
 [ -z "$(uci -q get dhcp.main.server || true)" ]
+[ "$(uci get dhcp.main.noresolv)" = 1 ]
 set_dnsmasq_upstream || exit 1
 [ "$(uci get dhcp.main.server)" = '127.0.0.1#53335' ]
 [ "$(uci get dhcp.main.noresolv)" = 1 ]
+[ "$(uci get adguardhome.luci.managed_dnsmasq_noresolv_present)" = 1 ]
+[ "$(uci get adguardhome.luci.managed_dnsmasq_noresolv_value)" = 1 ]
 [ -z "$(uci changes dhcp)" ]
+uci add_list "firewall.$FIREWALL_SECTION.dest_ip=192.0.2.53"
+uci add_list "firewall.$FIREWALL_SECTION.dest_ip=2001:db8::53"
+uci set "firewall.$FIREWALL_SECTION.enabled=0"
+uci set "firewall.$FIREWALL_SECTION.src_ip=192.0.2.0/24"
+uci commit firewall
 set_firewall_redirect || exit 1
 [ "$(uci get "firewall.$FIREWALL_SECTION.dest_port")" = 53335 ]
+for stale_option in dest_ip enabled src_ip; do
+	if uci -q get "firewall.$FIREWALL_SECTION.$stale_option"; then
+		printf 'managed firewall redirect retained stale option: %s\n' "$stale_option" >&2
+		exit 1
+	fi
+done
+[ "$(uci get "firewall.$FIREWALL_SECTION.target")" = DNAT ]
+[ "$(uci get "firewall.$FIREWALL_SECTION.src")" = lan ]
+[ "$(uci get "firewall.$FIREWALL_SECTION.src_dport")" = 53 ]
+[ "$(uci get "firewall.$FIREWALL_SECTION.family")" = ipv4 ]
 clear_firewall_redirect || exit 1
 if uci -q get "firewall.$FIREWALL_SECTION"; then exit 1; fi
 [ -z "$(uci changes firewall)" ]
@@ -104,6 +122,53 @@ uci set firewall.defaults.forward=ACCEPT
 before="$(uci changes firewall)"
 clear_firewall_redirect || exit 1
 [ "$(uci changes firewall)" = "$before" ]
+
+# A takeover owns only its temporary noresolv change.  Normal cleanup and a
+# post-commit rollback must restore both the old value and option absence.
+for previous_noresolv in absent 0 1; do
+	if [ "$previous_noresolv" = absent ]; then
+		printf "config dnsmasq 'main'\n" | uci import dhcp
+	else
+		printf "config dnsmasq 'main'\n option noresolv '%s'\n" \
+			"$previous_noresolv" | uci import dhcp
+	fi
+	printf "config luci 'luci'\n" | uci import adguardhome
+	set_dnsmasq_upstream || exit 1
+	if [ "$previous_noresolv" = absent ]; then
+		[ "$(uci get adguardhome.luci.managed_dnsmasq_noresolv_present)" = 0 ]
+		if uci -q get adguardhome.luci.managed_dnsmasq_noresolv_value; then exit 1; fi
+	else
+		[ "$(uci get adguardhome.luci.managed_dnsmasq_noresolv_present)" = 1 ]
+		[ "$(uci get adguardhome.luci.managed_dnsmasq_noresolv_value)" = \
+			"$previous_noresolv" ]
+	fi
+	clear_managed_dnsmasq_upstream || exit 1
+	if [ "$previous_noresolv" = absent ]; then
+		if uci -q get dhcp.main.noresolv; then exit 1; fi
+	else
+		[ "$(uci get dhcp.main.noresolv)" = "$previous_noresolv" ]
+	fi
+	if uci -q get adguardhome.luci.managed_dnsmasq_noresolv_present ||
+	   uci -q get adguardhome.luci.managed_dnsmasq_noresolv_value; then
+		exit 1
+	fi
+done
+
+printf "config dnsmasq 'main'\n option noresolv '0'\n" | uci import dhcp
+printf "config luci 'luci'\n" | uci import adguardhome
+TEST_SNAPSHOT_FAIL=1
+if set_dnsmasq_upstream; then
+	printf 'failed takeover unexpectedly succeeded\n' >&2
+	exit 1
+fi
+TEST_SNAPSHOT_FAIL=0
+[ "$(uci get dhcp.main.noresolv)" = 0 ]
+if uci -q get dhcp.main.server ||
+   uci -q get adguardhome.luci.managed_dnsmasq_upstream ||
+   uci -q get adguardhome.luci.managed_dnsmasq_noresolv_present ||
+   uci -q get adguardhome.luci.managed_dnsmasq_noresolv_value; then
+	exit 1
+fi
 
 # The real settings loader must tell monitoring that an ordinary pending edit
 # is busy, without stopping a healthy core or touching DNS/the user's delta.

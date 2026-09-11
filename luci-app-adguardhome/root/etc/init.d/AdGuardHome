@@ -27,9 +27,14 @@ NORMALIZER_GROUP="root"
 MAX_YAML_SIZE=524288
 MAX_TLS_FILE_SIZE=1048576
 MAX_UCI_CONFIG_SIZE=1048576
+# Linux permits 4095 pathname bytes; reserve the 55-byte LuCI stage suffix.
+MAX_WORK_DIR_LENGTH=4040
+MAX_WORK_DIR_COMPONENT_LENGTH=255
 MANAGED_JAIL_OPTION="managed_jail_mount"
 MANAGED_TLS_FINGERPRINT="managed_tls_fingerprint"
 MANAGED_DNSMASQ_UPSTREAM="managed_dnsmasq_upstream"
+MANAGED_DNSMASQ_NORESOLV_PRESENT="managed_dnsmasq_noresolv_present"
+MANAGED_DNSMASQ_NORESOLV_VALUE="managed_dnsmasq_noresolv_value"
 UCI_CONFIG_DIRECTORY="/etc/config"
 UCI_DELTA_DIRECTORY="/tmp/.uci"
 MANAGED_CONFIG_SNAPSHOT_DIR="/root/.luci-app-adguardhome"
@@ -54,7 +59,7 @@ INTEGRATION_LOCK="/var/lock/AdGuardHome-integration.lock"
 NORMALIZER_RUNTIME_DIR="/var/run/luci-app-adguardhome"
 NORMALIZER_LOCK="${NORMALIZER_RUNTIME_DIR}/normalizer.lock"
 YAML_JOB_RUNTIME_DIR="/var/run/luci-app-adguardhome-yaml"
-MONITOR_INTERVAL=5
+MONITOR_INTERVAL=30
 # First boot can download and compile the packaged default filters before the
 # DNS sockets appear, especially on slower routers.  Keep takeover disabled
 # while allowing the official core enough time to become genuinely ready.
@@ -322,7 +327,11 @@ monotonic_seconds() {
 }
 
 validate_work_dir() {
-	local value="$1"
+	local value="$1" remaining component
+	if [ "${#value}" -gt "$MAX_WORK_DIR_LENGTH" ]; then
+		log_error "Work directory is too long"
+		return 1
+	fi
 	case "$value" in
 		""|/|//*|*//*|*/)
 			log_error "Invalid work directory: '${value}'"
@@ -353,6 +362,16 @@ validate_work_dir() {
 			return 1
 			;;
 	esac
+	remaining="${value#/}"
+	while [ -n "$remaining" ]; do
+		component="${remaining%%/*}"
+		if [ "${#component}" -gt "$MAX_WORK_DIR_COMPONENT_LENGTH" ]; then
+			log_error "Work directory contains an overlong path component"
+			return 1
+		fi
+		[ "$remaining" = "$component" ] && break
+		remaining="${remaining#*/}"
+	done
 	[ -n "$value" ] && [ "$value" != / ] && ! path_contains_symlink "$value"
 }
 
@@ -648,12 +667,8 @@ load_settings() {
 			;;
 		1) ;;
 		2)
-			# Disk mode remains available without touching an unsafe foreign
-			# object, but a requested RAM start must fail closed.
-			if [ "$memory_requested" = 1 ]; then
-				log_error "Unsafe or incomplete AdGuard Home memory namespace"
-				return 1
-			fi
+			log_error "Unsafe or incomplete AdGuard Home memory namespace"
+			return 1
 			;;
 		*) return 1 ;;
 	esac
@@ -1691,9 +1706,122 @@ memory_copy_live_data_locked() (
 	return 0
 )
 
+memory_quarantine_stopped_conflicts_locked() (
+	local source="${MEMORY_WORK_DIR}/data" target="$MEMORY_BACKING_DATA_MOUNT"
+	local quarantine scan_rc=0 state_rc=0
+	[ "$MEMORY_ACTIVE" = 1 ] && [ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	official_running && exit 1
+	adguard_uid_process_exists && exit 1
+	memory_state_load || state_rc=$?
+	[ "$state_rc" = 0 ] || exit 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
+	uid853_mounted_tree_is_writable "$target" || exit 1
+	quarantine="$(mktemp -d "$target/.luci-writeback.XXXXXX")" || exit 1
+	case "$quarantine" in
+		"$target"/.luci-writeback.??????) ;;
+		*) rmdir "$quarantine" 2>/dev/null || true; exit 1 ;;
+	esac
+	if [ -e "$source/${quarantine##*/}" ] || [ -L "$source/${quarantine##*/}" ]; then
+		rmdir "$quarantine" || exit 1
+		exit 1
+	fi
+	mkdir -m 0700 "$quarantine/items" || {
+		rmdir "$quarantine" 2>/dev/null || true
+		exit 1
+	}
+	# The authenticated trees contain only files and directories.  Move each
+	# conflicting destination aside on the same bind mount, so no old data is
+	# destroyed if the retry still fails.
+	run_bounded 120 2 /usr/bin/find "$source" -xdev -mindepth 1 \
+		-exec /bin/sh -c '
+			source="$1"
+			target="$2"
+			quarantine="$3"
+			shift 3
+			umask 077
+			for source_path do
+				relative="${source_path#"$source"/}"
+				[ "$relative" != "$source_path" ] || exit 1
+				target_path="$target/$relative"
+				[ -e "$target_path" ] || continue
+				if [ -f "$source_path" ]; then
+					[ -f "$target_path" ] && continue
+				else
+					[ -d "$source_path" ] && [ -d "$target_path" ] && continue
+				fi
+				item="$quarantine/items/$relative"
+				mkdir -p "${item%/*}" && mv "$target_path" "$item" || exit 1
+				: >"$quarantine/.moved" || exit 1
+			done
+		' sh "$source" "$target" "$quarantine" '{}' + || scan_rc=$?
+	chown -R "${ADGUARD_UID}:${ADGUARD_GID}" "$quarantine" || exit 1
+	uid853_mounted_tree_is_writable "$target" || exit 1
+	[ "$scan_rc" = 0 ] || exit 1
+	if [ ! -e "$quarantine/.moved" ]; then
+		rmdir "$quarantine/items" "$quarantine" || exit 1
+		exit 2
+	fi
+	chmod 0700 "$quarantine" "$quarantine/items" || exit 1
+	memory_state_load || exit 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
+	log_error "Quarantined conflicting AdGuard Home persistent RAM data"
+)
+
 memory_copy_stopped_data_locked() {
-	memory_copy_live_data_locked 0
+	local copy_rc=0 quarantine_rc=0
+	memory_copy_live_data_locked 0 || copy_rc=$?
+	if [ "$copy_rc" = 0 ]; then
+		memory_prune_stopped_data_locked
+		return
+	fi
+	[ "$copy_rc" = 1 ] || return "$copy_rc"
+	memory_quarantine_stopped_conflicts_locked || quarantine_rc=$?
+	[ "$quarantine_rc" = 0 ] || return 1
+	memory_copy_live_data_locked 0 || return 1
+	memory_prune_stopped_data_locked
 }
+
+# Once the stopped copy has succeeded, remove only persistent entries that no
+# longer exist in the authenticated RAM tree.  The live copy remains additive
+# so a concurrent database update can never race a deletion.
+memory_prune_stopped_data_locked() (
+	local source="${MEMORY_WORK_DIR}/data" target="$MEMORY_BACKING_DATA_MOUNT"
+	local state_rc=0
+	[ "$MEMORY_ACTIVE" = 1 ] && [ -n "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	official_running && exit 1
+	adguard_uid_process_exists && exit 1
+	memory_state_load || state_rc=$?
+	[ "$state_rc" = 0 ] || exit 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
+	uid853_mounted_tree_is_writable "$target" || exit 1
+	run_bounded 120 2 \
+		/sbin/start-stop-daemon -S -c "${ADGUARD_UID}:${ADGUARD_GID}" \
+		-n AGHDataPrune -x /usr/bin/find -- \
+		"$target" -xdev -depth -mindepth 1 -exec /bin/sh -c '
+			source="$1"
+			target="$2"
+			shift 2
+			for path do
+				relative="${path#"$target"/}"
+				[ "$relative" != "$path" ] || exit 1
+				[ -e "$source/$relative" ] && continue
+				if [ -d "$path" ]; then
+					rmdir "$path"
+				else
+					rm -f "$path"
+				fi || exit 1
+			done
+		' sh "$source" "$target" '{}' + || exit 1
+	memory_state_load || exit 1
+	[ "$MEMORY_STATE_PERSISTENT_WORK_DIR" = "$MEMORY_BACKING_WORK_DIR" ] || exit 1
+	memory_bindings_valid "$MEMORY_BACKING_WORK_DIR" || exit 1
+	official_running && exit 1
+	adguard_uid_process_exists && exit 1
+	log_error "Pruned stale AdGuard Home persistent RAM data"
+)
 
 root_private_config_source() {
 	local candidate="$1" parent mode
@@ -3326,7 +3454,7 @@ dnsmasq_takeover_is_safe() {
 }
 
 clear_managed_dnsmasq_upstream() {
-	local managed_port upstream
+	local managed_port upstream previous_present previous_value=""
 	managed_port="$(uci -q get \
 		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}")"
 	[ -n "$managed_port" ] || return 0
@@ -3336,24 +3464,65 @@ clear_managed_dnsmasq_upstream() {
 	}
 	upstream="127.0.0.1#${managed_port}"
 	load_dnsmasq_section "$upstream" || return 1
+	if ! previous_present="$(uci -q get \
+	   "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}")"; then
+		# Installations created before this state was recorded can only retain the
+		# former cleanup behavior.  New takeovers always publish the exact state.
+		previous_present=0
+	fi
+	case "$previous_present" in
+		0) ;;
+		1)
+			previous_value="$(uci -q get \
+				"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}")" || {
+				log_error "Managed dnsmasq noresolv state is incomplete"
+				return 1
+			}
+			;;
+		*)
+			log_error "Managed dnsmasq noresolv state is invalid"
+			return 1
+			;;
+	esac
 	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
 	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
-	uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
+	if [ "$previous_present" = 1 ]; then
+		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" || return 1
+	else
+		uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
+	fi
 	uci -q commit dhcp || return 1
 	reload_service_if_present /etc/init.d/dnsmasq restart || return 1
 	uci -q delete \
 		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}" || return 1
+	uci -q delete \
+		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}" \
+		>/dev/null 2>&1 || true
+	uci -q delete \
+		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}" \
+		>/dev/null 2>&1 || true
 	uci -q commit "$PLUGIN_CONFIG" || return 1
 	refresh_managed_config_snapshot
 }
 
 rollback_new_dnsmasq_upstream() {
+	local previous_present="$1" previous_value="$2"
 	local upstream="127.0.0.1#${dns_port}"
 	uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
-	uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
+	if [ "$previous_present" = 1 ]; then
+		uci -q set "${DNSMASQ_UCI}.noresolv=${previous_value}" >/dev/null 2>&1 || true
+	else
+		uci -q delete "${DNSMASQ_UCI}.noresolv" >/dev/null 2>&1 || true
+	fi
 	uci -q commit dhcp >/dev/null 2>&1 || true
 	uci -q delete \
 		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}" \
+		>/dev/null 2>&1 || true
+	uci -q delete \
+		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}" \
+		>/dev/null 2>&1 || true
+	uci -q delete \
+		"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}" \
 		>/dev/null 2>&1 || true
 	uci -q commit "$PLUGIN_CONFIG" >/dev/null 2>&1 || true
 	refresh_managed_config_snapshot >/dev/null 2>&1 || true
@@ -3361,11 +3530,14 @@ rollback_new_dnsmasq_upstream() {
 }
 
 set_dnsmasq_upstream() {
-	local upstream="127.0.0.1#${dns_port}"
+	local upstream="127.0.0.1#${dns_port}" previous_present=0 previous_value=""
 	load_dnsmasq_section || return 1
 	dnsmasq_takeover_is_safe || return 1
 	# A default CLI delta belongs to its author, not this DNS transaction.
 	uci_guard_no_delta dhcp && uci_guard_no_delta "$PLUGIN_CONFIG" || return 1
+	if previous_value="$(uci -q get "${DNSMASQ_UCI}.noresolv")"; then
+		previous_present=1
+	fi
 	uci -q add_list "${DNSMASQ_UCI}.server=${upstream}" || return 1
 	uci -q set "${DNSMASQ_UCI}.noresolv=1" || {
 		uci -q del_list "${DNSMASQ_UCI}.server=${upstream}" >/dev/null 2>&1 || true
@@ -3377,10 +3549,26 @@ set_dnsmasq_upstream() {
 	}
 	if ! uci -q set \
 	   "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_UPSTREAM}=${dns_port}" ||
-	   ! uci -q commit "$PLUGIN_CONFIG" ||
+	   ! uci -q set \
+	   "${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_PRESENT}=${previous_present}"; then
+		rollback_new_dnsmasq_upstream "$previous_present" "$previous_value"
+		return 1
+	fi
+	if [ "$previous_present" = 1 ]; then
+		uci -q set \
+			"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}=${previous_value}" || {
+			rollback_new_dnsmasq_upstream "$previous_present" "$previous_value"
+			return 1
+		}
+	else
+		uci -q delete \
+			"${PLUGIN_CONFIG}.${PLUGIN_SECTION}.${MANAGED_DNSMASQ_NORESOLV_VALUE}" \
+			>/dev/null 2>&1 || true
+	fi
+	if ! uci -q commit "$PLUGIN_CONFIG" ||
 	   ! refresh_managed_config_snapshot ||
 	   ! reload_service_if_present /etc/init.d/dnsmasq restart; then
-		rollback_new_dnsmasq_upstream
+		rollback_new_dnsmasq_upstream "$previous_present" "$previous_value"
 		return 1
 	fi
 }
@@ -3410,28 +3598,38 @@ dnsmasq_integration_matches() (
 )
 
 set_firewall_redirect() {
-	local section="firewall.${FIREWALL_SECTION}" owner family=ipv4
+	local section="firewall.${FIREWALL_SECTION}" owner family=ipv4 existed=0
 	if uci -q get "$section" >/dev/null 2>&1; then
 		owner="$(uci -q get "${section}.${FIREWALL_OWNER_OPTION}")"
 		if [ "$owner" != "$FIREWALL_OWNER_VALUE" ]; then
 			log_error "Refusing to overwrite the existing firewall.${FIREWALL_SECTION} section"
 			return 1
 		fi
+		existed=1
 	fi
 	uci_guard_no_delta firewall || return 1
-	uci -q set "${section}=redirect" || return 1
-	uci -q set "${section}.${FIREWALL_OWNER_OPTION}=${FIREWALL_OWNER_VALUE}" || return 1
-	uci -q set "${section}.src=lan" || return 1
-	uci -q set "${section}.proto=tcp udp" || return 1
-	uci -q set "${section}.src_dport=53" || return 1
-	uci -q set "${section}.dest_port=${dns_port}" || return 1
-	uci -q set "${section}.target=DNAT" || return 1
 	# Redirect IPv6 only when the supervised core actually owns an IPv6 DNS
 	# socket; otherwise leave IPv6 port 53 with dnsmasq instead of black-holing it.
 	dns_ipv6_listening && family=any
-	uci -q set "${section}.family=${family}" || return 1
-	uci -q set "${section}.reflection=0" || return 1
-	uci -q commit firewall || return 1
+	if ! {
+		{ [ "$existed" != 1 ] || uci -q delete "$section"; } &&
+			uci -q set "${section}=redirect" &&
+			uci -q set "${section}.${FIREWALL_OWNER_OPTION}=${FIREWALL_OWNER_VALUE}" &&
+			uci -q set "${section}.src=lan" &&
+			uci -q set "${section}.proto=tcp udp" &&
+			uci -q set "${section}.src_dport=53" &&
+			uci -q set "${section}.dest_port=${dns_port}" &&
+			uci -q set "${section}.target=DNAT" &&
+			uci -q set "${section}.family=${family}" &&
+			uci -q set "${section}.reflection=0"
+	}; then
+		uci -q revert firewall >/dev/null 2>&1 || true
+		return 1
+	fi
+	uci -q commit firewall || {
+		uci -q revert firewall >/dev/null 2>&1 || true
+		return 1
+	}
 	reload_service_if_present /etc/init.d/firewall reload
 }
 
@@ -3454,6 +3652,8 @@ clear_firewall_redirect() {
 firewall_integration_matches() (
 	local section="$FIREWALL_SECTION" expected_family=ipv4
 	local type owner src proto src_dport dest_port target family reflection
+	local option value FIREWALL_UNMANAGED_OPTION=0
+	mark_unmanaged_firewall_option() { FIREWALL_UNMANAGED_OPTION=1; }
 	config_load firewall || return 1
 	config_get type "$section" TYPE
 	config_get owner "$section" "$FIREWALL_OWNER_OPTION"
@@ -3464,6 +3664,17 @@ firewall_integration_matches() (
 	config_get target "$section" target
 	config_get family "$section" family
 	config_get reflection "$section" reflection
+	# Any explicit option outside the managed shape can narrow, disable or
+	# redirect the rule while all canonical fields still appear to match.
+	for option in enabled dest device direction ipset helper src_ip src_mac src_port src_dip \
+		dest_ip extra limit limit_burst utc_time start_date stop_date start_time \
+		stop_time weekdays monthdays mark set_mark set_xmark dscp set_dscp \
+		reflection_src reflection_zone counter log log_limit; do
+		config_get value "$section" "$option"
+		[ -z "$value" ] || return 1
+		config_list_foreach "$section" "$option" mark_unmanaged_firewall_option || return 1
+		[ "$FIREWALL_UNMANAGED_OPTION" = 0 ] || return 1
+	done
 	dns_ipv6_listening && expected_family=any
 	[ "$type" = redirect ] && [ "$owner" = "$FIREWALL_OWNER_VALUE" ] &&
 		[ "$src" = lan ] && [ "$proto" = "tcp udp" ] &&
@@ -4455,8 +4666,8 @@ memory_deactivate_locked() {
 	}
 	old_backing="$MEMORY_BACKING_WORK_DIR"
 	# The core is stopped but both authenticated mounts remain present.  Copy
-	# RAM data directly over matching persistent paths through the backing
-	# alias; retain unrelated files and never replace the data root.
+	# RAM data through the backing alias, then prune stale entries only after a
+	# complete copy; never replace the data root.
 	memory_copy_stopped_data_locked || return 1
 	memory_suspend_data_bindings "$old_backing" || return 1
 	if ! memory_restore_official_persistent_paths; then
@@ -4906,7 +5117,7 @@ orchestrate_core_locked() {
 
 reconcile_core_locked() {
 	local settings_rc=0 OFFICIAL_SOCKET_SNAPSHOT_READY=0
-	# Five-second monitoring must not traverse every data file.  Any branch that
+	# Periodic monitoring must not traverse every data file.  Any branch that
 	# copies, starts, switches or removes RAM state reaches a full guarded entry.
 	load_settings light || settings_rc=$?
 	[ "$settings_rc" != 2 ] || return 0

@@ -5,11 +5,7 @@ on:
     types: [published]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  actions: read
-  pages: write
-  id-token: write
+permissions: {}
 
 concurrency:
   group: github-pages
@@ -22,14 +18,14 @@ jobs:
           (startsWith(github.event.release.tag_name, 'v3.') &&
            github.event.release.prerelease == false) }}
     runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      pages: write
     outputs:
       current: ${{ steps.releases.outputs.current }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-
-      - name: Select current and previous stable v3 releases
+      - name: Select current stable v3 release
         id: releases
         shell: bash
         env:
@@ -53,11 +49,7 @@ jobs:
             printf 'Skipping old release %s; latest stable release is %s\n' "$REQUESTED_TAG" "$current"
             exit 0
           fi
-          previous=${stable_tags[1]:-}
-          [[ -z $previous || $previous =~ ^v3\.[0-9A-Za-z.+_~-]+$ ]] ||
-            die "not a stable v3 release tag: $previous"
-
-          printf 'current=%s\nprevious=%s\n' "$current" "$previous" >>"$GITHUB_OUTPUT"
+          printf 'current=%s\n' "$current" >>"$GITHUB_OUTPUT"
 
       - name: Require passing tests for release commit
         if: steps.releases.outputs.current != ''
@@ -87,24 +79,25 @@ jobs:
             exit 1
           }
 
+      - name: Check out selected release
+        if: steps.releases.outputs.current != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ steps.releases.outputs.current }}
+          persist-credentials: false
+
       - name: Download release APKs
         if: steps.releases.outputs.current != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           CURRENT_TAG: ${{ steps.releases.outputs.current }}
-          PREVIOUS_TAG: ${{ steps.releases.outputs.previous }}
         run: |
           set -Eeuo pipefail
-          mkdir -p release/current release/previous
+          mkdir -p release/current
           gh release download "$CURRENT_TAG" --dir release/current \
             --pattern 'luci-app-adguardhome-*.apk' \
             --pattern 'luci-i18n-adguardhome-zh-cn-*.apk'
-          if [[ -n $PREVIOUS_TAG ]]; then
-            gh release download "$PREVIOUS_TAG" --dir release/previous \
-              --pattern 'luci-app-adguardhome-*.apk' \
-              --pattern 'luci-i18n-adguardhome-zh-cn-*.apk'
-          fi
 
       - name: Build and verify signed feed
         if: steps.releases.outputs.current != ''
@@ -112,30 +105,28 @@ jobs:
         env:
           APK_SIGNING_KEY_B64: ${{ secrets.APK_SIGNING_KEY_B64 }}
           CURRENT_TAG: ${{ steps.releases.outputs.current }}
-          PREVIOUS_TAG: ${{ steps.releases.outputs.previous }}
         run: |
           set -Eeuo pipefail
           mkdir -p site
           cp keys/public-key.pem site/public-key.pem
           docker run --rm \
             -e APK_SIGNING_KEY_B64 \
-            -e CURRENT_TAG -e PREVIOUS_TAG \
+            -e CURRENT_TAG \
             -v "$PWD:/work" \
             -w /work \
-            alpine:3.23 sh -ec '
-              apk add --no-cache openssl
-              set -- /sbin/apk keys/public-key.pem "$CURRENT_TAG" release/current site/packages
-              [ -z "$PREVIOUS_TAG" ] || set -- "$@" "$PREVIOUS_TAG" release/previous
-              exec sh scripts/publish-feed.sh "$@"
+            alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40 sh -ec '
+              apk add --no-cache openssl=3.5.8-r0
+              exec sh scripts/publish-feed.sh /sbin/apk keys/public-key.pem \
+                "$CURRENT_TAG" release/current site/packages
             '
 
       - name: Configure GitHub Pages
         if: steps.releases.outputs.current != ''
-        uses: actions/configure-pages@v6
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6
 
       - name: Upload Pages artifact
         if: steps.releases.outputs.current != ''
-        uses: actions/upload-pages-artifact@v5
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5
         with:
           path: site
 
@@ -143,10 +134,13 @@ jobs:
     needs: build
     if: needs.build.outputs.current != ''
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      pages: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - name: Deploy GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.1.0
-PKG_RELEASE:=2
+PKG_RELEASE:=3
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -20,13 +20,73 @@ LUCI_MAINTAINER:=terrytyc
 LUCI_URL:=https://github.com/terrytyc/luci-app-adguardhome
 
 define AdGuardHome/UciPendingGuard
-pending_uci_changes="$$(uci -q changes 2>/dev/null)" || {
-	echo "Unable to inspect pending UCI changes; package installation aborted." >&2
-	exit 1
+for uci_config in $(1); do
+	pending_uci_changes="$$(uci -q changes "$$uci_config" 2>/dev/null)" || {
+		echo "Unable to inspect pending $$uci_config UCI changes; package installation aborted." >&2
+		exit 1
+	}
+	[ -z "$$pending_uci_changes" ] || {
+		echo "Commit or revert pending $$uci_config changes before installing this package." >&2
+		exit 1
+	}
+done
+endef
+
+define AdGuardHome/YamlMaintenance
+yaml_job_runtime=/var/run/luci-app-adguardhome-yaml
+yaml_job_lock="$${yaml_job_runtime}/update.lock"
+yaml_maintenance_marker="$${yaml_job_runtime}/removing"
+yaml_maintenance_created=0
+
+root_private_empty_file() {
+	root_private_file "$$1" || return 1
+	[ "$$(wc -c <"$$1" 2>/dev/null)" = 0 ]
 }
-[ -z "$$pending_uci_changes" ] || {
-	echo "Commit or revert pending UCI changes before installing this package." >&2
-	exit 1
+
+begin_yaml_maintenance() {
+	if [ -e "$$yaml_job_runtime" ] || [ -L "$$yaml_job_runtime" ]; then
+		root_private_directory "$$yaml_job_runtime" || return 1
+	else
+		mkdir -m 0700 "$$yaml_job_runtime" || return 1
+		chown 0:0 "$$yaml_job_runtime" && chmod 0700 "$$yaml_job_runtime" || return 1
+	fi
+	if [ -e "$$yaml_job_lock" ] || [ -L "$$yaml_job_lock" ]; then
+		root_private_empty_file "$$yaml_job_lock" || return 1
+	else
+		(umask 077; set -C; : >"$$yaml_job_lock") 2>/dev/null || return 1
+		chown 0:0 "$$yaml_job_lock" && chmod 0600 "$$yaml_job_lock" || return 1
+	fi
+	[ ! -e /proc/self/fd/191 ] || return 1
+	exec 191>>"$$yaml_job_lock" || return 1
+	[ /proc/self/fd/191 -ef "$$yaml_job_lock" ] || return 1
+	/usr/bin/flock -x -w 300 191 || return 1
+	[ /proc/self/fd/191 -ef "$$yaml_job_lock" ] &&
+		root_private_empty_file "$$yaml_job_lock" || return 1
+	if [ -e "$$yaml_maintenance_marker" ] || [ -L "$$yaml_maintenance_marker" ]; then
+		root_private_empty_file "$$yaml_maintenance_marker" || return 1
+	else
+		(umask 077; set -C; : >"$$yaml_maintenance_marker") 2>/dev/null || return 1
+		yaml_maintenance_created=1
+		chown 0:0 "$$yaml_maintenance_marker" &&
+			chmod 0600 "$$yaml_maintenance_marker" || return 1
+		root_private_empty_file "$$yaml_maintenance_marker" || return 1
+	fi
+}
+
+rollback_yaml_maintenance() {
+	[ "$$yaml_maintenance_created" = 1 ] || return 0
+	[ -e /proc/self/fd/191 ] && [ /proc/self/fd/191 -ef "$$yaml_job_lock" ] &&
+		root_private_empty_file "$$yaml_maintenance_marker" || return 0
+	rm -f "$$yaml_maintenance_marker" 2>/dev/null || true
+}
+
+finish_yaml_maintenance() {
+	[ -e /proc/self/fd/191 ] && [ /proc/self/fd/191 -ef "$$yaml_job_lock" ] &&
+		root_private_directory "$$yaml_job_runtime" &&
+		root_private_empty_file "$$yaml_job_lock" &&
+		root_private_empty_file "$$yaml_maintenance_marker" || return 1
+	rm -f "$$yaml_maintenance_marker" || return 1
+	[ ! -e "$$yaml_maintenance_marker" ] && [ ! -L "$$yaml_maintenance_marker" ]
 }
 endef
 
@@ -66,7 +126,18 @@ define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
-$(AdGuardHome/UciPendingGuard)
+$(AdGuardHome/PrivateFiles)
+
+$(AdGuardHome/YamlMaintenance)
+
+trap 'rollback_yaml_maintenance' 0
+trap 'exit 1' HUP INT TERM
+begin_yaml_maintenance || {
+	echo "Unable to quiesce LuCI YAML updates; installation aborted." >&2
+	exit 1
+}
+
+$(call AdGuardHome/UciPendingGuard,adguardhome dhcp firewall)
 
 $(AdGuardHome/RunBounded)
 
@@ -81,12 +152,22 @@ if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
 		exit 1
 	}
 fi
+trap - 0 HUP INT TERM
 exit 0
 endef
 
 define Package/$(PKG_NAME)/postinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
+
+$(AdGuardHome/PrivateFiles)
+
+$(AdGuardHome/YamlMaintenance)
+
+begin_yaml_maintenance || {
+	echo "Unable to preserve the LuCI YAML maintenance gate." >&2
+	exit 1
+}
 
 if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
    [ -L /etc/uci-defaults/40_luci-AdGuardHome ]; then
@@ -102,6 +183,7 @@ elif [ -d /tmp/luci-modulecache ]; then
 fi
 # Load the updated RPC module without restarting the shared daemon.
 [ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1
+finish_yaml_maintenance || exit 1
 exit 0
 endef
 
@@ -115,6 +197,16 @@ esac
 $(AdGuardHome/RunBounded)
 
 $(AdGuardHome/PrivateFiles)
+
+$(AdGuardHome/YamlMaintenance)
+
+trap 'rollback_yaml_maintenance' 0
+trap 'exit 1' HUP INT TERM
+begin_yaml_maintenance || {
+	echo "Unable to quiesce LuCI YAML updates; uninstall aborted." >&2
+	exit 1
+}
+
 runtime_dir=/var/run/luci-app-adguardhome
 remove_state="$$runtime_dir/remove-ok"
 
@@ -153,6 +245,7 @@ else
 fi
 (umask 077; printf '1\n' >"$$remove_state") || exit 1
 chown 0:0 "$$remove_state" && chmod 0600 "$$remove_state" || exit 1
+trap - 0 HUP INT TERM
 exit 0
 endef
 
@@ -165,6 +258,13 @@ rm -f "$$IPKG_INSTROOT/lib/upgrade/keep.d/luci-app-adguardhome"
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
 $(AdGuardHome/PrivateFiles)
+
+$(AdGuardHome/YamlMaintenance)
+
+begin_yaml_maintenance || {
+	echo "Unable to preserve the LuCI YAML maintenance gate." >&2
+	exit 1
+}
 
 snapshot_dir=/root/.luci-app-adguardhome
 runtime_dir=/var/run/luci-app-adguardhome
@@ -189,7 +289,8 @@ if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
 elif [ -d /tmp/luci-modulecache ]; then
 	rm -rf /tmp/luci-modulecache/
 fi
-[ ! -x /etc/init.d/rpcd ] || /etc/init.d/rpcd reload >/dev/null 2>&1
+[ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1
+finish_yaml_maintenance || exit 1
 exit 0
 endef
 
@@ -197,7 +298,7 @@ define Package/luci-i18n-adguardhome-zh-cn/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
 
-$(AdGuardHome/UciPendingGuard)
+$(call AdGuardHome/UciPendingGuard,luci)
 exit 0
 endef
 

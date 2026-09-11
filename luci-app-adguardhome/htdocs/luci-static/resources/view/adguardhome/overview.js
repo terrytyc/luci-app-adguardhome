@@ -131,7 +131,7 @@ function waitForYamlUpdate(token, scope) {
 		unknown: _('The credential update returned an unknown job state.'),
 		unavailable: _('The credential update is still running, but its status is temporarily unavailable: %s. Do not submit it again; reload this page later.'),
 		pending: _('The credential update is still running. Do not submit it again; reload this page later.'),
-	});
+	}, uncertainCredentialUpdateError);
 }
 
 function waitForSettingsUpdate(token, scope) {
@@ -568,12 +568,15 @@ return view.extend({
 		};
 
 		option = coreSection.option(form.DummyValue, '_change_credentials', ' ');
-		option.renderWidget = () => E('button', {
-			class: 'cbi-button cbi-button-action adguardhome-action-button',
-			type: 'button',
-			disabled: !L.hasViewPermission() ? 'disabled' : null,
-			click: ui.createHandlerFn(this, 'openCredentialsDialog'),
-		}, _('Change Username and Password'));
+		option.renderWidget = () => {
+			this.credentialsButton = E('button', {
+				class: 'cbi-button cbi-button-action adguardhome-action-button',
+				type: 'button',
+				click: ui.createHandlerFn(this, 'openCredentialsDialog'),
+			}, _('Change Username and Password'));
+			this.updateMemoryWritebackButton();
+			return this.credentialsButton;
+		};
 
 		this.settingsMap = map;
 		this.committedSettings = settings;
@@ -647,13 +650,19 @@ return view.extend({
 		if (this.memoryWritebackButton)
 			this.memoryWritebackButton.disabled = !this.memoryWritebackAvailable ||
 				!!this.memoryWritebackBusy || !!this.settingsSubmission || !!this.credentialsPreparing ||
-				!!this.memoryWritebackUncertain || !this.committedSettings || !L.hasViewPermission();
+				!!this.memoryWritebackUncertain || !!this.credentialsUncertain ||
+				!this.committedSettings || !L.hasViewPermission();
+		if (this.credentialsButton)
+			this.credentialsButton.disabled = !!this.credentialsPreparing || !!this.settingsSubmission ||
+				!!this.memoryWritebackBusy || !!this.memoryWritebackUncertain ||
+				!!this.credentialsUncertain || !L.hasViewPermission();
 	},
 
 	async handleMemoryWriteback() {
 		const scope = this.pageScope;
 		if (!this.memoryWritebackAvailable || this.memoryWritebackBusy || this.settingsSubmission || this.credentialsPreparing ||
-		    this.memoryWritebackUncertain || !L.hasViewPermission() || !operation.isPageActive(scope))
+		    this.memoryWritebackUncertain || this.credentialsUncertain ||
+		    !L.hasViewPermission() || !operation.isPageActive(scope))
 			return;
 
 		const revision = this.committedSettings?.revision;
@@ -720,7 +729,8 @@ return view.extend({
 	async openCredentialsDialog() {
 		const scope = this.pageScope;
 		if (this.credentialsPreparing || this.settingsSubmission || this.memoryWritebackBusy ||
-		    this.memoryWritebackUncertain || !L.hasViewPermission() || !operation.isPageActive(scope))
+		    this.memoryWritebackUncertain || this.credentialsUncertain ||
+		    !L.hasViewPermission() || !operation.isPageActive(scope))
 			return;
 
 		this.credentialsPreparing = true;
@@ -881,7 +891,7 @@ return view.extend({
 				if (operation.isPageInactiveError(error))
 					throw error;
 				throw uncertainCredentialUpdateError(
-					_('The username or password update outcome is unknown. The request may have reached the router, but its response could not be read: %s. Reopen this dialog to review the current account before making another change.').format(errorMessage(error)),
+					_('The username or password update outcome is unknown. The request may have reached the router, but its response could not be read: %s. Reload this page before making any other change.').format(errorMessage(error)),
 				);
 			});
 			if (typeof response?.error === 'string' && response.error)
@@ -891,10 +901,14 @@ return view.extend({
 			if (typeof response.token !== 'string' ||
 			    !/^[0-9a-f]{32}$/.test(response.token))
 				throw uncertainCredentialUpdateError(
-					_('The username or password update outcome is unknown. The server accepted the update job but did not return a valid status token. Reopen this dialog to review the current account before making another change.'),
+					_('The username or password update outcome is unknown. The server accepted the update job but did not return a valid status token. Reload this page before making any other change.'),
 				);
 
 			const result = await waitForYamlUpdate(response.token, scope);
+			if (result?.indeterminate === true)
+				throw uncertainCredentialUpdateError(typeof result?.error === 'string' && result.error
+					? result.error
+					: _('The username or password update outcome is unknown. Reload this page before making any other change.'));
 			if (result?.ok !== true)
 				throw new Error(typeof result?.error === 'string' && result.error
 					? result.error
@@ -907,6 +921,10 @@ return view.extend({
 			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
+			if (error?.credentialUpdateUncertain === true) {
+				this.credentialsUncertain = true;
+				this.updateMemoryWritebackButton();
+			}
 			operation.failure(error?.credentialUpdateUncertain === true
 				? errorMessage(error)
 				: _('Unable to change the username or password: %s').format(errorMessage(error)),
@@ -915,7 +933,7 @@ return view.extend({
 			username = null;
 			password = null;
 			confirmation = null;
-			if (operation.isPageActive(scope)) {
+			if (operation.isPageActive(scope) && !this.credentialsUncertain) {
 				submitButton.disabled = false;
 				cancelButton.disabled = false;
 			}
@@ -1037,6 +1055,10 @@ return view.extend({
 			return this.settingsSubmission;
 		if (this.memoryWritebackBusy || this.credentialsPreparing)
 			return Promise.resolve();
+		if (this.credentialsUncertain) {
+			operation.failure(_('The username or password update outcome is unknown. Reload this page before making any other change.'));
+			return Promise.resolve();
+		}
 		if (this.memoryWritebackUncertain) {
 			operation.failure(_('The memory write-back outcome is unknown. Reload this page before trying again.'));
 			return Promise.resolve();

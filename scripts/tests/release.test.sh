@@ -25,18 +25,41 @@ check_selection() {
 	[[ $(<"$temporary/output") == "$expected" ]] || die "release selection: $requested"
 }
 check_selection v3.0.0-r1 $'v3.0.0-r2\nv3.0.0-r1' ''
-check_selection v3.0.0-r2 $'v3.0.0-r2\nv3.0.0-r1' $'current=v3.0.0-r2\nprevious=v3.0.0-r1'
-check_selection '' $'v3.0.0-r2\nv3.0.0-r1' $'current=v3.0.0-r2\nprevious=v3.0.0-r1'
-check_selection '' v3.0.0-r1 $'current=v3.0.0-r1\nprevious='
-check_selection v3.0.0-r10 $'v3.0.0-r9\nv3.0.0-r2\nv3.0.0-r10' $'current=v3.0.0-r10\nprevious=v3.0.0-r9'
-check_selection '' $'v3.0.0-r9\nv3.0.0-r10\nv3.1.0-r1' $'current=v3.1.0-r1\nprevious=v3.0.0-r10'
+check_selection v3.0.0-r2 $'v3.0.0-r2\nv3.0.0-r1' 'current=v3.0.0-r2'
+check_selection '' $'v3.0.0-r2\nv3.0.0-r1' 'current=v3.0.0-r2'
+check_selection '' v3.0.0-r1 'current=v3.0.0-r1'
+check_selection v3.0.0-r10 $'v3.0.0-r9\nv3.0.0-r2\nv3.0.0-r10' 'current=v3.0.0-r10'
+check_selection '' $'v3.0.0-r9\nv3.0.0-r10\nv3.1.0-r1' 'current=v3.1.0-r1'
 check_selection v3.0.0-r9 $'v3.0.0-r9\nv3.0.0-r10' ''
-[[ $(grep -Fc "if: steps.releases.outputs.current != ''" "$workflow") == 5 ]] || die 'build steps must skip old releases'
+[[ $(grep -Fc "if: steps.releases.outputs.current != ''" "$workflow") == 6 ]] || die 'build steps must skip old releases'
 grep -Fq "if: needs.build.outputs.current != ''" "$workflow" || die 'deploy must skip old releases'
 ! grep -Fq 'inputs.tag' "$workflow" || die 'manual publication must use the latest release'
+! grep -qi previous "$workflow" || die 'publication must not retain an unindexed previous release'
+grep -Fq 'ref: ${{ steps.releases.outputs.current }}' "$workflow" || die 'publication must check out the selected tag'
+grep -Fq 'persist-credentials: false' "$workflow" || die 'release checkout must not retain write credentials'
+! grep -Eq 'uses: [^ ]+@v[0-9]' "$workflow" || die 'publication actions must use immutable commits'
+[[ $(grep -Ec 'uses: [^ ]+@[0-9a-f]{40}( |$)' "$workflow") == 4 ]] ||
+	die 'publication action pins are missing'
+grep -Fq 'alpine:3.23@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40' "$workflow" ||
+	die 'feed container is not pinned by digest'
+grep -Fq 'apk add --no-cache openssl=3.5.8-r0' "$workflow" ||
+	die 'feed OpenSSL dependency is not pinned'
+[[ $(grep -Fc 'permissions:' "$workflow") == 3 ]] || die 'workflow permissions are not job-scoped'
 grep -Fq 'branches: [main]' "$repo/.github/workflows/test.yml" || die 'tests must run on main pushes'
 grep -Fq '  pull_request:' "$repo/.github/workflows/test.yml" || die 'tests must run on pull requests'
 ! grep -Eq '^ +tags:' "$repo/.github/workflows/test.yml" || die 'release tags must not duplicate commit tests'
+! grep -REq 'uses: [^ ]+@v[0-9]' "$repo/.github/workflows" ||
+	die 'workflow actions must use immutable commits'
+! grep -Fq "if: github.event_name != 'pull_request'" "$repo/.github/workflows/test.yml" ||
+	die 'full tests must run on pull requests'
+grep -Fq 'bash scripts/prepare-test-sdk.sh "$RUNNER_TEMP/openwrt-sdk" "$GITHUB_WORKSPACE"' \
+	"$repo/.github/workflows/test.yml" || die 'CI does not prepare a real OpenWrt SDK'
+grep -Fq 'NO_DEPS=1 JOBS=2 bash scripts/build-apk.sh' "$repo/.github/workflows/test.yml" ||
+	die 'CI does not build and verify real APKs'
+grep -Fq 'openwrt-sdk-25.12.0-x86-64_gcc-14.3.0_musl.Linux-x86_64.tar.zst' \
+	"$repo/scripts/prepare-test-sdk.sh" || die 'test SDK URL is not pinned'
+grep -Fq '9f371906ce6d2f95418f69fac06df58bf9df0ffc4abed6206c30f1b547fcfc12' \
+	"$repo/scripts/prepare-test-sdk.sh" || die 'test SDK checksum is not pinned'
 
 gate=$(awk '
  /name: Require passing tests/ { selected=1 }
@@ -135,16 +158,20 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 		if [[ $name == luci-app-adguardhome ]]; then
 			printf '    - adguardhome>=0.107.76-r1\n'
 			hooks='pre-install post-install pre-deinstall post-deinstall pre-upgrade post-upgrade'
+			uci_configs='adguardhome dhcp firewall'
 		else
 			printf '    - luci-app-adguardhome\n'
 			hooks='pre-install pre-upgrade'
+			uci_configs=luci
 		fi
 		printf 'scripts:\n'
 		for hook in $hooks; do
 			printf '  %s: |\n    #!/bin/sh\n' "$hook"
 			case "$hook" in
 				pre-install|pre-upgrade)
-					printf '    pending_uci_changes="$(uci -q changes 2>/dev/null)"\n'
+					printf '    for uci_config in %s; do\n' "$uci_configs"
+					printf '      pending_uci_changes="$(uci -q changes "$uci_config" 2>/dev/null)"\n'
+					printf '    done\n'
 					[[ $name != luci-app-adguardhome ]] || printf '    run_bounded 180 5 /etc/init.d/AdGuardHome stop\n' ;;
 				post-install|post-upgrade)
 					printf '    default_postinst\n    # AdGuard Home initialization failed; package installation aborted.\n    /etc/init.d/rpcd reload\n' ;;
@@ -184,11 +211,18 @@ case "$1" in
 esac
 SH
 chmod +x "$bin/make" "$sdk/staging_dir/host/bin/apk"
-export SDK=$sdk JOBS=1 PATH="$bin:$PATH" SOURCE_REF=HEAD
+build_tmp=$temporary/build-tmp
+mkdir "$build_tmp"
+export SDK=$sdk JOBS=1 PATH="$bin:$PATH" SOURCE_REF=HEAD TMPDIR=$build_tmp
 script=$fixture/scripts/build-apk.sh
+assert_build_tmp_clean() {
+	! compgen -G "$build_tmp/luci-app-adguardhome-build.*" >/dev/null ||
+		die 'build temporary directory was not cleaned'
+}
 for destination in first second; do
 	OUTPUT_DIR=$temporary/$destination bash "$script"
 	[[ $(readlink "$package_link") == "$package_dir" ]] || die 'SDK link not restored after success'
+	assert_build_tmp_clean
 done
 for artifact in "$temporary/first/"*; do
 	cmp "$artifact" "$temporary/second/${artifact##*/}"
@@ -198,12 +232,15 @@ archive=$temporary/first/luci-app-adguardhome-3.0.0-r2.tar.gz
 ! tar -tzf "$archive" | grep -q untracked || die 'untracked file shipped'
 SOURCE_REF=v3.0.0-r1 OUTPUT_DIR=$temporary/tag bash "$script"
 [[ -f $temporary/tag/luci-app-adguardhome-3.0.0-r1.apk ]] || die 'tag build used working-tree version'
+assert_build_tmp_clean
 if FAIL_BUILD=1 bash "$script"; then die 'build failure was ignored'; fi
 [[ $(readlink "$package_link") == "$package_dir" ]] || die 'SDK link not restored after failure'
+assert_build_tmp_clean
 hangup_rc=0
 HANGUP_BUILD=1 bash "$script" || hangup_rc=$?
 [[ $hangup_rc == 129 ]] || die 'HUP did not stop the build with its signal status'
 [[ $(readlink "$package_link") == "$package_dir" ]] || die 'SDK link not restored after HUP'
+assert_build_tmp_clean
 
 expect_failure() {
 	local reason=$1
@@ -248,8 +285,8 @@ done
 check_apk_failure main 'empty post-install hook' '/^  post-install: |$/,/^  [-a-z]*: |$/{ /^    /d; }'
 for hook in pre-install pre-upgrade; do
 	check_apk_failure i18n "missing its $hook hook" "/^  $hook: |$/d"
-	check_apk_failure main "main APK $hook lost the UCI guard" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /pending_uci_changes=/d; }"
-	check_apk_failure i18n "zh-cn APK $hook lost the UCI guard" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /pending_uci_changes=/d; }"
+	check_apk_failure main "main APK $hook lost its scoped UCI guard" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /for uci_config in/d; }"
+	check_apk_failure i18n "zh-cn APK $hook lost its scoped UCI guard" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /for uci_config in/d; }"
 	check_apk_failure main "$hook lost safe coordinator stop" "/^  $hook: |$/,/^  [-a-z]*: |$/{ /run_bounded /d; }"
 done
 for hook in post-install post-upgrade; do
@@ -264,9 +301,10 @@ expect_failure 'versioned adguardhome dependency' env BAD_CORE_DEPENDENCY=1 \
 	OUTPUT_DIR="$temporary/rejected-build" bash "$script"
 [[ ! -e $temporary/rejected-build ]] || die 'invalid build was published'
 [[ $(readlink "$package_link") == "$package_dir" ]] || die 'SDK link not restored after APK verification failure'
+assert_build_tmp_clean
 
 # The key is disposable; the real openssl checks run, while the fake APK tool
-# records which release pair enters the index without requiring an SDK.
+# records the release pair entering the index without requiring an SDK.
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
 	-out "$temporary/private-key.pem" >/dev/null 2>&1
 openssl pkey -in "$temporary/private-key.pem" -pubout \
@@ -274,23 +312,19 @@ openssl pkey -in "$temporary/private-key.pem" -pubout \
 APK_SIGNING_KEY_B64=$(base64 <"$temporary/private-key.pem" | tr -d '\n')
 export APK_SIGNING_KEY_B64
 publish=$repo/scripts/publish-feed.sh
-for history in single previous; do
-	args=("$apk" "$temporary/public-key.pem" v3.0.0-r2 "$temporary/first" "$temporary/feed-$history")
-	[[ $history != previous ]] || args+=(v3.0.0-r1 "$temporary/tag")
-	sh "$publish" "${args[@]}"
-	[[ $(<"$temporary/feed-$history/packages.adb") == "$main_name"$'\n'"$i18n_name" ]] || die 'feed indexed the wrong release pair'
-	[[ -f $temporary/feed-$history/$main_name && -f $temporary/feed-$history/$i18n_name ]] || die 'current feed pair is missing'
-done
-[[ -f $temporary/feed-previous/luci-app-adguardhome-3.0.0-r1.apk &&
-	-f $temporary/feed-previous/luci-i18n-adguardhome-zh-cn-3.0.0-r1.apk ]] || die 'previous release assets were not retained'
+sh "$publish" "$apk" "$temporary/public-key.pem" v3.0.0-r2 "$temporary/first" "$temporary/feed"
+[[ $(<"$temporary/feed/packages.adb") == "$main_name"$'\n'"$i18n_name" ]] || die 'feed indexed the wrong release pair'
+[[ -f $temporary/feed/$main_name && -f $temporary/feed/$i18n_name ]] || die 'current feed pair is missing'
+[[ $(find "$temporary/feed" -maxdepth 1 -type f -name '*.apk' | wc -l) == 2 ]] ||
+	die 'feed retained APKs outside the current release'
 expect_failure 'current APK version does not match its release tag' sh "$publish" "$apk" \
 	"$temporary/public-key.pem" v3.0.0-r1 "$temporary/first" "$temporary/rejected-current"
-expect_failure 'previous APK version does not match its release tag' sh "$publish" "$apk" \
-	"$temporary/public-key.pem" v3.0.0-r2 "$temporary/first" "$temporary/rejected-previous" v3.0.0-r0 "$temporary/tag"
-check_apk_failure main 'main APK pre-upgrade lost the UCI guard' '/^  pre-upgrade: |$/,/^  [-a-z]*: |$/{ /pending_uci_changes=/d; }'
-expect_failure 'main APK pre-upgrade lost the UCI guard' sh "$publish" "$apk" \
+expect_failure 'Usage:' sh "$publish" "$apk" "$temporary/public-key.pem" v3.0.0-r2 \
+	"$temporary/first" "$temporary/rejected-history" v3.0.0-r1 "$temporary/tag"
+check_apk_failure main 'main APK pre-upgrade lost its scoped UCI guard' '/^  pre-upgrade: |$/,/^  [-a-z]*: |$/{ /for uci_config in/d; }'
+expect_failure 'main APK pre-upgrade lost its scoped UCI guard' sh "$publish" "$apk" \
 	"$temporary/public-key.pem" v3.0.0-r2 "$bad_dir" "$temporary/rejected-hook"
-for rejected in current previous hook; do
+for rejected in current history hook; do
 	[[ ! -e $temporary/rejected-$rejected ]] || die "invalid $rejected feed was published"
 done
-printf 'release selection, test gate, APK contracts, signed feed and SDK cleanup tests passed\n'
+printf 'release selection, pinned build inputs, APK contracts, current signed feed and SDK cleanup tests passed\n'

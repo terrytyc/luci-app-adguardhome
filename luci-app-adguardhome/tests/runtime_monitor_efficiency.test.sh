@@ -12,7 +12,7 @@ trap 'rm -rf "$test_tmp"' EXIT
 
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-grep -qx MONITOR_INTERVAL=5 "$init_file"
+grep -qx MONITOR_INTERVAL=30 "$init_file"
 for name in reconcile_core_locked monitor_interval_locked monitor wait_for_core_ready \
 	normalize_memory_writeback_interval; do
 	eval "$(function_body "$init_file" "$name")"
@@ -219,7 +219,7 @@ wait_for_core_ready 53335 none /etc/AdGuardHome
 events="${test_tmp}/monitor"
 (
 	ROUND=0
-	MONITOR_INTERVAL=5
+	MONITOR_INTERVAL=30
 	# Only bound the otherwise-infinite loop; all production scheduling branches
 	# and the real lock-result wrapper are executed unchanged.
 	eval "$(function_body "$init_file" monitor | sed 's/while :; do/while monitor_next_round; do/')"
@@ -281,7 +281,7 @@ events="${test_tmp}/monitor"
 		esac
 	}
 	sleep() {
-		[ "$*" = 5 ] || exit 1
+		[ "$*" = 30 ] || exit 1
 		record "state:${ROUND}:${next_writeback}:${last_interval}"
 	}
 	monitor

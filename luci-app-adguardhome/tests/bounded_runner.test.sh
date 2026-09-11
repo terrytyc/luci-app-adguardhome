@@ -71,6 +71,12 @@ cmp -s "${temp_dir}/init.helper" "${temp_dir}/defaults.helper" || {
 	printf 'init and uci-defaults run_bounded implementations differ\n' >&2
 	exit 1
 }
+if grep -Fq -- '-- "-$$child"' "$helper_source"; then
+	printf 'run_bounded still passes unsupported -- to BusyBox kill\n' >&2
+	exit 1
+fi
+grep -Fq 'kill "-$$1" "-$$child"' "$helper_source"
+grep -Fq 'kill -0 "-$$child"' "$helper_source"
 if grep -Fq '/usr/bin/timeout' "$init_file" "$defaults_file" "$makefile" "$helper_source" ||
 	grep -Fq 'coreutils-timeout' "$makefile"; then
 	printf 'external timeout implementation is still referenced by the package\n' >&2
@@ -105,6 +111,38 @@ session_is_gone() {
 		remaining=$((remaining - 1))
 	done
 	return 1
+}
+
+# BusyBox kill accepts a negative process-group id directly but rejects the
+# coreutils-style `--` separator used by the former helper.
+busybox_signal_pid_file="${temp_dir}/busybox-signal.pid"
+# shellcheck disable=SC2016
+/usr/bin/setsid /bin/sh -c 'printf "%s\n" "$$" >"$1"; exec /bin/sleep 30' \
+	busybox-signal "$busybox_signal_pid_file" &
+busybox_signal_runner=$!
+busybox_signal_wait=5
+while [ ! -s "$busybox_signal_pid_file" ] && [ "$busybox_signal_wait" -gt 0 ]; do
+	sleep 1
+	busybox_signal_wait=$((busybox_signal_wait - 1))
+done
+[ -s "$busybox_signal_pid_file" ] || {
+	/bin/kill -KILL "$busybox_signal_runner" 2>/dev/null || true
+	wait "$busybox_signal_runner" 2>/dev/null || true
+	printf 'BusyBox process-group fixture did not start\n' >&2
+	exit 1
+}
+busybox_signal_pgid="$(cat "$busybox_signal_pid_file")"
+if ! busybox kill -0 "-$busybox_signal_pgid"; then
+	/bin/kill -KILL "-$busybox_signal_pgid" 2>/dev/null || true
+	wait "$busybox_signal_runner" 2>/dev/null || true
+	printf 'BusyBox kill rejected a direct negative process-group id\n' >&2
+	exit 1
+fi
+busybox kill -TERM "-$busybox_signal_pgid"
+wait "$busybox_signal_runner" 2>/dev/null || true
+session_is_gone "$busybox_signal_pgid" || {
+	printf 'BusyBox process-group signal left group %s running\n' "$busybox_signal_pgid" >&2
+	exit 1
 }
 
 find /tmp -maxdepth 1 -type f -name 'luci-app-adguardhome-bounded.*' -print 2>/dev/null |

@@ -30,7 +30,8 @@ grep -Fqx 'CONFIG_TARGET_ARCH_PACKAGES="x86_64"' "$SDK/.config" ||
 	die 'SDK is not configured for x86_64 packages'
 
 source_commit=$(git -C "$REPO" rev-parse --verify "${SOURCE_REF:-HEAD}^{commit}")
-stage=$(mktemp -d /root/luci-app-adguardhome-build.XXXXXX)
+stage=$(mktemp -d "${TMPDIR:-/tmp}/luci-app-adguardhome-build.XXXXXX")
+stage=$(cd -- "$stage" && pwd -P)
 link=$SDK/package/feeds/local/luci-app-adguardhome
 old_link=
 
@@ -45,7 +46,7 @@ cleanup() {
 		ln -sfn "$old_link" "$link"
 	fi
 	case "$stage" in
-		/root/luci-app-adguardhome-build.*) rm -rf -- "$stage" ;;
+		*/luci-app-adguardhome-build.*) rm -rf -- "$stage" ;;
 	esac
 	exit "$rc"
 }

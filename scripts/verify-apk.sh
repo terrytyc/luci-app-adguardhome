@@ -129,10 +129,14 @@ done
 for hook in pre-install pre-upgrade; do
 	extract_script "$i18n_metadata" "$hook" >"$temporary/i18n-$hook" ||
 		die "zh-cn APK is missing its $hook hook"
-	grep -Fq 'pending_uci_changes="$(uci -q changes 2>/dev/null)"' \
-		"$temporary/main-$hook" || die "main APK $hook lost the UCI guard"
-	grep -Fq 'pending_uci_changes="$(uci -q changes 2>/dev/null)"' \
-		"$temporary/i18n-$hook" || die "zh-cn APK $hook lost the UCI guard"
+	grep -Fq 'for uci_config in adguardhome dhcp firewall; do' \
+		"$temporary/main-$hook" || die "main APK $hook lost its scoped UCI guard"
+	grep -Fq 'for uci_config in luci; do' \
+		"$temporary/i18n-$hook" || die "zh-cn APK $hook lost its scoped UCI guard"
+	for guard_script in "$temporary/main-$hook" "$temporary/i18n-$hook"; do
+		grep -Fq 'pending_uci_changes="$(uci -q changes "$uci_config" 2>/dev/null)"' \
+			"$guard_script" || die "$hook UCI guard no longer checks its selected config"
+	done
 	grep -Fq 'run_bounded 180 5 /etc/init.d/AdGuardHome stop' \
 		"$temporary/main-$hook" || die "main APK $hook lost safe coordinator stop"
 done

@@ -32,23 +32,29 @@ const MEMORY_STATE_PATH = `${MEMORY_RUNTIME_DIRECTORY}/state`;
 const ADGUARD_UID = 853;
 const ADGUARD_GID = 853;
 const MAX_MEMORY_WRITEBACK_INTERVAL = 10080;
+// Linux permits 4095 pathname bytes; reserve the 55-byte LuCI stage suffix.
+const MAX_WORK_DIR_LENGTH = 4040;
+const MAX_WORK_DIR_COMPONENT_LENGTH = 255;
 
 function valid_work_dir(value) {
 	if (type(value) != 'string' ||
+	    length(value) > MAX_WORK_DIR_LENGTH ||
 	    !match(value, /^\/[A-Za-z0-9_./+@%:,=-]+$/) ||
 	    match(value, /\/\//) ||
 	    substr(value, length(value) - 1, 1) == '/')
 		return null;
 
 	let components = split(substr(value, 1), '/');
+	for (let component in components)
+		if (!length(component) || length(component) > MAX_WORK_DIR_COMPONENT_LENGTH ||
+		    component == '.' || component == '..')
+			return null;
+
 	if (match(value, /^\/(bin|boot|dev|etc|lib|lib64|mnt|overlay|proc|rom|root|run|sbin|sys|tmp|usr|var)$/))
 		return null;
 
 	let current = '';
 	for (let component in components) {
-		if (!length(component) || component == '.' || component == '..')
-			return null;
-
 		current += `/${component}`;
 		let metadata = lstat(current);
 		// Existing custom mount ancestors must still be real directories.
@@ -73,24 +79,17 @@ function valid_work_dir(value) {
 }
 
 function configured_boolean(value) {
-	if (type(value) != 'string')
-		return null;
-
-	switch (lc(value)) {
+	switch (value) {
 		case '1':
 		case 'on':
 		case 'true':
 		case 'yes':
 		case 'enabled':
 			return true;
-		case '0':
-		case 'off':
-		case 'false':
-		case 'no':
-		case 'disabled':
-			return false;
 		default:
-			return null;
+			// Match config_get_bool(..., 0): every unsupported or missing value
+			// falls back to false instead of gaining case-insensitive meaning.
+			return false;
 	}
 }
 
