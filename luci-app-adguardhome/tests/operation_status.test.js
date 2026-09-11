@@ -46,8 +46,9 @@ function loadOperation() {
 	};
 	const fakeUi = {
 		showModal(title, child, ...classes) {
-			rendered.push({ title, child: Array.isArray(child) ? child[0] : child, content: child, classes });
-			return {};
+			const record = { title, child: Array.isArray(child) ? child[0] : child, content: child, classes, headingRemoved: false };
+			rendered.push(record);
+			return { firstElementChild: { remove() { record.headingRemoved = true; } } };
 		},
 		hideModal() {
 			hidden++;
@@ -98,6 +99,7 @@ assert.equal(state.rendered.at(-1).child.text,
 assert.deepEqual(state.rendered.at(-1).classes,
 	[ 'alert-message', 'notice', 'spinning' ]);
 assert.equal(state.rendered.at(-1).child.tag, 'p');
+assert.equal(state.rendered.at(-1).headingRemoved, true, 'pending status must not retain the theme-colored empty title');
 assert.equal(state.timers.size, 0,
 	'pending operations must wait for a real result without repaint or countdown timers');
 assert.equal(state.rendered.length, 1);
@@ -107,6 +109,7 @@ assert.equal(state.operation._modalVisible, true,
 state.operation.success(undefined, initialTicket);
 assert.equal(state.rendered.at(-1).child.text, 'Configuration changes applied.');
 assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'notice' ]);
+assert.equal(state.rendered.at(-1).headingRemoved, true, 'success status must not retain an empty title');
 assert.equal(state.hidden(), 0);
 state.advanceOne();
 assert.equal(state.hidden(), 1, 'success status must close automatically');
@@ -124,6 +127,7 @@ assert.equal(state.rendered.at(-1).child.textChildren, true,
 	'LuCI interprets scalar children as HTML; operation messages must use a text-child array');
 assert.equal(state.rendered.at(-1).child.text, errorText);
 assert.deepEqual(state.rendered.at(-1).classes, [ 'alert-message', 'error' ]);
+assert.equal(state.rendered.at(-1).headingRemoved, true, 'failure status must not retain an empty title');
 assert.equal(state.timers.size, 0, 'failure status must remain until dismissed');
 const dismissFailure = state.rendered.at(-1).content[1].children[0].attrs.click;
 dismissFailure();

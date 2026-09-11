@@ -65,7 +65,10 @@ function loadOperation() {
 		},
 	};
 	const fakeUi = {
-		showModal(_title, child) { rendered.push(Array.isArray(child) ? child[0] : child); },
+		showModal(_title, child) {
+			rendered.push(Array.isArray(child) ? child[0] : child);
+			return { firstElementChild: { remove() {} } };
+		},
 		hideModal() { hidden++; },
 	};
 	const LuCIClass = createLuCIClass();

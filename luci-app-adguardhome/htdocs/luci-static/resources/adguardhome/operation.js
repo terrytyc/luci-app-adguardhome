@@ -184,7 +184,7 @@ return baseclass.extend({
 
 		const content = E('p', {}, [ message ]);
 		const generation = this._generation;
-		ui.showModal('', type === 'error' ? [ content,
+		const modal = ui.showModal('', type === 'error' ? [ content,
 			E('div', { class: 'right' }, E('button', {
 				class: 'cbi-button',
 				type: 'button',
@@ -194,6 +194,8 @@ return baseclass.extend({
 				},
 			}, _('Close'))),
 		] : content, ...classes);
+		// LuCI creates an empty heading which Argon renders as a colored bar.
+		modal.firstElementChild.remove();
 		this._modalVisible = true;
 	},
 
