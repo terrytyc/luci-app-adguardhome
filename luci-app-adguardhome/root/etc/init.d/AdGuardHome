@@ -5318,8 +5318,24 @@ network_ready() {
 }
 
 service_triggers() {
-	# START only orders scripts; DHCP/IPv6 address setup can finish later.
-	procd_add_raw_trigger 'interface.*.up' 5000 "$initscript" network_ready
+	# netifd reports readiness as interface.update with a string l3_device.
+	# procd's .* matcher ignores suffixes; match the event and ready payload.
+	json_add_array
+	json_add_string "" interface.update
+	json_add_array
+	json_add_string "" if
+	json_add_array
+	json_add_string "" has
+	json_add_string "" l3_device
+	json_close_array
+	json_add_array
+	json_add_string "" run_script
+	json_add_string "" "$initscript"
+	json_add_string "" network_ready
+	json_close_array
+	json_close_array
+	json_add_int "" 5000
+	json_close_array
 }
 
 # This is the only process supervised by the compatibility wrapper.  It never

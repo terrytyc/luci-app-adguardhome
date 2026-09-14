@@ -743,12 +743,8 @@ return view.extend({
 		this.updateMemoryWritebackButton();
 		const operationTicket = operation.start(_('Preparing account change…'));
 		let info = null;
-		let bcrypt = null;
 		try {
-			[info, bcrypt] = await operation.requestActive(() => Promise.all([
-				callGetCredentials(),
-				L.require('adguardhome.bcrypt'),
-			]), scope);
+			info = await operation.requestActive(callGetCredentials, scope);
 			if (typeof info?.error === 'string' && info.error)
 				throw new Error(info.error);
 			if (info?.available !== true || typeof info.username !== 'string' ||
@@ -809,7 +805,6 @@ return view.extend({
 		}, _('Change Username and Password'));
 		submitButton.addEventListener('click', ui.createHandlerFn(this, async () => {
 			await this.changeCredentials(
-				bcrypt,
 				info,
 				usernameInput,
 				passwordInput,
@@ -842,7 +837,7 @@ return view.extend({
 		}, 0);
 	},
 
-	async changeCredentials(bcrypt, info, usernameInput, passwordInput, confirmationInput, status, submitButton, cancelButton) {
+	async changeCredentials(info, usernameInput, passwordInput, confirmationInput, status, submitButton, cancelButton) {
 		const scope = this.pageScope;
 		let username = String(usernameInput.value ?? '');
 		let password = String(passwordInput.value ?? '');
@@ -873,7 +868,7 @@ return view.extend({
 			showError(_('The password must contain at least 8 characters.'));
 			return;
 		}
-		if (password && bcrypt.truncates(password)) {
+		if (password && new TextEncoder().encode(password).length > 72) {
 			showError(_('The password exceeds the 72-byte BCrypt limit.'));
 			return;
 		}
@@ -885,13 +880,17 @@ return view.extend({
 		cancelButton.disabled = true;
 		const operationTicket = operation.start();
 		try {
-			const passwordHash = password ? await bcrypt.hash(password) : '';
-			if (!operation.isPageActive(scope))
-				return;
-			password = null;
 			usernameInput.value = '';
 			passwordInput.value = '';
 			confirmationInput.value = '';
+			let passwordHash = '';
+			if (password) {
+				const bcrypt = await operation.requestActive(() => L.require('adguardhome.bcrypt'), scope);
+				passwordHash = await bcrypt.hash(password);
+			}
+			if (!operation.isPageActive(scope))
+				return;
+			password = null;
 			const response = await operation.requestActive(
 				() => callSetCredentials(username, passwordHash, info.sha256),
 				scope,
@@ -926,9 +925,6 @@ return view.extend({
 		} catch (error) {
 			if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
 				return;
-			usernameInput.value = '';
-			passwordInput.value = '';
-			confirmationInput.value = '';
 			if (error?.credentialUpdateUncertain === true) {
 				this.credentialsUncertain = true;
 				this.updateMemoryWritebackButton();

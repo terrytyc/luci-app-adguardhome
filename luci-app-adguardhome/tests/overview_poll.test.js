@@ -153,7 +153,7 @@ async function testCredentialPolling() {
 			waitForJob() { started.resolve(); return job.promise; },
 		});
 		state.handlers.set_credentials = () => ({ accepted: true, token: 'b'.repeat(32) });
-		const change = state.view.changeCredentials({}, { username: 'admin', sha256: 'a'.repeat(64) },
+		const change = state.view.changeCredentials({ username: 'admin', sha256: 'a'.repeat(64) },
 			{ value: 'operator' }, { value: '' }, { value: '' }, { style: {} }, {}, {});
 		await started.promise;
 		assert.equal(state.view.credentialsPreparing, true, 'credential worker waiting must retain the existing action guard');

@@ -10,7 +10,7 @@ trap 'rm -rf "$test_tmp"' EXIT HUP INT TERM
 # Execute the real lifecycle entry points without launching a core or monitor.
 # shellcheck disable=SC1090
 . "$script_dir/lib/function-body.sh"
-for name in record_ready_core_runtime monitor_needed declare_monitor_instance sync_monitor_instance start_service service_triggers \
+for name in record_ready_core_runtime monitor_needed declare_monitor_instance sync_monitor_instance start_service \
 	orchestrate_core_locked reconcile_core_locked monitor_interval_locked; do
 	eval "$(function_body "$init_file" "$name")"
 done
@@ -115,9 +115,11 @@ json_set_namespace() { [ "$*" = procd ]; }
 json_close_object() { return 0; }
 json_add_array() { [ "$*" = triggers ]; }
 json_close_array() { return 0; }
-procd_add_raw_trigger() { TX_TRIGGERS="$*"; }
+# Native rule generation and event matching are covered by
+# scripts/tests/interface-trigger.integration.sh; this test covers submission.
+service_triggers() { TX_TRIGGERS=1; }
 json_dump() {
-	[ "$TX_TRIGGERS" = "interface.*.up 5000 $initscript network_ready" ] || return 1
+	[ "$TX_TRIGGERS" = 1 ] || return 1
 	printf '%s\n' "$TX_DEFINITION"
 }
 ubus() {

@@ -116,8 +116,10 @@ if [[ $mode == light ]]; then
 else
 	printf 'TEST scripts/tests/rpc-lifecycle.integration.sh\n'
 	bash "$SCRIPT_DIR/tests/rpc-lifecycle.integration.sh"
+	printf 'TEST scripts/tests/interface-trigger.integration.sh\n'
+	bash "$SCRIPT_DIR/tests/interface-trigger.integration.sh"
 	printf 'TEST scripts/tests/apk-hook.integration.sh\n'
 	bash "$SCRIPT_DIR/tests/apk-hook.integration.sh"
-	printf 'TEST_OK shell=%d javascript=%d rpc_integration=1 apk_integration=1\n' \
+	printf 'TEST_OK shell=%d javascript=%d rpc_integration=1 interface_integration=1 apk_integration=1\n' \
 		"${#shell_tests[@]}" "${#js_tests[@]}"
 fi

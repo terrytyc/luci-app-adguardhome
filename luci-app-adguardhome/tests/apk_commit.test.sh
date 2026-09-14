@@ -18,7 +18,7 @@ awk -v helper_dir="$package_dir/scripts" -f "$package_dir/scripts/expand-helpers
 . "$script_dir/lib/function-body.sh"
 for name in entry_metadata root_private_directory root_private_file bounded_private_file \
 	yaml_job_runtime_is_private yaml_job_lock_file_is_private prepare_yaml_job_runtime \
-	core_package_fingerprint apk_reconcile_locked apk_commit coordinator_present network_ready service_triggers; do
+	core_package_fingerprint apk_reconcile_locked apk_commit coordinator_present network_ready; do
 	eval "$(function_body "$test_tmp/init.sh" "$name")"
 done
 
@@ -200,12 +200,9 @@ previous_snapshot="$(cat "$snapshot")"
 )
 rm -f "$snapshot"
 
-# The native interface trigger retries only while the coordinator still has
+# The interface callback retries only while the coordinator still has
 # a procd object; a queued event after a manual stop cannot resurrect it.
-procd_add_raw_trigger() { record "trigger:$*"; }
-reset_events
-service_triggers
-assert_events "trigger:interface.*.up 5000 $initscript network_ready"
+# Native rule matching is covered by scripts/tests/interface-trigger.integration.sh.
 ubus() { [ "$*" = '-S call service list {"name":"AdGuardHome"}' ]; printf '%s\n' "$TEST_COORDINATOR"; }
 jsonfilter() { [ "$*" = '-e @.AdGuardHome' ]; sed '/^$/d'; }
 TEST_ENABLED=1 TEST_RUNNING=0 TEST_COORDINATOR='{}'

@@ -28,7 +28,8 @@ fetch digest.apk 1bb1a001ab2dcb7fed204ecf2c7ac27485dd1771d52a8564581f3725b4e38c7
 	https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/base/ucode-mod-digest-2026.01.16~85922056-r2.apk
 
 tar -xzf "$runtime/rootfs.tar.gz" -C "$runtime/root" \
-	./lib ./usr/lib ./usr/bin/ucode ./sbin/uci
+	./lib ./usr/lib ./usr/bin/ucode ./sbin/uci \
+	./sbin/procd ./sbin/ubusd ./bin/ubus ./bin/busybox ./usr/bin/jshn ./usr/share/libubox/jshn.sh
 tar --warning=no-unknown-keyword -xzf "$runtime/apk-tools-static.apk" -C "$runtime/apk" sbin/apk.static
 # The exact downloaded bytes were checked above; extraction executes no package scripts.
 "$runtime/apk/sbin/apk.static" extract --allow-untrusted \

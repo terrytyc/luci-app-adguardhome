@@ -66,12 +66,8 @@ function loadOverview() {
 		},
 	};
 	class BcryptInstance {
-		truncates(password) {
-			assert.equal(this, bcrypt, 'methods must run on the loaded class instance');
-			return Buffer.byteLength(password, 'utf8') > 72;
-		}
 		async hash(password) {
-			assert.equal(this, bcrypt);
+			assert.equal(this, bcrypt, 'methods must run on the loaded class instance');
 			events.push([ 'hash', password ]);
 			return encodedHash;
 		}
@@ -89,6 +85,7 @@ function loadOverview() {
 		},
 	};
 	const context = {
+		TextEncoder,
 		operation,
 		rpc: {
 			declare: specification => async (...args) => {
@@ -134,8 +131,8 @@ function loadOverview() {
 	return {
 		view, bcrypt, credentialReply, moduleReply, handlers, events, nodes, modals, failures, timers, preparations,
 		setActive(value) { active = value; },
-		inputs() { return nodes.filter(node => node.tag === 'input'); },
-		submit() { return nodes.find(node => node.tag === 'button' && node.events.click).events.click(); },
+		inputs() { return nodes.filter(node => node.tag === 'input').slice(-3); },
+		submit() { return nodes.filter(node => node.tag === 'button' && node.events.click).slice(-1)[0].events.click(); },
 	};
 }
 
@@ -143,8 +140,8 @@ async function readyDialog() {
 	const state = loadOverview();
 	assert.deepEqual(state.events, [], 'overview module initialization must not load bcrypt');
 	const pending = state.view.openCredentialsDialog();
-	assert.deepEqual(state.events, [ 'operation-start', 'get_credentials', 'require-bcrypt' ],
-		'the waiting modal must open before credentials and the optional class load in parallel');
+	assert.deepEqual(state.events, [ 'operation-start', 'get_credentials' ],
+		'opening the dialog must only request account information');
 	assert.deepEqual(state.preparations, [ 'Preparing account change…' ]);
 	assert.equal(state.view.credentialsPreparing, true);
 	Object.assign(state.view, {
@@ -158,12 +155,9 @@ async function readyDialog() {
 	await state.view.openCredentialsDialog();
 	await state.view.handleSaveApply();
 	await state.view.handleMemoryWriteback();
-	assert.deepEqual(state.events, [ 'operation-start', 'get_credentials', 'require-bcrypt' ],
+	assert.deepEqual(state.events, [ 'operation-start', 'get_credentials' ],
 		'duplicate clicks, Apply and write-back must not overlap delayed credential preparation');
 	state.credentialReply.resolve(info);
-	await Promise.resolve();
-	assert.equal(state.modals.length, 0, 'the dialog must wait for its hashing dependency');
-	state.moduleReply.resolve(state.bcrypt);
 	await pending;
 	assert.equal(state.modals.length, 1);
 	assert.equal(state.modals[0].title, 'Change AdGuard Home Account');
@@ -182,11 +176,30 @@ async function main() {
 		await state.view.openCredentialsDialog();
 		assert.deepEqual(state.events, [], `${busy}: credential preparation must not replace another operation`);
 	}
+	const cancelled = await readyDialog();
+	cancelled.inputs()[0].value = 'operator';
+	cancelled.inputs()[1].value = cancelled.inputs()[2].value = 'eight-characters';
+	cancelled.nodes.find(node => node.tag === 'button' && node.attrs.click).attrs.click();
+	assert.equal(cancelled.events.includes('require-bcrypt'), false, 'cancelling must not load bcrypt');
+	assert.equal(cancelled.inputs().every(input => input.value === ''), true);
+	assert.equal(cancelled.events.some(Array.isArray), false);
+
 	const success = await readyDialog();
 	const [ username, password, confirmation ] = success.inputs();
 	username.value = 'operator';
 	password.value = confirmation.value = 'eight-characters';
-	await success.submit();
+	const pendingSuccess = success.submit();
+	assert.equal(success.events.filter(event => event === 'require-bcrypt').length, 1);
+	assert.equal(success.view.credentialsPreparing, true, 'module loading must hold the existing action guard');
+	assert.equal(success.inputs().every(input => input.value === ''), true,
+		'sensitive inputs must be cleared before waiting for the module');
+	const waitingEvents = success.events.slice();
+	await success.view.openCredentialsDialog();
+	await success.view.handleSaveApply();
+	await success.view.handleMemoryWriteback();
+	assert.deepEqual(success.events, waitingEvents, 'other actions must remain paused while the module loads');
+	success.moduleReply.resolve(success.bcrypt);
+	await pendingSuccess;
 	assert.deepEqual(success.events.filter(Array.isArray), [
 		[ 'hash', 'eight-characters' ],
 		[ 'set_credentials', 'operator', encodedHash, info.sha256 ],
@@ -199,6 +212,7 @@ async function main() {
 
 	for (const [ value, expected ] of [
 		[ 'short', 'at least 8 characters' ],
+		[ 'x'.repeat(73), '72-byte BCrypt limit' ],
 		[ '界'.repeat(25), '72-byte BCrypt limit' ],
 	]) {
 		const state = await readyDialog();
@@ -208,11 +222,22 @@ async function main() {
 		assert.equal(error?.attrs.role, 'alert', 'credential validation errors must be announced');
 		assert.equal(String(error?.textContent).includes(expected), true);
 		assert.equal(state.events.some(Array.isArray), false, 'invalid passwords must not hash or submit');
+		assert.equal(state.events.includes('require-bcrypt'), false, 'invalid passwords must not load bcrypt');
+	}
+	for (const password of [ 'x'.repeat(72), '界'.repeat(24) ]) {
+		const state = await readyDialog();
+		state.inputs()[1].value = state.inputs()[2].value = password;
+		state.moduleReply.resolve(state.bcrypt);
+		await state.submit();
+		assert.deepEqual(state.events.find(Array.isArray), [ 'hash', password ],
+			'exactly 72 UTF-8 bytes must reach hashing');
+		assert.equal(state.failures.length, 0);
 	}
 
 	const renamed = await readyDialog();
 	renamed.inputs()[0].value = 'operator';
 	await renamed.submit();
+	assert.equal(renamed.events.includes('require-bcrypt'), false, 'username-only updates must not load bcrypt');
 	assert.deepEqual(renamed.events.find(Array.isArray), [ 'set_credentials', 'operator', '', info.sha256 ],
 		'username-only updates must preserve the password without hashing an empty string');
 
@@ -293,27 +318,60 @@ async function main() {
 		}
 	}
 
-	for (const failedDependency of [ 'moduleReply', 'credentialReply' ]) {
+	{
 		const state = loadOverview();
 		const pending = state.view.openCredentialsDialog();
-		state[failedDependency].reject(new Error('load failed'));
+		state.credentialReply.reject(new Error('load failed'));
 		await pending;
 		assert.equal(state.modals.length, 0);
 		assert.equal(state.failures.length, 1);
 		assert.equal(state.view.credentialsPreparing, false, 'failed preparation must release its action guard');
 		assert.match(state.failures[0], /Unable to prepare.*load failed/);
-		state.moduleReply.resolve(state.bcrypt);
-		state.credentialReply.resolve(info);
+		assert.equal(state.events.includes('require-bcrypt'), false);
+	}
+	const failedModule = await readyDialog();
+	failedModule.inputs()[1].value = failedModule.inputs()[2].value = 'eight-characters';
+	const failedLoad = failedModule.submit();
+	failedModule.moduleReply.reject(new Error('class load failed'));
+	await failedLoad;
+	assert.match(failedModule.failures[0], /Unable to change.*class load failed/);
+	assert.equal(failedModule.view.credentialsPreparing, false);
+	assert.equal(failedModule.view.credentialsUncertain, undefined, 'a failed class load has not submitted a change');
+	assert.equal(failedModule.view.credentialsButton.disabled, false);
+	assert.equal(failedModule.view.memoryWritebackButton.disabled, false);
+	assert.equal(failedModule.inputs().every(input => input.value === ''), true);
+	assert.equal(failedModule.events.some(Array.isArray), false, 'a failed class load must neither hash nor submit');
+	// LuCI retains a rejected class-load promise until the page is reloaded.
+	// Reopening the dialog and changing only the username must still work.
+	await failedModule.view.openCredentialsDialog();
+	failedModule.inputs()[0].value = 'operator';
+	await failedModule.submit();
+	assert.equal(failedModule.events.filter(event => event === 'require-bcrypt').length, 1);
+	assert.deepEqual(failedModule.events.find(Array.isArray), [ 'set_credentials', 'operator', '', info.sha256 ]);
+	assert.equal(failedModule.events.includes('operation-success'), true);
+
+	for (const rejects of [ false, true ]) {
+		const state = await readyDialog();
+		state.inputs()[1].value = state.inputs()[2].value = 'eight-characters';
+		const pending = state.submit();
+		state.setActive(false);
+		if (rejects)
+			state.moduleReply.reject(new Error('late class load failure'));
+		else
+			state.moduleReply.resolve(state.bcrypt);
+		await pending;
+		assert.equal(state.events.some(Array.isArray), false, 'leaving during module loading must prevent hashing and submission');
+		assert.equal(state.failures.length, 0, 'an obsolete module response must not display an error');
+		assert.equal(state.inputs().every(input => input.value === ''), true);
 	}
 
 	const inactive = loadOverview();
 	const pending = inactive.view.openCredentialsDialog();
 	inactive.setActive(false);
 	inactive.credentialReply.resolve(info);
-	inactive.moduleReply.reject(new Error('late class load failure'));
 	await pending;
 	assert.equal(inactive.modals.length, 0);
-	assert.equal(inactive.failures.length, 0, 'obsolete class-load errors must not become XHR/modals on a new page');
+	assert.equal(inactive.failures.length, 0, 'obsolete account information must not become XHR/modals on a new page');
 
 	const alreadyInactive = loadOverview();
 	alreadyInactive.setActive(false);
@@ -322,9 +380,12 @@ async function main() {
 
 	const hashing = await readyDialog();
 	const hashReply = deferred();
-	hashing.bcrypt.hash = () => hashReply.promise;
+	const hashingStarted = deferred();
+	hashing.bcrypt.hash = () => { hashingStarted.resolve(); return hashReply.promise; };
+	hashing.moduleReply.resolve(hashing.bcrypt);
 	hashing.inputs()[1].value = hashing.inputs()[2].value = 'eight-characters';
 	const pendingHash = hashing.submit();
+	await hashingStarted.promise;
 	assert.equal(hashing.view.credentialsPreparing, true, 'hashing must hold the same guard as the credential worker');
 	hashing.setActive(false);
 	hashReply.resolve(encodedHash);

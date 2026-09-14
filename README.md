@@ -42,6 +42,38 @@ apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号或密码。
 `@terrytyc` 指定使用本项目软件源，避免同名包被其他源替换。正常校验签名，无需 `--allow-untrusted`。保留配置升级固件时，请将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，一并保留公钥。
 
+安装、更新或卸载前，先提交或撤销 `uci changes` 显示的改动。插件安装后，这项检查也适用于其他软件的安装、更新和卸载。
+
+<details>
+<summary>更新与卸载命令</summary>
+
+更新：先下载并检查，再停止服务、离线安装。成功后删除临时缓存，失败时保留供重试。
+
+```sh
+agh_cache=/tmp/luci-app-adguardhome-apk
+mkdir -p "$agh_cache" &&
+apk --cache-dir "$agh_cache" update &&
+apk --cache-dir "$agh_cache" cache --upgrade download \
+  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
+apk --cache-dir "$agh_cache" --network=no add --upgrade --simulate \
+  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
+agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
+/etc/init.d/AdGuardHome stop &&
+apk --cache-dir "$agh_cache" --network=no add --upgrade \
+  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
+rm -rf "$agh_cache"
+```
+
+卸载：确认服务停止后删除插件，保留 UCI、YAML 和 data。
+
+```sh
+agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
+/etc/init.d/AdGuardHome stop &&
+apk del luci-i18n-adguardhome-zh-cn luci-app-adguardhome
+```
+
+</details>
+
 ## 🧭 DNS 模式
 
 | 模式 | 工作方式 |
@@ -52,17 +84,17 @@ apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 
 后两种模式要求 AdGuard Home 监听端口不是 53；`53335` 只是模板默认值，实际以 YAML 为准。
 
-上游模式要求只有一个 dnsmasq 实例，保留条件转发；已有普通上游或匹配所有域名的转发规则时会拒绝接管。启用后添加 `127.0.0.1#<DNS 端口>` 并临时设置 `noresolv=1`。停用或离开此模式时，删除插件记录的上游，并把 `noresolv` 恢复为接管前的存在状态和原值，不改 `resolvfile`。其他模式切换也只撤销插件创建的接管项；无法确定归属时会报错，不猜测清理目标。
+上游模式仅支持一个 dnsmasq 实例，保留条件转发；已有普通上游或全域转发规则时会拒绝接管。模式切换和停用只撤销插件创建的接管项，并恢复相关设置；撤销失败时保留核心运行，修正问题后可重试。
 
 概览中的 DNS“就绪”表示接管配置与核心监听匹配，不等同于外网解析测试或实时防火墙检查。
 
 选择“无”，并且关闭内存运行或将定时回写设为 `0` 时，不启动插件监控进程，核心仍由官方服务管理。关闭定时回写不影响手动回写和停止时回写。通过 SSH 修改 UCI 后，请执行 `/etc/init.d/AdGuardHome reload` 应用设置。
 
-防火墙接管撤销失败时会保留可重试状态，确认重载成功后才完成清理。无法确认撤销成功时不会继续停止核心。
-
 ## 💾 内存运行
 
 开启后，插件把持久目录中的 data 载入 RAM，再挂载到原来的 `<工作目录>/data`。**主程序、YAML 和 UCI 工作目录路径都不变。** 不需要额外安装 rsync、cron 或 timeout 软件包。
+
+RAM 准备失败且可安全回退时，会改用磁盘；实际存储模式以概览为准。
 
 - 默认每 **60 分钟**回写，可设为 1–10080 分钟；`0` 关闭定时回写。
 - “立即回写”只处理当前运行的 data，不应用页面中尚未保存的设置。
@@ -76,15 +108,11 @@ apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 
 工作目录默认是 `/etc/AdGuardHome`，YAML 固定为目录下的 `AdGuardHome.yaml`，修改工作目录时自动同步配置路径。可选择其他持久目录，但须使用可写、核心用户可访问的专用绝对路径；不能用 tmpfs / ramfs、符号链接或 `/`、`/etc` 等系统目录，也不会自动放宽共享父目录权限。
 
-使用外部磁盘时，请在 `/etc/config/fstab` 声明挂载目标及设备、UUID 或 LABEL。启动和配置写入前会检查对应目标已可写挂载，并在启动端核对设备身份；缺盘时不会改用挂载点下面的闪存目录。禁用的 fstab 挂载条目仍保留这项依赖。没有 fstab 条目的路径按普通持久目录处理，插件无法推测它原来属于哪块外盘。缺盘时仍可在设置页停用服务或选择其他目录。
+使用外部磁盘时，请在 `/etc/config/fstab` 声明挂载目标及设备、UUID 或 LABEL。插件会检查挂载及写入条件，缺盘时不会写入挂载点下面的闪存目录；仍可停用服务或更换目录。禁用的 fstab 条目也保留此检查，没有条目的路径按普通持久目录处理。
 
-保存应用会先核对核心进程、官方参数、YAML、证书及核心文件是否与已应用状态一致。确认一致时，仅调整回写间隔或 DNS 接管，不重启核心；设置无变化也会检查运行状态。状态记录缺失或发现变化时执行完整启动协调，保留“再次应用以修复运行状态”的用途。
+保存应用会检查运行状态。运行正常且核心配置未变时，调整回写间隔或 DNS 模式无需重启核心；无修改时也可再次应用，恢复异常状态。
 
-YAML／密码保存、证书续期重启和故障恢复重新启动核心后，会在验证成功时更新运行记录，后续仅调整周期或 DNS 不会因为旧进程记录再次重启。恢复 DNS 时如果原核心仍在运行，会保留它原有的运行记录。
-
-设置比较和应用结果确认只核对 RAM 状态、目录及挂载身份，不重复遍历 data；实际启动、复制、切换和清理仍执行完整检查。原始设置已规范且完全相同时，跳过 UCI 写事务，继续检查恢复快照和运行状态。
-
-更换工作目录不会搬移旧数据：新目录有 YAML 就使用现有文件，没有则写入模板，旧目录保留。需要沿用配置与 data 时，请先自行复制。
+更换工作目录不会搬移旧数据：新目录有 YAML 就使用现有文件，没有则在启用并启动时写入模板，旧目录保留。需要沿用配置与 data 时，请先自行复制。
 
 YAML 草稿只保留在当前页面。未保存时，重新载入、载入模板及离页会提示确认；只有“校验、保存并应用”才写入配置。读取完整 YAML 需要插件写权限，避免只读账号取得密码哈希或内嵌私钥。
 
@@ -116,13 +144,13 @@ config luci 'luci'
 
 开机、关机由插件统一协调，官方服务不再独立自启动。网络接口就绪后，插件会按需补启尚未运行的核心，不会因网络变化重启正常运行的核心。卸载插件不恢复官方自启动。
 
-如果官方服务被重新勾选自启动，插件会在下次启动、应用配置、网络接口就绪或 APK 事务结束时取消它；运行状态正常时只纠正自启动，不额外重启核心。不做定时扫描，因此不会在勾选后立即撤销。
+官方服务被重新勾选自启动后，插件会在下次启动、应用配置、接口就绪或 APK 事务结束时纠正，不额外重启正常运行的核心。
 
 </details>
 
 ### 🔒 HTTPS 与证书续期
 
-如果配置了 HTTPS，通过插件启动或重启时，会重新读取证书路径，确保官方核心沙箱可读取证书、私钥及必要父目录。之后更换路径也按新配置处理，不判断证书是否过期。ACME 签发、续期后会同步证书访问权限，内容变化时会自动重启核心加载；手动停止插件后只同步权限，不会被续期事件重新启动。
+插件启动时会按当前 HTTPS 配置准备证书访问权限。ACME 签发、续期后，证书内容变化会自动重启核心加载；手动停止后只同步权限，不会重新启动核心。
 
 直接调用官方小写 `/etc/init.d/adguardhome` 会绕过插件的启动前权限准备，请使用 LuCI 或 `/etc/init.d/AdGuardHome`。
 
@@ -130,11 +158,11 @@ config luci 'luci'
 
 ### 📦 更新前知道这些
 
-- 支持 APK 覆盖更新，保留当前格式的 UCI、YAML 和 data。更新先预下载并检查离线安装，再停止服务；完成后按现有启用状态恢复，不会重启共享的 rpcd 进程。
+- 支持 APK 覆盖更新，保留当前格式的 UCI、YAML 和 data。建议使用上面的更新命令；完成后按现有启用状态恢复，不会重启共享的 rpcd 进程。
 - 卸载只停止核心、移除插件接管并关闭官方自启动，保留当前 UCI、YAML 和 data，不恢复首次安装前的配置。首次安装失败仍会尝试恢复当次安装前的 UCI；覆盖更新不依赖原始快照。
 - 官方核心通过 APK 更新后，插件会检查运行状态：启用时按需重启到新核心，关闭时停止被安装脚本拉起的核心。检查由 APK 触发，插件关闭时也有效；无关软件更新不会重启状态正常的核心。
 - 不迁移旧插件格式或清理历史遗留文件。配置格式不同的旧安装，请手动整理，或卸载 LuCI 插件后重装，无需卸载官方核心。
-- 导入已有官方实例时保留启用状态，以 `none` 模式开始，不接管原 DNS 流程；易失目录中的 YAML 和 data 会导入 `/etc/AdGuardHome`，原目录保留。
+- 导入已有官方实例时保留启用状态，以 `none` 模式开始，不接管原 DNS 流程；易失目录中的 YAML 和 data 会导入 `/etc/AdGuardHome`，原目录保留。目标 data 非空时保留，不覆盖、不合并。
 - 固件升级保留清单随工作目录同步，包含当前 YAML 和插件 UCI 快照，**不包含整个 data**。
 
 历史改动见 [Releases](https://github.com/terrytyc/luci-app-adguardhome/releases)。
