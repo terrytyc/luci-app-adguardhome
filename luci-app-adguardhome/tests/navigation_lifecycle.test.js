@@ -176,14 +176,13 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 async function runSettingsSubmissionScenario(kind) {
 	const oldRevision = 'a'.repeat(64);
 	const terminalRevision = 'b'.repeat(64);
-	const currentRevision = 'c'.repeat(64);
 	const values = new Map([
-		[ 'config.enabled', '1' ],
-		[ 'config.work_dir', '/etc/AdGuardHome' ],
-		[ 'config.verbose', '0' ],
-		[ 'luci.redirect', 'dnsmasq-upstream' ],
-		[ 'luci.run_from_memory', '0' ],
-		[ 'luci.memory_writeback_interval', '60' ],
+		[ 'config.enabled', '0' ],
+		[ 'config.work_dir', '/mnt/storage/AdGuardHome' ],
+		[ 'config.verbose', '1' ],
+		[ 'luci.redirect', 'redirect' ],
+		[ 'luci.run_from_memory', '1' ],
+		[ 'luci.memory_writeback_interval', '77' ],
 	]);
 	const failures = [];
 	let successes = 0;
@@ -194,11 +193,12 @@ async function runSettingsSubmissionScenario(kind) {
 	let refreshCalls = 0;
 	let setArguments = null;
 	let context = null;
+	let active = true;
 	const optionCache = new Map(values);
 	const visibleValues = new Map(optionCache);
 
 	const operation = Object.assign(loadOperation().operation, {
-		isPageActive: () => true,
+		isPageActive: () => active,
 		pageInactiveError: () => Object.assign(new Error('inactive'), { pageInactive: true }),
 		isPageInactiveError: error => error?.pageInactive === true,
 		start: () => ({}),
@@ -229,19 +229,7 @@ async function runSettingsSubmissionScenario(kind) {
 				};
 			return { state: 'done', ok: true, revision: terminalRevision };
 		},
-		get_settings: async () => {
-			if (kind === 'reload-failure')
-				throw new Error('authoritative reload failed');
-			return {
-				enabled: false,
-				work_dir: '/mnt/storage/AdGuardHome',
-				verbose: true,
-				redirect: 'redirect',
-				run_from_memory: true,
-				memory_writeback_interval: 77,
-				revision: currentRevision,
-			};
-		},
+		get_settings: async () => assert.fail('the completed settings job already verified its candidate'),
 	};
 	const view = loadView('overview', operation, {}, rpcHandlers);
 	const map = {
@@ -250,12 +238,18 @@ async function runSettingsSubmissionScenario(kind) {
 		async parse() {},
 		async load() {
 			loadCalls++;
+			if (kind === 'reload-failure')
+				throw new Error('form option reload failed');
+			if (kind === 'leave-reload')
+				active = false;
 			optionCache.clear();
 			for (const [ key, value ] of values)
 				optionCache.set(key, value);
 		},
 		async reset() {
 			resetCalls++;
+			if (kind === 'reset-failure' && resetCalls === 1)
+				throw new Error('form reset failed');
 			visibleValues.clear();
 			for (const [ key, value ] of optionCache)
 				visibleValues.set(key, value);
@@ -285,7 +279,7 @@ async function runSettingsSubmissionScenario(kind) {
 			assert.equal(successes + failures.length, 1,
 				'the original settings outcome must be reported before the extra status refresh');
 			if (kind === 'success') {
-				assert.equal(context.committedSettings.revision, currentRevision);
+				assert.equal(context.committedSettings.revision, terminalRevision);
 				assert.equal(loadCalls, 1);
 				assert.equal(resetCalls, 1);
 			}
@@ -293,7 +287,7 @@ async function runSettingsSubmissionScenario(kind) {
 	});
 
 	await view.handleSaveApply.call(context);
-	assert.equal(refreshCalls, 1, 'success and failure must each trigger only one post-apply status refresh');
+	assert.equal(refreshCalls, active ? 1 : 0, 'only an active view may refresh after Apply');
 	return {
 		context,
 		failures,
@@ -1035,6 +1029,7 @@ async function main() {
 		'status-transport',
 		'indeterminate',
 		'reload-failure',
+		'reset-failure',
 		'bad-token',
 	]) {
 		const result = await runSettingsSubmissionScenario(kind);
@@ -1042,10 +1037,10 @@ async function main() {
 			`${kind} must discard the stale committed snapshot`);
 		assert.equal(result.map.readonly, true,
 			`${kind} must lock the visible form until a full reload`);
-		assert.equal(result.resetCalls, 1,
+		assert.equal(result.resetCalls, kind === 'reset-failure' ? 2 : 1,
 			`${kind} must redraw the settings form in read-only mode`);
-		assert.equal(result.loadCalls, 0,
-			`${kind} must not adopt an unconfirmed candidate into option caches`);
+		assert.equal(result.loadCalls, [ 'reload-failure', 'reset-failure' ].includes(kind) ? 1 : 0,
+			`${kind} may rebuild option caches only after a confirmed job success`);
 		assert.equal(result.failures.length, 1,
 			`${kind} must show one explicit settings failure`);
 		assert.equal(result.successes, 0);
@@ -1058,6 +1053,10 @@ async function main() {
 	const statusTransport = await runSettingsSubmissionScenario('status-transport');
 	assert.equal(statusTransport.statusCalls, 6,
 		'settings status transport failures must be bounded before the form is locked');
+	const leftSettings = await runSettingsSubmissionScenario('leave-reload');
+	assert.equal(leftSettings.context.committedSettings.revision, 'a'.repeat(64));
+	assert.equal(leftSettings.failures.length, 0);
+	assert.equal(leftSettings.successes, 0, 'a form reload must not report Apply results after leaving the page');
 
 	const successfulSettings = await runSettingsSubmissionScenario('success');
 	assert.equal(successfulSettings.failures.length, 0);
@@ -1066,15 +1065,15 @@ async function main() {
 		'a successful transaction must redraw the authoritative settings once');
 	assert.equal(successfulSettings.loadCalls, 1,
 		'a successful transaction must reload JSONMap option caches once');
-	assert.equal(successfulSettings.context.committedSettings?.revision, 'c'.repeat(64));
+	assert.equal(successfulSettings.context.committedSettings?.revision, 'b'.repeat(64));
 	assert.equal(successfulSettings.context.committedSettings.workDir, '/mnt/storage/AdGuardHome');
 	assert.deepEqual(successfulSettings.setArguments, [
+		false,
+		'/mnt/storage/AdGuardHome',
 		true,
-		'/etc/AdGuardHome',
-		false,
-		'dnsmasq-upstream',
-		false,
-		60,
+		'redirect',
+		true,
+		77,
 		'a'.repeat(64),
 	], 'the frontend settings update must not submit the derived config_file');
 	assert.equal(successfulSettings.values.get('config.work_dir'), '/mnt/storage/AdGuardHome',
@@ -1148,11 +1147,6 @@ async function main() {
 		overview,
 		/response\.token[\s\S]*?throw uncertainSettingsUpdateError\([\s\S]*?did not return a valid status token/,
 		'every accepted settings apply must return a valid coordinator status token',
-	);
-	assert.match(
-		overview,
-		/committed = await getSettings\(scope\);\s*await reloadSettingsMap\(map, committed\);[\s\S]*?this\.committedSettings = committed;/,
-		'the visible settings form must be reset to the authoritative snapshot before adopting its revision',
 	);
 	assert.match(
 		overview,

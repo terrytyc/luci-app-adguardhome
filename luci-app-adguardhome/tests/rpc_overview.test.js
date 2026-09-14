@@ -484,4 +484,20 @@ for (const unused of [ 'get_status', 'get_config_info' ]) {
 	assert.ok(!acl['luci-app-adguardhome'].read.ubus['luci.adguardhome'].includes(unused));
 }
 
+// Stop at the transaction boundary to count path resolution independently of
+// the existing native worker/staging integration test.
+reset();
+let pathReads = 0;
+sandbox.config_path = () => { pathReads++; return fixture.configFile; };
+sandbox.index = (value, text) => value.indexOf(text);
+sandbox.random_token = () => 'a'.repeat(32);
+sandbox.prepare_yaml_job = () => ({ error: 'path checked' });
+vm.runInContext(extractFunction('update_yaml'), sandbox);
+assert.equal(sandbox.update_yaml('dns: {}\n', originalHash, fixture.configFile).error, 'path checked');
+assert.equal(pathReads, 0, 'an internal verified path avoids repeating configuration and mount reads');
+assert.equal(sandbox.rpc.set_yaml.call({ args: {
+	content: 'dns: {}\n', sha256: originalHash, verified_path: '/tmp/untrusted',
+} }).error, 'path checked');
+assert.equal(pathReads, 1, 'the public YAML method must resolve its path and ignore caller-supplied paths');
+
 console.log('single-snapshot overview RPC and locked endpoint probe tests passed');

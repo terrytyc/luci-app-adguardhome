@@ -150,7 +150,7 @@ yaml_job_pending_matches() { [ "$1:$2:$3" = "$token:$revision:$candidate" ]; }
 write_yaml_job_state() { printf '%s\n' "$2" >>"$states"; }
 log_error() { :; }
 token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-for change in unchanged disk interval dns core work ram missing-baseline dead-core fallback unmounted \
+for change in unchanged disk interval dns dns-repair-unchanged core work ram missing-baseline dead-core fallback unmounted \
              normalized-enabled normalized-interval missing-field drift-after-commit drift-after-refresh \
              dns-final-drift dns-repair-failure; do
 	reset_settings_fixture
@@ -160,6 +160,7 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 		disk) STORED_RAM=0 RAW_MEMORY=0 RAM_ACTIVE=0 requested_ram=0 ;;
 		interval) requested_interval=120 ;;
 		dns) requested_mode=redirect; INTEGRATION_OK=0 ;;
+		dns-repair-unchanged) INTEGRATION_OK=0 ;;
 		core) requested_verbose=1 ;;
 		work) requested_work=/other ;;
 		ram) requested_ram=0 ;;
@@ -184,7 +185,8 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 	case "$change" in
 		unchanged|disk|interval|normalized-*|missing-field)
 			[ "$(cat "$events")" = monitor ]; restarted=0 ;;
-		dns) [ "$(cat "$events")" = "$(printf 'ready\ndns\nmonitor')" ]; restarted=0 ;;
+		dns|dns-repair-unchanged)
+			[ "$(cat "$events")" = "$(printf 'ready\ndns\nmonitor')" ]; restarted=0 ;;
 		dns-final-drift|dns-repair-failure)
 			[ "$(cat "$events")" = "$(printf 'ready\ndns\nrestart')" ]; restarted=1 ;;
 		*) [ "$(cat "$events")" = restart ]; restarted=1 ;;
@@ -194,8 +196,9 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 	assert_count "$restarted" load:full
 	case "$change" in
 		core|work|ram|fallback|unmounted) assert_count 2 load:light; assert_count 0 fingerprint ;;
-		missing-baseline|dead-core|drift-after-commit|drift-after-refresh)
-			assert_count 3 load:light; assert_count 1 fingerprint ;;
+		unchanged|disk|missing-baseline|dead-core|drift-after-refresh)
+			assert_count 2 load:light; assert_count 1 fingerprint ;;
+		dns-repair-unchanged) assert_count 2 load:light; assert_count 2 fingerprint ;;
 		dns|dns-final-drift) assert_count 3 load:light; assert_count 2 fingerprint ;;
 		*) assert_count 3 load:light; assert_count 1 fingerprint ;;
 	esac
@@ -205,6 +208,27 @@ for change in unchanged disk interval dns core work ram missing-baseline dead-co
 		*) assert_count 0 write-guard; assert_count 0 commit ;;
 	esac
 done
+
+# The no-op shortcut still rereads the persisted revision after runtime work;
+# a failed final read must never report success.
+(
+	reset_settings_fixture
+	change=final-read-failure
+	revision="$(settings_values_revision 1 /persistent 0 dnsmasq-upstream 1 60)"
+	candidate="$revision"
+	sync_monitor_instance() {
+		record monitor
+		load_settings() { count "load:${1:-full}"; return 1; }
+	}
+	if settings_update_job_locked 1 /persistent 0 dnsmasq-upstream 1 60 \
+		"$revision" "$token" "$candidate"; then
+		exit 1
+	fi
+	[ "$(cat "$events")" = monitor ]
+	[ "$(tail -n 1 "$states")" = "indeterminate:${revision}:${candidate}" ]
+	assert_count 2 load:light
+	assert_count 0 commit
+)
 
 # A stale revision or pending edit still fails before runtime repair. A pending
 # edit appearing after the raw field reads also cannot authorize the no-op.

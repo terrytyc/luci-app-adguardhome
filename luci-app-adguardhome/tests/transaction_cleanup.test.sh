@@ -79,4 +79,47 @@ if install_config_candidate_attempt "$config_file" wrong '' "$stage" ''; then
 fi
 [ ! -e "$stage" ]
 [ "$(yaml_file_hash "$config_file")" = "$original_hash" ]
-printf 'ok - installer normalization and rejected YAML install clean temporary files\n'
+
+# Use the real atomic installer through its retry boundary. Definite failures
+# must return once, remove the stage and preserve the previous active YAML.
+candidate="$test_tmp/candidate.yaml"
+printf 'dns:\n  port: 53336\n' >"$candidate"
+chmod 0600 "$candidate"
+candidate_hash="$(yaml_file_hash "$candidate")"
+validate_work_dir_mount_dependency() { return 0; }
+eval "$(function_body "$init_file" install_config_candidate_attempt |
+	sed '1s/install_config_candidate_attempt/install_attempt_original/')"
+install_config_candidate_attempt() {
+	printf '%s\n' "$4" >>"$test_tmp/attempts"
+	install_attempt_original "$@"
+}
+for failure in stale-revision permissions rename; do
+	: >"$test_tmp/attempts"
+	if (
+		expected="$original_hash"
+		case "$failure" in
+			stale-revision) expected=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa ;;
+			permissions) secure_config_inode() { return 1; } ;;
+			rename) mv() { return 1; } ;;
+		esac
+		install_config_candidate "$candidate" "$expected" "$candidate_hash" ''
+	); then
+		exit 1
+	fi
+	[ "$(wc -l <"$test_tmp/attempts")" = 1 ]
+	[ ! -e "${config_file}.install.$$.0" ]
+	[ "$(yaml_file_hash "$config_file")" = "$original_hash" ]
+done
+
+# Occupied names, including a dangling symlink, are left untouched. Only the
+# first free name enters the exclusive-create/copy/hash/rename transaction.
+printf 'existing stage\n' >"${config_file}.install.$$.0"
+ln -s absent "${config_file}.install.$$.1"
+: >"$test_tmp/attempts"
+install_config_candidate "$candidate" "$original_hash" "$candidate_hash" ''
+[ "$(cat "$test_tmp/attempts")" = "${config_file}.install.$$.2" ]
+[ "$(cat "${config_file}.install.$$.0")" = 'existing stage' ]
+[ "$(readlink "${config_file}.install.$$.1")" = absent ]
+[ ! -e "${config_file}.install.$$.2" ]
+[ "$(yaml_file_hash "$config_file")" = "$candidate_hash" ]
+printf 'ok - normalization and atomic YAML install preserve data and clean failed stages\n'

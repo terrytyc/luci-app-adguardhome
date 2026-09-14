@@ -114,8 +114,10 @@ if [[ $mode == light ]]; then
 	printf 'LIGHT_TEST_OK shell=%d javascript=%d skipped=%d\n' \
 		"$shell_count" "${#js_tests[@]}" "$((${#shell_tests[@]} - shell_count))"
 else
+	printf 'TEST scripts/tests/rpc-lifecycle.integration.sh\n'
+	bash "$SCRIPT_DIR/tests/rpc-lifecycle.integration.sh"
 	printf 'TEST scripts/tests/apk-hook.integration.sh\n'
 	bash "$SCRIPT_DIR/tests/apk-hook.integration.sh"
-	printf 'TEST_OK shell=%d javascript=%d apk_integration=1\n' \
+	printf 'TEST_OK shell=%d javascript=%d rpc_integration=1 apk_integration=1\n' \
 		"${#shell_tests[@]}" "${#js_tests[@]}"
 fi

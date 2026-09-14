@@ -23,9 +23,14 @@ version=$("$apk" --version)
 
 test_parent=$(cd -- "${APK_HOOK_TEST_TMPDIR:-/tmp}" && pwd -P)
 temporary=$(mktemp -d "$test_parent/adguardhome-apk-hook.XXXXXX")
+cache_server_pid=
 cleanup() {
 	local rc=$?
 	trap - EXIT
+	if [[ -n $cache_server_pid ]]; then
+		kill "$cache_server_pid" 2>/dev/null || true
+		wait "$cache_server_pid" 2>/dev/null || true
+	fi
 	case "$temporary" in
 		"$test_parent"/adguardhome-apk-hook.??????) rm -rf -- "$temporary" ;;
 		*) printf 'Refusing to remove unexpected test directory: %s\n' "$temporary" >&2; exit 1 ;;
@@ -233,6 +238,100 @@ chroot "$root" /sbin/uci revert network
 apk_transaction add "$temporary/uci-guard.apk"
 [[ -f $root/usr/share/guard-payload ]] || die 'clean retry did not install payload'
 printf 'ok - native pre-commit blocks payload and preserves real UCI pending changes\n'
+
+# Prepare a signed remote repository before stopping the core. Explicit cache
+# targets must include their dependencies, without caching/upgrading WORLD.
+cache_root=$temporary/cache-root
+cache_feed=$temporary/cache-feed
+cache_dir=$temporary/cache
+cache_keys=$temporary/cache-keys
+cache_repositories=$temporary/cache-repositories
+cp -a "$root" "$cache_root"
+mkdir -p "$cache_feed" "$cache_dir" "$cache_keys" "$temporary/empty-keys"
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+	-out "$temporary/cache-key.pem" 2>/dev/null
+openssl pkey -in "$temporary/cache-key.pem" -pubout -out "$cache_keys/test.pem" 2>/dev/null
+for revision in 1 2; do
+	for name in cache-main cache-locale cache-dependency cache-unrelated; do
+		payload=$temporary/$name-$revision
+		mkdir -p "$payload/usr/share"
+		printf '%s\n' "$revision" >"$payload/usr/share/$name"
+		depends=()
+		case "$name" in
+			cache-main) depends=(--info "depends:cache-dependency>=$revision-r0") ;;
+			cache-locale) depends=(--info "depends:cache-main>=$revision-r0") ;;
+		esac
+		"$apk" mkpkg --info "name:$name" --info "version:$revision-r0" \
+			--info arch:noarch "${depends[@]}" --files "$payload" \
+			--output "$cache_feed/$name-$revision-r0.apk" >/dev/null
+	done
+done
+"$apk" mkndx --allow-untrusted --sign-key "$temporary/cache-key.pem" \
+	--output "$cache_feed/packages.adb" "$cache_feed/"*.apk >/dev/null
+cached_apk() {
+	"$apk" --root "$cache_root" --arch x86_64 --keys-dir "$cache_keys" \
+		--cache-dir "$cache_dir" --repositories-file "$cache_repositories" --sync=no "$@"
+}
+cached_apk --network=no --repositories-file /dev/null --repository "$cache_feed/packages.adb" \
+	--scripts=no add cache-main=1-r0 cache-locale=1-r0 cache-dependency=1-r0 cache-unrelated=1-r0 \
+	>"$temporary/cache-install.log" 2>&1
+sed -i -e 's/^cache-main=.*/cache-main@fixture/' -e 's/^cache-locale=.*/cache-locale@fixture/' \
+	-e '/^cache-dependency=/d' -e 's/^cache-unrelated=.*/cache-unrelated/' "$cache_root/etc/apk/world"
+
+# A loopback HTTP server exercises APK's actual download/cache path; local
+# file repositories intentionally bypass package caching. Python is already
+# present for the native YAML tests, and no router dependency is introduced.
+python3 - "$cache_feed" "$temporary/cache-port" <<'PY' >"$temporary/cache-http.log" 2>&1 &
+import functools, http.server, sys
+server = http.server.HTTPServer(('127.0.0.1', 0), functools.partial(http.server.SimpleHTTPRequestHandler, directory=sys.argv[1]))
+with open(sys.argv[2], 'w') as port:
+    port.write(str(server.server_port))
+server.serve_forever()
+PY
+cache_server_pid=$!
+for attempt in {1..100}; do [[ -s $temporary/cache-port ]] && break; sleep .02; done
+[[ -s $temporary/cache-port ]] || die 'cache test HTTP server did not start'
+printf '@fixture http://127.0.0.1:%s/packages.adb\n' "$(cat "$temporary/cache-port")" >"$cache_repositories"
+cached_apk update >"$temporary/cache-update.log" 2>&1
+chroot "$cache_root" /etc/init.d/adguardhome start
+: >"$cache_root/events"
+cache_installed=$(cksum <"$cache_root/lib/apk/db/installed")
+mv "$cache_feed/cache-dependency-2-r0.apk" "$temporary/missing-dependency.apk"
+if cached_apk cache --upgrade download cache-main@fixture cache-locale@fixture \
+	>"$temporary/cache-missing.log" 2>&1; then
+	die 'pre-download unexpectedly accepted its missing dependency'
+fi
+[[ -f $cache_root/core-running && ! -s $cache_root/events ]] || die 'failed pre-download touched the core'
+[[ $(cksum <"$cache_root/lib/apk/db/installed") == "$cache_installed" ]] || die 'pre-download changed installed packages'
+mv "$temporary/missing-dependency.apk" "$cache_feed/cache-dependency-2-r0.apk"
+cached_apk cache --upgrade download cache-main@fixture cache-locale@fixture \
+	>"$temporary/cache-download.log" 2>&1
+[[ $(find "$cache_dir" -name '*.apk' | wc -l) == 3 ]] || die 'cache did not contain exactly the two targets and dependency'
+if grep -q 'cache-unrelated-2-r0.apk' "$temporary/cache-http.log"; then
+	die 'targeted pre-download fetched an unrelated WORLD upgrade'
+fi
+kill "$cache_server_pid"
+wait "$cache_server_pid" 2>/dev/null || true
+cache_server_pid=
+if cached_apk --keys-dir "$temporary/empty-keys" --network=no add --simulate --upgrade \
+	cache-main@fixture cache-locale@fixture >"$temporary/cache-untrusted.log" 2>&1; then
+	die 'offline upgrade accepted an untrusted cached index'
+fi
+grep -q 'UNTRUSTED signature' "$temporary/cache-untrusted.log" || die 'untrusted-index test missed signature validation'
+cached_apk --network=no add --simulate --upgrade cache-main@fixture cache-locale@fixture \
+	>"$temporary/cache-simulate.log" 2>&1
+[[ -f $cache_root/core-running && ! -s $cache_root/events ]] || die 'cache preparation or simulation touched the core'
+[[ $(cksum <"$cache_root/lib/apk/db/installed") == "$cache_installed" ]] || die 'cache preparation changed installed packages'
+pending=$(chroot "$cache_root" /sbin/uci -q changes)
+[[ -z $pending ]] && chroot "$cache_root" /etc/init.d/adguardhome stop && \
+	cached_apk --network=no add --upgrade cache-main@fixture cache-locale@fixture \
+	>"$temporary/cache-offline.log" 2>&1
+for name in cache-main cache-locale cache-dependency; do
+	[[ $(<"$cache_root/usr/share/$name") == 2 ]] || die "offline upgrade missed $name"
+done
+[[ $(<"$cache_root/usr/share/cache-unrelated") == 1 ]] || die 'offline target upgrade changed an unrelated package'
+[[ -f $cache_root/core-running ]] || die 'offline APK post-commit did not restore the enabled core'
+printf 'ok - signed target/dependency pre-download preserves service on failure and upgrades offline without unrelated WORLD packages\n'
 
 # APK still removes a package after pre-deinstall fails. Exercise the current
 # Makefile bodies under the real platform default_prerm and native APK, with

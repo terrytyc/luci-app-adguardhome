@@ -44,14 +44,24 @@ apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 
 默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号或密码。
 
-后续更新只需：
+后续更新先缓存本插件、中文翻译及所需依赖，确认能够离线安装后再停止核心：
 
 ```sh
-apk update &&
+agh_cache=/tmp/luci-app-adguardhome-apk
+mkdir -p "$agh_cache" &&
+apk --cache-dir "$agh_cache" update &&
+apk --cache-dir "$agh_cache" cache --upgrade download \
+  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
+apk --cache-dir "$agh_cache" --network=no add --upgrade --simulate \
+  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
 agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
 /etc/init.d/AdGuardHome stop &&
-apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
+apk --cache-dir "$agh_cache" --network=no add --upgrade \
+  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
+rm -rf "$agh_cache"
 ```
+
+下载或离线检查失败时，命令不会停止核心。APK 仍校验签名；这里只更新指定包及依赖，不升级整个系统。临时缓存成功后删除，失败时保留供重试。
 
 卸载也先确认停止成功，再交给 APK 删除插件；当前 UCI、YAML 和 data 保留：
 
@@ -153,7 +163,7 @@ config luci 'luci'
 
 ### 📦 更新前知道这些
 
-- 支持 APK 覆盖更新，保留当前格式的 UCI、YAML 和 data。安装前停止服务，完成后按现有启用状态恢复；不会重启共享的 rpcd 进程。
+- 支持 APK 覆盖更新，保留当前格式的 UCI、YAML 和 data。更新先预下载并检查离线安装，再停止服务；完成后按现有启用状态恢复，不会重启共享的 rpcd 进程。
 - 卸载只停止核心、移除插件接管并关闭官方自启动，保留当前 UCI、YAML 和 data，不恢复首次安装前的配置。首次安装失败仍会尝试恢复当次安装前的 UCI；覆盖更新不依赖原始快照。
 - 官方核心通过 APK 更新后，插件会检查运行状态：启用时按需重启到新核心，关闭时停止被安装脚本拉起的核心。检查由 APK 触发，插件关闭时也有效；无关软件更新不会重启状态正常的核心。
 - 此检查在整个 APK 事务结束后执行，不阻止官方安装脚本在升级期间启动核心。事务中断、跳过安装脚本或钩子失败时，不保证自动恢复，应检查服务状态和系统日志。

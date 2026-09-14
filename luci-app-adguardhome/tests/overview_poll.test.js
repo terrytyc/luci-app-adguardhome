@@ -444,6 +444,56 @@ async function testApplyRefresh() {
 	}
 }
 
+async function testSettingsResultReuse() {
+	for (const changed of [ false, true ]) {
+		const state = loadOverview();
+		await state.view.render(await state.view.load());
+		const map = state.view.settingsMap;
+		const data = map.initialData;
+		if (changed) {
+			Object.assign(data.config, { enabled: '0', work_dir: '/mnt/storage/agh', verbose: '1' });
+			Object.assign(data.luci, { redirect: 'none', run_from_memory: '1', memory_writeback_interval: '0' });
+		}
+		const committedData = JSON.parse(JSON.stringify(data));
+		let cachedValues, renderedValues;
+		Object.assign(map, {
+			data: {
+				get: (_config, section, option) => data[section][option],
+				set: (_config, section, option, value) => { data[section][option] = value; },
+			},
+			checkDepends() {}, async parse() {},
+			async load() { cachedValues = JSON.parse(JSON.stringify(data)); },
+			async reset() { renderedValues = JSON.parse(JSON.stringify(cachedValues)); },
+		});
+		const revision = (changed ? 'b' : 'a').repeat(64);
+		const submittedRevisions = [];
+		state.handlers.set_settings = (...args) => {
+			submittedRevisions.push(args[6]);
+			assert.deepEqual(args.slice(0, 6), [ data.config.enabled === '1', data.config.work_dir,
+				data.config.verbose === '1', data.luci.redirect, data.luci.run_from_memory === '1',
+				Number(data.luci.memory_writeback_interval) ]);
+			return { accepted: true, token: 'c'.repeat(32) };
+		};
+		state.handlers.get_settings_update = () => ({ state: 'done', ok: true, revision });
+		state.handlers.get_settings = () => assert.fail('successful Apply must reuse its verified candidate');
+		Object.assign(state.operation, {
+			start: () => ({}), success() {}, failure: message => assert.fail(message),
+			waitForJob: (status, token) => status(token),
+		});
+		state.calls.length = 0;
+		await state.view.submitSettings();
+		assert.deepEqual(renderedValues, committedData);
+		data.config.work_dir = '/etc/unsaved-draft';
+		data.luci.memory_writeback_interval = '123';
+		await state.view.handleReset();
+		assert.deepEqual(JSON.parse(JSON.stringify(data)), committedData);
+		assert.deepEqual(renderedValues, committedData, 'Reset must reload the newly committed form baseline');
+		await state.view.submitSettings();
+		assert.deepEqual(submittedRevisions, [ 'a'.repeat(64), revision ]);
+		assert.deepEqual(state.calls, [ 'set_settings', 'get_settings_update', 'set_settings', 'get_settings_update' ]);
+	}
+}
+
 async function main() {
 	const state = loadOverview();
 	const initial = await state.view.load();
@@ -633,6 +683,7 @@ async function main() {
 	await testDnsAndWritebackAvailability();
 	await testWritebackClickUncertainty();
 	await testCredentialPolling();
+	await testSettingsResultReuse();
 	console.log('combined overview polling, live YAML values and unsaved-form protection tests passed');
 }
 

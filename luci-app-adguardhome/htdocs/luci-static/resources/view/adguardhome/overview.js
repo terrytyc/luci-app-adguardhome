@@ -1030,7 +1030,7 @@ return view.extend({
 
 			let committed = null;
 			try {
-				committed = await getSettings(scope);
+				committed = { ...candidate, revision: result.revision };
 				await reloadSettingsMap(map, committed);
 				if (!operation.isPageActive(scope))
 					throw operation.pageInactiveError();

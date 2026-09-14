@@ -1127,7 +1127,7 @@ function memory_writeback(expected_revision) {
 	]);
 }
 
-function update_yaml(content, expected_hash) {
+function update_yaml(content, expected_hash, verified_path) {
 	if (type(content) != 'string' || !length(content) ||
 	    length(content) > MAX_CONFIG_LENGTH || index(content, "\u0000") >= 0)
 		return { error: 'Invalid YAML content' };
@@ -1135,7 +1135,8 @@ function update_yaml(content, expected_hash) {
 	    !match(expected_hash, /^[0-9a-f]{64}$/))
 		return { error: 'Invalid or missing YAML revision' };
 
-	let path = config_path();
+	// Credentials reuse the path already validated by this request's read_yaml().
+	let path = verified_path || config_path();
 	let token = random_token();
 	let candidate_hash = sha256(content);
 	if (!path || !token || !candidate_hash)
@@ -1621,7 +1622,7 @@ function update_credentials(username, password_hash, expected_hash) {
 	let content = join('\n', record.lines);
 	if (content == yaml.content)
 		return { error: 'No username or password change was requested' };
-	return update_yaml(content, expected_hash);
+	return update_yaml(content, expected_hash, yaml.path);
 }
 
 function reset_yaml(expected_hash) {

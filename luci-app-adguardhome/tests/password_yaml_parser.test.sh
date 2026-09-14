@@ -47,6 +47,7 @@ trap 'exit 1' HUP INT TERM
 const TEST_CANDIDATE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 let mock_yaml = null;
 let updated_content = null;
+let updated_path = null;
 let no_op_hashes = 0;
 
 function read_yaml() {
@@ -58,8 +59,9 @@ function sha256(content) {
 	return content == mock_yaml.content ? mock_yaml.sha256 : TEST_CANDIDATE;
 }
 
-function update_yaml(content, expected_hash) {
+function update_yaml(content, expected_hash, verified_path) {
 	updated_content = content;
+	updated_path = verified_path;
 	return expected_hash == mock_yaml.sha256
 		? { accepted: true }
 		: { error: 'unexpected revision' };
@@ -207,13 +209,16 @@ if (supported_username_scalar('"root user"') != null ||
 print('ok - safe username validation\n');
 
 function expect_update(name, content, username, password_hash, expected_content) {
-	mock_yaml = { content, sha256: REVISION };
+	mock_yaml = { content, sha256: REVISION, path: '/mnt/adguardhome/AdGuardHome.yaml' };
 	updated_content = null;
+	updated_path = null;
 	let result = update_credentials(username, password_hash, REVISION);
 	if (result?.accepted != true)
 		fail(name, `credential update failed: ${result?.error || 'unknown error'}`);
 	if (updated_content != expected_content)
 		fail(name, 'credential update produced unexpected YAML');
+	if (updated_path != mock_yaml.path)
+		fail(name, 'credential update did not reuse its verified YAML path');
 	if (!credential_record(updated_content))
 		fail(name, 'credential update produced YAML that cannot be managed again');
 	print(`ok - ${name}\n`);
