@@ -44,35 +44,6 @@ apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 
 默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号或密码。
 
-后续更新先缓存本插件、中文翻译及所需依赖，确认能够离线安装后再停止核心：
-
-```sh
-agh_cache=/tmp/luci-app-adguardhome-apk
-mkdir -p "$agh_cache" &&
-apk --cache-dir "$agh_cache" update &&
-apk --cache-dir "$agh_cache" cache --upgrade download \
-  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
-apk --cache-dir "$agh_cache" --network=no add --upgrade --simulate \
-  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
-agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
-/etc/init.d/AdGuardHome stop &&
-apk --cache-dir "$agh_cache" --network=no add --upgrade \
-  luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc &&
-rm -rf "$agh_cache"
-```
-
-下载或离线检查失败时，命令不会停止核心。APK 仍校验签名；这里只更新指定包及依赖，不升级整个系统。临时缓存成功后删除，失败时保留供重试。
-
-卸载也先确认停止成功，再交给 APK 删除插件；当前 UCI、YAML 和 data 保留：
-
-```sh
-agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
-/etc/init.d/AdGuardHome stop &&
-apk del luci-i18n-adguardhome-zh-cn luci-app-adguardhome
-```
-
-停止失败时先处理服务日志中的原因，不继续升级或卸载。APK 的包级安装、升级、卸载脚本即使报错，也可能继续替换或删除文件；卸载前脚本的失败甚至不一定反映在 APK 退出码中。
-
 `@terrytyc` 指定使用本项目软件源，避免同名包被其他源替换。正常校验签名，无需 `--allow-untrusted`。保留配置升级固件时，请将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，一并保留公钥。
 
 ## 🧭 DNS 模式
