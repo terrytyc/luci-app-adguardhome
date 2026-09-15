@@ -211,6 +211,7 @@ for name in luci-app-adguardhome luci-i18n-adguardhome-zh-cn; do
 		printf 'info:\n  name: %s\n  version: %s\n  arch: noarch\n  origin: %s\n  depends:\n' "$name" "$version" "$origin"
 		if [[ $name == luci-app-adguardhome ]]; then
 			printf '    - adguardhome>=0.107.76-r1\n    - dnsmasq\n    - firewall4\n'
+			printf '  replaces: # 1 items\n    - luci-app-AdGuardHome\n'
 			hooks='pre-install post-install pre-deinstall post-deinstall pre-upgrade post-upgrade'
 		else
 			printf '    - luci-app-adguardhome\n'
@@ -332,6 +333,7 @@ check_apk_failure main 'versioned adguardhome dependency' 's/adguardhome>=0.107.
 check_apk_failure main 'dnsmasq dependency' '/^    - dnsmasq$/d'
 check_apk_failure main 'firewall4 dependency' '/^    - firewall4$/d'
 check_apk_failure i18n 'luci-app-adguardhome dependency' '/^    - luci-app-adguardhome$/d'
+check_apk_failure main 'luci-app-AdGuardHome file replacement' '/^    - luci-app-AdGuardHome$/d'
 check_apk_failure main 'conffile manifest is missing' '/^# payload-conffile:/d'
 check_apk_failure main 'does not preserve its active YAML' '\|^# payload-conffile: /etc/AdGuardHome/AdGuardHome.yaml$|d'
 check_apk_failure main 'does not preserve its private snapshot directory' '\|^# payload-conffile: /root/.luci-app-adguardhome/$|d'

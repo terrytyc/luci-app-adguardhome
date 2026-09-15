@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.2.0
-PKG_RELEASE:=5
+PKG_RELEASE:=6
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -151,28 +151,69 @@ $(AdGuardHome/UciPendingGuard)
 
 $(AdGuardHome/RunBounded)
 
-adguardhome_pids() {
-	local entry executable pid
-	for entry in /proc/[0-9]*/exe; do
-		executable="$$(readlink "$$entry" 2>/dev/null)" || continue
-		executable="$${executable% (deleted)}"
-		case "$${executable##*/}" in AdGuardHome|adguardhome) ;; *) continue ;; esac
-		pid="$${entry%/exe}"
-		printf '%s ' "$${pid##*/}"
-	done
+adguardhome_inventory() {
+	/usr/bin/ucode -e '
+		import * as fs from "fs";
+		function normalized(name) { return replace(lc(name), /[-_]/g, ""); }
+		function basename(path) { return replace(path, /^.*\//, ""); }
+		function core(name) { return normalized(name) == "adguardhome"; }
+		function known(name) { return core(name) || normalized(name) == "luciappadguardhome"; }
+		let pids = {}, ancestors = {}, services = {};
+		for (let pid in fs.lsdir("/proc")) {
+			if (!match(pid, /^[0-9]+$$/) || +pid <= 1) continue;
+			let exe = fs.readlink(`/proc/$${pid}/exe`);
+			if (!exe) continue;
+			exe = basename(replace(exe, / \(deleted\)$$/, ""));
+			let comm = trim(fs.readfile(`/proc/$${pid}/comm`) || "");
+			if (core(exe) || (core(comm) && !match(exe, /^(busybox|sh|ash|bash|dash|ucode|lua|python3?|node)$$/)))
+				pids[pid] = true;
+		}
+		if (ARGV[0] == "pids") { print(join(" ", keys(pids))); exit(0); }
+		for (let pid in pids) {
+			for (let depth = 0; +pid > 1 && !ancestors[pid] && depth < 64; depth++) {
+				ancestors[pid] = true;
+				let parent = match(fs.readfile(`/proc/$${pid}/status`) || "", /\nPPid:\s+([0-9]+)/);
+				pid = parent ? parent[1] : "0";
+			}
+		}
+		for (let name in fs.lsdir("/etc/init.d") || [])
+			if (known(name)) services[name] = true;
+		let registered = json(fs.stdin.read("all"));
+		if (type(registered) != "object") exit(1);
+		for (let name, service in registered) {
+			if (known(name)) { services[name] = true; continue; }
+			let matched = 0, instances = service.instances || {};
+			for (let id, instance in instances)
+				if (core(basename(instance.command?.[0] || "")) || ancestors["" + instance.pid]) matched++;
+			if (!matched) continue;
+			if (matched != length(instances)) {
+				warn(`AdGuard Home shares service $${name} with unrelated instances; separate it before installing.\n`);
+				exit(1);
+			}
+			services[name] = true;
+		}
+		for (let name in services) {
+			if (!match(name, /^[A-Za-z0-9_.-]+$$/)) {
+				warn(`Unsupported AdGuard Home service name: $${name}\n`);
+				exit(1);
+			}
+		}
+		print(join(" ", keys(services)));
+	' "$$1"
 }
 
 stop_adguardhome_processes() {
 	local signal pids remaining
 	for signal in TERM KILL; do
-		pids="$$(adguardhome_pids)"
+		pids="$$(adguardhome_inventory pids)" || return 1
 		[ -n "$$pids" ] || return 0
 		kill "-$$signal" $$pids 2>/dev/null || true
 		remaining=10
 		[ "$$signal" != KILL ] || remaining=2
 		while [ "$$remaining" -gt 0 ]; do
 			sleep 1
-			[ -n "$$(adguardhome_pids)" ] || return 0
+			pids="$$(adguardhome_inventory pids)" || return 1
+			[ -n "$$pids" ] || return 0
 			remaining=$$((remaining - 1))
 		done
 	done
@@ -180,6 +221,21 @@ stop_adguardhome_processes() {
 	return 1
 }
 
+program_files="/etc/init.d/AdGuardHome /etc/uci-defaults/40_luci-AdGuardHome /etc/hotplug.d/acme/95-AdGuardHome"
+for file in $$program_files; do
+	for target in "$$file" "$$file.apk-new"; do
+		owner="$$(apk info --who-owns --quiet "$$target" 2>/dev/null)"
+		case "$$owner" in
+			''|luci-app-adguardhome|luci-app-AdGuardHome) ;;
+			*) echo "$$target is owned by $$owner; resolve the package conflict before installing." >&2; exit 1 ;;
+		esac
+	done
+done
+# Discover supervision before stopping a core and losing its parent chain.
+services="$$(ubus -t 5 -S call service list | adguardhome_inventory services)" || {
+	echo "Unable to identify old AdGuard Home services; installation cleanup is incomplete." >&2
+	exit 1
+}
 coordinator_retry=0
 if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
 	if [ -f /etc/init.d/AdGuardHome ] && [ ! -L /etc/init.d/AdGuardHome ] &&
@@ -191,7 +247,7 @@ if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
 	fi
 fi
 
-for service in AdGuardHome luci-app-adguardhome adguardhome; do
+for service in $$services; do
 	service_script="/etc/init.d/$$service"
 	if [ -f "$$service_script" ] && [ ! -L "$$service_script" ] && [ -x "$$service_script" ]; then
 		[ "$$service" = AdGuardHome ] ||
@@ -200,11 +256,23 @@ for service in AdGuardHome luci-app-adguardhome adguardhome; do
 	fi
 	# Disabling boot links alone does not cancel a live procd respawn.
 	ubus -t 5 call service delete "{\"name\":\"$$service\"}" >/dev/null 2>&1 || true
-	for link in /etc/rc.d/[SK][0-9][0-9]"$$service"; do
-		[ ! -L "$$link" ] || rm -f "$$link" || exit 1
+	service_target="$$(readlink -f "$$service_script")"
+	[ -n "$$service_target" ] || continue
+	for link in /etc/rc.d/[SK][0-9][0-9]*; do
+		[ -L "$$link" ] || continue
+		[ "$$(readlink -f "$$link")" != "$$service_target" ] || rm -f "$$link" || exit 1
 	done
 done
 stop_adguardhome_processes || exit 1
+ubus -t 5 -S call service list | /usr/bin/ucode -e '
+	import { stdin } from "fs";
+	let registered = json(stdin.read("all"));
+	if (type(registered) != "object") exit(1);
+	for (let name in ARGV) if (registered[name]) {
+		warn(`Old AdGuard Home service $${name} is still registered; installation cleanup is incomplete.\n`);
+		exit(1);
+	}
+' $$services || exit 1
 
 # A leftover core under the same uid can make the first stop fail. Retry the
 # coordinator now, and never discard a failed RAM write-back or DNS restore.
@@ -222,8 +290,7 @@ fi
 
 # These are executable plugin files, not user configuration. Removing only
 # these targets prevents APK from retaining modified old code as .apk-new.
-for file in /etc/init.d/AdGuardHome /etc/uci-defaults/40_luci-AdGuardHome \
-	/etc/hotplug.d/acme/95-AdGuardHome; do
+for file in $$program_files; do
 	rm -f "$$file" "$$file.apk-new" || exit 1
 done
 rm -f "$$install_marker" || exit 1
@@ -380,5 +447,9 @@ exit 0
 endef
 
 include $(TOPDIR)/feeds/luci/luci.mk
+
+# APK has native file replacement metadata; this SDK exposes only its raw
+# package arguments here. Do not provide the alias and run unknown removal hooks.
+APK_SCRIPTS_luci-app-adguardhome += --info "replaces:luci-app-AdGuardHome"
 
 # call BuildPackage - OpenWrt buildroot signature

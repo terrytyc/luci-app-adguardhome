@@ -50,9 +50,9 @@ metadata_value() {
 	' "$1"
 }
 
-metadata_has_dependency() {
-	awk -v wanted="$2" '
-		$0 ~ /^  depends:/ { inside = 1; next }
+metadata_has_list_item() {
+	awk -v key="$2" -v wanted="$3" '
+		index($0, "  " key ":") == 1 { inside = 1; next }
 		inside && /^    - / {
 			if (substr($0, 7) == wanted) found = 1
 			next
@@ -109,14 +109,16 @@ verify_identity "$main_apk" luci-app-adguardhome "$main_metadata" "$main_root"
 verify_identity "$i18n_apk" luci-i18n-adguardhome-zh-cn \
 	"$i18n_metadata" "$i18n_root"
 
-metadata_has_dependency "$main_metadata" 'adguardhome>=0.107.76-r1' ||
+metadata_has_list_item "$main_metadata" depends 'adguardhome>=0.107.76-r1' ||
 	die 'main APK lost its versioned adguardhome dependency'
-metadata_has_dependency "$main_metadata" dnsmasq ||
+metadata_has_list_item "$main_metadata" depends dnsmasq ||
 	die 'main APK lost its dnsmasq dependency'
-metadata_has_dependency "$main_metadata" firewall4 ||
+metadata_has_list_item "$main_metadata" depends firewall4 ||
 	die 'main APK lost its firewall4 dependency'
-metadata_has_dependency "$i18n_metadata" luci-app-adguardhome ||
+metadata_has_list_item "$i18n_metadata" depends luci-app-adguardhome ||
 	die 'zh-cn APK lost its luci-app-adguardhome dependency'
+metadata_has_list_item "$main_metadata" replaces luci-app-AdGuardHome ||
+	die 'main APK lost its luci-app-AdGuardHome file replacement'
 
 conffiles=$main_root/lib/apk/packages/luci-app-adguardhome.conffiles
 [ -f "$conffiles" ] && [ ! -L "$conffiles" ] ||
