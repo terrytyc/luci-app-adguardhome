@@ -96,6 +96,9 @@ source = init.read_text()
 line = '\trun_bounded 20 4 "$@" >/dev/null 2>&1 || rc=$?'
 assert source.count(line) == 1
 source = source.replace(line, '\trun_bounded 20 4 "$@" >/test/normalizer.log 2>&1 || rc=$?')
+jail = 'set -- /sbin/ujail -n AGHNormalize'
+assert source.count(jail) == 1
+source = source.replace(jail, 'set -- /sbin/ujail -d 4 -n AGHNormalize')
 entry = '#!/bin/sh /etc/rc.common\n'
 assert source.startswith(entry)
 source = source.replace(entry, entry + '''case "${action:-}" in
@@ -145,6 +148,8 @@ fail() {
 	printf 'FAIL: %s\n' "$*" >&2
 	run /bin/ubus call service list > "$temporary/failed-services.log" || true
 	run /bin/ps w > "$temporary/failed-processes.log" || true
+	run /bin/ls -l /usr/bin/AdGuardHome /lib/ld-musl-x86_64.so.1 /lib/libc.so > "$temporary/core-paths.log" 2>&1 || true
+	run /bin/readlink -f /usr/bin/AdGuardHome /lib/ld-musl-x86_64.so.1 /lib/libc.so >> "$temporary/core-paths.log" 2>&1 || true
 	cat "$temporary/"*.log "$root/tmp/system.log" >&2; exit 1
 }
 run() { chroot "$root" "$@"; }
@@ -247,4 +252,8 @@ timeout --kill-after=2s 180s unshare --mount --pid --net --fork --kill-child bas
 	rmdir /.oldroot
 	/bin/ifconfig lo up
 	exec /bin/bash /test/driver.sh / /sbin/apk /test
-' package-lifecycle "$root" "$apk" "$temporary"
+' package-lifecycle "$root" "$apk" "$temporary" || {
+	rc=$?
+	dmesg | grep -Ei 'apparmor|denied' | tail -30 >&2 || true
+	exit "$rc"
+}
