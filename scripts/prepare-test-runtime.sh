@@ -26,14 +26,24 @@ fetch apk-tools-static.apk 2edccd3267ce540f8d2371a0f394e84b40d8348ecc28425309e6d
 	https://dl-cdn.alpinelinux.org/alpine/v3.23/main/x86_64/apk-tools-static-3.0.8-r0.apk
 fetch digest.apk 1bb1a001ab2dcb7fed204ecf2c7ac27485dd1771d52a8564581f3725b4e38c74 \
 	https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/base/ucode-mod-digest-2026.01.16~85922056-r2.apk
+fetch adguardhome.apk baa844b544db7dc5f470f76b8b903b6c87924e21055f962b1da64bd25c8d26a2 \
+	https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/packages/adguardhome-0.107.79-r1.apk
+fetch flock.apk 2beb095dd74e47e6545af914d4a19d3f575fa1dd597882aa31624055050d82f3 \
+	https://downloads.openwrt.org/releases/25.12.0/packages/x86_64/base/flock-2.41.5-r1.apk
 
 tar -xzf "$runtime/rootfs.tar.gz" -C "$runtime/root" \
 	./lib ./usr/lib ./usr/bin/ucode ./sbin/uci \
-	./sbin/procd ./sbin/ubusd ./bin/ubus ./bin/busybox ./usr/bin/jshn ./usr/share/libubox/jshn.sh
+	./sbin/procd ./sbin/ubusd ./bin/ubus ./bin/busybox ./usr/bin/jshn ./usr/share/libubox/jshn.sh \
+	./etc/rc.common ./etc/hosts ./etc/config/firewall ./etc/config/dhcp \
+	./sbin/ujail ./sbin/validate_data ./usr/bin/jsonfilter
 tar --warning=no-unknown-keyword -xzf "$runtime/apk-tools-static.apk" -C "$runtime/apk" sbin/apk.static
 # The exact downloaded bytes were checked above; extraction executes no package scripts.
 "$runtime/apk/sbin/apk.static" extract --allow-untrusted \
 	--destination "$runtime/root" "$runtime/digest.apk"
+"$runtime/apk/sbin/apk.static" extract --allow-untrusted \
+	--destination "$runtime/root" "$runtime/adguardhome.apk"
+"$runtime/apk/sbin/apk.static" extract --allow-untrusted \
+	--destination "$runtime/root" "$runtime/flock.apk"
 "$runtime/apk/sbin/apk.static" --version
 "$runtime/root/lib/ld-musl-x86_64.so.1" \
 	--library-path "$runtime/root/lib:$runtime/root/usr/lib" \

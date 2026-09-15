@@ -80,6 +80,7 @@ clear_recorded_integration_locked() { return "${CLEAR_RC:-0}"; }
 wait_for_core_ready() { return "${READY_RC:-0}"; }
 apply_integration_locked() { return "${APPLY_RC:-0}"; }
 runtime_settings_match() { :; }
+official_socket_snapshot() { :; }
 dns_port_listening() { :; }
 log_error() { :; }
 

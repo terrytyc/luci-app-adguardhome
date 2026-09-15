@@ -7,8 +7,8 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/run-bounded.mk
 include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
-PKG_VERSION:=3.2.0
-PKG_RELEASE:=7
+PKG_VERSION:=3.3.0
+PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -264,15 +264,30 @@ for service in $$services; do
 	done
 done
 stop_adguardhome_processes || exit 1
-ubus -t 5 -S call service list | /usr/bin/ucode -e '
+# procd deletes a service after its last instance exits. A monitor sleeping
+# inside ash may need procd's termination timeout before that happens.
+remaining=10
+while :; do
+	cleanup_rc=0
+	ubus -t 5 -S call service list | /usr/bin/ucode -e '
 	import { stdin } from "fs";
-	let registered = json(stdin.read("all"));
-	if (type(registered) != "object") exit(1);
-	for (let name in ARGV) if (registered[name]) {
-		warn(`Old AdGuard Home service $${name} is still registered; installation cleanup is incomplete.\n`);
-		exit(1);
+	let registered;
+	try { registered = json(stdin.read("all")); } catch (e) { exit(2); }
+	if (type(registered) != "object") exit(2);
+	for (let name in ARGV) if (registered[name]) exit(1);
+	' $$services || cleanup_rc=$$?
+	[ "$$cleanup_rc" != 0 ] || break
+	[ "$$cleanup_rc" = 1 ] || {
+		echo "Unable to inspect old AdGuard Home services; installation cleanup is incomplete." >&2
+		exit 1
 	}
-' $$services || exit 1
+	[ "$$remaining" -gt 0 ] || {
+		echo "Old AdGuard Home services are still registered; installation cleanup is incomplete: $$services" >&2
+		exit 1
+	}
+	sleep 1
+	remaining=$$((remaining - 1))
+done
 
 # A leftover core under the same uid can make the first stop fail. Retry the
 # coordinator now, and never discard a failed RAM write-back or DNS restore.
@@ -330,7 +345,7 @@ fi
 # Load the updated RPC module without restarting the shared daemon.
 [ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1
 install_rc=0
-/etc/init.d/AdGuardHome install_check >/dev/null 2>&1 || {
+/etc/init.d/AdGuardHome install_check >/dev/null || {
 	echo "AdGuard Home files were installed, but service verification failed; check the plugin and core logs." >&2
 	install_rc=1
 }
@@ -419,7 +434,7 @@ if [ -e "$$managed_snapshot" ] || [ -L "$$managed_snapshot" ]; then
 	rm -f "$$managed_snapshot" || exit 1
 fi
 rmdir "$$snapshot_dir" 2>/dev/null || true
-for applied_state in "$$runtime_dir/applied-runtime" "$$runtime_dir"/.applied-runtime.??????; do
+for applied_state in "$$runtime_dir/applied-runtime" "$$runtime_dir"/.applied-runtime.?????? "$$runtime_dir/apk-core-before"; do
 	[ -e "$$applied_state" ] || [ -L "$$applied_state" ] || continue
 	root_private_file "$$applied_state" || exit 1
 	rm -f "$$applied_state" || exit 1

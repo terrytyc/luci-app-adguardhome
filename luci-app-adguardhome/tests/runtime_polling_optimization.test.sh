@@ -312,4 +312,45 @@ fi
 	[ "$(grep -cx cleanup "$calls")" = 1 ]
 )
 
+# Installation uses the same snapshot across DNS and integration checks, but
+# its first listener check must still reject an invisible RAM data mount.
+(
+	for name in install_check integration_status_locked; do
+		eval "$(function_body "$init_file" "$name")"
+	done
+	open_integration_read_lock() { :; }
+	read_settings() { :; }
+	load_runtime_dns_port() { dns_port=53335; }
+	uci_guard_no_delta() { :; }
+	uci() {
+		case "$2" in
+			export) return 0 ;;
+			get) printf '%s\n' "$redirect_mode" ;;
+			*) return 1 ;;
+		esac
+	}
+	integration_matches_desired() { [ "$redirect_mode" != redirect ] || dns_ipv6_listening; }
+	log_error() { :; }
+	service_enabled=1 MEMORY_ACTIVE=1
+	PLUGIN_CONFIG=adguardhome PLUGIN_SECTION=luci
+	MEMORY_BACKING_WORK_DIR="${test_tmp}/work"
+	MEMORY_DATA_DIR="${test_tmp}/work/data"
+	table udp 00000000 07
+	table tcp 00000000 0A
+	table udp6 00000000000000000000000000000000 07
+	table tcp6 00000000000000000000000000000000 0A
+	for redirect_mode in none dnsmasq-upstream redirect; do
+		: >"$calls"
+		install_check
+		[ "$(grep -cx service "$calls")" = 1 ]
+		install_check
+		[ "$(grep -cx service "$calls")" = 2 ]
+	done
+	MEMORY_DATA_DIR="${test_tmp}/other/data"
+	: >"$calls"
+	rc=0; install_check 2>"$test_tmp/install-error" || rc=$?
+	[ "$rc" = 1 ] && [ "$(grep -cx service "$calls")" = 1 ]
+	grep -q 'cannot see the active RAM data mount' "$test_tmp/install-error"
+)
+
 printf 'ok - builtin PID readers, parent-chain bounds and fresh owned socket checks\n'

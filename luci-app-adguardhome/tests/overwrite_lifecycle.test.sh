@@ -117,27 +117,46 @@ export managed_log
 [ "$(cat "$managed_log")" = "$(printf 'validated\nkept\nrefreshed')" ]
 
 eval "$(function_body "$init_file" install_check)"
-open_integration_read_lock() { return 0; }
-read_settings() { return 0; }
+eval "$(function_body "$init_file" log_error)"
+logger() { printf '%s\n' "$*" >>"$test_tmp/check-log"; }
+open_integration_read_lock() { [ "$lock_ready" = 1 ]; }
+read_settings() { [ "$settings_ready" = 1 ]; }
 official_running() { [ "$core_running" = 1 ]; }
-load_runtime_dns_port() { dns_port=53335; }
-dns_port_listening() { [ "$dns_ready" = 1 ]; }
-integration_status_locked() { [ "$1:$2:$integration_ready" = 53335:none:1 ]; }
+load_runtime_dns_port() { dns_port=53335; [ "$yaml_ready" = 1 ]; }
+official_socket_snapshot() { [ "$core_running" = 1 ]; }
+official_memory_data_mount_visible() { [ "$memory_visible" = 1 ]; }
+dns_port_listening() { [ "$dns_ready:$memory_visible" = 1:1 ]; }
+integration_status_locked() { [ "$1:$2" = 53335:none ]; return "$integration_rc"; }
 redirect_mode=none
-for scenario in disabled disabled_running ready no_listener no_integration; do
-	service_enabled=1 core_running=1 dns_ready=1 integration_ready=1 expected=0
+for scenario in disabled disabled_running ready lock settings yaml no_core no_memory no_listener no_integration invalid_integration; do
+	service_enabled=1 core_running=1 dns_ready=1 integration_rc=0 expected=0
+	lock_ready=1 settings_ready=1 yaml_ready=1 memory_visible=1 reason=''
 	case "$scenario" in
 		disabled) service_enabled=0 core_running=0 ;;
-		disabled_running) service_enabled=0 expected=1 ;;
-		no_listener) dns_ready=0 expected=1 ;;
-		no_integration) integration_ready=0 expected=1 ;;
+		disabled_running) service_enabled=0 reason='the disabled core is still running' ;;
+		lock) lock_ready=0 reason='unable to acquire the integration lock within 30 seconds' ;;
+		settings) settings_ready=0 reason='unable to read valid service settings and runtime paths' ;;
+		yaml) yaml_ready=0 reason='unable to read a valid DNS port from the active YAML' ;;
+		no_core) core_running=0 reason='the supervised core has no owned sockets' ;;
+		no_memory) memory_visible=0 reason='the supervised core cannot see the active RAM data mount' ;;
+		no_listener) dns_ready=0 reason='the supervised core is not listening on DNS port 53335 for none' ;;
+		no_integration) integration_rc=1 reason='DNS integration does not match none on port 53335' ;;
+		invalid_integration) integration_rc=2 reason='DNS integration configuration is unavailable or has pending changes' ;;
 	esac
+	[ -z "$reason" ] || expected=1
+	: >"$test_tmp/check-log"
 	rc=0
-	install_check || rc=$?
+	install_check 2>"$test_tmp/check-error" || rc=$?
 	[ "$rc" = "$expected" ] || {
 		printf 'installation verification failed: %s\n' "$scenario" >&2
 		exit 1
 	}
+	if [ "$expected" = 1 ]; then
+		[ "$(cat "$test_tmp/check-error")" = "Installation verification failed: $reason" ]
+		[ "$(cat "$test_tmp/check-log")" = "-t AdGuardHome Installation verification failed: $reason" ]
+	else
+		[ ! -s "$test_tmp/check-error" ] && [ ! -s "$test_tmp/check-log" ]
+	fi
 done
 
 # A healthy monitor can briefly own the real integration lock after startup.
@@ -147,7 +166,7 @@ done
 	eval "$(function_body "$init_file" integration_status)"
 	INTEGRATION_LOCK="$test_tmp/integration.lock"
 	: >"$INTEGRATION_LOCK"
-	service_enabled=1 dns_ready=1 integration_ready=1
+	service_enabled=1 dns_ready=1 integration_rc=0
 	read_settings() {
 		[ -e "$test_tmp/lock-released" ] || return 1
 		printf 'read\n' >>"$test_tmp/settings-read"
@@ -172,7 +191,7 @@ done
 	wait "$lock_owner"
 	[ "$(cat "$test_tmp/settings-read")" = read ]
 	dns_ready=0
-	rc=0; install_check || rc=$?
+	rc=0; install_check 2>"$test_tmp/check-error" || rc=$?
 	[ "$rc" = 1 ]
 )
 

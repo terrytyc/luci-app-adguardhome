@@ -120,10 +120,12 @@ else
 	bash "$SCRIPT_DIR/tests/interface-trigger.integration.sh"
 	printf 'TEST scripts/tests/install-cleanup.integration.sh\n'
 	bash "$SCRIPT_DIR/tests/install-cleanup.integration.sh"
+	printf 'TEST scripts/tests/package-lifecycle.integration.sh\n'
+	bash "$SCRIPT_DIR/tests/package-lifecycle.integration.sh"
 	printf 'TEST scripts/tests/package-replaces.integration.sh\n'
 	bash "$SCRIPT_DIR/tests/package-replaces.integration.sh"
 	printf 'TEST scripts/tests/apk-hook.integration.sh\n'
 	bash "$SCRIPT_DIR/tests/apk-hook.integration.sh"
-	printf 'TEST_OK shell=%d javascript=%d rpc_integration=1 interface_integration=1 install_integration=1 replaces_integration=1 apk_integration=1\n' \
+	printf 'TEST_OK shell=%d javascript=%d rpc_integration=1 interface_integration=1 install_integration=1 package_lifecycle_integration=1 replaces_integration=1 apk_integration=1\n' \
 		"${#shell_tests[@]}" "${#js_tests[@]}"
 fi

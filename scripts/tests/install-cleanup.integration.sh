@@ -255,10 +255,11 @@ grep -q 'service verification failed' "$temporary/postinst.log" || fail 'postins
 
 # Failed service deletion leaves a pending respawn even while no core PID
 # exists. The final native service query must reject that incomplete cleanup.
-ubus call service set '{"name":"delayed-filter","instances":{"main":{"command":["/opt/managed/AdGuardHome","/tmp/process.uc","delayed"],"respawn":["3600","3","0"]}}}' >/dev/null
+# Keep the respawn gap longer than the bounded shutdown wait.
+ubus call service set '{"name":"delayed-filter","instances":{"main":{"command":["/opt/managed/AdGuardHome","/tmp/process.uc","delayed"],"respawn":["3600","30","0"]}}}' >/dev/null
 for attempt in {1..100}; do [[ -f $root/tmp/delayed.ready ]] && break; sleep .02; done
 [[ -f $root/tmp/delayed.ready ]] || fail 'delayed core did not start'
-ubus call service list '{"name":"delayed-filter","verbose":true}' | grep -q '"timeout": 3,' || fail 'native procd did not accept the three-second respawn timeout'
+ubus call service list '{"name":"delayed-filter","verbose":true}' | grep -q '"timeout": 30,' || fail 'native procd did not accept the thirty-second respawn timeout'
 : > "$root/tmp/fail-delete"
 sha256sum "$root/etc/init.d/AdGuardHome" "$root/etc/hotplug.d/acme/95-AdGuardHome" > "$temporary/programs.sha256"
 if chroot "$root" /bin/sh /tmp/preinst > "$temporary/delete.log" 2>&1; then

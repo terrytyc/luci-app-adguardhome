@@ -380,8 +380,9 @@ chmod 0700 "$root/var/run/luci-app-adguardhome" "$root/root/.luci-app-adguardhom
 printf 'ram-data\n' >"$root/tmp/luci-app-adguardhome-memory/state"
 printf 'dns-ownership\n' >"$root/root/.luci-app-adguardhome/managed-adguardhome.config"
 printf 'applied-state\n' >"$root/var/run/luci-app-adguardhome/applied-runtime"
+printf 'core-fingerprint\n' >"$root/var/run/luci-app-adguardhome/apk-core-before"
 chmod 0600 "$root/root/.luci-app-adguardhome/managed-adguardhome.config" \
-	"$root/var/run/luci-app-adguardhome/applied-runtime"
+	"$root/var/run/luci-app-adguardhome/applied-runtime" "$root/var/run/luci-app-adguardhome/apk-core-before"
 # A previous successful stop followed by failed post-deinstall must not
 # authorize cleanup after this new stop fails.
 printf '1\n' >"$root/var/run/luci-app-adguardhome/remove-ok"
@@ -393,6 +394,7 @@ grep -Fq 'exited with error 1' "$temporary/apk.log" || die 'fixture did not fail
 [[ $(<"$root/tmp/luci-app-adguardhome-memory/state") == ram-data ]] || die 'failed removal lost RAM state'
 [[ $(<"$root/root/.luci-app-adguardhome/managed-adguardhome.config") == dns-ownership ]] || die 'failed removal lost recovery snapshot'
 [[ $(<"$root/var/run/luci-app-adguardhome/applied-runtime") == applied-state ]] || die 'failed removal lost runtime state'
+[[ -s $root/var/run/luci-app-adguardhome/apk-core-before ]] || die 'failed removal lost the core package snapshot'
 [[ ! -e $root/var/run/luci-app-adguardhome/remove-ok ]] || die 'failed removal retained an old success marker'
 printf 'ok - native failed removal deletes package without restarting it or discarding recovery state\n'
 printf 'APK_HOOK_INTEGRATION_OK (%s; isolated dummy services)\n' "$version"
