@@ -86,31 +86,6 @@ for revision in 1 2 3; do
 		awk -v helper_dir="$package/scripts" -f "$package/scripts/expand-helpers.awk" \
 			"$package/root/$path" > "$payload/$path"
 	done
-	# Capture the original failed invocation; do not rerun initialization or
-	# replace any validation, arguments or return values in this native fixture.
-	python3 - "$payload" <<'PY'
-import pathlib, sys
-payload = pathlib.Path(sys.argv[1])
-init = payload / 'etc/init.d/AdGuardHome'
-source = init.read_text()
-line = '\trun_bounded 20 4 "$@" >/dev/null 2>&1 || rc=$?'
-assert source.count(line) == 1
-source = source.replace(line, '\trun_bounded 20 4 "$@" >/test/normalizer.log 2>&1 || rc=$?')
-jail = 'set -- /sbin/ujail -n AGHNormalize'
-assert source.count(jail) == 1
-source = source.replace(jail, 'set -- /sbin/ujail -d 4 -n AGHNormalize')
-entry = '#!/bin/sh /etc/rc.common\n'
-assert source.startswith(entry)
-source = source.replace(entry, entry + '''case "${action:-}" in
-    normalize_config|check_work_dir) exec 2>>"/test/init-$action.log"; set -x ;;
-esac
-''', 1)
-init.write_text(source)
-defaults = payload / 'etc/uci-defaults/40_luci-AdGuardHome'
-source = defaults.read_text()
-assert source.startswith('#!/bin/sh\n')
-defaults.write_text(source.replace('#!/bin/sh\n', '#!/bin/sh\nexec 2>>/test/defaults.log\nset -x\n', 1))
-PY
 	printf '/etc/init.d/AdGuardHome\n/etc/uci-defaults/40_luci-AdGuardHome\n' > "$payload/lib/apk/packages/luci-app-adguardhome.list"
 	# Keep package networking out of the fixture; all DNS and HTTP checks use
 	# actual listening sockets in a private network namespace.
@@ -148,8 +123,6 @@ fail() {
 	printf 'FAIL: %s\n' "$*" >&2
 	run /bin/ubus call service list > "$temporary/failed-services.log" || true
 	run /bin/ps w > "$temporary/failed-processes.log" || true
-	run /bin/ls -l /usr/bin/AdGuardHome /lib/ld-musl-x86_64.so.1 /lib/libc.so > "$temporary/core-paths.log" 2>&1 || true
-	run /bin/readlink -f /usr/bin/AdGuardHome /lib/ld-musl-x86_64.so.1 /lib/libc.so >> "$temporary/core-paths.log" 2>&1 || true
 	cat "$temporary/"*.log "$root/tmp/system.log" >&2; exit 1
 }
 run() { chroot "$root" "$@"; }
@@ -252,8 +225,4 @@ timeout --kill-after=2s 180s unshare --mount --pid --net --fork --kill-child bas
 	rmdir /.oldroot
 	/bin/ifconfig lo up
 	exec /bin/bash /test/driver.sh / /sbin/apk /test
-' package-lifecycle "$root" "$apk" "$temporary" || {
-	rc=$?
-	dmesg | grep -Ei 'apparmor|denied' | tail -30 >&2 || true
-	exit "$rc"
-}
+' package-lifecycle "$root" "$apk" "$temporary"
