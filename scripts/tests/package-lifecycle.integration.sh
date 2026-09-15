@@ -86,6 +86,28 @@ for revision in 1 2 3; do
 		awk -v helper_dir="$package/scripts" -f "$package/scripts/expand-helpers.awk" \
 			"$package/root/$path" > "$payload/$path"
 	done
+	# Capture the original failed invocation; do not rerun initialization or
+	# replace any validation, arguments or return values in this native fixture.
+	python3 - "$payload" <<'PY'
+import pathlib, sys
+payload = pathlib.Path(sys.argv[1])
+init = payload / 'etc/init.d/AdGuardHome'
+source = init.read_text()
+line = '\trun_bounded 20 4 "$@" >/dev/null 2>&1 || rc=$?'
+assert source.count(line) == 1
+source = source.replace(line, '\trun_bounded 20 4 "$@" >/test/normalizer.log 2>&1 || rc=$?')
+entry = '#!/bin/sh /etc/rc.common\n'
+assert source.startswith(entry)
+source = source.replace(entry, entry + '''case "${action:-}" in
+    normalize_config|check_work_dir) exec 2>>"/test/init-$action.log"; set -x ;;
+esac
+''', 1)
+init.write_text(source)
+defaults = payload / 'etc/uci-defaults/40_luci-AdGuardHome'
+source = defaults.read_text()
+assert source.startswith('#!/bin/sh\n')
+defaults.write_text(source.replace('#!/bin/sh\n', '#!/bin/sh\nexec 2>>/test/defaults.log\nset -x\n', 1))
+PY
 	printf '/etc/init.d/AdGuardHome\n/etc/uci-defaults/40_luci-AdGuardHome\n' > "$payload/lib/apk/packages/luci-app-adguardhome.list"
 	# Keep package networking out of the fixture; all DNS and HTTP checks use
 	# actual listening sockets in a private network namespace.
