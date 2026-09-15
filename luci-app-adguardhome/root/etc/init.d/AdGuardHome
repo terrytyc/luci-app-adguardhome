@@ -3765,10 +3765,11 @@ integration_matches_desired() {
 }
 
 open_integration_read_lock() {
-	# Status must not create a lock or wait behind a start/apply transaction.
+	# Status returns busy immediately; installation can explicitly wait.
 	[ -f "$INTEGRATION_LOCK" ] && [ ! -L "$INTEGRATION_LOCK" ] || return 2
 	exec 198<"$INTEGRATION_LOCK" || return 2
-	/usr/bin/flock -n -s 198 || return 2
+	[ "$#" -gt 0 ] || set -- -n
+	/usr/bin/flock -s "$@" 198 || return 2
 	[ /proc/self/fd/198 -ef "$INTEGRATION_LOCK" ] || return 2
 }
 
@@ -3801,7 +3802,7 @@ integration_status() (
 # default_postinst does not propagate init-script start failures. Check the
 # resulting listener and DNS integration without repeating the startup work.
 install_check() (
-	open_integration_read_lock && read_settings || exit 1
+	open_integration_read_lock -w 30 && read_settings || exit 1
 	if [ "$service_enabled" != 1 ]; then
 		! official_running
 		exit $?

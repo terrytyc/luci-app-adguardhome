@@ -140,6 +140,42 @@ for scenario in disabled disabled_running ready no_listener no_integration; do
 	}
 done
 
+# A healthy monitor can briefly own the real integration lock after startup.
+# UI snapshots stay nonblocking; installation waits before reading settings.
+(
+	eval "$(function_body "$init_file" open_integration_read_lock)"
+	eval "$(function_body "$init_file" integration_status)"
+	INTEGRATION_LOCK="$test_tmp/integration.lock"
+	: >"$INTEGRATION_LOCK"
+	service_enabled=1 dns_ready=1 integration_ready=1
+	read_settings() {
+		[ -e "$test_tmp/lock-released" ] || return 1
+		printf 'read\n' >>"$test_tmp/settings-read"
+	}
+	(
+		exec 9>"$INTEGRATION_LOCK"
+		/usr/bin/flock -x 9
+		: >"$test_tmp/lock-acquired"
+		sleep 1
+		: >"$test_tmp/lock-released"
+	) &
+	lock_owner=$!
+	while [ ! -e "$test_tmp/lock-acquired" ]; do
+		kill -0 "$lock_owner" || exit 1
+		sleep .01
+	done
+	rc=0; integration_status 53335 none || rc=$?
+	[ "$rc" = 2 ] && [ ! -e "$test_tmp/lock-released" ]
+	rc=0; (open_integration_read_lock -w 0) || rc=$?
+	[ "$rc" = 2 ] && [ ! -e "$test_tmp/settings-read" ]
+	install_check
+	wait "$lock_owner"
+	[ "$(cat "$test_tmp/settings-read")" = read ]
+	dns_ready=0
+	rc=0; install_check || rc=$?
+	[ "$rc" = 1 ]
+)
+
 start_body="$(function_body "$init_file" start_service)"
 printf '%s\n' "$start_body" |
 	grep -Fq '/etc/uci-defaults/40_luci-AdGuardHome' || {
