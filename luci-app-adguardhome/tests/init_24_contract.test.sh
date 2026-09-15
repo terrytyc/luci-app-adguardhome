@@ -130,6 +130,7 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 (
 	eval "$(function_body "$init_file" yaml_update_locked)"
 	eval "$(function_body "$init_file" yaml_update_job_locked)"
+	eval "$(function_body "$init_file" resume_paused_yaml_runtime)"
 	expected_hash=1111111111111111111111111111111111111111111111111111111111111111
 	candidate_hash=3333333333333333333333333333333333333333333333333333333333333333
 	token=22222222222222222222222222222222
@@ -149,7 +150,7 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 	check_core_config_file() { [ "$scenario" != validation ]; }
 	official_running() { return 0; }
 	clear_recorded_integration_locked() { touched=1; return 1; }
-	resume_paused_yaml_runtime() { return 1; }
+	resume_yaml_runtime() { [ "$scenario" = cleanup-restored ]; }
 	log_error() { :; }
 	cleanup_yaml_update() { :; }
 	cleanup_yaml_job_stage() { :; }
@@ -158,25 +159,97 @@ settings_values_body="$(function_body "$init_file" settings_values_revision)"
 		[ "$1" = "$token" ] || return 1
 		printf '%s\n' "$2" >>"$states"
 	}
-	for scenario in validation settings mount stage hash-read hash-conflict cleanup; do
+	for scenario in validation settings mount stage hash-read hash-conflict cleanup cleanup-restored; do
 		: >"$states"
 		touched=0
 		# Values from an earlier call must not affect this job's classification.
-		update_rc=2 terminal=failure
+		update_rc=2 terminal=failure YAML_UPDATE_RECOVERY=restored
 		if yaml_update_job_locked "$expected_hash" "$candidate_hash" \
 		   /unused/AdGuardHome.yaml.luci-test 9 "$token"; then
 			exit 1
 		fi
 		case "$scenario" in
-			settings|cleanup) expected=indeterminate ;;
-			*) expected=failure ;;
+			settings) expected=indeterminate suffix=:unverified ;;
+			cleanup) expected=indeterminate suffix=:recovery ;;
+			cleanup-restored) expected=failure suffix=:restored ;;
+			*) expected=failure suffix='' ;;
 		esac
 		[ "$(tail -n 1 "$states")" = \
-			"${expected}:${expected_hash}:${candidate_hash}" ] || exit 1
-		case "$scenario" in cleanup) [ "$touched" = 1 ] ;; *) [ "$touched" = 0 ] ;; esac
+			"${expected}:${expected_hash}:${candidate_hash}${suffix}" ] || exit 1
+		case "$scenario" in cleanup*) [ "$touched" = 1 ] ;; *) [ "$touched" = 0 ] ;; esac
 	done
 ) || {
 	printf 'YAML preflight failure was confused with an uncertain runtime result\n' >&2
+	exit 1
+}
+
+# Follow actual installation into a rejected core start, with both successful
+# and failed rollback. A handled failure must never become "interrupted".
+(
+	for name in yaml_update_locked yaml_update_job_locked attempt_yaml_rollback; do
+		eval "$(function_body "$init_file" "$name")"
+	done
+	config_file="$protocol_tmp/AdGuardHome.yaml"
+	stage="$protocol_tmp/candidate.yaml"
+	token=22222222222222222222222222222222
+	states="$protocol_tmp/yaml-runtime-states"
+	OFFICIAL_SERVICE=stop_fixture
+	load_settings() { service_enabled=1 work_dir="$protocol_tmp" redirect_mode=none; }
+	validate_work_dir_mount_dependency() { :; }
+	validate_yaml_stage() { :; }
+	active_config_hash() { sha256sum "$config_file" | cut -d ' ' -f 1; }
+	check_core_config_file() { TLS_DESIRED_MOUNTS=''; }
+	official_running() { return 0; }
+	clear_recorded_integration_locked() { :; }
+	stop_fixture() { :; }
+	wait_for_core_stopped() { :; }
+	snapshot_config_file() { cp "$1" "$2"; }
+	secure_config_inode() { :; }
+	secure_active_paths() { :; }
+	load_runtime_dns_port() { dns_port=53335; }
+	sync_official_uci() { :; }
+	start_official_core() { return 1; }
+	rollback_yaml_update() {
+		rollback_backup="$1"
+		[ "$rollback" = restored ] || return 1
+		cp "$1" "$config_file" && rm -f "$1" && rmdir "${1%/*}"
+	}
+	log_error() { :; }
+	cleanup_yaml_update() { :; }
+	cleanup_yaml_job_stage() { :; }
+	yaml_job_pending_matches() { return 0; }
+	write_yaml_job_state() { printf '%s\n' "$2" >>"$states"; }
+	for rollback in restored failed; do
+		printf 'previous YAML\n' >"$config_file"
+		printf 'candidate YAML\n' >"$stage"
+		expected_hash="$(active_config_hash)"
+		candidate_hash="$(sha256sum "$stage" | cut -d ' ' -f 1)"
+		exec 9<"$stage"
+		: >"$states"
+		if yaml_update_job_locked "$expected_hash" "$candidate_hash" "$stage" 9 "$token"; then exit 1; fi
+		exec 9<&-
+		case "$rollback" in
+			restored)
+				[ "$(tail -n 1 "$states")" = "failure:${expected_hash}:${candidate_hash}:restored" ]
+				[ "$(cat "$config_file")" = 'previous YAML' ]
+				;;
+			failed)
+				[ "$(tail -n 1 "$states")" = "indeterminate:${expected_hash}:${candidate_hash}:recovery" ]
+				[ "$(cat "$config_file")" = 'candidate YAML' ]
+				[ -z "$YAML_BACKUP_CLEANUP" ]
+				;;
+		esac || exit 1
+		[ ! -f "$rollback_backup" ] || {
+			rm -f "$rollback_backup" && rmdir "${rollback_backup%/*}"
+		}
+	done
+	# A successful transaction whose result cannot be read is still uncertain.
+	yaml_update_locked() { return 0; }
+	load_settings() { return 1; }
+	if yaml_update_job_locked "$expected_hash" "$candidate_hash" "$stage" 9 "$token"; then exit 1; fi
+	[ "$(tail -n 1 "$states")" = "indeterminate:${expected_hash}:${candidate_hash}:unverified" ]
+) || {
+	printf 'YAML runtime failure lost its confirmed rollback outcome\n' >&2
 	exit 1
 }
 rm -rf "$protocol_tmp"

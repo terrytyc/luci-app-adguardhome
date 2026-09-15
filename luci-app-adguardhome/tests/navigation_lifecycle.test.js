@@ -114,6 +114,7 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 	);
 	const source = fs.readFileSync(viewPath, 'utf8');
 	const animationFrames = new Map();
+	const translatedMessages = [];
 	const windowEvents = new EventTarget();
 	let nextAnimationFrame = 1;
 	const rpc = {
@@ -137,7 +138,7 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		},
 		L: { env: {}, hasViewPermission: () => true, resource: value => value },
 		URL,
-		_: translated,
+		_: value => { translatedMessages.push(value); return translated(value); },
 		console,
 		window: {
 			location: { href: 'https://router.example/cgi-bin/luci/admin/services/adguardhome' },
@@ -161,6 +162,7 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 		{ filename: viewPath },
 	);
 	loadedView.beforeUnloadListenerCount = () => getEventListeners(windowEvents, 'beforeunload').length;
+	loadedView.translatedMessages = translatedMessages;
 	loadedView.pageHideListenerCount = () => getEventListeners(windowEvents, 'pagehide').length;
 	loadedView.dispatchWindowEvent = event => windowEvents.dispatchEvent(event);
 	loadedView.pendingAnimationFrames = () => animationFrames.size;
@@ -347,7 +349,13 @@ async function testYamlTemplateReset() {
 }
 
 async function testYamlSubmissions() {
-	for (const kind of [ 'success', 'cas-rejected', 'response-lost', 'bad-token', 'reload-failure', 'leave-request', 'leave-status', 'leave-reload' ]) {
+	const terminalFailures = {
+		'rolled-back': { state: 'done', ok: false, error: 'The YAML update failed. The previous configuration and runtime were restored; check the plugin log.' },
+		'recovery-failed': { state: 'done', ok: false, indeterminate: true, error: 'The YAML update failed and recovery did not complete. Check the plugin log and reload the current YAML before editing it again.' },
+		'unverified': { state: 'done', ok: false, indeterminate: true, error: 'The YAML update result could not be confirmed. Check the plugin log and reload the current YAML before editing it again.' },
+		'interrupted': { state: 'done', ok: false, indeterminate: true, error: 'The YAML update was interrupted; reload the current YAML before editing it again' },
+	};
+	for (const kind of [ 'success', 'cas-rejected', 'response-lost', 'bad-token', 'reload-failure', 'leave-request', 'leave-status', 'leave-reload', ...Object.keys(terminalFailures) ]) {
 		const state = loadOperation();
 		const scope = state.operation.createPageScope();
 		const oldHash = 'a'.repeat(64), newHash = 'b'.repeat(64), token = 'c'.repeat(32);
@@ -375,7 +383,7 @@ async function testYamlSubmissions() {
 				polls.push(args);
 				if (kind === 'leave-status')
 					state.dispatch('pagehide');
-				return { state: 'done', ok: true, sha256: newHash };
+				return terminalFailures[kind] ?? { state: 'done', ok: true, sha256: newHash };
 			},
 			async get_yaml() {
 				reads++;
@@ -396,6 +404,8 @@ async function testYamlSubmissions() {
 		await view.saveYaml();
 		assert.equal(setCalls, 1, `${kind}: never replay a mutation automatically`);
 		assert.equal(accepted, kind !== 'cas-rejected');
+		if (terminalFailures[kind])
+			assert.ok(view.translatedMessages.includes(terminalFailures[kind].error), 'fixed RPC failure messages must enter LuCI translation');
 		if (kind === 'success') {
 			assert.equal(view.yamlEditor.value, committed);
 			assert.equal(view.yamlHash, newHash);
@@ -424,24 +434,27 @@ async function testYamlSubmissions() {
 		} else {
 			assert.equal(view.yamlEditor.value, draft, `${kind}: preserve the editor draft`);
 			assert.equal(reads, 0, `${kind}: do not overwrite the draft with an unconfirmed reload`);
-			assert.deepEqual(polls, kind === 'leave-status' ? [ [ token ] ] : []);
+			assert.deepEqual(polls, kind === 'leave-status' || terminalFailures[kind] ? [ [ token ] ] : []);
 			if (kind.startsWith('leave-')) {
 				assert.equal(state.rendered.length, 1, 'late replies must not display results on another page');
 				assert.equal(view.yamlHash, oldHash, 'an obsolete continuation must not mutate editor state');
-			} else if (kind === 'cas-rejected') {
-				assert.match(state.rendered.at(-1).text, /YAML changed after page load/);
+			} else if (kind === 'cas-rejected' || kind === 'rolled-back') {
+				assert.match(state.rendered.at(-1).text, kind === 'cas-rejected' ? /YAML changed after page load/ : /previous configuration and runtime were restored/);
 				assert.equal(view.yamlHash, oldHash);
 				assert.equal(view.yamlEditor.readOnly, false);
 				assert.equal(view.saveButton.disabled, false);
 			} else {
-				assert.match(state.rendered.at(-1).text, /outcome is unknown.*Reload the page/);
+				if (terminalFailures[kind])
+					assert.ok(state.rendered.at(-1).text.includes(terminalFailures[kind].error));
+				else
+					assert.match(state.rendered.at(-1).text, /outcome is unknown.*Reload the page/);
 				assert.equal(view.yamlHash, '', `${kind}: invalidate the uncertain revision`);
 				assert.equal(view.yamlEditor.readOnly, true);
 				assert.equal(view.saveButton.disabled, true);
 				assert.equal(view.resetButton.disabled, true);
 				assert.equal(view.reloadButton.disabled, false, 'allow explicit recovery from disk');
 				assert.equal(view.editorNotice.hidden, false);
-				assert.match(view.editorNotice.textContent, /outcome is unknown.*Use Reload from disk/);
+				assert.match(view.editorNotice.textContent, /Use Reload from disk/);
 				await view.saveYaml();
 				assert.equal(setCalls, 1, 'require a reload before another uncertain submission');
 				await view.handleReload(true);

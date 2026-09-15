@@ -1,6 +1,12 @@
 #!/bin/sh
 # SPDX-License-Identifier: Apache-2.0
 
+if [ -e /var/run/luci-app-adguardhome-yaml/install-incomplete ] ||
+   [ -L /var/run/luci-app-adguardhome-yaml/install-incomplete ]; then
+	echo "AdGuard Home installation cleanup is incomplete; initialization was not started." >&2
+	exit 1
+fi
+
 UCI_CONFIG="adguardhome"
 OFFICIAL_SECTION="config"
 LUCI_SECTION="luci"

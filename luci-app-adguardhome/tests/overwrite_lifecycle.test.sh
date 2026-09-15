@@ -116,6 +116,30 @@ export managed_log
 }
 [ "$(cat "$managed_log")" = "$(printf 'validated\nkept\nrefreshed')" ]
 
+eval "$(function_body "$init_file" install_check)"
+open_integration_read_lock() { return 0; }
+read_settings() { return 0; }
+official_running() { [ "$core_running" = 1 ]; }
+load_runtime_dns_port() { dns_port=53335; }
+dns_port_listening() { [ "$dns_ready" = 1 ]; }
+integration_status_locked() { [ "$1:$2:$integration_ready" = 53335:none:1 ]; }
+redirect_mode=none
+for scenario in disabled disabled_running ready no_listener no_integration; do
+	service_enabled=1 core_running=1 dns_ready=1 integration_ready=1 expected=0
+	case "$scenario" in
+		disabled) service_enabled=0 core_running=0 ;;
+		disabled_running) service_enabled=0 expected=1 ;;
+		no_listener) dns_ready=0 expected=1 ;;
+		no_integration) integration_ready=0 expected=1 ;;
+	esac
+	rc=0
+	install_check || rc=$?
+	[ "$rc" = "$expected" ] || {
+		printf 'installation verification failed: %s\n' "$scenario" >&2
+		exit 1
+	}
+done
+
 start_body="$(function_body "$init_file" start_service)"
 printf '%s\n' "$start_body" |
 	grep -Fq '/etc/uci-defaults/40_luci-AdGuardHome' || {

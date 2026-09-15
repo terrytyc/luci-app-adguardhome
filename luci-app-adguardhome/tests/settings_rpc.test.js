@@ -720,6 +720,34 @@ assert.equal(writeFixture.entries.get(jobPath), pending);
 assert.equal(writeSandbox.api.replace_yaml_job(token, terminal), true);
 assert.equal(writeFixture.entries.get(jobPath), terminal);
 
+for (const [state, reason, message] of [
+	[ 'failure', '', /rejected/ ],
+	[ 'failure', 'restored', /previous configuration and runtime were restored/ ],
+	[ 'indeterminate', '', /was interrupted/ ],
+	[ 'indeterminate', 'recovery', /recovery did not complete/ ],
+	[ 'indeterminate', 'unverified', /result could not be confirmed/ ],
+]) {
+	resetWrites();
+	const content = `${state}:${expectedHash}:${candidateHash}${reason ? ':' + reason : ''}\n`;
+	writeFixture.entries.set(jobPath, content);
+	const result = writeSandbox.api.update_job_status(token, false);
+	assert.equal(result.state, 'done');
+	assert.equal(result.ok, false);
+	assert.equal(result.indeterminate === true, state === 'indeterminate', 'unconfirmed recovery must still require a reload');
+	assert.match(result.error, message);
+	assert.equal(writeFixture.entries.get(jobPath), content, 'reading an existing terminal must preserve its reason');
+}
+for (const invalid of [
+	`pending:${expectedHash}:${candidateHash}:restored\n`,
+	`failure:${expectedHash}:${candidateHash}:recovery\n`,
+	`indeterminate:${expectedHash}:${candidateHash}:restored\n`,
+	`indeterminate:${expectedHash}:${candidateHash}:unknown\n`,
+]) {
+	resetWrites();
+	writeFixture.entries.set(jobPath, invalid);
+	assert.equal(writeSandbox.api.read_yaml_job(token), null, 'only fixed state/reason combinations are valid');
+}
+
 resetWrites();
 writeFixture.directory = false;
 assert.equal(writeSandbox.api.replace_yaml_job(token, terminal), false,

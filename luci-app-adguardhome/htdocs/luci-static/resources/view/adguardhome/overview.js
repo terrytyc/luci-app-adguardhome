@@ -914,11 +914,11 @@ return view.extend({
 			const result = await waitForYamlUpdate(response.token, scope);
 			if (result?.indeterminate === true)
 				throw uncertainCredentialUpdateError(typeof result?.error === 'string' && result.error
-					? result.error
+					? _(result.error)
 					: _('The username or password update outcome is unknown. Reload this page before making any other change.'));
 			if (result?.ok !== true)
 				throw new Error(typeof result?.error === 'string' && result.error
-					? result.error
+					? _(result.error)
 					: _('The server rejected the credential update.'));
 
 			operation.success(undefined, operationTicket);

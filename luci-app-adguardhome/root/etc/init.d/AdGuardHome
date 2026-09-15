@@ -7,7 +7,7 @@
 
 USE_PROCD=1
 # rc.common sources procd.sh (and takes its service lock) before dispatch.
-case "${action:-}" in integration_status|web_listening|overview_status|memory_status) USE_PROCD="" ;; esac
+case "${action:-}" in integration_status|web_listening|overview_status|memory_status|install_check) USE_PROCD="" ;; esac
 START=18
 STOP=90
 
@@ -70,7 +70,7 @@ FIREWALL_SECTION="adguardhome_redirect"
 FIREWALL_OWNER_OPTION="name"
 FIREWALL_OWNER_VALUE="AdGuard Home (luci-app-adguardhome)"
 
-EXTRA_COMMANDS="do_redirect isrunning monitor reconcile apk_commit network_ready integration_status web_listening overview_status check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_writeback_job memory_cleanup memory_prepare memory_status"
+EXTRA_COMMANDS="do_redirect isrunning monitor reconcile apk_commit network_ready integration_status web_listening overview_status install_check check_work_dir check_config normalize_config settings_update yaml_update yaml_update_job tls_prepare tls_refresh memory_checkpoint memory_writeback memory_writeback_job memory_cleanup memory_prepare memory_status"
 EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tisrunning\t\tReport the official service status
 \treconcile\t\tReconcile DNS integration with the core state
@@ -79,6 +79,7 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tintegration_status <port> <mode>\tRead DNS listener and integration configuration status
 \tweb_listening <port>\tVerify an official-core TCP listener
 \toverview_status <dns|0> <mode> <https|0> <http|0>\tRead integration and Web listeners together
+\tinstall_check\t\tVerify the installed service without starting it again
 \tcheck_work_dir <path>\tCheck a persistent work directory
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
@@ -3797,6 +3798,18 @@ integration_status() (
 	integration_status_locked "$@"
 )
 
+# default_postinst does not propagate init-script start failures. Check the
+# resulting listener and DNS integration without repeating the startup work.
+install_check() (
+	open_integration_read_lock && read_settings || exit 1
+	if [ "$service_enabled" != 1 ]; then
+		! official_running
+		exit $?
+	fi
+	load_runtime_dns_port && dns_port_listening &&
+		integration_status_locked "$dns_port" "$redirect_mode"
+)
+
 overview_status() (
 	local dns_port="${1:-}" redirect_mode="${2:-}" https_port="${3:-}" http_port="${4:-}"
 	local port integration=unknown https=0 http=0 status=0
@@ -4165,10 +4178,12 @@ finalize_yaml_update_process() {
 
 attempt_yaml_rollback() {
 	local backup="$1" was_running="$2"
+	YAML_UPDATE_RECOVERY=failed
 	if rollback_yaml_update "$backup" "$was_running" >/dev/null 2>&1; then
 		YAML_BACKUP_CLEANUP=""
 		YAML_INSTALLED=0
 		YAML_RUNTIME_PAUSED=0
+		YAML_UPDATE_RECOVERY=restored
 		return 0
 	fi
 	# Never let the EXIT cleanup destroy the sole known-good copy if restoring
@@ -4196,8 +4211,10 @@ abort_yaml_update() {
 }
 
 resume_paused_yaml_runtime() {
+	YAML_UPDATE_RECOVERY=failed
 	if resume_yaml_runtime "$YAML_WAS_RUNNING"; then
 		YAML_RUNTIME_PAUSED=0
+		YAML_UPDATE_RECOVERY=restored
 		return 0
 	fi
 	return 1
@@ -4213,6 +4230,7 @@ yaml_update_locked() {
 	local before_hash final_hash verify_hash held_hash fd_path
 	local committed_port committed_mode committed_work_dir committed_tls_mounts
 	local was_running=0 backup="" backup_directory="" runtime_fingerprint=""
+	YAML_UPDATE_RECOVERY=""
 	load_settings || return 1
 	validate_work_dir_mount_dependency "${config_file%/*}" || return 2
 	validate_yaml_stage "$expected_hash" "$candidate_hash" "$stage" \
@@ -4510,6 +4528,7 @@ cleanup_yaml_job_stage() {
 yaml_update_job_locked() {
 	local expected_hash="$1" candidate_hash="$2" stage="$3" inherited_fd="$4"
 	local token="$5" final_hash restarted=0 update_rc=0 terminal=indeterminate
+	local YAML_UPDATE_RECOVERY="" reason=""
 	yaml_job_pending_matches "$token" "$expected_hash" "$candidate_hash" || return 1
 	write_yaml_job_state "$token" \
 		"running:$$:${expected_hash}:${candidate_hash}" || return 1
@@ -4518,11 +4537,19 @@ yaml_update_job_locked() {
 		"$stage" "$inherited_fd" || update_rc=$?
 	if [ "$update_rc" != 0 ]; then
 		cleanup_yaml_job_stage "$stage" "$inherited_fd"
-		# Only preflight rejection proves that no YAML/runtime change began.
-		# Later failures remain uncertain even after an attempted rollback.
-		[ "$update_rc" != 2 ] || terminal=failure
+		# A completed recovery proves failure without leaving the candidate active.
+		# Other returned failures are unconfirmed, not interrupted workers.
+		if [ "$update_rc" = 2 ]; then
+			terminal=failure
+		else
+			case "$YAML_UPDATE_RECOVERY" in
+				restored) terminal=failure; reason=:restored ;;
+				failed) reason=:recovery ;;
+				*) reason=:unverified ;;
+			esac
+		fi
 		write_yaml_job_state "$token" \
-			"${terminal}:${expected_hash}:${candidate_hash}" >/dev/null 2>&1 || true
+			"${terminal}:${expected_hash}:${candidate_hash}${reason}" >/dev/null 2>&1 || true
 		return 1
 	fi
 
@@ -4539,7 +4566,7 @@ yaml_update_job_locked() {
 	# The transaction may already be committed.  Never turn a reporting failure
 	# into a false rejection that could encourage an unsafe automatic retry.
 	write_yaml_job_state "$token" \
-		"indeterminate:${expected_hash}:${candidate_hash}" >/dev/null 2>&1 || true
+		"indeterminate:${expected_hash}:${candidate_hash}:unverified" >/dev/null 2>&1 || true
 	return 1
 }
 

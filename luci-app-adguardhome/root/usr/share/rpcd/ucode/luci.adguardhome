@@ -720,13 +720,18 @@ function parse_yaml_job_state(content) {
 		return null;
 
 	let fields = match(content,
-		/^(pending|failure|indeterminate):([0-9a-f]{64}):([0-9a-f]{64})\n$/);
-	if (fields)
+		/^(pending|failure|indeterminate):([0-9a-f]{64}):([0-9a-f]{64})(:(restored|recovery|unverified))?\n$/);
+	if (fields) {
+		if (fields[5] && !((fields[1] == 'failure' && fields[5] == 'restored') ||
+		    (fields[1] == 'indeterminate' && fields[5] != 'restored')))
+			return null;
 		return {
 			state: fields[1],
 			expected_hash: fields[2],
 			candidate_hash: fields[3],
+			reason: fields[5],
 		};
+	}
 
 	fields = match(content,
 		/^running:([1-9][0-9]*):([0-9a-f]{64}):([0-9a-f]{64})\n$/);
@@ -1341,6 +1346,10 @@ function update_job_status(token, settings) {
 				? 'The write-back was interrupted; refresh the page before trying again'
 				: settings
 				? 'The settings update was interrupted; reload the current settings before editing them again'
+				: record.reason == 'recovery'
+				? 'The YAML update failed and recovery did not complete. Check the plugin log and reload the current YAML before editing it again.'
+				: record.reason == 'unverified'
+				? 'The YAML update result could not be confirmed. Check the plugin log and reload the current YAML before editing it again.'
 				: 'The YAML update was interrupted; reload the current YAML before editing it again',
 		}
 		: {
@@ -1350,6 +1359,8 @@ function update_job_status(token, settings) {
 				? 'Write-back failed or RAM data is no longer running; check the plugin log'
 				: settings
 				? 'Settings were rejected or changed concurrently'
+				: record.reason == 'restored'
+				? 'The YAML update failed. The previous configuration and runtime were restored; check the plugin log.'
 				: 'YAML was rejected or changed concurrently',
 		};
 	if (result.ok && !writeback)

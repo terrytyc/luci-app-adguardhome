@@ -281,6 +281,22 @@ async function main() {
 			expected: /outcome is unknown.*Reload this page/,
 			uncertain: true,
 		},
+		{
+			name: 'confirmed rollback',
+			reply: () => ({ accepted: true, token: 'b'.repeat(32) }),
+			statusReply: () => ({ state: 'done', ok: false,
+				error: 'The YAML update failed. The previous configuration and runtime were restored; check the plugin log.' }),
+			expected: /previous configuration and runtime were restored/,
+			uncertain: false,
+		},
+		{
+			name: 'failed recovery',
+			reply: () => ({ accepted: true, token: 'b'.repeat(32) }),
+			statusReply: () => ({ state: 'done', ok: false, indeterminate: true,
+				error: 'The YAML update failed and recovery did not complete. Check the plugin log and reload the current YAML before editing it again.' }),
+			expected: /recovery did not complete/,
+			uncertain: true,
+		},
 	]) {
 		const state = await readyDialog();
 		state.handlers.set_credentials = (...args) => {

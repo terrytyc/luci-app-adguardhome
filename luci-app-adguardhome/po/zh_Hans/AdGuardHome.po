@@ -12,6 +12,21 @@ msgstr ""
 msgid "AdGuard Home"
 msgstr "AdGuard Home"
 
+msgid "The YAML update failed. The previous configuration and runtime were restored; check the plugin log."
+msgstr "YAML 更新失败，已恢复之前的配置和运行状态；请查看插件日志。"
+
+msgid "The YAML update failed and recovery did not complete. Check the plugin log and reload the current YAML before editing it again."
+msgstr "YAML 更新失败，恢复未完成。请查看插件日志，并重新载入当前 YAML 后再编辑。"
+
+msgid "The YAML update result could not be confirmed. Check the plugin log and reload the current YAML before editing it again."
+msgstr "无法确认 YAML 更新结果。请查看插件日志，并重新载入当前 YAML 后再编辑。"
+
+msgid "The YAML update was interrupted; reload the current YAML before editing it again"
+msgstr "YAML 更新任务已中断；请重新载入当前 YAML 后再编辑。"
+
+msgid "YAML was rejected or changed concurrently"
+msgstr "YAML 校验未通过，或配置已发生变化。"
+
 msgid "Preparing account change…"
 msgstr "正在准备修改账号…"
 

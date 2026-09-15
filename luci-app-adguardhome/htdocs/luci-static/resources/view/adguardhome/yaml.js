@@ -479,14 +479,14 @@ return view.extend({
 			const result = await this.waitForYamlUpdate(accepted.token, scope);
 			if (result?.indeterminate === true)
 				throw uncertainYamlUpdateError(typeof result?.error === 'string' && result.error
-					? result.error
+					? _(result.error)
 					: undefined);
 			if (result?.ok === true &&
 			    (typeof result.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(result.sha256)))
 				throw uncertainYamlUpdateError(_('The YAML update succeeded, but its result could not be verified. Reload the page before editing it again.'));
 			if (result?.ok !== true)
 				throw new Error(typeof result?.error === 'string' && result.error
-					? result.error
+					? _(result.error)
 					: _('The server rejected the YAML configuration. Check its syntax and protected settings.'));
 
 			this.invalidateYamlEditor();

@@ -35,7 +35,7 @@ i18n_hook="$(extract_hook 'define Package/luci-i18n-adguardhome-zh-cn/preinst')"
 printf '%s\n' "$main_hook" | grep -Fq "$guard_reference"
 printf '%s\n' "$i18n_hook" | grep -Fq "$guard_reference"
 guard_line="$(printf '%s\n' "$main_hook" | grep -nF "$guard_reference" | cut -d: -f1)"
-stop_line="$(printf '%s\n' "$main_hook" | grep -nF '/etc/init.d/AdGuardHome stop' | cut -d: -f1)"
+stop_line="$(printf '%s\n' "$main_hook" | grep -n -m1 -F '/etc/init.d/AdGuardHome stop' | cut -d: -f1)"
 [ "$guard_line" -lt "$stop_line" ]
 i18n_line="$(grep -n '^define Package/luci-i18n-adguardhome-zh-cn/preinst$' "$makefile" | cut -d: -f1)"
 include_reference="include ${make_dollar}(TOPDIR)/feeds/luci/luci.mk"

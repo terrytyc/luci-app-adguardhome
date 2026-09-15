@@ -65,6 +65,18 @@ if (!finished || !closed || result != `indeterminate:${HASH}:${HASH}\n`)
 	die('Native job callback failed to publish its result and release the lock');
 if (!remove_yaml_stage(TOKEN, null) || remove_yaml_stage('../invalid', null))
 	die('Offline stage cleanup must allow settings recovery while validating the token');
+for (let item in [ [ 'failure', 'restored' ], [ 'indeterminate', 'recovery' ],
+                  [ 'indeterminate', 'unverified' ] ]) {
+	let record = parse_yaml_job_state(`${item[0]}:${HASH}:${HASH}:${item[1]}\n`);
+	if (!record || record.state != item[0] || record.reason != item[1])
+		die('Native parser lost the confirmed YAML failure reason');
+}
+for (let state in [ 'pending', 'failure', 'indeterminate' ])
+	if (!parse_yaml_job_state(`${state}:${HASH}:${HASH}\n`))
+		die('Native parser rejected a legacy task record');
+if (parse_yaml_job_state(`pending:${HASH}:${HASH}:restored\n`) ||
+    parse_yaml_job_state(`indeterminate:${HASH}:${HASH}:restored\n`))
+	die('Native parser accepted an invalid recovery classification');
 UCODE
 	if [ -n "${UCODE_LOADER:-}" ]; then
 		"$UCODE_LOADER" --library-path "${UCODE_LIBRARY_PATH:-}" "$UCODE" \

@@ -21,7 +21,7 @@ run_bounded() (
 	}
 	bounded_abort() {
 		trap - HUP INT QUIT TERM
-		[ -z "$$watchdog" ] || /bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		[ -z "$$watchdog" ] || /bin/kill -USR1 "$$watchdog" 2>/dev/null || true
 		[ -z "$$watchdog" ] || wait "$$watchdog" 2>/dev/null || true
 		if [ -n "$$child" ]; then
 			bounded_signal_session TERM
@@ -44,8 +44,8 @@ run_bounded() (
 	(
 		bounded_sleeper=""
 		bounded_watchdog_abort() {
-			trap - HUP INT QUIT TERM
-			[ -z "$$bounded_sleeper" ] || /bin/kill -TERM "$$bounded_sleeper" 2>/dev/null || true
+			trap - HUP INT QUIT TERM USR1
+			[ -z "$$bounded_sleeper" ] || /bin/kill -KILL "$$bounded_sleeper" 2>/dev/null || true
 			[ -z "$$bounded_sleeper" ] || wait "$$bounded_sleeper" 2>/dev/null || true
 			exit 1
 		}
@@ -57,7 +57,9 @@ run_bounded() (
 			bounded_sleeper=""
 			return "$$bounded_sleep_rc"
 		}
-		trap bounded_watchdog_abort HUP INT QUIT TERM
+		# APK can invoke hooks with SIGTERM ignored. Use a separate cancellation
+		# signal so a completed command does not wait out its watchdog timeout.
+		trap bounded_watchdog_abort HUP INT QUIT TERM USR1
 		bounded_watchdog_sleep "$$limit" || exit 1
 		kill -0 "-$$child" 2>/dev/null || /bin/kill -0 "$$child" 2>/dev/null || exit 1
 		printf '1\n' >"$$marker" || exit 1
@@ -71,7 +73,7 @@ run_bounded() (
 	if [ "$$expired" = 1 ]; then
 		wait "$$watchdog" 2>/dev/null || true
 	else
-		/bin/kill -TERM "$$watchdog" 2>/dev/null || true
+		/bin/kill -USR1 "$$watchdog" 2>/dev/null || true
 		wait "$$watchdog" 2>/dev/null || true
 	fi
 	trap - HUP INT QUIT TERM

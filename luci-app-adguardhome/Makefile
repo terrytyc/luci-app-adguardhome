@@ -8,7 +8,7 @@ include $(ADGUARDHOME_SOURCE_DIR)scripts/private-files.mk
 
 PKG_NAME:=luci-app-adguardhome
 PKG_VERSION:=3.2.0
-PKG_RELEASE:=4
+PKG_RELEASE:=5
 PKG_LICENSE:=Apache-2.0 BSD-3-Clause
 
 LUCI_TITLE:=LuCI support for AdGuard Home
@@ -121,8 +121,7 @@ define Package/$(PKG_NAME)/conffiles
 /root/.luci-app-adguardhome/
 endef
 
-# Stop an installed coordinator before replacing its files. APK preserves
-# conffiles; first-install rollback is local to the initialization script.
+# Stop old services and cores before replacing plugin code; retain user data.
 define Package/$(PKG_NAME)/preinst
 #!/bin/sh
 [ -z "$$IPKG_INSTROOT" ] || exit 0
@@ -138,21 +137,96 @@ begin_yaml_maintenance || {
 	exit 1
 }
 
+# APK continues after a failed preinst. Keep initialization blocked until
+# cleanup succeeds, including when an old coordinator cannot write back RAM.
+install_marker="$$yaml_job_runtime/install-incomplete"
+if [ -e "$$install_marker" ] || [ -L "$$install_marker" ]; then
+	root_private_empty_file "$$install_marker" || exit 1
+else
+	(umask 077; set -C; : >"$$install_marker") || exit 1
+fi
+trap - 0
+
 $(AdGuardHome/UciPendingGuard)
 
 $(AdGuardHome/RunBounded)
 
+adguardhome_pids() {
+	local entry executable pid
+	for entry in /proc/[0-9]*/exe; do
+		executable="$$(readlink "$$entry" 2>/dev/null)" || continue
+		executable="$${executable% (deleted)}"
+		case "$${executable##*/}" in AdGuardHome|adguardhome) ;; *) continue ;; esac
+		pid="$${entry%/exe}"
+		printf '%s ' "$${pid##*/}"
+	done
+}
+
+stop_adguardhome_processes() {
+	local signal pids remaining
+	for signal in TERM KILL; do
+		pids="$$(adguardhome_pids)"
+		[ -n "$$pids" ] || return 0
+		kill "-$$signal" $$pids 2>/dev/null || true
+		remaining=10
+		[ "$$signal" != KILL ] || remaining=2
+		while [ "$$remaining" -gt 0 ]; do
+			sleep 1
+			[ -n "$$(adguardhome_pids)" ] || return 0
+			remaining=$$((remaining - 1))
+		done
+	done
+	echo "AdGuard Home processes are still running; installation cleanup is incomplete." >&2
+	return 1
+}
+
+coordinator_retry=0
 if [ -e /etc/init.d/AdGuardHome ] || [ -L /etc/init.d/AdGuardHome ]; then
-	[ -f /etc/init.d/AdGuardHome ] && [ ! -L /etc/init.d/AdGuardHome ] &&
-		[ -x /etc/init.d/AdGuardHome ] || {
-		echo "The installed AdGuard Home coordinator is unsafe." >&2
-		exit 1
-	}
+	if [ -f /etc/init.d/AdGuardHome ] && [ ! -L /etc/init.d/AdGuardHome ] &&
+	   [ -x /etc/init.d/AdGuardHome ]; then
+		run_bounded 180 5 /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || {
+			grep -q '^stop_wrapper_locked()' /etc/init.d/AdGuardHome && coordinator_retry=1
+			echo "Old AdGuard Home stop failed; clearing remaining core processes." >&2
+		}
+	fi
+fi
+
+for service in AdGuardHome luci-app-adguardhome adguardhome; do
+	service_script="/etc/init.d/$$service"
+	if [ -f "$$service_script" ] && [ ! -L "$$service_script" ] && [ -x "$$service_script" ]; then
+		[ "$$service" = AdGuardHome ] ||
+			run_bounded 180 5 "$$service_script" stop >/dev/null 2>&1 || true
+		run_bounded 5 1 "$$service_script" disable >/dev/null 2>&1 || true
+	fi
+	# Disabling boot links alone does not cancel a live procd respawn.
+	ubus -t 5 call service delete "{\"name\":\"$$service\"}" >/dev/null 2>&1 || true
+	for link in /etc/rc.d/[SK][0-9][0-9]"$$service"; do
+		[ ! -L "$$link" ] || rm -f "$$link" || exit 1
+	done
+done
+stop_adguardhome_processes || exit 1
+
+# A leftover core under the same uid can make the first stop fail. Retry the
+# coordinator now, and never discard a failed RAM write-back or DNS restore.
+if [ "$$coordinator_retry" = 1 ]; then
 	run_bounded 180 5 /etc/init.d/AdGuardHome stop >/dev/null 2>&1 || {
-		echo "Unable to stop the installed AdGuard Home coordinator." >&2
+		echo "Unable to finish coordinator cleanup; recovery data was kept." >&2
 		exit 1
 	}
 fi
+if [ -e /tmp/luci-app-adguardhome-memory/state ] ||
+   [ -L /tmp/luci-app-adguardhome-memory/state ]; then
+	echo "AdGuard Home RAM write-back is incomplete; memory data was kept." >&2
+	exit 1
+fi
+
+# These are executable plugin files, not user configuration. Removing only
+# these targets prevents APK from retaining modified old code as .apk-new.
+for file in /etc/init.d/AdGuardHome /etc/uci-defaults/40_luci-AdGuardHome \
+	/etc/hotplug.d/acme/95-AdGuardHome; do
+	rm -f "$$file" "$$file.apk-new" || exit 1
+done
+rm -f "$$install_marker" || exit 1
 trap - 0 HUP INT TERM
 exit 0
 endef
@@ -176,6 +250,10 @@ if [ -e /etc/uci-defaults/40_luci-AdGuardHome ] ||
 	exit 1
 fi
 
+# default_postinst enables init scripts only on first install. Recreate the
+# new coordinator's boot links after clearing the previous service on upgrade.
+/etc/init.d/AdGuardHome enable >/dev/null 2>&1 || exit 1
+
 rm -f /tmp/luci-indexcache.* || exit 1
 if [ -L /tmp/luci-modulecache ] || [ -f /tmp/luci-modulecache ]; then
 	rm -f /tmp/luci-modulecache || exit 1
@@ -184,8 +262,13 @@ elif [ -d /tmp/luci-modulecache ]; then
 fi
 # Load the updated RPC module without restarting the shared daemon.
 [ -x /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1 || exit 1
+install_rc=0
+/etc/init.d/AdGuardHome install_check >/dev/null 2>&1 || {
+	echo "AdGuard Home files were installed, but service verification failed; check the plugin and core logs." >&2
+	install_rc=1
+}
 finish_yaml_maintenance || exit 1
-exit 0
+exit "$$install_rc"
 endef
 
 define Package/$(PKG_NAME)/prerm

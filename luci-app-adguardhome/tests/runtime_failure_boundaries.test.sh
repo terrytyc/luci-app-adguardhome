@@ -149,6 +149,7 @@ done
 			YAML_BACKUP_CLEANUP="$backup" CORE_RUNNING=1
 			: >"$events"
 			attempt_yaml_rollback "$backup" "$was_running"
+			[ "$YAML_UPDATE_RECOVERY" = restored ]
 			expected="$(printf 'cleanup\nstop\nstopped\nrestore\nsecure\nload\nport\nsync')"
 			if [ "$was_running:$TEST_ENABLED" = 1:1 ]; then
 				expected="$(printf '%s\nstart\nready\ndns' "$expected")"
@@ -186,6 +187,7 @@ done
 		YAML_BACKUP_CLEANUP="$backup" CORE_RUNNING=1
 		: >"$events"
 		if attempt_yaml_rollback "$backup" 1; then exit 1; fi
+		[ "$YAML_UPDATE_RECOVERY" = failed ]
 		[ "$(tail -n 1 "$events")" = "$FAIL_STEP" ]
 		[ "$(cat "$backup")" = 'previous YAML' ] && [ -z "$YAML_BACKUP_CLEANUP" ]
 		! grep -qx remove "$events"
