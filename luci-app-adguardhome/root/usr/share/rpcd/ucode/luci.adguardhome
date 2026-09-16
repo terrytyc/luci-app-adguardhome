@@ -1063,7 +1063,9 @@ function start_settings_process(job, expected_hash, candidate_hash, args) {
 }
 
 function update_settings(enabled, work_dir, verbose, redirect,
-					 run_from_memory, interval, expected_revision) {
+					 run_from_memory, interval, expected_revision, force_restart) {
+	if (type(force_restart) != 'bool')
+		return { error: 'Invalid force restart flag' };
 	if (type(expected_revision) != 'string' ||
 	    !match(expected_revision, /^[0-9a-f]{64}$/))
 		return { error: 'Invalid or missing settings revision' };
@@ -1086,6 +1088,8 @@ function update_settings(enabled, work_dir, verbose, redirect,
 	let job = prepare_yaml_job(token, expected_revision, candidate.revision);
 	if (job.error)
 		return job;
+	if (job.reused && force_restart)
+		return { error: 'Another operation is already in progress; wait for it to finish before forcing a restart' };
 	if (job.reused)
 		return { accepted: true, token: job.token, reused: true };
 
@@ -1101,6 +1105,7 @@ function update_settings(enabled, work_dir, verbose, redirect,
 			token,
 			candidate.revision,
 			`${job.lock_descriptor}`,
+			force_restart ? '1' : '0',
 	]);
 }
 
@@ -2016,6 +2021,7 @@ const methods = {
 			run_from_memory: false,
 			memory_writeback_interval: -1,
 			revision: '',
+			force_restart: false,
 		},
 		call: function(request) {
 			return update_settings(
@@ -2025,7 +2031,8 @@ const methods = {
 				request.args.redirect,
 				request.args.run_from_memory,
 				request.args.memory_writeback_interval,
-				request.args.revision
+				request.args.revision,
+				'force_restart' in request.args ? request.args.force_restart : false
 			);
 		},
 	},

@@ -305,4 +305,38 @@ done
 	done
 )
 
-printf 'ok - monitor duty selection, core start/stop, identical declarations and failed submission propagation\n'
+# A full restart finishes the stopped-core/data boundary, deletes the old
+# coordinator once, and waits for procd before declaring the new monitor.
+(
+	eval "$(function_body "$init_file" restart_wrapper_locked)"
+	events="$test_tmp/full-restart-events"
+	stop_wrapper_locked() { printf 'stop-data\n' >>"$events"; [ "$scenario" != stop-failed ]; }
+	orchestrate_core_locked() { printf 'start\n' >>"$events"; }
+	jsonfilter() { cat; }
+	sleep() { printf 'wait\n' >>"$events"; }
+	ubus() {
+		case "$*" in
+			*'service delete'*) printf 'delete\n' >>"$events" ;;
+			*'service list'*)
+				[ "$scenario" != query-failed ] || return 1
+				count="$(cat "$test_tmp/queries")"
+				printf '%s\n' "$((count + 1))" >"$test_tmp/queries"
+				[ "$count" -ge 2 ] || printf 'registered\n'
+				;;
+			*) return 1 ;;
+		esac
+	}
+	for scenario in normal stop-failed query-failed; do
+		: >"$events"
+		printf '0\n' >"$test_tmp/queries"
+		if [ "$scenario" = normal ]; then
+			restart_wrapper_locked
+			[ "$(cat "$events")" = "$(printf 'stop-data\ndelete\nwait\nstart')" ]
+		else
+			if restart_wrapper_locked; then exit 1; fi
+			[ "$(cat "$events")" = stop-data ]
+		fi
+	done
+)
+
+printf 'ok - monitor duty selection, full restart, identical declarations and failed submission propagation\n'

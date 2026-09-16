@@ -148,19 +148,21 @@ wait_for_core_ready() { [ "$OFFICIAL_SOCKET_SNAPSHOT_READY" = 0 ] || exit 1; rec
 apply_integration_locked() { [ "${OFFICIAL_SOCKET_SNAPSHOT_READY:-0}" = 0 ] || exit 1; record dns; [ "$DNS_APPLY_OK" = 1 ]; }
 sync_monitor_instance() { [ "${OFFICIAL_SOCKET_SNAPSHOT_READY:-0}" = 0 ] || exit 1; record monitor; }
 orchestrate_core_locked() { [ "$OFFICIAL_SOCKET_SNAPSHOT_READY" = 0 ] || exit 1; load_settings; record restart; }
+restart_wrapper_locked() { [ "$OFFICIAL_SOCKET_SNAPSHOT_READY" = 0 ] || exit 1; load_settings; record full-restart; }
 official_running() { return 0; }
 yaml_job_runtime_is_private() { return 0; }
 yaml_job_pending_matches() { [ "$1:$2:$3" = "$token:$revision:$candidate" ]; }
 write_yaml_job_state() { printf '%s\n' "$2" >>"$states"; }
 log_error() { :; }
 token=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
-for change in unchanged disk redirect interval dns dns-repair-unchanged core work ram missing-baseline dead-core wrong-bind fallback unmounted \
+for change in unchanged forced disk redirect interval dns dns-repair-unchanged core work ram missing-baseline dead-core wrong-bind fallback unmounted \
              normalized-enabled normalized-interval missing-field drift-after-commit drift-after-refresh \
              dns-final-drift dns-repair-failure; do
 	reset_settings_fixture
 	requested_work=/persistent requested_verbose=0 requested_ram=1
-	requested_mode=dnsmasq-upstream requested_interval=60
+	requested_mode=dnsmasq-upstream requested_interval=60 force_restart=0
 	case "$change" in
+		forced) force_restart=1 ;;
 		disk) STORED_RAM=0 RAW_MEMORY=0 RAM_ACTIVE=0 requested_ram=0 ;;
 		redirect) STORED_MODE=redirect requested_mode=redirect ;;
 		interval) requested_interval=120 ;;
@@ -187,8 +189,9 @@ for change in unchanged disk redirect interval dns dns-repair-unchanged core wor
 	candidate="$(settings_values_revision 1 "$requested_work" "$requested_verbose" \
 		"$requested_mode" "$requested_ram" "$requested_interval")"
 	settings_update_job_locked 1 "$requested_work" "$requested_verbose" \
-		"$requested_mode" "$requested_ram" "$requested_interval" "$revision" "$token" "$candidate"
+		"$requested_mode" "$requested_ram" "$requested_interval" "$revision" "$token" "$candidate" "$force_restart"
 	case "$change" in
+		forced) [ "$(cat "$events")" = full-restart ]; restarted=1 ;;
 		unchanged|disk|redirect|interval|normalized-*|missing-field)
 			[ "$(cat "$events")" = monitor ]; restarted=0 ;;
 		dns|dns-repair-unchanged)
@@ -201,7 +204,7 @@ for change in unchanged disk redirect interval dns dns-repair-unchanged core wor
 	assert_count 1 snapshot
 	assert_count "$restarted" load:full
 	case "$change" in
-		core|work|ram|fallback|unmounted) assert_count 2 load:light; assert_count 0 fingerprint ;;
+		forced|core|work|ram|fallback|unmounted) assert_count 2 load:light; assert_count 0 fingerprint ;;
 		unchanged|disk|redirect|missing-baseline|dead-core|wrong-bind|drift-after-refresh)
 			assert_count 2 load:light; assert_count 1 fingerprint ;;
 		dns-repair-unchanged) assert_count 2 load:light; assert_count 2 fingerprint ;;
@@ -214,12 +217,27 @@ for change in unchanged disk redirect interval dns dns-repair-unchanged core wor
 		*) assert_count 0 write-guard; assert_count 0 commit ;;
 	esac
 	case "$change" in
-		core|work|ram|fallback|unmounted|missing-baseline|drift-after-commit|drift-after-refresh)
+		forced|core|work|ram|fallback|unmounted|missing-baseline|drift-after-commit|drift-after-refresh)
 			assert_count 0 owned-snapshot ;;
 		dns|dns-repair-unchanged) assert_count 2 owned-snapshot ;;
 		*) assert_count 1 owned-snapshot ;;
 	esac
 done
+
+# A failed forced restart must take the existing restore path and report
+# failure even if the previous runtime was successfully restored.
+(
+	reset_settings_fixture
+	revision="$(settings_values_revision 1 /persistent 0 dnsmasq-upstream 1 60)"
+	candidate="$revision"
+	restart_wrapper_locked() { record full-restart-failed; return 1; }
+	if settings_update_job_locked 1 /persistent 0 dnsmasq-upstream 1 60 \
+	   "$revision" "$token" "$candidate" 1; then
+		exit 1
+	fi
+	[ "$(cat "$events")" = "$(printf 'full-restart-failed\nrestart')" ]
+	[ "$(tail -n 1 "$states")" = "failure:${revision}:${candidate}" ]
+)
 
 # The no-op shortcut still rereads the persisted revision after runtime work;
 # a failed final read must never report success.

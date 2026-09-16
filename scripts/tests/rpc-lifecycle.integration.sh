@@ -50,12 +50,26 @@ set -eu
 mode=$(cat /tmp/worker-mode)
 stage=
 case "$1" in
-	settings_update) expected=$8; token=$9; shift 9; candidate=$1; lock=$2 ;;
+	settings_update)
+		[ "$#" = 12 ]
+		expected=$8; token=$9; shift 9; candidate=$1; lock=$2
+		case "$3" in 0|1) ;; *) exit 1 ;; esac
+		printf '%s\n' "$3" >/tmp/worker-force
+		;;
 	yaml_update_job) expected=$2; candidate=$3; stage=$4; descriptor=$5; lock=$6; token=$7
 		test -r "/proc/self/fd/$descriptor" ;;
 	*) exit 1 ;;
 esac
 test -r "/proc/self/fd/$lock"
+wait_for_release() {
+	remaining=500
+	while [ ! -e "$1" ] && [ "$remaining" -gt 0 ]; do
+		sleep 0.01
+		remaining=$((remaining - 1))
+	done
+	test -e "$1"
+}
+[ "$mode" != handoff ] || wait_for_release /tmp/release-pending
 [ "$mode" != exit ] || exit 0
 if [ "$mode" = failure ]; then
 	result="failure:$expected:$candidate"
@@ -68,12 +82,7 @@ temporary="/var/run/luci-app-adguardhome-yaml/.$token.Work01"
 printf '%s\n' "$result" > "$temporary"
 mv "$temporary" "/var/run/luci-app-adguardhome-yaml/$token"
 if [ "$mode" = handoff ]; then
-	remaining=500
-	while [ ! -e /tmp/release-worker ] && [ "$remaining" -gt 0 ]; do
-		sleep 0.01
-		remaining=$((remaining - 1))
-	done
-	test -e /tmp/release-worker
+	wait_for_release /tmp/release-worker
 fi
 SH
 chmod 0755 "$root/etc/init.d/AdGuardHome"

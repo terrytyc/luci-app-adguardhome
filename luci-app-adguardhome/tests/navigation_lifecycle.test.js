@@ -120,7 +120,8 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 	const rpc = {
 		declare: specification => async (...args) => {
 			const handler = rpcHandlers[specification.method];
-			return typeof handler === 'function' ? handler(...args) : {};
+			const parameters = (specification.params ?? []).map((_name, index) => args[index]);
+			return typeof handler === 'function' ? handler(...parameters) : {};
 		},
 	};
 	const view = { extend: definition => definition };
@@ -175,7 +176,7 @@ function loadView(name, operation, ui, rpcHandlers = {}) {
 	return loadedView;
 }
 
-async function runSettingsSubmissionScenario(kind) {
+async function runSettingsSubmissionScenario(kind, mode) {
 	const oldRevision = 'a'.repeat(64);
 	const terminalRevision = 'b'.repeat(64);
 	const values = new Map([
@@ -274,7 +275,6 @@ async function runSettingsSubmissionScenario(kind) {
 		pageScope: {},
 		settingsMap: map,
 		committedSettings: { revision: oldRevision, memoryWritebackInterval: 60 },
-		submitSettings: () => view.submitSettings.call(context),
 		async statusPollCallback() {
 			refreshCalls++;
 			assert.equal(context.settingsSubmission, null);
@@ -288,7 +288,7 @@ async function runSettingsSubmissionScenario(kind) {
 		},
 	});
 
-	await view.handleSaveApply.call(context);
+	await view.handleSaveApply.call(context, null, mode);
 	assert.equal(refreshCalls, active ? 1 : 0, 'only an active view may refresh after Apply');
 	return {
 		context,
@@ -1088,7 +1088,17 @@ async function main() {
 		true,
 		77,
 		'a'.repeat(64),
+		false,
 	], 'the frontend settings update must not submit the derived config_file');
+	for (const mode of [ '0', '1' ]) {
+		const result = await runSettingsSubmissionScenario('success', mode);
+		assert.deepEqual(result.setArguments, [
+			...successfulSettings.setArguments.slice(0, -1), mode === '1',
+		], `Apply mode ${mode} must propagate its restart choice to the settings RPC`);
+		assert.equal(result.setCalls, 1, 'each Apply action must submit exactly one transaction');
+		assert.equal(result.failures.length, 0);
+		assert.equal(result.successes, 1);
+	}
 	assert.equal(successfulSettings.values.get('config.work_dir'), '/mnt/storage/AdGuardHome',
 		'the visible JSON model must contain the authoritative work directory');
 	assert.equal(successfulSettings.values.get('luci.memory_writeback_interval'), '77',
@@ -1139,7 +1149,7 @@ async function main() {
 	), 'utf8');
 	assert.match(
 		overview,
-		/handleSave:\s*null,[\s\S]*?handleSaveApply\(\)\s*\{[\s\S]*?this\.submitSettings\(\)/,
+		/handleSave:\s*null,[\s\S]*?handleSaveApply\(ev, mode\)\s*\{[\s\S]*?this\.submitSettings\(mode === '1'\)/,
 		'only Save & Apply may start the RPC-backed settings transaction',
 	);
 	assert.doesNotMatch(overview, /return this\.handleSave\(\)/,

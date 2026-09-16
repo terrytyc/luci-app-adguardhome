@@ -469,6 +469,7 @@ async function testSettingsResultReuse() {
 		const submittedRevisions = [];
 		state.handlers.set_settings = (...args) => {
 			submittedRevisions.push(args[6]);
+			assert.equal(args[7], false, 'direct settings submissions must default to ordinary Apply');
 			assert.deepEqual(args.slice(0, 6), [ data.config.enabled === '1', data.config.work_dir,
 				data.config.verbose === '1', data.luci.redirect, data.luci.run_from_memory === '1',
 				Number(data.luci.memory_writeback_interval) ]);

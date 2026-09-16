@@ -247,8 +247,8 @@ assert.match(updateSource,
 	/start_settings_process\(job, expected_revision, candidate\.revision, \[\s*'settings_update'/,
 	'settings must be applied asynchronously through the coordinator command');
 assert.match(updateSource,
-	/`\$\{candidate\.memory_writeback_interval\}`,\s*expected_revision,\s*token,\s*candidate\.revision,\s*`\$\{job\.lock_descriptor\}`,\s*\]\)/,
-	'the coordinator must receive the CAS revision, one-shot credential and inherited lock descriptor');
+	/`\$\{candidate\.memory_writeback_interval\}`,\s*expected_revision,\s*token,\s*candidate\.revision,\s*`\$\{job\.lock_descriptor\}`,\s*force_restart \? '1' : '0',\s*\]\)/,
+	'the coordinator must retain the lock descriptor position and append the force restart flag');
 assert.match(startSource,
 	/function\(\) \{\s*finish_settings_process\(\s*token, expected_hash, candidate_hash, job\.lock/,
 	'the process callback must not forward or interpret a raw wait status');
@@ -260,7 +260,7 @@ assert.doesNotMatch(source, /function settings_process_succeeded\(/,
 	'raw wait status must never be treated as settings convergence proof');
 
 assert.match(source,
-	/function update_settings\(enabled, work_dir, verbose, redirect,\s*run_from_memory, interval, expected_revision\)/,
+	/function update_settings\(enabled, work_dir, verbose, redirect,\s*run_from_memory, interval, expected_revision, force_restart\)/,
 	'the settings update API must derive config_file instead of accepting it');
 const setSettingsStart = source.indexOf('\tset_settings: {');
 const setSettingsEnd = source.indexOf('\tget_settings_update: {', setSettingsStart);
@@ -308,17 +308,40 @@ const launchSandbox = {
 };
 vm.createContext(launchSandbox);
 vm.runInContext(`${startSource}\n${updateSource}\n${extractFunction('memory_writeback')}\nthis.update = update_settings; this.writeback = memory_writeback;`, launchSandbox);
-assert.equal(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
-	true, 120, snapshot.revision).accepted, true);
+vm.runInContext(`this.setSettings = ({ ${setSettingsMethod} }).set_settings;`, launchSandbox);
+assert.equal(launchSandbox.setSettings.args.force_restart, false);
+assert.equal(launchSandbox.setSettings.call({ args: snapshot }).accepted, true,
+	'old pages without the new flag must keep ordinary Apply behavior');
 assert.equal(settingsSnapshots, 1, 'a settings submission reads its current snapshot once');
 assert.deepEqual(launchedArguments, [
 	'settings_update', '1', fixture.workDir, '0', fixture.redirect, '1', '120',
-	snapshot.revision, token, candidate.revision, '193',
-], 'the worker must receive ten arguments with the numeric lock descriptor last');
+	snapshot.revision, token, candidate.revision, '193', '0',
+], 'ordinary Apply must retain the tenth lock descriptor and append zero');
+const ordinaryArguments = [ ...launchedArguments ];
+for (const force_restart of [ false, true ]) {
+	assert.equal(launchSandbox.setSettings.call({ args: { ...snapshot, force_restart } }).accepted, true);
+	assert.deepEqual(launchedArguments, [ ...ordinaryArguments.slice(0, -1), force_restart ? '1' : '0' ],
+		'the force flag must not alter settings revisions or worker credentials');
+}
+settingsSnapshots = 0;
+launchedArguments = null;
+for (const force_restart of [ null, 0, 1, '0', '1', 'true', [], {} ]) {
+	assert.equal(launchSandbox.setSettings.call({ args: { ...snapshot, force_restart } }).error,
+		'Invalid force restart flag');
+}
+assert.equal(settingsSnapshots, 0, 'invalid flags must fail before reading settings or creating a job');
+assert.equal(launchedArguments, null);
+launchSandbox.prepare_yaml_job = () => ({ token, reused: true });
+assert.equal(launchSandbox.setSettings.call({ args: snapshot }).reused, true);
+assert.match(launchSandbox.setSettings.call({ args: { ...snapshot, force_restart: true } }).error,
+	/already in progress/,
+	'forced Apply must not reuse an ordinary job that may skip the restart');
+assert.equal(launchedArguments, null, 'reusing or rejecting an active job must not launch another worker');
+launchSandbox.prepare_yaml_job = () => ({ token, lock: {}, lock_descriptor: 193 });
 settingsSnapshots = 0;
 launchedArguments = null;
 assert.ok(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
-	true, 120, expectedHash).error, 'a stale page revision is rejected before launching a worker');
+	true, 120, expectedHash, false).error, 'a stale page revision is rejected before launching a worker');
 assert.equal(settingsSnapshots, 1);
 assert.equal(launchedArguments, null);
 
@@ -375,7 +398,7 @@ for (const failure of [ 'unavailable', 'exception' ]) {
 		return null;
 	};
 	assert.ok(launchSandbox.update(true, fixture.workDir, false, fixture.redirect,
-		true, 120, snapshot.revision).error);
+		true, 120, snapshot.revision, false).error);
 	assert.equal(discarded, 1, `${failure}: failed launch must discard its pending job`);
 	assert.equal(released, 1, `${failure}: failed launch must release its held lock`);
 }

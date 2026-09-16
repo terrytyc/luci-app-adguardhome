@@ -54,6 +54,7 @@ const callSetSettings = rpc.declare({
 		'run_from_memory',
 		'memory_writeback_interval',
 		'revision',
+		'force_restart',
 	],
 	expect: { '': { accepted: false, token: '', reused: false } },
 	reject: true,
@@ -949,7 +950,7 @@ return view.extend({
 		}
 	},
 
-	async submitSettings() {
+	async submitSettings(forceRestart = false) {
 		const scope = this.pageScope;
 		const map = this.settingsMap;
 		if (!map || !operation.isPageActive(scope))
@@ -990,6 +991,7 @@ return view.extend({
 					candidate.runFromMemory,
 					candidate.memoryWritebackInterval,
 					candidate.revision,
+					forceRestart,
 				), scope);
 			} catch (error) {
 				if (operation.isPageInactiveError(error) || !operation.isPageActive(scope))
@@ -1059,7 +1061,7 @@ return view.extend({
 
 	handleSave: null,
 
-	handleSaveApply() {
+	handleSaveApply(ev, mode) {
 		if (this.settingsSubmission)
 			return this.settingsSubmission;
 		if (this.memoryWritebackBusy || this.credentialsPreparing)
@@ -1074,7 +1076,7 @@ return view.extend({
 		}
 
 		const scope = this.pageScope;
-		const submission = this.submitSettings();
+		const submission = this.submitSettings(mode === '1');
 		this.settingsSubmission = submission;
 		this.updateMemoryWritebackButton();
 		return submission.finally(() => {

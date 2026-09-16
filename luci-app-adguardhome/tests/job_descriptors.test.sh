@@ -41,7 +41,7 @@ for held_fd in 3 187 197; do
 		/usr/bin/flock -n -x "$held_fd"
 		exec 1000<"$test_tmp/stage"
 		settings_update_job_locked() {
-			[ "$#:$1:$9" = 9:1:candidate ]
+			[ "$#:$1:$9:${10}" = 10:1:candidate:1 ]
 			[ "$held_fd" = 187 ] || [ ! -e /proc/self/fd/187 ]
 			[ -e /proc/self/fd/1000 ]
 			yaml_job_lock_fd_valid "" "$held_fd"
@@ -56,7 +56,7 @@ for held_fd in 3 187 197; do
 			if /usr/bin/flock -n "$test_tmp/update.lock" true; then return 1; fi
 			printf 'applied\n' >"$test_tmp/applied"
 		}
-		settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate "$held_fd"
+		settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate "$held_fd" 1
 		[ "$(cat "$test_tmp/applied")" = applied ]
 	)
 done
@@ -82,11 +82,14 @@ for stage_fd in 187 193; do (
 (
 	exec 4</dev/null 187</dev/null
 	settings_update_job_locked() { exit 99; }
-	if settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate 4; then
+	if settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate 4 0; then
 		exit 1
 	fi
 	[ -e /proc/self/fd/187 ]
 	if settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate; then
+		exit 1
+	fi
+	if settings_update 1 /etc/AdGuardHome 0 none 0 60 revision token candidate 4 invalid; then
 		exit 1
 	fi
 )

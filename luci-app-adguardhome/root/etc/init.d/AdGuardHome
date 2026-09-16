@@ -83,7 +83,7 @@ EXTRA_HELP="\tdo_redirect [0|1]\tApply or remove DNS integration
 \tcheck_work_dir <path>\tCheck a persistent work directory
 \tcheck_config <yaml> <workdir>\tValidate one YAML as uid 853
 \tnormalize_config <yaml> <workdir>\tValidate and normalize one installer YAML
-\tsettings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate> <lock-fd>\tApply an authenticated asynchronous settings job
+\tsettings_update <enabled> <workdir> <verbose> <mode> <ram> <minutes> <revision> <token> <candidate> <lock-fd> <force-restart>\tApply an authenticated asynchronous settings job
 \tyaml_update <old-hash> <new-hash> <stage> <fd>\tCommit a validated LuCI YAML edit
 \tyaml_update_job <old-hash> <new-hash> <stage> <stage-fd> <lock-fd> <token>\tRun an asynchronous LuCI YAML edit
 \ttls_prepare\t\tPrepare current YAML TLS access before core start
@@ -4966,9 +4966,15 @@ prepare_wrapper_locked() {
 settings_update_locked() {
 	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
 	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
-	local expected_revision="$7" current_revision
+	local expected_revision="$7" force_restart="${8:-0}" current_revision
 	local old_enabled old_work_dir old_verbose old_redirect old_memory old_interval fast_apply=0
 	local settings_unchanged=0 OFFICIAL_SOCKET_SNAPSHOT_READY=0
+	local apply_action=orchestrate_core_locked
+	case "$force_restart" in
+		0) ;;
+		1) apply_action=restart_wrapper_locked ;;
+		*) return 1 ;;
+	esac
 	SETTINGS_CORE_RESTARTED=1
 	# run_locked() has acquired the integration lock.  Keep every recovery path
 	# that can commit UCI disabled until this second, authoritative CAS succeeds.
@@ -4996,7 +5002,7 @@ settings_update_locked() {
 	old_interval="$memory_writeback_interval"
 	# Every Apply reaches the coordinator, including unchanged settings. Reuse
 	# a running core only when its process and all startup inputs still match.
-	if [ "$old_enabled:$requested_enabled" = 1:1 ] &&
+	if [ "$force_restart" = 0 ] && [ "$old_enabled:$requested_enabled" = 1:1 ] &&
 	   [ "$old_work_dir" = "$requested_work_dir" ] &&
 	   [ "$old_verbose" = "$requested_verbose" ] &&
 	   [ "$old_memory" = "$requested_memory" ] &&
@@ -5050,8 +5056,16 @@ settings_update_locked() {
 		return 0
 	fi
 	OFFICIAL_SOCKET_SNAPSHOT_READY=0
-	if orchestrate_core_locked; then
-		log_error "Applied AdGuard Home settings (enabled ${old_enabled}->${requested_enabled}, DNS ${old_redirect}->${requested_redirect}, memory ${old_memory}->${requested_memory})"
+	if "$apply_action"; then
+		if [ "$force_restart" = 1 ]; then
+			if [ "$requested_enabled" = 1 ]; then
+				log_error "Force-applied AdGuard Home settings: coordinator and core restarted"
+			else
+				log_error "Force-applied AdGuard Home settings: coordinator and core remain stopped"
+			fi
+		else
+			log_error "Applied AdGuard Home settings (enabled ${old_enabled}->${requested_enabled}, DNS ${old_redirect}->${requested_redirect}, memory ${old_memory}->${requested_memory})"
+		fi
 		return 0
 	fi
 	log_error "Unable to apply the new AdGuard Home settings; restoring the previous settings"
@@ -5071,8 +5085,11 @@ settings_update_job_locked() {
 	local requested_enabled="$1" requested_work_dir="${2%/}" requested_verbose="$3"
 	local requested_redirect="$4" requested_memory="$5" requested_interval="$6"
 	local expected_revision="$7" token="$8" candidate_revision="$9"
+	local force_restart="${10:-0}"
 	local calculated_revision current_revision restarted=0 settings_rc terminal
 	local SETTINGS_CORE_RESTARTED=1
+
+	case "$force_restart" in 0|1) ;; *) return 1 ;; esac
 	yaml_job_hash_valid "$expected_revision" || return 1
 	yaml_job_token_valid "$token" || return 1
 	yaml_job_hash_valid "$candidate_revision" || return 1
@@ -5099,7 +5116,7 @@ settings_update_job_locked() {
 
 	settings_update_locked "$requested_enabled" "$requested_work_dir" \
 		"$requested_verbose" "$requested_redirect" "$requested_memory" \
-		"$requested_interval" "$expected_revision"
+		"$requested_interval" "$expected_revision" "$force_restart"
 	settings_rc=$?
 	case "$settings_rc" in
 		0)
@@ -5122,10 +5139,11 @@ settings_update_job_locked() {
 }
 
 settings_update() {
-	[ "$#" = 10 ] || return 1
+	[ "$#" = 11 ] || return 1
+	case "${11}" in 0|1) ;; *) return 1 ;; esac
 	prepare_job_descriptors "" "${10}" || return 1
 	run_locked settings_update_job_locked "$1" "$2" "$3" "$4" "$5" \
-		"$6" "$7" "$8" "$9"
+		"$6" "$7" "$8" "$9" "${11}"
 }
 
 orchestrate_core_locked() {
@@ -5594,6 +5612,28 @@ stop_wrapper_locked() {
 		memory_deactivate_locked || return 1
 	fi
 	return 0
+}
+
+restart_wrapper_locked() {
+	local remaining=10 state
+	stop_wrapper_locked 0 || return 1
+	# Recreate the coordinator too: submitting an unchanged monitor definition
+	# preserves its PID. procd deletes the object only after that monitor exits.
+	state="$(ubus -S call service list '{"name":"AdGuardHome"}')" || return 1
+	if [ -n "$(printf '%s' "$state" | jsonfilter -e '@.AdGuardHome')" ]; then
+		ubus call service delete '{"name":"AdGuardHome"}' >/dev/null || return 1
+		while :; do
+			state="$(ubus -S call service list '{"name":"AdGuardHome"}')" || return 1
+			[ -n "$(printf '%s' "$state" | jsonfilter -e '@.AdGuardHome')" ] || break
+			[ "$remaining" -gt 0 ] || {
+				log_error "AdGuard Home coordinator did not finish stopping"
+				return 1
+			}
+			sleep 1
+			remaining=$((remaining - 1))
+		done
+	fi
+	orchestrate_core_locked
 }
 
 stop_service() {

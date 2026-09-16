@@ -15,7 +15,8 @@ function wait(submit, method, handoff) {
 		uloop.run();
 		let result = call(method, { token: submit.token });
 		if (handoff && !released && index(readfile(`${JOBS}/${submit.token}`), 'success:') == 0) {
-			check(result.state == 'running', 'Published success escaped the worker lock');
+			check(call(method, { token: submit.token }).state == 'running',
+				'Published success escaped the worker lock');
 			writefile('/tmp/release-worker', '1');
 			released = true;
 		}
@@ -35,7 +36,16 @@ let previous = null;
 for (let mode in ['success', 'failure', 'success', 'exit', 'success', 'handoff']) {
 	writefile('/tmp/worker-mode', mode);
 	let submit = call('set_settings', settings);
+	if (mode == 'handoff') {
+		let reused = call('set_settings', settings);
+		check(reused.reused && reused.token == submit.token, 'Ordinary Apply did not reuse its active job');
+		settings.force_restart = true;
+		check(!!call('set_settings', settings).error, 'Forced Apply reused an ordinary active job');
+		settings.force_restart = false;
+		writefile('/tmp/release-pending', '1');
+	}
 	let result = wait(submit, 'get_settings_update', mode == 'handoff');
+	check(readfile('/tmp/worker-force') == '0\n', 'Ordinary Apply did not send the default zero flag');
 	check(result.ok == (mode == 'success' || mode == 'handoff'), `${mode}: incorrect result`);
 	check(!!result.indeterminate == (mode == 'exit'), `${mode}: incorrect recovery`);
 	check(sprintf('%J', call('get_settings_update', { token: submit.token })) == sprintf('%J', result),
@@ -45,6 +55,16 @@ for (let mode in ['success', 'failure', 'success', 'exit', 'success', 'handoff']
 	check(length(lsdir('/proc/self/fd')) == descriptors, `${mode}: leaked descriptor`);
 	previous = submit.token;
 }
+
+writefile('/tmp/worker-mode', 'success');
+settings.force_restart = true;
+check(wait(call('set_settings', settings), 'get_settings_update').ok, 'Forced settings submission failed');
+check(readfile('/tmp/worker-force') == '1\n', 'Forced Apply did not reach the worker');
+for (let flag in [null, 0, 1, '1', 'true', [], {}]) {
+	settings.force_restart = flag;
+	check(!!call('set_settings', settings).error, 'Nonboolean force flag was accepted');
+}
+check(length(lsdir('/proc/self/fd')) == descriptors, 'Forced settings submission leaked a descriptor');
 
 // Exercise the second native callback and its held read-only YAML descriptor.
 writefile('/tmp/worker-mode', 'success');
@@ -64,4 +84,4 @@ uci.commit('adguardhome');
 uci.unload('adguardhome');
 check(!!call('set_yaml', { content: yaml.content, sha256: yaml.sha256, verified_path: yaml.path }).error,
 	'The public YAML method bypassed configured-path validation');
-printf('RPC_LIFECYCLE_OK tasks=8 handoff=running records=1 descriptors=stable\n');
+printf('RPC_LIFECYCLE_OK tasks=9 force=validated handoff=running records=1 descriptors=stable\n');

@@ -115,6 +115,30 @@ PY
 		--output "$temporary/package-$revision.apk" >/dev/null
 done
 
+cat > "$temporary/apply.uc" <<'UC'
+import * as uloop from 'uloop';
+let methods = loadfile('/usr/share/rpcd/ucode/luci.adguardhome', { raw_mode: true })()['luci.adguardhome'];
+uloop.init();
+let settings = methods.get_settings.call();
+settings.force_restart = ARGV[0] == '1';
+let job = methods.set_settings.call({ args: settings });
+if (!job.accepted) die(sprintf('Settings submission failed: %J', job));
+let complete = false;
+for (let attempt = 0; attempt < 300; attempt++) {
+	let timer = uloop.timer(100, function() { uloop.end(); });
+	uloop.run();
+	let result = methods.get_settings_update.call({ args: { token: job.token } });
+	if (result.error) die(sprintf('Settings polling failed: %J', result));
+	if (result.state == 'done') {
+		if (!result.ok || result.restarted != (ARGV[1] == '1'))
+			die(sprintf('Unexpected settings result: %J', result));
+		complete = true;
+		break;
+	}
+}
+if (!complete) die('Settings worker did not finish');
+UC
+
 cat > "$temporary/driver.sh" <<'SH'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -130,6 +154,21 @@ run_apk() {
 	"$apk" --root "$root" --arch x86_64 --allow-untrusted --network=no \
 		--repositories-file /dev/null --sync=no "$@" > "$temporary/apk.log" 2>&1 || fail 'APK transaction failed'
 	! grep -q 'exited with error' "$temporary/apk.log" || fail 'APK package script failed'
+}
+apply_settings() {
+	run /usr/bin/ucode /test/apply.uc "$@" > "$temporary/apply.log" 2>&1 || fail 'native settings apply failed'
+}
+core_pid() {
+	local executable
+	for executable in /proc/[0-9]*/exe; do
+		[[ $(readlink "$executable" 2>/dev/null) == /usr/bin/AdGuardHome ]] || continue
+		executable=${executable%/exe}
+		printf '%s\n' "${executable##*/}"
+	done
+}
+monitor_pid() {
+	run /bin/ubus call service list '{"name":"AdGuardHome"}' |
+		run /usr/bin/jsonfilter -e '@.AdGuardHome.instances.monitor.pid'
 }
 run /bin/busybox-static syslogd -n -O /tmp/system.log > "$temporary/syslogd.log" 2>&1 &
 run /sbin/ubusd > "$temporary/ubusd.log" 2>&1 &
@@ -166,6 +205,31 @@ run /etc/init.d/adguardhome running || fail 'enabled upgrade lost the core'
 sha256sum -c "$temporary/upgrade-yaml.sha256" >/dev/null || fail 'enabled upgrade changed user YAML'
 printf 'ok - native enabled upgrade executes defaults, real RAM core/monitor startup and service verification\n'
 
+# Exercise the installed RPC, its authenticated worker and both real processes.
+core_before=$(core_pid)
+monitor_before=$(monitor_pid)
+[[ $core_before =~ ^[0-9]+$ && $monitor_before =~ ^[0-9]+$ ]] || fail 'apply fixture lacks unique core and monitor PIDs'
+apply_settings 0 0
+[[ $(core_pid) == "$core_before" && $(monitor_pid) == "$monitor_before" ]] || fail 'unchanged apply restarted core or monitor'
+sha256sum -c "$temporary/upgrade-yaml.sha256" >/dev/null || fail 'unchanged apply changed user YAML'
+printf 'ok - native unchanged RPC apply preserves core and monitor PIDs\n'
+
+printf 'write-back-on-force\n' > "$root/etc/AdGuardHome/data/force-sentinel"
+chown 853:853 "$root/etc/AdGuardHome/data/force-sentinel"
+chmod 0600 "$root/etc/AdGuardHome/data/force-sentinel"
+[[ ! -e $root/tmp/luci-app-adguardhome-memory/backing-data/force-sentinel ]] || fail 'force sentinel was not written to RAM'
+apply_settings 1 1
+core_after=$(core_pid)
+monitor_after=$(monitor_pid)
+[[ $core_after =~ ^[0-9]+$ && $monitor_after =~ ^[0-9]+$ &&
+   $core_after != "$core_before" && $monitor_after != "$monitor_before" ]] || fail 'force apply did not replace core and monitor PIDs'
+[[ ! -e /proc/$core_before && ! -e /proc/$monitor_before ]] || fail 'force apply left an old core or monitor process'
+[[ -f $root/tmp/luci-app-adguardhome-memory/state ]] || fail 'force apply fell back from RAM'
+[[ $(cat "$root/tmp/luci-app-adguardhome-memory/backing-data/force-sentinel") == write-back-on-force ]] || fail 'force apply lost RAM write-back'
+sha256sum -c "$temporary/upgrade-yaml.sha256" >/dev/null || fail 'force apply changed user YAML'
+run /etc/init.d/AdGuardHome install_check || fail 'force apply failed service verification'
+printf 'ok - native forced RPC apply replaces core and monitor, writes RAM data back and preserves YAML\n'
+
 run /etc/init.d/AdGuardHome stop > "$temporary/stop.log" 2>&1 || fail 'fixture did not stop'
 run /sbin/uci set adguardhome.config.enabled=0
 run /sbin/uci commit adguardhome
@@ -175,6 +239,10 @@ run /etc/init.d/AdGuardHome install_check || fail 'disabled upgrade failed verif
 [[ -L $root/etc/rc.d/S18AdGuardHome ]] || fail 'disabled upgrade lost coordinator boot links'
 sha256sum -c "$temporary/upgrade-yaml.sha256" >/dev/null || fail 'disabled upgrade changed user YAML'
 printf 'ok - native disabled upgrade keeps core stopped and coordinator enabled\n'
+apply_settings 1 0
+[[ -z $(core_pid) && -z $(monitor_pid) ]] || fail 'disabled force apply started core or monitor'
+sha256sum -c "$temporary/upgrade-yaml.sha256" >/dev/null || fail 'disabled force apply changed user YAML'
+printf 'ok - native disabled force apply keeps core and monitor stopped\n'
 
 # A successful uninstall must stop the real RAM core, write back its data, and
 # remove only plugin state. The YAML, user UCI, data and adjacent files remain.
@@ -205,10 +273,10 @@ for path in etc/init.d/AdGuardHome lib/apk/commit_hooks.d/90-luci-app-adguardhom
 	[[ ! -e $root/$path && ! -L $root/$path ]] || fail "successful uninstall retained $path"
 done
 printf 'ok - native successful uninstall stops real core, writes RAM data back and removes temporary snapshot\n'
-printf 'PACKAGE_LIFECYCLE_OK fresh=disabled upgrade=ram-monitor,disabled removal=ram-writeback\n'
+printf 'PACKAGE_LIFECYCLE_OK fresh=disabled upgrade=ram-monitor,disabled apply=unchanged,forced,disabled removal=ram-writeback\n'
 SH
 mkdir "$root/test" "$root/.oldroot"
-cp "$temporary/driver.sh" "$temporary/"package-*.apk "$root/test/"
+cp "$temporary/driver.sh" "$temporary/apply.uc" "$temporary/"package-*.apk "$root/test/"
 timeout --kill-after=2s 180s unshare --mount --pid --net --fork --kill-child bash -c '
 	set -eu
 	mount --make-rprivate /
