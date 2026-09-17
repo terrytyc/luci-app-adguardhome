@@ -24,7 +24,7 @@ DNS、配置、日志，在路由器里一处管理。
 
 软件源只提供本插件和中文翻译，均为 `noarch`；核心及依赖仍从固件官方源安装。
 
-通过 SSH 执行一次，添加签名公钥、软件源并安装：
+通过 SSH 执行以下命令安装，已安装时会更新插件及翻译：
 
 ```sh
 mkdir -p /etc/apk/keys /etc/apk/repositories.d
@@ -35,7 +35,7 @@ grep -qxF "$feed" /etc/apk/repositories.d/customfeeds.list 2>/dev/null || \
   printf '%s\n' "$feed" >> /etc/apk/repositories.d/customfeeds.list
 apk update &&
 agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
-apk add luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
+apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
 ```
 
 打开 LuCI → **服务 → AdGuard Home**，勾选启用并保存应用。全新安装默认关闭，不会立即接管 DNS。
