@@ -29,13 +29,17 @@ DNS、配置、日志，在路由器里一处管理。
 ```sh
 mkdir -p /etc/apk/keys /etc/apk/repositories.d
 wget -O /etc/apk/keys/terrytyc-adguardhome.pem \
-  https://terrytyc.github.io/luci-app-adguardhome/public-key.pem
+  https://terrytyc.github.io/luci-app-adguardhome/public-key.pem || exit 1
 feed='@terrytyc https://terrytyc.github.io/luci-app-adguardhome/packages/packages.adb'
 grep -qxF "$feed" /etc/apk/repositories.d/customfeeds.list 2>/dev/null || \
   printf '%s\n' "$feed" >> /etc/apk/repositories.d/customfeeds.list
-apk update &&
-agh_pending="$(uci -q changes)" && [ -z "$agh_pending" ] &&
-apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
+apk update
+agh_pending="$(uci -q changes)"
+if [ -n "$agh_pending" ]; then
+  echo '请先提交或撤销尚未保存的 UCI 修改。' >&2
+else
+  apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terrytyc
+fi
 ```
 
 打开 LuCI → **服务 → AdGuard Home**，勾选启用并保存应用。全新安装默认关闭，不会立即接管 DNS。
