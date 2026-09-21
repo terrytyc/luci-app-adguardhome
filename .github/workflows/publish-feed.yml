@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       actions: read
-      contents: read
+      contents: write
       pages: write
     outputs:
       current: ${{ steps.releases.outputs.current }}
@@ -131,6 +131,15 @@ jobs:
               exec sh scripts/publish-feed.sh /sbin/apk keys/public-key.pem \
                 "$CURRENT_TAG" release/current site/packages
             '
+
+      - name: Publish the signed APKs to GitHub Release
+        if: steps.releases.outputs.current != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_TAG: ${{ steps.releases.outputs.current }}
+        run: |
+          gh release upload "$CURRENT_TAG" site/packages/*.apk \
+            --repo "$GITHUB_REPOSITORY" --clobber
 
       - name: Configure GitHub Pages
         if: steps.releases.outputs.current != ''

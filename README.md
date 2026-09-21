@@ -39,7 +39,7 @@ apk add --upgrade luci-app-adguardhome@terrytyc luci-i18n-adguardhome-zh-cn@terr
 
 打开 LuCI → **服务 → AdGuard Home**，勾选启用并保存应用。全新安装默认关闭，不会立即接管 DNS。
 默认管理账号为 `admin / admin`，管理端口为 HTTP `3000`，DNS 端口为 `53335`，HTTPS 默认关闭。可在设置页修改 AdGuard Home 登录账号或密码。
-`@terrytyc` 指定使用本项目软件源，避免同名包被其他源替换。正常校验签名，无需 `--allow-untrusted`。保留配置升级固件时，请将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，一并保留公钥。
+`@terrytyc` 指定使用本项目软件源，避免同名包被其他源替换。软件源和 APK 均有签名；导入上述公钥后，也可上传 Release 中的 APK 安装，无需 `--allow-untrusted`。保留配置升级固件时，请将 `/etc/apk/keys/terrytyc-adguardhome.pem` 加入 `/etc/sysupgrade.conf`，一并保留公钥。
 
 ## 🧭 DNS 模式
 

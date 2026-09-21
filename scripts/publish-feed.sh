@@ -111,12 +111,18 @@ sh "$apk_verifier" "$apk_bin" "$current_version" \
 	"$main_package" "$i18n_package"
 cp -p "$main_package" "$i18n_package" "$stage_dir/"
 
-"$apk_bin" mkndx --allow-untrusted --sign-key "$private_key" \
+mkdir "$key_dir/trusted"
+cp "$public_key" "$key_dir/trusted/public-key.pem"
+for package_path in "$stage_dir"/*.apk; do
+	"$apk_bin" adbsign --allow-untrusted --reset-signatures --sign-key "$private_key" "$package_path"
+	"$apk_bin" --keys-dir "$key_dir/trusted" verify "$package_path" >/dev/null ||
+		die "signed APK failed signature verification: ${package_path##*/}"
+done
+
+"$apk_bin" --keys-dir "$key_dir/trusted" mkndx --sign-key "$private_key" \
 	--output "$stage_dir/packages.adb" \
 	"$stage_dir/${main_package##*/}" "$stage_dir/${i18n_package##*/}"
 
-mkdir "$key_dir/trusted"
-cp "$public_key" "$key_dir/trusted/public-key.pem"
 "$apk_bin" --keys-dir "$key_dir/trusted" verify "$stage_dir/packages.adb" >/dev/null ||
 	die 'generated packages.adb failed signature verification'
 chmod 0755 "$stage_dir"

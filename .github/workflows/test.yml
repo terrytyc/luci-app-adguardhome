@@ -58,6 +58,11 @@ jobs:
             "OUTPUT_DIR=$RUNNER_TEMP/real-apks" \
             NO_DEPS=1 JOBS=2 bash scripts/build-apk.sh
 
+      - name: Test standalone APK and feed signatures
+        run: |
+          bash scripts/tests/package-signing.integration.sh \
+            "$RUNNER_TEMP/luci-full-runtime/apk/sbin/apk.static" "$RUNNER_TEMP/real-apks"
+
       - name: Upload verified release APKs
         if: github.event_name == 'push'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

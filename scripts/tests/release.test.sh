@@ -31,7 +31,7 @@ check_selection '' v3.0.0-r1 'current=v3.0.0-r1'
 check_selection v3.0.0-r10 $'v3.0.0-r9\nv3.0.0-r2\nv3.0.0-r10' 'current=v3.0.0-r10'
 check_selection '' $'v3.0.0-r9\nv3.0.0-r10\nv3.1.0-r1' 'current=v3.1.0-r1'
 check_selection v3.0.0-r9 $'v3.0.0-r9\nv3.0.0-r10' ''
-[[ $(grep -Fc "if: steps.releases.outputs.current != ''" "$workflow") == 6 ]] || die 'build steps must skip old releases'
+[[ $(grep -Fc "if: steps.releases.outputs.current != ''" "$workflow") == 7 ]] || die 'build steps must skip old releases'
 grep -Fq "if: needs.build.outputs.current != ''" "$workflow" || die 'deploy must skip old releases'
 ! grep -Fq 'inputs.tag' "$workflow" || die 'manual publication must use the latest release'
 ! grep -qi previous "$workflow" || die 'publication must not retain an unindexed previous release'
@@ -41,6 +41,8 @@ grep -Fq 'ref: ${{ steps.tests.outputs.head_sha }}' "$workflow" ||
 	die 'publication must not resolve a movable tag after the test gate'
 grep -Fq 'persist-credentials: false' "$workflow" || die 'release checkout must not retain write credentials'
 ! grep -Fq 'gh release download' "$workflow" || die 'signed feed must not trust independently uploaded release APKs'
+grep -Fq 'gh release upload "$CURRENT_TAG" site/packages/*.apk' "$workflow" ||
+	die 'release downloads must use the signed feed APKs'
 grep -Fq 'TEST_RUN_ID: ${{ steps.tests.outputs.run_id }}' "$workflow" ||
 	die 'feed download is not bound to the passing test run'
 grep -Fq 'TEST_ARTIFACT_ATTEMPT: ${{ steps.tests.outputs.artifact_attempt }}' "$workflow" ||
@@ -260,10 +262,19 @@ case "$1" in
 				fi
 				sed -n 's/^# payload-version: //p' "$5" >"$4/usr/share/luci-app-adguardhome/version" ;;
 		esac ;;
-	mkndx)
-		[ "$2" = --allow-untrusted ] && [ "$3" = --sign-key ] && [ -f "$4" ] && [ "$5" = --output ]
-		printf '%s\n' "${7##*/}" "${8##*/}" >"$6" ;;
-	--keys-dir) [ -f "$2/public-key.pem" ] && [ "$3" = verify ] && [ -s "$4" ] ;;
+	adbsign)
+		[ "$2" = --allow-untrusted ] && [ "$3" = --reset-signatures ] && [ "$4" = --sign-key ] && [ -f "$5" ]
+		printf '# signed\n' >>"$6" ;;
+	--keys-dir)
+		[ -f "$2/public-key.pem" ]
+		case "$3" in
+			verify) [ -s "$4" ]; case "$4" in *.apk) grep -qx '# signed' "$4" ;; esac ;;
+			mkndx)
+				[ "$4" = --sign-key ] && [ -f "$5" ] && [ "$6" = --output ]
+				grep -qx '# signed' "$8" && grep -qx '# signed' "$9"
+				printf '%s\n' "${8##*/}" "${9##*/}" >"$7" ;;
+			*) exit 9 ;;
+		esac ;;
 	*) exit 9 ;;
 esac
 SH
